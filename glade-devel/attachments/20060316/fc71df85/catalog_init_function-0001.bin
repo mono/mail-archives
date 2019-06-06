@@ -1,0 +1,296 @@
+Index: src/glade-catalog.c
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-catalog.c,v
+retrieving revision 1.29
+diff -u -p -r1.29 glade-catalog.c
+--- src/glade-catalog.c	24 Jan 2006 05:37:29 -0000	1.29
++++ src/glade-catalog.c	16 Mar 2006 20:46:46 -0000
+@@ -37,6 +37,7 @@
+ #include "glade-catalog.h"
+ #include "glade-widget-class.h"
+ 
++typedef void   (*GladeCatalogInitFunc) (void);
+ 
+ struct _GladeCatalog
+ {
+@@ -57,6 +58,11 @@ struct _GladeCatalog
+ 
+ 	GladeXmlContext *context;/* Xml context is stored after open
+ 				  * before classes are loaded         */
++	
++	GModule *module;
++	
++	gchar *init_function_name;/* Catalog's init function name */
++	GladeCatalogInitFunc init_function;
+ };
+ 
+ struct _GladeWidgetGroup
+@@ -80,6 +86,20 @@ void                   widget_group_free
+  */
+ static GList *loaded_catalogs = NULL;
+ 
++static gboolean
++catalog_get_function (GladeCatalog *catalog, 
++		      const gchar *symbol_name,
++		      gpointer *symbol_ptr)
++{
++	if (catalog->module == NULL)
++		catalog->module = glade_util_load_library (catalog->library);
++	
++	if (catalog->module)
++		return g_module_symbol (catalog->module, symbol_name, symbol_ptr);
++
++	return FALSE;
++}
++
+ static GladeCatalog *
+ catalog_open (const gchar *filename)
+ {
+@@ -88,7 +108,7 @@ catalog_open (const gchar *filename)
+ 	GladeXmlDoc     *doc;
+ 	GladeXmlNode    *root;
+ 
+-	g_debug ("Loading catalog: %s\n", filename);
++	g_debug ("Opening catalog: %s\n", filename);
+ 
+ 	/* get the context & root node of the catalog file */
+ 	context = glade_xml_context_new_from_path (filename,
+@@ -130,7 +150,13 @@ catalog_open (const gchar *filename)
+ 		glade_xml_get_property_string (root, GLADE_TAG_DEPENDS);
+ 	catalog->domain =
+ 		glade_xml_get_property_string (root, GLADE_TAG_DOMAIN);
+-
++	catalog->init_function_name =
++		glade_xml_get_value_string (root, GLADE_TAG_INIT_FUNCTION);
++	
++	if (catalog->init_function_name)
++		catalog_get_function (catalog, catalog->init_function_name,
++				      (gpointer) &catalog->init_function);
++	
+ 	g_debug ("Successfully parsed catalog: %s\n", catalog->name);
+ 
+ 	return catalog;
+@@ -146,6 +172,15 @@ catalog_load (GladeCatalog *catalog)
+ 
+ 	g_return_if_fail (catalog->context != NULL);
+ 	
++	g_debug ("Loading catalog: %s\n", catalog->name);
++	
++	if (catalog->init_function)
++	{
++		g_debug ("Executing catalog's init function. (%s)\n", 
++			 catalog->init_function_name);
++		catalog->init_function ();
++	}
++	
+ 	doc  = glade_xml_context_get_doc (catalog->context);
+ 	root = glade_xml_doc_get_root (doc);
+ 	node = glade_xml_node_get_children (root);
+@@ -171,7 +206,7 @@ catalog_load (GladeCatalog *catalog)
+ 	catalog->context =
+ 		(glade_xml_context_free (catalog->context), NULL);
+ 	
+-	g_debug ("Successfully parsed catalog: %s\n", catalog->name);
++	g_debug ("Successfully loaded catalog: %s\n", catalog->name);
+ 
+ 	return;
+ }
+Index: src/glade-project-view.c
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-project-view.c,v
+retrieving revision 1.55
+diff -u -p -r1.55 glade-project-view.c
+--- src/glade-project-view.c	16 Mar 2006 06:59:01 -0000	1.55
++++ src/glade-project-view.c	16 Mar 2006 20:46:46 -0000
+@@ -192,7 +192,7 @@ glade_project_view_populate_model (Glade
+ 		g_assert (gwidget);
+ 
+ 		if (gwidget->parent == NULL)
+-			toplevels = g_list_append (toplevels, object);
++			toplevels = g_list_prepend (toplevels, object);
+ 	}
+ 
+ 	/* add the widgets and recurse */
+Index: src/glade-property.c
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-property.c,v
+retrieving revision 1.82
+diff -u -p -r1.82 glade-property.c
+--- src/glade-property.c	1 Mar 2006 19:59:12 -0000	1.82
++++ src/glade-property.c	16 Mar 2006 20:46:48 -0000
+@@ -315,8 +315,9 @@ glade_property_write_impl (GladeProperty
+ 	 * the opening and the closing of the property tag */
+ 	tmp = glade_property_class_make_string_from_gvalue (property->class,
+ 							    property->value);
+-	if (!tmp || !tmp[0])
+-		return FALSE;
++	
++	/* an empty string is a valid value (a flag set to 0) */
++	if (tmp == NULL) return FALSE;
+ 
+ 	if (property->class->orig_def == NULL)
+ 	{
+Index: src/glade-widget-class.c
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-widget-class.c,v
+retrieving revision 1.88
+diff -u -p -r1.88 glade-widget-class.c
+--- src/glade-widget-class.c	16 Mar 2006 06:59:01 -0000	1.88
++++ src/glade-widget-class.c	16 Mar 2006 20:46:49 -0000
+@@ -929,55 +929,6 @@ glade_widget_class_merge (GladeWidgetCla
+ 		(&widget_class->children, parent_class->children, widget_class);
+ }
+ 
+-/**
+- * glade_widget_class_load_library:
+- * @library_name: name of the library
+- *
+- * Loads the named library from the Glade modules directory, or failing that
+- * from the standard platform specific directories.
+- *
+- * The @library_name should not include any platform specifix prefix or suffix,
+- * those are automatically added, if needed, by g_module_build_path()
+- *
+- * Returns: a #GModule on success, or %NULL on failure.
+- */
+-static GModule *
+-glade_widget_class_load_library (const gchar *library_name)
+-{
+-	gchar   *path;
+-	GModule *module;
+-
+-	path = g_module_build_path (glade_modules_dir, library_name);
+-	if (!path)
+-	{
+-		g_warning (_("Not enough memory."));
+-		return NULL;
+-	}
+-
+-	module = g_module_open (path, G_MODULE_BIND_LAZY);
+-	g_free (path);
+-
+-	if (!module)
+-	{
+-		path = g_module_build_path (NULL, library_name);
+-		if (!path)
+-		{
+-			g_warning (_("Not enough memory."));
+-			return NULL;
+-		}
+-
+-		module = g_module_open (path, G_MODULE_BIND_LAZY);
+-		g_free (path);
+-	}
+-
+-	if (!module)
+-	{
+-		g_warning (_("Unable to open the module %s."), library_name);
+-	}
+-
+-	return module;
+-}
+-
+ GladeWidgetClass *
+ glade_widget_class_new (GladeXmlNode *class_node,
+ 			const gchar  *catname, 
+@@ -1028,7 +979,7 @@ glade_widget_class_new (GladeXmlNode *cl
+ 	module = NULL;
+ 	if (library) 
+ 	{
+-		module = glade_widget_class_load_library (library);
++		module = glade_util_load_library (library);
+ 		if (!module)
+ 		{
+ 			g_warning ("Failed to load external library '%s'",
+Index: src/glade-utils.c
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-utils.c,v
+retrieving revision 1.68
+diff -u -p -r1.68 glade-utils.c
+--- src/glade-utils.c	16 Mar 2006 05:29:37 -0000	1.68
++++ src/glade-utils.c	16 Mar 2006 20:46:56 -0000
+@@ -1416,3 +1416,53 @@ glade_util_copy_file (const gchar  *src_
+ 	}
+ 	return success;
+ }
++
++
++/**
++ * glade_util_load_library:
++ * @library_name: name of the library
++ *
++ * Loads the named library from the Glade modules directory, or failing that
++ * from the standard platform specific directories.
++ *
++ * The @library_name should not include any platform specifix prefix or suffix,
++ * those are automatically added, if needed, by g_module_build_path()
++ *
++ * Returns: a #GModule on success, or %NULL on failure.
++ */
++GModule *
++glade_util_load_library (const gchar *library_name)
++{
++	gchar   *path;
++	GModule *module;
++
++	path = g_module_build_path (glade_modules_dir, library_name);
++	if (!path)
++	{
++		g_warning (_("Not enough memory."));
++		return NULL;
++	}
++
++	module = g_module_open (path, G_MODULE_BIND_LAZY);
++	g_free (path);
++
++	if (!module)
++	{
++		path = g_module_build_path (NULL, library_name);
++		if (!path)
++		{
++			g_warning (_("Not enough memory."));
++			return NULL;
++		}
++
++		module = g_module_open (path, G_MODULE_BIND_LAZY);
++		g_free (path);
++	}
++
++	if (!module)
++	{
++		g_warning (_("Unable to open the module %s."), library_name);
++	}
++
++	return module;
++}
+Index: src/glade-utils.h
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-utils.h,v
+retrieving revision 1.42
+diff -u -p -r1.42 glade-utils.h
+--- src/glade-utils.h	24 Feb 2006 02:04:38 -0000	1.42
++++ src/glade-utils.h	16 Mar 2006 20:46:56 -0000
+@@ -115,6 +115,8 @@ LIBGLADEUI_API
+ gboolean          glade_util_copy_file             (const gchar  *src_path,
+ 						    const gchar  *dest_path);
+ 
++LIBGLADEUI_API
++GModule          *glade_util_load_library          (const gchar  *library_name);
+ 
+ G_END_DECLS
+ 
+Index: src/glade.h
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade.h,v
+retrieving revision 1.58
+diff -u -p -r1.58 glade.h
+--- src/glade.h	16 Mar 2006 06:59:01 -0000	1.58
++++ src/glade.h	16 Mar 2006 20:46:56 -0000
+@@ -132,6 +132,7 @@ typedef struct _GladeProject      GladeP
+ #define GLADE_TAG_VISIBLE_LINES                   "visible-lines"
+ #define GLADE_TAG_RESOURCE                        "resource"
+ #define GLADE_TAG_ATK_RELATION                    "atk-relation"
++#define GLADE_TAG_INIT_FUNCTION                   "init-function"
+ 
+ #define GLADE_NUMERICAL_STEP_INCREMENT             1
+ #define GLADE_FLOATING_STEP_INCREMENT              0.01F

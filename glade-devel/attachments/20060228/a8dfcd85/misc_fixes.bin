@@ -1,0 +1,261 @@
+Index: src/glade-gtk.c
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-gtk.c,v
+retrieving revision 1.104
+diff -u -p -r1.104 glade-gtk.c
+--- src/glade-gtk.c	24 Feb 2006 20:25:50 -0000	1.104
++++ src/glade-gtk.c	28 Feb 2006 20:13:47 -0000
+@@ -353,14 +353,14 @@ glade_gtk_box_verify_size (GObject *obje
+ void GLADEGTK_API
+ glade_gtk_box_add_child (GObject *object, GObject *child)
+ {
+-	gint num_children, position;
+-	GladeWidget *gbox, *gchild;
++	GladeWidget *gbox;
++	GladeProject *project;
+ 	
+ 	g_return_if_fail (GTK_IS_BOX (object));
+ 	g_return_if_fail (GTK_IS_WIDGET (child));
+ 	
+ 	gbox = glade_widget_get_from_gobject (object);
+-	gchild = glade_widget_get_from_gobject (child);
++	project = glade_widget_get_project (gbox);
+ 
+ 	/*
+ 	  Try to remove the last placeholder if any, this way GtkBox`s size 
+@@ -383,17 +383,20 @@ glade_gtk_box_add_child (GObject *object
+ 	}
+ 	
+ 	gtk_container_add (GTK_CONTAINER (object), GTK_WIDGET (child));
+-
+-	num_children = g_list_length (GTK_BOX (object)->children);
+-
+-	glade_widget_property_set (gbox, "size", num_children);
+-
+-	/* Packing props arent around when parenting during a glade_widget_dup() */
+-	if (gchild && gchild->packing_properties)
++	
++	if (glade_project_is_loading (project))
+ 	{
+-		if (!glade_widget_pack_property_get (gchild, "position", &position))
+-			position = num_children - 1;
+-		glade_widget_pack_property_set (gchild, "position", position);
++		GladeWidget *gchild;
++		gint num_children;
++		
++		num_children = g_list_length (GTK_BOX (object)->children);
++		glade_widget_property_set (gbox, "size", num_children);
++		
++		gchild = glade_widget_get_from_gobject (child);
++		
++		/* Packing props arent around when parenting during a glade_widget_dup() */
++		if (gchild && gchild->packing_properties)
++			glade_widget_pack_property_set (gchild, "position", num_children - 1);
+ 	}
+ }
+ 
+@@ -922,6 +925,48 @@ glade_gtk_image_set_stock (GObject *obje
+ 	g_type_class_unref (eclass);
+ }
+ 
++static gboolean
++glade_gtk_combo_box_common_set (GObject *object,
++				GValue *value,
++				gint *val)
++{
++	GladeWidget *gcombo;
++	GObject *model;
++	
++	g_return_val_if_fail (GTK_IS_COMBO_BOX (object), FALSE);
++	gcombo = glade_widget_get_from_gobject (object);
++	g_return_val_if_fail (GLADE_IS_WIDGET (gcombo), FALSE);
++	
++	glade_widget_property_get (gcombo, "model", &model);
++	*val = g_value_get_int (value);
++	
++	return (model && *val != -1) ? TRUE : FALSE;
++}
++
++void GLADEGTK_API
++glade_gtk_combo_box_set_active (GObject *object, GValue *value)
++{
++	gint val;
++	if (glade_gtk_combo_box_common_set (object, value, &val))
++		gtk_combo_box_set_active (GTK_COMBO_BOX (object), val);
++}
++
++void GLADEGTK_API
++glade_gtk_combo_box_set_column_span_column (GObject *object, GValue *value)
++{
++	gint val;
++	if (glade_gtk_combo_box_common_set (object, value, &val))
++		gtk_combo_box_set_column_span_column (GTK_COMBO_BOX (object), val);
++}
++
++void GLADEGTK_API
++glade_gtk_combo_box_set_row_span_column (GObject *object, GValue *value)
++{
++	gint val;
++	if (glade_gtk_combo_box_common_set (object, value, &val))
++		gtk_combo_box_set_row_span_column (GTK_COMBO_BOX (object), val);
++}
++
+ void GLADEGTK_API
+ glade_gtk_combo_box_set_items (GObject *object, GValue *value)
+ {
+@@ -1638,14 +1683,10 @@ glade_gtk_dialog_get_internal_child (Gtk
+ GList * GLADEGTK_API
+ glade_gtk_dialog_get_internal_children (GtkDialog  *dialog)
+ {
+-	GList *list = NULL;
+-
+ 	g_return_val_if_fail (GTK_IS_DIALOG (dialog), NULL);
+-
+-	list = g_list_prepend (list, dialog->vbox);
+-	list = g_list_prepend (list, dialog->action_area);
+-
+-	return list;
++	
++	/* Do not include action_area because it is already inside vbox */
++	return g_list_prepend (NULL, dialog->vbox);
+ }
+ 
+ 
+@@ -1800,10 +1841,7 @@ glade_gtk_expander_add_child (GObject *o
+ /* GtkTable */
+ 
+ static gboolean
+-glade_gtk_table_has_child (GtkTable *table, 
+-			   gboolean skip_placeholders, 
+-			   guint left_attach,
+-			   guint top_attach)
++glade_gtk_table_has_child (GtkTable *table, guint left_attach, guint top_attach)
+ {
+ 	GList *list;
+ 
+@@ -1811,9 +1849,6 @@ glade_gtk_table_has_child (GtkTable *tab
+ 	{
+ 		GtkTableChild *child = list->data;
+ 		
+-		if (skip_placeholders && GLADE_IS_PLACEHOLDER (child->widget))
+-			continue;
+-			
+ 		if (left_attach >= child->left_attach && left_attach < child->right_attach &&
+ 		    top_attach >= child->top_attach && top_attach < child->bottom_attach)
+ 			return TRUE;
+@@ -1847,21 +1882,7 @@ glade_gtk_table_refresh_placeholders (Gt
+ 		GtkTableChild *child = list->data;
+ 		
+ 		if (GLADE_IS_PLACEHOLDER (child->widget))
+-		{
+-			guint left_attach, top_attach;
+-
+-			gtk_container_child_get (GTK_CONTAINER (table), child->widget,
+-						 "left-attach", &left_attach, 
+-						 "top-attach", &top_attach, NULL);
+-
+-			gtk_container_child_set (GTK_CONTAINER (table), child->widget,
+-						 "right-attach", left_attach + 1,
+-						 "bottom-attach", top_attach + 1, NULL);
+-			
+-			if (glade_gtk_table_has_child (table, TRUE,
+-						       left_attach, top_attach))
+-				toremove = g_list_prepend (toremove, child->widget);
+-		}
++			toremove = g_list_prepend (toremove, child->widget);
+ 	}
+ 
+ 	if (toremove)
+@@ -1874,7 +1895,7 @@ glade_gtk_table_refresh_placeholders (Gt
+ 
+ 	for (i = 0; i < table->ncols; i++)
+ 		for (j = 0; j < table->nrows; j++)
+-			if (glade_gtk_table_has_child (table, FALSE, i, j) == FALSE)
++			if (glade_gtk_table_has_child (table, i, j) == FALSE)
+ 				gtk_table_attach_defaults (table,
+ 							   glade_placeholder_new (),
+ 					 		   i, i + 1, j, j + 1);
+@@ -2543,7 +2564,7 @@ glade_gtk_radio_menu_item_set_group (GOb
+ static GladeWidget * 
+ glade_gtk_menu_bar_append_new_submenu (GladeWidget *parent, GladeProject *project)
+ {
+-	GladeWidgetClass *submenu_class = NULL;
++	static GladeWidgetClass *submenu_class = NULL;
+ 	GladeWidget *gsubmenu;
+ 	
+ 	if (submenu_class == NULL)
+Index: src/glade-widget.c
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-widget.c,v
+retrieving revision 1.168
+diff -u -p -r1.168 glade-widget.c
+--- src/glade-widget.c	24 Feb 2006 20:25:50 -0000	1.168
++++ src/glade-widget.c	28 Feb 2006 20:13:54 -0000
+@@ -556,7 +556,9 @@ glade_widget_build_object (GladeWidgetCl
+ 		glade_property_class =
+ 			glade_widget_class_get_property_class (klass,
+ 							       pspec[i]->name);
+-		if (!glade_property_class)
++		if (glade_property_class == NULL ||
++		    glade_property_class->set_function ||
++		    glade_property_class->ignore)
+ 			/* Ignore properties that are not accounted for
+ 			 * by the GladeWidgetClass
+ 			 */
+@@ -2803,6 +2805,8 @@ glade_widget_properties_from_widget_info
+ 		
+ 		property          = glade_property_new (pclass, NULL, value);
+ 		property->enabled = value ? TRUE : property->enabled;
++		/* If value is not specified, use the introspected default */
++		if (value == NULL && pclass->orig_def) g_value_copy (pclass->orig_def, property->value);
+ 
+ 		if (glade_property_class_is_object (pclass))
+ 		{
+@@ -2881,9 +2885,14 @@ glade_widget_params_from_widget_info (Gl
+ 		}
+ 		/* Now try filling the parameter with the default on the GladeWidgetClass.
+ 		 */
+-		else if (g_value_type_compatible (G_VALUE_TYPE (glade_property_class->def),
++		else if (g_value_type_compatible (G_VALUE_TYPE (glade_property_class->orig_def),
+ 						  G_VALUE_TYPE (&parameter.value)))
+-			g_value_copy (glade_property_class->def, &parameter.value);
++			{
++				if (g_type_is_a (G_VALUE_TYPE (glade_property_class->orig_def), G_TYPE_OBJECT))
++						if (g_value_get_object (glade_property_class->orig_def) == NULL)
++							continue;
++				g_value_copy (glade_property_class->orig_def, &parameter.value);
++			}
+ 		else
+ 		{
+ 			g_critical ("Type mismatch on %s property of %s",
+Index: widgets/gtk+.xml.in
+===================================================================
+RCS file: /cvs/gnome/glade3/widgets/gtk+.xml.in,v
+retrieving revision 1.33
+diff -u -p -r1.33 gtk+.xml.in
+--- widgets/gtk+.xml.in	24 Feb 2006 20:26:04 -0000	1.33
++++ widgets/gtk+.xml.in	28 Feb 2006 20:13:56 -0000
+@@ -52,6 +52,7 @@
+ 	<property id="parent" disabled="True"/>
+ 	<property id="style" disabled="True"/>
+ 	<property id="sensitive" ignore="True"/>
++	<property id="has-default" ignore="True" common="True"/>
+       </properties>
+     </glade-widget-class>
+ 
+@@ -481,6 +482,15 @@
+     <glade-widget-class name="GtkComboBox" generic-name="combobox" _title="Combo Box">
+       <post-create-function>glade_gtk_combo_box_post_create</post-create-function>
+       <properties>
++        <property id="active">
++	  <set-function>glade_gtk_combo_box_set_active</set-function>
++	</property>
++        <property id="column-span-column">
++	  <set-function>glade_gtk_combo_box_set_column_span_column</set-function>
++	</property>
++        <property id="row-span-column">
++	  <set-function>glade_gtk_combo_box_set_row_span_column</set-function>
++	</property>
+ 	<property id="items" _name="Items" translatable="True">
+ 	  <spec>glade_standard_strv_spec</spec>
+ 	  <_tooltip>The items in this combo box</_tooltip>

@@ -1,0 +1,348 @@
+Index: src/glade-app.c
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-app.c,v
+retrieving revision 1.29
+diff -u -r1.29 glade-app.c
+--- src/glade-app.c	22 Jan 2006 09:09:33 -0000	1.29
++++ src/glade-app.c	23 Jan 2006 23:06:23 -0000
+@@ -82,6 +82,7 @@
+ 				      * GladeWidgets.
+ 				      */
+ 	GtkAccelGroup *accel_group;	/* Default acceleration group for this app */
++	GList *undo_list, *redo_list;	/* Lists of buttons to refresh in update-ui signal */
+ };
+ 
+ enum
+@@ -332,6 +333,64 @@
+ }
+ 
+ static void
++glade_app_refresh_undo_redo_button (GladeApp *app,
++				    GtkWidget *button,
++				    gboolean undo)
++{
++	GladeCommand *command = NULL;
++	static GtkTooltips *button_tips = NULL;
++	GladeProject *project;
++	gchar *desc;
++
++	if (button_tips == NULL)
++		button_tips = gtk_tooltips_new ();
++	
++	if ((project = glade_app_get_active_project (app)) != NULL)
++	{
++		if (undo)
++			command = glade_command_next_undo_item (project);
++		else
++			command = glade_command_next_redo_item (project);
++	}
++
++	/* Change tooltips */
++	desc = g_strdup_printf ((undo) ? _("Undo: %s") : _("Redo: %s"),
++			command ? command->description : _("the last action"));
++	gtk_tooltips_set_tip (GTK_TOOLTIPS (button_tips), button, desc, NULL);
++	g_free (desc);
++
++	/* Set sensitivity on the button */
++	gtk_widget_set_sensitive (button, command != NULL);
++}
++
++void
++glade_app_undo_redo_button_update_ui (GladeApp *app)
++{
++	GList *list;
++	gboolean clean_undo_list = FALSE, clean_redo_list = FALSE;
++	
++	for (list = app->priv->undo_list; list; list = list->next)
++	{
++		if (list->data)
++			glade_app_refresh_undo_redo_button (app, list->data, TRUE);
++		else
++			clean_undo_list = TRUE;
++	}
++	if (clean_undo_list)
++		app->priv->undo_list = g_list_remove_all (app->priv->undo_list, NULL);
++		
++	for (list = app->priv->redo_list; list; list = list->next)
++	{
++		if (list->data)
++			glade_app_refresh_undo_redo_button (app, list->data, FALSE);
++		else
++			clean_redo_list = TRUE;
++	}
++	if (clean_redo_list)
++		app->priv->redo_list = g_list_remove_all (app->priv->redo_list, NULL);
++}
++
++static void
+ glade_app_init (GladeApp *app)
+ {
+ 	static gboolean initialized = FALSE;
+@@ -394,6 +453,12 @@
+ 
+ 	/* Load the configuration file */
+ 	app->priv->config = glade_app_config_load (app);
++	
++	/* Undo/Redo button list */
++	app->priv->undo_list = app->priv->redo_list = NULL;
++	g_signal_connect (app, "update-ui", 
++			  G_CALLBACK (glade_app_undo_redo_button_update_ui),
++			  NULL);	
+ }
+ 
+ GType
+@@ -807,6 +872,48 @@
+ 	app->priv->accel_group = accel_group;
+ }
+ 
++static GtkWidget *
++glade_app_undo_redo_button_new (GladeApp *app, gboolean undo)
++{
++	GtkWidget *button;
++	
++	button = gtk_button_new_from_stock ((undo) ? 
++					    GTK_STOCK_UNDO : 
++					    GTK_STOCK_REDO);
++	
++	g_signal_connect_swapped (button, "clicked",
++				  (undo) ? G_CALLBACK (glade_app_command_undo) : 
++					   G_CALLBACK (glade_app_command_redo),
++				  app);
++	
++	if (undo)
++	{
++		app->priv->undo_list = g_list_prepend (app->priv->undo_list, button);
++		g_object_add_weak_pointer (G_OBJECT (button), &app->priv->undo_list->data);
++	}
++	else
++	{
++		app->priv->redo_list = g_list_prepend (app->priv->redo_list, button);
++		g_object_add_weak_pointer (G_OBJECT (button), &app->priv->redo_list->data);
++	}
++	
++	glade_app_refresh_undo_redo_button (app, button, undo);
++	
++	return button;
++}
++
++GtkWidget *
++glade_app_undo_button_new (GladeApp *app)
++{
++	return glade_app_undo_redo_button_new (app, TRUE);
++}
++
++GtkWidget *
++glade_app_redo_button_new (GladeApp *app)
++{
++	return glade_app_undo_redo_button_new (app, FALSE);
++}
++
+ /* Default application convinience functions */
+ 
+ static GladeApp *glade_default_app = NULL;
+@@ -1027,3 +1134,16 @@
+ 	}
+ }
+ 
++GtkWidget *
++glade_default_app_undo_button_new (void)
++{
++	g_return_val_if_fail (glade_default_app != NULL, NULL);
++	return glade_app_undo_redo_button_new (glade_default_app, TRUE);
++}
++
++GtkWidget *
++glade_default_app_redo_button_new (void)
++{
++	g_return_val_if_fail (glade_default_app != NULL, NULL);
++	return glade_app_undo_redo_button_new (glade_default_app, FALSE);
++}
+Index: src/glade-app.h
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-app.h,v
+retrieving revision 1.12
+diff -u -r1.12 glade-app.h
+--- src/glade-app.h	6 Dec 2005 20:46:48 -0000	1.12
++++ src/glade-app.h	23 Jan 2006 23:06:23 -0000
+@@ -101,6 +101,9 @@
+ LIBGLADEUI_API void               glade_app_set_accel_group (GladeApp *app, GtkAccelGroup *accel_group);
+ LIBGLADEUI_API void               glade_app_update_instance_count  (GladeApp *app, GladeProject *project);
+ 
++LIBGLADEUI_API GtkWidget 	 *glade_app_undo_button_new (GladeApp *app);
++LIBGLADEUI_API GtkWidget 	 *glade_app_redo_button_new (GladeApp *app);
++
+ /* Default glade application */
+ LIBGLADEUI_API void               glade_default_app_set (GladeApp *app);
+ LIBGLADEUI_API GtkWidget*         glade_default_app_get_window (void);
+@@ -131,7 +134,8 @@
+ 								      gboolean      emit_signal);
+ LIBGLADEUI_API void               glade_default_app_selection_clear  (gboolean      emit_signal);
+ LIBGLADEUI_API void               glade_default_app_selection_changed(void);
+-
++LIBGLADEUI_API GtkWidget	         *glade_default_app_undo_button_new  (void);
++LIBGLADEUI_API GtkWidget	         *glade_default_app_redo_button_new  (void);
+ 
+ G_END_DECLS
+ 
+Index: src/glade-gtk.c
+===================================================================
+RCS file: /cvs/gnome/glade3/src/glade-gtk.c,v
+retrieving revision 1.96
+diff -u -r1.96 glade-gtk.c
+--- src/glade-gtk.c	23 Jan 2006 02:22:33 -0000	1.96
++++ src/glade-gtk.c	23 Jan 2006 23:06:31 -0000
+@@ -496,25 +496,15 @@
+ 
+ /* GtkTable */
+ static gboolean
+-glade_gtk_table_has_child (GtkTable *table,
+-			   guint left_attach,
+-			   guint right_attach,
+-			   guint top_attach,
+-			   guint bottom_attach)
++glade_gtk_table_has_child (GtkTable *table, guint left_attach, guint top_attach)
+ {
+ 	GList *list;
+ 
+ 	for (list = table->children; list && list->data; list = list->next)
+ 	{
+ 		GtkTableChild *child = list->data;
+-		
+-		if (child->left_attach   == left_attach &&
+-		    child->right_attach  == right_attach &&
+-		    child->top_attach    == top_attach &&
+-		    child->bottom_attach == bottom_attach)
+-
+-		if (left_attach >= child->left_attach && left_attach <= child->right_attach &&
+-		    top_attach >= child->top_attach && top_attach <= child->bottom_attach)
++		if (left_attach >= child->left_attach && left_attach < child->right_attach &&
++		    top_attach >= child->top_attach && top_attach < child->bottom_attach)
+ 			return TRUE;
+ 
+ 	}
+@@ -585,8 +575,7 @@
+ 
+ 	for (i = 0; i < table->ncols; i++)
+ 		for (j = 0; j < table->nrows; j++)
+-			if (glade_gtk_table_has_child
+-			    (table, i, i + 1, j, j + 1) == FALSE)
++			if (glade_gtk_table_has_child (table, i, j) == FALSE)
+ 				gtk_table_attach_defaults
+ 					(table, glade_placeholder_new (),
+ 					 i, i + 1, j, j + 1);
+@@ -1950,8 +1939,7 @@
+ 	if (position < 0)
+ 	{
+ 		position = glade_gtk_menu_shell_get_item_position (container, child);
+-		glade_widget_property_set (gitem, "position", position);
+-		return;
++		g_value_set_int (value, position);
+ 	}
+ 	
+ 	g_object_ref (child);
+@@ -3332,7 +3320,7 @@
+ 	}
+ 	
+ 	if (glade_gtk_menu_editor_is_child (e, widget))
+-		g_idle_add (glade_gtk_menu_editor_update_treeview_idle, e);
++		glade_gtk_menu_editor_update_treeview_idle (e);
+ 
+ }
+ 
+@@ -3411,10 +3399,12 @@
+ 	GladeGtkMenuEditor *e;
+ 	GtkCellRenderer *renderer;
+ 	GtkTreeViewColumn *column;
+-	GtkWidget *vbox, *signal_editor_w, *paned, *hbox, *prop_vbox;
+-	GtkWidget *label, *scroll, *item, *button, *buttonbox;
++	GtkWidget *vbox, *signal_editor_w, *paned, *hbox, *prop_vbox, *tree_vbox;
++	GtkWidget *label, *scroll, *item, *button, *buttonbox, *button_table;
+ 	gchar *title;
+ 
++	if (menubar == NULL) return NULL;
++		
+ 	if (g_object_get_data (menubar, "GladeGtkMenuEditor")) return NULL;
+ 	
+ 	/* Editor's struct */
+@@ -3474,11 +3464,15 @@
+ 	hbox = gtk_hbox_new (FALSE, 8);
+ 	gtk_paned_pack1 (GTK_PANED (paned), hbox, TRUE, FALSE);
+ 	
++	/* TreeView Vbox */
++	tree_vbox = gtk_vbox_new (FALSE, 8);
++	gtk_box_pack_start (GTK_BOX (hbox), tree_vbox, FALSE, TRUE, 0);
++	
+ 	/* ScrolledWindow */
+ 	scroll = gtk_scrolled_window_new (NULL, NULL);
+ 	gtk_scrolled_window_set_shadow_type (GTK_SCROLLED_WINDOW (scroll), GTK_SHADOW_IN);
+ 	gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll), GTK_POLICY_NEVER, GTK_POLICY_ALWAYS);
+-	gtk_box_pack_start (GTK_BOX (hbox), scroll, FALSE, TRUE, 0);
++	gtk_box_pack_start (GTK_BOX (tree_vbox), scroll, TRUE, TRUE, 0);
+ 
+ 	/* TreeView */
+ 	e->treeview = gtk_tree_view_new_with_model (GTK_TREE_MODEL (e->store));
+@@ -3512,6 +3506,19 @@
+ 
+ 	gtk_container_add (GTK_CONTAINER (scroll), e->treeview);
+ 	
++	/* Add/Remove buttons */
++	button_table = gtk_table_new (1, 2, TRUE);
++	gtk_table_set_col_spacings (GTK_TABLE (button_table), 8);
++	gtk_box_pack_start (GTK_BOX (tree_vbox), button_table, FALSE, TRUE, 0);
++	
++	button = gtk_button_new_from_stock (GTK_STOCK_ADD);
++	g_signal_connect (button, "clicked", G_CALLBACK (glade_gtk_menu_editor_add_item_activate), e);
++	gtk_table_attach_defaults (GTK_TABLE (button_table), button, 0, 1, 0, 1);
++
++	e->remove_button = button = gtk_button_new_from_stock (GTK_STOCK_REMOVE);
++	g_signal_connect (button, "clicked", G_CALLBACK (glade_gtk_menu_editor_delete_item_activate), e);
++	gtk_table_attach_defaults (GTK_TABLE (button_table), button, 1, 2, 0, 1);
++	
+ 	/* PopUp */
+ 	e->popup = gtk_menu_new ();
+ 	
+@@ -3561,12 +3568,10 @@
+ 	gtk_box_set_spacing (GTK_BOX (buttonbox), 8);
+ 	gtk_box_pack_start (GTK_BOX (vbox), buttonbox, FALSE, TRUE, 0);
+ 
+-	button = gtk_button_new_from_stock (GTK_STOCK_ADD);
+-	g_signal_connect (button, "clicked", G_CALLBACK (glade_gtk_menu_editor_add_item_activate), e);
++	button = glade_default_app_undo_button_new ();
+ 	gtk_container_add (GTK_CONTAINER (buttonbox), button);
+ 
+-	e->remove_button = button = gtk_button_new_from_stock (GTK_STOCK_REMOVE);
+-	g_signal_connect (button, "clicked", G_CALLBACK (glade_gtk_menu_editor_delete_item_activate), e);
++	button = glade_default_app_redo_button_new ();
+ 	gtk_container_add (GTK_CONTAINER (buttonbox), button);
+ 
+ 	button = gtk_button_new_from_stock (GTK_STOCK_CLOSE);
+@@ -3592,24 +3597,17 @@
+ 	{
+ 		gtk_window_set_default_size (GTK_WINDOW (editor->window), 600, 440);
+ 		gtk_widget_show (editor->window);
++		return;
+ 	}
+ 	else
+ 	{
+-		GtkWidget *dialog;
+ 		GladeWidget *gmenubar = glade_widget_get_from_gobject (menubar);
+ 		
+-		dialog = gtk_message_dialog_new (NULL,
+-				GTK_DIALOG_MODAL,
+-				GTK_MESSAGE_INFO,
+-				GTK_BUTTONS_OK,
+-				_("An MenuBar editor is already runing for \"%s\""),
+-				glade_widget_get_name (gmenubar));
+-		
+-		gtk_message_dialog_format_secondary_text (GTK_MESSAGE_DIALOG (dialog), 
+-			_("It is not posible to launch more than one editor per menubar."));
+-		
+-		gtk_dialog_run (GTK_DIALOG (dialog));
+-		gtk_widget_destroy (dialog);
++		glade_util_ui_message (GTK_WIDGET (glade_default_app_get_transient_parent ()),
++					GLADE_UI_INFO,
++					_("An MenuBar editor is already runing for \"%s\"\n"
++					  "It is not posible to launch more than one editor per menubar."),
++					(gmenubar) ? glade_widget_get_name (gmenubar) : _("unknown"));
+ 	}
+ }
