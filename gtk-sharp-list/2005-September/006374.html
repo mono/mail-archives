@@ -1,0 +1,423 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Gtk-sharp-list] Invoking code in the main loop.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:gtk-sharp-list%40lists.ximian.com?Subject=%5BGtk-sharp-list%5D%20Invoking%20code%20in%20the%20main%20loop.&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006372.html">
+   <LINK REL="Next"  HREF="006376.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Gtk-sharp-list] Invoking code in the main loop.</H1>
+    <B>Mike Hull</B> 
+    <A HREF="mailto:gtk-sharp-list%40lists.ximian.com?Subject=%5BGtk-sharp-list%5D%20Invoking%20code%20in%20the%20main%20loop.&In-Reply-To="
+       TITLE="[Gtk-sharp-list] Invoking code in the main loop.">mike.hull at coversant.net
+       </A><BR>
+    <I>Tue Sep  6 11:18:32 EDT 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006372.html">[Gtk-sharp-list] Windows installer for .NET
+</A></li>
+        <LI>Next message: <A HREF="006376.html">[Gtk-sharp-list] Automagic Console/X Display detection?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6374">[ date ]</a>
+              <a href="thread.html#6374">[ thread ]</a>
+              <a href="subject.html#6374">[ subject ]</a>
+              <a href="author.html#6374">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I need to implement ISynchronizeInvoke for Widget. To do this i need to 
+be able to test if an Invoke is required.  How would I go about 
+synchronously getting the thread id of the GLib MainLoop? Or tell if the 
+code is being executed within the main loop...
+
+I have created an implementation that I use in wrapper classes for the 
+widgets I need. Currently, when the class is instantiated it add a 
+delegate pointing to a method that sets the thread id on the object to 
+GLib.Idle.  Setting the thread id this way can cause the MainLoop to get 
+blocked if something happens that causes an Invoke before the correct 
+thread id is set.
+
+Is this something that could be added to the source of Gtk#?
+
+Does Gtk# use a signle managed thread for all Widgets?  I'm seeing some 
+behavior that seems to block the GLib main loop when the main loop's 
+thread id is not the same as the current thread.
+
+-- 
+Mike Hull
+Coversant, Inc.
+<A HREF="http://www.coversant.net">http://www.coversant.net</A>
+
+-------------- next part --------------
+using System;
+using System.Collections.Generic;
+using Coversant.Glib;
+using System.Threading;
+using Coversant.Trace;
+using System.ComponentModel;
+
+namespace Coversant.CGtk
+{
+    public delegate void EmptyDelegate();
+    public delegate T EmptyDelegate&lt;T&gt;();
+
+    [Traceable(TraceLevel.Warning)]
+    public class GtkSynchronizeInvoke : ISynchronizeInvoke
+    {
+        private Queue&lt;WorkItem&gt; work;
+        private volatile int threadid;
+        private static GtkSynchronizeInvoke _MainThread;
+        public static GtkSynchronizeInvoke MainThread
+        {
+            get { return _MainThread; }
+        }
+        static GtkSynchronizeInvoke()
+        {
+            _MainThread = new GtkSynchronizeInvoke();
+        }
+        public static void Init()
+        {
+
+        }
+        public GtkSynchronizeInvoke()
+        {
+            //Assume this was created in the Gtk thread.
+            threadid = Thread.CurrentThread.ManagedThreadId;
+
+            //Make sure we have the correct threadid for Gtk.
+            GLib.Idle.Add(new GLib.IdleHandler(SetThreadID));
+        }
+
+        /// &lt;summary&gt;
+        /// Adds delegate to the queue to be invoked in the Gtk main loop.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;method&quot;&gt;Method to Invoke&lt;/param&gt;
+        /// &lt;param name=&quot;args&quot;&gt;Method's Arguments&lt;/param&gt;
+        /// &lt;returns&gt;IAsyncResult&lt;/returns&gt;
+        public IAsyncResult BeginInvoke(Delegate method, params object[] args)
+        {
+            if (args == null) args = new object[] { };
+            WorkItem result = new WorkItem(null, method, args);
+            Enqueue(result);
+            return result;
+        }
+        private void Enqueue(WorkItem result)
+        {
+            lock (this) if (work == null) work = new Queue&lt;WorkItem&gt;();
+            lock (work)
+            {
+                work.Enqueue(result);
+            }
+            WakeupMain();
+        }
+        /// &lt;summary&gt;
+        /// Blocks the current thread while waiting for a response.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;result&quot;&gt;The IAsyncResult returned by BeginInvoke&lt;/param&gt;
+        /// &lt;returns&gt;Return value of the method invoked by BeginInvoke&lt;/returns&gt;
+        public object EndInvoke(IAsyncResult result)
+        {
+            WorkItem item = (WorkItem)result;
+            WaitFor(item);
+            if (item.ExceptionThrown) throw item.Exception;
+            return item.ReturnValue;
+        }
+        /// &lt;summary&gt;
+        /// Invokes the method in the Gtk Main loop. Do not use this in a Gui thread, it may block it.
+        /// &lt;/summary&gt;
+        /// &lt;param name=&quot;method&quot;&gt;Method&lt;/param&gt;
+        /// &lt;param name=&quot;args&quot;&gt;Arguments to pass to Method&lt;/param&gt;
+        /// &lt;returns&gt;Method's return value.&lt;/returns&gt;
+        public object Invoke(Delegate method, params object[] args)
+        {
+            IAsyncResult asyncResult;
+            asyncResult = BeginInvoke(method, args);
+            return EndInvoke(asyncResult);
+        }
+        public bool InvokeRequired
+        {
+            get
+            {
+                return Thread.CurrentThread.ManagedThreadId != threadid;
+            }
+        }
+
+#if NET_2_0
+        /// &lt;summary&gt;
+        /// Adds delegate to the queue to be invoked in the Gtk main loop.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;Return value type.&lt;/typeparam&gt;
+        /// &lt;param name=&quot;method&quot;&gt;Method to Invoke&lt;/param&gt;
+        /// &lt;param name=&quot;args&quot;&gt;Method's Arguments&lt;/param&gt;
+        /// &lt;returns&gt;IAsyncResult&lt;/returns&gt;
+        public IAsyncResult BeginInvoke&lt;T&gt;(Delegate method, params object[] args)
+        {
+            if (args == null) args = new object[] { };
+            WorkItem&lt;T&gt; result = new WorkItem&lt;T&gt;(null, method, args);
+            Enqueue(result);
+            WakeupMain();
+            return result;
+        }
+        public T EndInvoke&lt;T&gt;(IAsyncResult result)
+        {
+            WorkItem&lt;T&gt; item = (WorkItem&lt;T&gt;)result;
+            WaitFor(item);
+            if (item.ExceptionThrown) throw item.Exception;
+            return item.ReturnValue;
+        }
+        /// &lt;summary&gt;
+        /// Invokes the method in the Gtk Main loop. Do not use this in a Gui thread, it may block it.
+        /// &lt;/summary&gt;
+        /// &lt;typeparam name=&quot;T&quot;&gt;Return Value Type&lt;/typeparam&gt;
+        /// &lt;param name=&quot;method&quot;&gt;Method&lt;/param&gt;
+        /// &lt;param name=&quot;args&quot;&gt;Arguments to pass to Method&lt;/param&gt;
+        /// &lt;returns&gt;Method's return value.&lt;/returns&gt;
+        public T Invoke&lt;T&gt;(Delegate method, params object[] args)
+        {
+            IAsyncResult asyncResult;
+            asyncResult = BeginInvoke&lt;T&gt;(method, args);
+            return EndInvoke&lt;T&gt;(asyncResult);
+        }
+#endif
+
+        private void WakeupMain()
+        {
+            GLib.Idle.Add(new GLib.IdleHandler(Ready));
+        }
+        private bool Ready()
+        {
+            int count;
+            lock (work) count = work.Count;
+            while (count &gt; 0)
+            {
+                WorkItem item;
+                lock (work) item = work.Dequeue();
+                if (item != null)
+                {
+                    item.ThreadID = Thread.CurrentThread.ManagedThreadId;
+                    item.CallBack();
+                }
+                lock (work) count = work.Count;
+            }
+            return false;
+        }
+        private bool SetThreadID()
+        {
+            threadid = Thread.CurrentThread.ManagedThreadId;
+            return false;
+        }
+        private void WaitFor(WorkItem item)
+        {
+            IAsyncResult result = ((IAsyncResult)item);
+            if (threadid == Thread.CurrentThread.ManagedThreadId)
+            {
+                while (!result.IsCompleted)
+                {
+                    if (Gtk.Application.EventsPending())
+                        Gtk.Application.RunIteration();
+                    else
+                        System.Threading.Thread.Sleep(50);
+                }
+            }
+            else
+            {
+                //We have a problem if this is happening in a Gtk.MainLoop thread
+                result.AsyncWaitHandle.WaitOne();
+            }
+        }
+
+        #region ISynchronizeInvoke Members
+
+        IAsyncResult ISynchronizeInvoke.BeginInvoke(Delegate method, object[] args)
+        {
+            return BeginInvoke(method, args);
+        }
+
+        object ISynchronizeInvoke.EndInvoke(IAsyncResult result)
+        {
+            return EndInvoke(result);
+        }
+
+        object ISynchronizeInvoke.Invoke(Delegate method, object[] args)
+        {
+            return Invoke(method, args);
+        }
+
+        bool ISynchronizeInvoke.InvokeRequired
+        {
+            get
+            {
+                return InvokeRequired;
+            }
+        }
+
+        #endregion
+    }
+
+#if NET_2_0
+    internal class WorkItem&lt;T&gt; : WorkItem
+    {
+        public new T ReturnValue
+        {
+            get
+            {
+                return (T)base.ReturnValue;
+            }
+            set
+            {
+                base.ReturnValue = value;
+            }
+        }
+        public WorkItem(object state, Delegate method, params object[] args)
+            : base(state , method, args)
+        { }
+    }
+#endif
+
+    internal class WorkItem : IAsyncResult
+    {
+        object[] _Args;
+        object _AsyncState;
+        volatile bool _Completed;
+        Delegate _Method;
+        ManualResetEvent _Event;
+        object _ReturnValue;
+        volatile int _ThreadID = -1;
+        volatile int _CreatedThreadID;
+        Exception _Exception;
+        volatile bool _ExceptionThrown;
+
+        internal WorkItem(object state, Delegate method, params object[] args)
+        {
+            _AsyncState = state;
+            _Method = method;
+            _Args = args;
+            _Event = new ManualResetEvent(false);
+            _Completed = false;
+            _CreatedThreadID = Thread.CurrentThread.ManagedThreadId;
+        }
+
+        internal int ThreadID
+        {
+            get { return _ThreadID; }
+            set { _ThreadID = value; }
+        }
+        internal object ReturnValue
+        {
+            get
+            {
+                object retval;
+                lock (this)
+                {
+                    retval = _ReturnValue;
+                }
+                return retval;
+            }
+            set
+            {
+                lock (this)
+                {
+                    _ReturnValue = value;
+                }
+            }
+        }
+        internal Exception Exception
+        {
+            get
+            {
+                Exception ex;
+                lock (this)
+                {
+                    ex = _Exception;
+                }
+                return ex;
+            }
+            set
+            {
+                lock (this)
+                {
+                    _Exception = value;
+                }
+                _ExceptionThrown = (_ExceptionThrown != null);
+            }
+        }
+        internal bool ExceptionThrown
+        {
+            get
+            {
+                return _ExceptionThrown;
+            }
+        }
+        internal void CallBack()
+        {
+            try
+            {
+                ReturnValue = _Method.DynamicInvoke(_Args);
+            }
+            catch (Exception ex)
+            {
+                this.Exception = ex;
+            }
+            _ThreadID = Thread.CurrentThread.ManagedThreadId;
+            _Event.Set();
+            _Completed = true;
+        }
+
+        #region IAsyncResult Members
+
+        object IAsyncResult.AsyncState
+        {
+            get { return _AsyncState; }
+        }
+
+        WaitHandle IAsyncResult.AsyncWaitHandle
+        {
+            get { return _Event; }
+        }
+
+        bool IAsyncResult.CompletedSynchronously
+        {
+            get { return false; }
+        }
+
+        bool IAsyncResult.IsCompleted
+        {
+            get { return _Completed; }
+        }
+
+        #endregion
+
+    }
+}
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006372.html">[Gtk-sharp-list] Windows installer for .NET
+</A></li>
+	<LI>Next message: <A HREF="006376.html">[Gtk-sharp-list] Automagic Console/X Display detection?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6374">[ date ]</a>
+              <a href="thread.html#6374">[ thread ]</a>
+              <a href="subject.html#6374">[ subject ]</a>
+              <a href="author.html#6374">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/gtk-sharp-list">More information about the Gtk-sharp-list
+mailing list</a><br>
+</body></html>

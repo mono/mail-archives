@@ -1,0 +1,230 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Gtk-sharp-list] PATCH: speed up treeview and managed values
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:bmaurer%40users.sourceforge.net">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="003378.html">
+   <LINK REL="Next"  HREF="003382.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Gtk-sharp-list] PATCH: speed up treeview and managed values
+   </H1>
+    <B>Ben Maurer
+    </B> 
+    <A HREF="mailto:bmaurer%40users.sourceforge.net"
+       TITLE="[Gtk-sharp-list] PATCH: speed up treeview and managed values">bmaurer@users.sourceforge.net
+       </A><BR>
+    <I>Sun, 15 Feb 2004 12:20:17 -0500</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="003378.html">[Gtk-sharp-list] PATCH: speed up treeview and managed values
+</A></li>
+        <LI> Next message: <A HREF="003382.html">[Gtk-sharp-list] PATCH: speed up treeview and managed values
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3379">[ date ]</a>
+              <a href="thread.html#3379">[ thread ]</a>
+              <a href="subject.html#3379">[ subject ]</a>
+              <a href="author.html#3379">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>--=-hLlW2XzALGnsm1cfFHmo
+Content-Type: text/plain
+Content-Transfer-Encoding: 7bit
+
+Attached is the patch that only does the ManagedValue part. As I said
+before, I am going to investigate change GLib.Value so that we can avoid
+the other part of the patch.
+
+Some profiling data:
+
+Before:
+&gt;<i>  19706.406  134056    0.147   Gtk.TreeStore::GetValue(TreeIter,int)
+</I>&gt;<i>   Callers (with count) that contribute at least for 1%:
+</I>&gt;<i>       132340  98 % System.Collections.Specialized.TreeNodeComparer::GtkDefaultComparer(TreeModel,TreeIter,TreeIter)
+</I>&gt;<i>         1714   1 % System.Collections.Specialized.TreeNodeComparer::GtkProjectNodeComparer(TreeModel,TreeIter,TreeIter)
+</I>
+After:
+&gt;<i>  9393.356  134056    0.070   Gtk.TreeStore::GetValue(TreeIter,int)
+</I>&gt;<i>   Callers (with count) that contribute at least for 1%:
+</I>&gt;<i>       132340  98 % System.Collections.Specialized.TreeNodeComparer::GtkDefaultComparer(TreeModel,TreeIter,TreeIter)
+</I>&gt;<i>         1714   1 % System.Collections.Specialized.TreeNodeComparer::GtkProjectNodeComparer(TreeModel,TreeIter,TreeIter)
+</I>
+This is from putting alot of values in a treeview (think, each method in
+the MCS compiler), while there is a default sort function.
+
+I just discovered that the 50% number i had given you was only with this
+patch, and that it infact got better with the other patch added.
+
+
+--=-hLlW2XzALGnsm1cfFHmo
+Content-Disposition: attachment; filename=gtksharp-managed-value.patch
+Content-Type: text/x-patch; name=gtksharp-managed-value.patch; charset=UTF-8
+Content-Transfer-Encoding: 7bit
+
+? glue/managedvalue.c
+Index: glib/ManagedValue.cs
+===================================================================
+RCS file: /cvs/public/gtk-sharp/glib/ManagedValue.cs,v
+retrieving revision 1.4
+diff -u -r1.4 ManagedValue.cs
+--- glib/ManagedValue.cs	3 Feb 2004 06:24:42 -0000	1.4
++++ glib/ManagedValue.cs	15 Feb 2004 16:54:06 -0000
+@@ -17,81 +17,48 @@
+ 	/// &lt;remarks&gt;
+ 	///  Utility class for creating GBoxed wrappers around managed types 
+ 	/// &lt;/remarks&gt;
+-
+-	// FIXME:
+-	// This used to use GCHandles, but I rewrote it to debug
+-	// some odd interactions. Since the boxed code in GLib is designed
+-	// to not interact directly with the pointers, just using our own
+-	// arbitrary pointer values is fine. Still, it might be useful
+-	// to use GCHandle later on.
++	
++	// This uses GCHandles to make sure the objects stay alive.
++	// The meat of the code is implemented in C, in order to save
++	// the high costs of this stuff in C#
+ 	
+ 	public class ManagedValue {
+-		private class ValueHolder {
+-			public object val;
+-			public int ref_count;
+-		}
+-		
+-		private delegate IntPtr CopyFunc (IntPtr ptr);
+-		private delegate void FreeFunc (IntPtr ptr);
+-		
+-		private static Hashtable pointers = new Hashtable ();
+-		private static IntPtr cur_ptr = IntPtr.Zero;
+-		private static CopyFunc copy;
+-		private static FreeFunc free;
+-		private static GType boxed_type = GType.Invalid;
+ 
+-		[DllImport(&quot;libgobject-2.0-0.dll&quot;)]
+-		private static extern IntPtr g_boxed_type_register_static (string typename, CopyFunc copy_func, FreeFunc free_func);
++		delegate void FreeFunc (IntPtr ptr);
++
++		static GType boxed_type = GType.Invalid;
++
++		[DllImport(&quot;gtksharpglue&quot;)]
++		static extern IntPtr gtksharp_managed_value_get_type (FreeFunc free);
+ 		
++		[DllImport(&quot;gtksharpglue&quot;)]
++		static extern void gtksharp_managed_value_notify_new (IntPtr handle);
++
+ 		public static GType GType {
+ 			get {
+-				if (boxed_type == GType.Invalid) {
+-					copy = new CopyFunc (Copy);
+-					free = new FreeFunc (Free);
+-				
+-					boxed_type = new GLib.GType (g_boxed_type_register_static (&quot;GtkSharpValue&quot;, copy, free));
+-				}
++				if (boxed_type == GType.Invalid)
++					boxed_type = new GType (gtksharp_managed_value_get_type (new FreeFunc (Free)));
+ 
+ 				return boxed_type;
+ 			}
+ 		}
+ 		
+-		public static IntPtr Copy (IntPtr ptr)
+-		{
+-			ValueHolder holder = (ValueHolder) pointers[ptr];
+-			holder.ref_count++;
+-			return ptr;
+-		}
+-
+ 		public static void Free (IntPtr ptr)
+ 		{
+-			ValueHolder holder = (ValueHolder) pointers[ptr];
+-			if (holder == null)
+-				return;
+-			holder.ref_count--;
+-			if (holder.ref_count &lt; 1)
+-				pointers.Remove (ptr);
++			((GCHandle) ptr).Free ();
+ 		}
+ 
+ 		public static IntPtr WrapObject (object obj)
+ 		{
+-			ValueHolder holder = new ValueHolder ();
+-			holder.val = obj;
+-			holder.ref_count = 1;
+-			cur_ptr = new IntPtr (((int) cur_ptr) + 1);
+-			pointers[cur_ptr] = holder;
+-			return cur_ptr;
++			IntPtr p = (IntPtr) GCHandle.Alloc (obj);
++			gtksharp_managed_value_notify_new (p);
++			return p;
+ 		}
+ 
+ 		public static object ObjectForWrapper (IntPtr ptr)
+ 		{
+-			if (!pointers.Contains (ptr))
+-				return null;
+-
+-			ValueHolder holder = (ValueHolder) pointers[ptr];
+-			return holder.val;
++			return ((GCHandle) ptr).Target;
+ 		}
+-
+ 	}
+ }
+ 
+Index: glue/Makefile.am
+===================================================================
+RCS file: /cvs/public/gtk-sharp/glue/Makefile.am,v
+retrieving revision 1.35
+diff -u -r1.35 Makefile.am
+--- glue/Makefile.am	29 Jan 2004 21:20:59 -0000	1.35
++++ glue/Makefile.am	15 Feb 2004 16:54:06 -0000
+@@ -13,6 +13,7 @@
+ 	fileselection.c		\
+ 	layout.c		\
+ 	list.c			\
++	managedvalue.c		\
+ 	nodestore.c		\
+ 	object.c		\
+ 	paned.c			\
+Index: glue/makefile.win32
+===================================================================
+RCS file: /cvs/public/gtk-sharp/glue/makefile.win32,v
+retrieving revision 1.9
+diff -u -r1.9 makefile.win32
+--- glue/makefile.win32	29 Jan 2004 21:20:59 -0000	1.9
++++ glue/makefile.win32	15 Feb 2004 16:54:06 -0000
+@@ -15,6 +15,7 @@
+         fileselection.o         \
+         layout.o                \
+         list.o                  \
++        managedvalue.o          \
+         nodestore.o             \
+         object.o                \
+         paned.o                 \
+
+--=-hLlW2XzALGnsm1cfFHmo--
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="003378.html">[Gtk-sharp-list] PATCH: speed up treeview and managed values
+</A></li>
+	<LI> Next message: <A HREF="003382.html">[Gtk-sharp-list] PATCH: speed up treeview and managed values
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3379">[ date ]</a>
+              <a href="thread.html#3379">[ thread ]</a>
+              <a href="subject.html#3379">[ subject ]</a>
+              <a href="author.html#3379">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

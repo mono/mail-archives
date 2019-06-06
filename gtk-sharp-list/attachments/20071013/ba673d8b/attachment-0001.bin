@@ -1,0 +1,470 @@
+// ObjectModel.cs - ObjectModel implementation and demo
+// Based on the TreeModelDemo sample from gtk-sharp.
+//
+// Author: Eskil Bylund <eskil@letterboxes.org>
+//
+// Copyright (c) 2007 Eskil Bylund
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of version 2 of the Lesser GNU General 
+// Public License as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this program; if not, write to the
+// Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
+// Boston, MA  02110-1301  USA.
+
+namespace GtkSamples
+{
+	using System;
+	using System.Collections.Generic;
+	using System.Reflection;
+	using System.Runtime.InteropServices;
+	using Gtk;
+
+	using System.IO; // For the demo
+
+	public class TreeModelDemo : Gtk.Window
+	{
+		public TreeModelDemo () : base("TreeModel demo")
+		{
+			DefaultSize = new Gdk.Size (640,480);
+			ScrolledWindow sw = new ScrolledWindow ();
+			Add(sw);
+
+			ObjectStore model = new ObjectStore (typeof(FileSystemInfo), "Name", "FullName");
+			TreeModelAdapter adapter = new TreeModelAdapter (model);
+
+			DirectoryInfo root = new DirectoryInfo ("/home");
+			model.Add (root);
+			foreach (FileSystemInfo info in root.GetFileSystemInfos ()) {
+				model.Add (root, info);
+			}
+
+			TreeView view = new TreeView (adapter);
+			view.HeadersVisible = true;
+			view.AppendColumn ("Name", new CellRendererText (), "text", 1);
+			view.AppendColumn ("Path", new CellRendererText (), "text", 2);
+			sw.Add (view);
+
+			sw.ShowAll ();
+		}
+
+		protected override bool OnDeleteEvent (Gdk.Event ev)
+		{
+			Application.Quit ();
+			return true;
+		}
+
+		public static void Main (string[] args)
+		{
+			Application.Init ();
+			Gtk.Window win = new TreeModelDemo ();	
+			win.Show ();
+			Application.Run ();
+		}
+
+	}
+
+	// TODO: Provide a strongly typed model? What about storing objects of a
+	// different type in the same model?
+
+	// FIXME: The columns in the model are of the same type as the properties.
+	// Would it be better to convert the properties that are objects to string
+	// to make the model easy to use with eg. CellRendererText? Make if configurable?
+
+	// FIXME: Rename the class to something else?
+
+	/// <summary>
+	/// A TreeModel that makes an object and the selected properties from it
+	/// available as columns in the model.
+	/// </summary>
+	public class ObjectStore : GLib.Object, TreeModelImplementor
+	{
+		private TreeModelAdapter adapter;
+		private Type objectType;
+		private string[] properties;
+
+		private Dictionary<object, GCHandle> iterCache;
+
+		private Dictionary<object, List<object>> parents;
+		private Dictionary<object, object> childToParent;
+		private List<object> roots;
+		private List<object> objects;
+
+		public ObjectStore (Type type, params string[] properties)
+		{
+			if (type == null)
+				throw new ArgumentNullException("type");
+
+			foreach (string property in properties) {
+				if (type.GetProperty (property) == null)
+					throw new ArgumentException("One of the specified properties does not exist.");
+			}
+
+			this.objectType = type;
+			this.properties = properties ?? new string[] {};
+
+			iterCache = new Dictionary<object, GCHandle> ();
+			parents = new Dictionary<object, List<object>> ();
+			childToParent = new Dictionary<object, object> ();
+			roots = new List<object> ();
+			objects = new List<object> ();
+
+			adapter = new TreeModelAdapter (this);
+		}
+
+		// Properties
+
+		public TreeModelFlags Flags
+		{
+			get { return TreeModelFlags.ItersPersist; }
+		}
+
+		public int NColumns
+		{
+			get { return 1 + properties.Length; }
+		}
+
+		// Methods
+
+		public TreeIter Add (object obj)
+		{
+			return Add (null, obj);
+		}
+
+		public TreeIter Add (object obj, int position)
+		{
+			return Add (null, obj, position);
+		}
+
+		public TreeIter Add (object parent, object obj)
+		{
+			return AddImpl (parent, obj, false, -1);
+		}
+
+		public TreeIter Add (object parent, object obj, int position)
+		{
+			return AddImpl (parent, obj, true, position);
+		}
+
+		private TreeIter AddImpl (object parent, object obj, bool insert, int position)
+		{
+			if (obj == null)
+				throw new ArgumentNullException ("obj");
+			if (obj.GetType () != objectType && !obj.GetType ().IsSubclassOf (objectType))
+				throw new ArgumentException ("Invalid type of object.");
+			if (parent != null && !objects.Contains (parent))
+				throw new ArgumentException ("Unknown parent.");
+			if (objects.Contains (obj))
+				throw new ArgumentException ("Object already in model.");
+
+			bool emitToggled = false;
+
+			if (parent != null) {
+				List<object> children;
+				if (!parents.TryGetValue (parent, out children)) {
+					children = new List<object> ();
+					parents [parent] = children;
+					emitToggled = true;
+				}
+				AddOrInsert(children, obj, insert, position);
+				childToParent.Add (obj, parent);
+			} else
+				AddOrInsert(roots, obj, insert, position);
+
+			objects.Add (obj);
+
+			TreeIter iter = IterFromNode (obj);
+			adapter.EmitRowInserted (GetPath (iter), iter);
+			if (emitToggled) {
+				TreeIter i = IterFromNode (parent);
+				adapter.EmitRowHasChildToggled (GetPath(i), i);
+			}
+			return iter;
+		}
+
+		public bool Contains (object obj)
+		{
+			return objects.Contains (obj);
+		}
+
+		public TreeIter GetIter (object obj)
+		{
+			if (!objects.Contains(obj))
+				throw new ArgumentException ("Object not in model.");
+
+			return IterFromNode (obj);
+		}
+
+		public void Remove (object obj)
+		{
+			if (!objects.Contains (obj))
+				throw new ArgumentException("Object not in model");
+
+			TreePath path = PathFromNode (obj);
+			object parentToToggle = null;
+
+			List<object> children;
+			if (parents.TryGetValue (obj, out children)) {
+				foreach (object child in children.ToArray ())
+					Remove (child);
+				parents.Remove (obj);
+			}
+
+			object parent;
+			if (childToParent.TryGetValue (obj, out parent)) {
+				parents [parent].Remove (obj);
+				childToParent.Remove (obj);
+				if (parents [parent].Count == 0) {
+					parents.Remove (parent);
+					parentToToggle = parent;
+				}
+			} else
+				roots.Remove (obj);
+
+			objects.Remove (obj);
+			iterCache.Remove (obj);
+
+			adapter.EmitRowDeleted (path);
+			if (parentToToggle != null) {
+				TreeIter iter = IterFromNode (parentToToggle);
+				adapter.EmitRowHasChildToggled (GetPath(iter), iter);
+			}
+		}
+
+		public GLib.GType GetColumnType (int col)
+		{
+			if (col == 0)
+				return (GLib.GType)objectType;
+			else {
+				PropertyInfo pinfo = objectType.GetProperty (properties [col - 1]);
+				return (GLib.GType)pinfo.PropertyType;
+			}
+		}
+
+		public bool GetIter (out TreeIter iter, TreePath path)
+		{
+			if (path == null)
+				throw new ArgumentNullException ("path");
+
+			iter = TreeIter.Zero;
+
+			object node = GetNodeAtPath (path);
+			if (node == null)
+				return false;
+
+			iter = IterFromNode (node);
+			return true;
+		}
+
+		public TreePath GetPath (TreeIter iter)
+		{
+			object node = NodeFromIter (iter);
+			if (node == null)
+				throw new ArgumentException ("iter");
+
+			return PathFromNode (node);
+		}
+
+		public void GetValue (TreeIter iter, int col, ref GLib.Value val)
+		{
+			object node = NodeFromIter (iter);
+			if (node == null || col > properties.Length)
+				return;
+
+			if (col == 0)
+				val = new GLib.Value (node);
+			else {
+				PropertyInfo pinfo = objectType.GetProperty (properties [col - 1]);
+				object pval = pinfo.GetValue (node, null);
+				if (pval != null)
+					val = new GLib.Value (pval);
+				else
+					val = new GLib.Value ((GLib.GType)pinfo.PropertyType);
+			}
+		}
+
+		public bool IterNext (ref TreeIter iter)
+		{
+			object node = NodeFromIter (iter);
+			if (node == null)
+				return false;
+
+			List<object> currentLevel;
+			if (childToParent.ContainsKey (node))
+				currentLevel = parents [childToParent [node]];
+			else
+				currentLevel = roots;
+
+			int index = currentLevel.IndexOf (node);
+			if (index + 1 < currentLevel.Count) {
+				iter = IterFromNode (currentLevel [index + 1]);
+				return true;
+			}
+			return false;
+		}
+
+		public bool IterChildren (out TreeIter child, TreeIter parent)
+		{
+			child = TreeIter.Zero;
+
+			object node = NodeFromIter (parent);
+			if (node == null)
+				return false;
+
+			List<object> children;
+			if (parent.UserData == IntPtr.Zero && roots.Count > 0) {
+				child = IterFromNode (objects [0]);
+				return true;
+			} else if (parents.TryGetValue (node, out children)) {
+				child = IterFromNode (children [0]);
+				return true;
+			}
+			return false;
+		}
+
+		public bool IterHasChild (TreeIter iter)
+		{
+			object node = NodeFromIter (iter);
+			if (node != null)
+				return parents.ContainsKey (node);
+			else if (iter.UserData == IntPtr.Zero)
+				return true;
+			return false;
+		}
+
+		public int IterNChildren (TreeIter iter)
+		{
+			if (iter.UserData == IntPtr.Zero)
+				return roots.Count;
+			else {
+				object node = NodeFromIter (iter);
+				if (node != null && parents.ContainsKey (node))
+					return parents [node].Count;
+			}
+			return 0;
+		}
+
+		public bool IterNthChild (out TreeIter child, TreeIter parent, int n)
+		{
+			child = TreeIter.Zero;
+
+			if (parent.UserData == IntPtr.Zero) {
+				if (roots.Count <= n)
+					return false;
+				child = IterFromNode (roots [n]);
+				return true;
+			} else {
+				object node = NodeFromIter (parent);
+
+				List<object> children;
+				if (node != null && parents.TryGetValue (parent, out children) && n < children.Count) {
+					child = IterFromNode (children [n]);
+					return true;
+				}
+			}
+			return false;
+		}
+
+		public bool IterParent (out TreeIter parent, TreeIter child)
+		{
+			parent = TreeIter.Zero;
+
+			object node = NodeFromIter (child);
+			if (node != null && childToParent.ContainsKey (node)) {
+				parent = IterFromNode (childToParent [node]);
+				return true;
+			}
+			return false;
+		}
+
+		public void RefNode (TreeIter iter)
+		{
+		}
+
+		public void UnrefNode (TreeIter iter)
+		{
+		}
+
+		private object GetNodeAtPath (TreePath path)
+		{
+			if (path.Indices.Length > 0) {
+				int index = path.Indices [0];
+				List<object> currentLevel = roots;
+				int level = 0;
+
+				object node = null;
+				do {
+					if (index >= currentLevel.Count)
+						return null;
+
+					node = currentLevel [index];
+					if (level + 1 < path.Indices.Length) {
+						if (parents.ContainsKey (node)) {
+							currentLevel = parents [node];
+							level++;
+						}
+						else
+							break;
+					} else
+						break;
+				} while (true);
+
+				return node;
+			}
+			return null;
+		}
+
+		private TreeIter IterFromNode (object node)
+		{
+			GCHandle gch;
+			if (!iterCache.TryGetValue (node, out gch)) {
+				gch = GCHandle.Alloc (node);
+				iterCache [node] = gch;
+			}
+
+			TreeIter result = TreeIter.Zero;
+			result.UserData = (IntPtr)gch;
+			return result;
+		}
+
+		private object NodeFromIter (TreeIter iter)
+		{
+			GCHandle gch = (GCHandle)iter.UserData;
+			return gch.Target;
+		}
+
+		private TreePath PathFromNode (object node)
+		{
+			if (node == null)
+				return new TreePath ();
+
+			TreePath path = new TreePath ();
+
+			object parent;
+			if (childToParent.TryGetValue (node, out parent)) {
+				do {
+					path.PrependIndex (parents [parent].IndexOf (node));
+					node = parent;
+				} while (childToParent.TryGetValue (node, out parent));
+			}
+			path.PrependIndex (roots.IndexOf (node));
+			return path;
+		}
+
+		private static void AddOrInsert(List<object> list, object obj,
+			bool insert, int position)
+		{
+			if (insert)
+				list.Insert(position, obj);
+			else
+				list.Add (obj);
+		}
+	}
+}

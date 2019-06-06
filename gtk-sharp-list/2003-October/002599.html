@@ -1,0 +1,198 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Gtk-sharp-list] GC-Safe P/Invoke
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:jonpryor%40vt.edu">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="002597.html">
+   <LINK REL="Next"  HREF="002601.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Gtk-sharp-list] GC-Safe P/Invoke
+   </H1>
+    <B>Jonathan Pryor
+    </B> 
+    <A HREF="mailto:jonpryor%40vt.edu"
+       TITLE="[Gtk-sharp-list] GC-Safe P/Invoke">jonpryor@vt.edu
+       </A><BR>
+    <I>Fri, 17 Oct 2003 21:25:43 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="002597.html">[Gtk-sharp-list] Help!!!
+</A></li>
+        <LI> Next message: <A HREF="002601.html">[Gtk-sharp-list] GC-Safe P/Invoke
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2599">[ date ]</a>
+              <a href="thread.html#2599">[ thread ]</a>
+              <a href="subject.html#2599">[ subject ]</a>
+              <a href="author.html#2599">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I came across this article a couple weeks ago, and was wondering if:
+ 1. it was a concern for Gtk#
+ 2. if Gtk# should do something about it?
+
+See:
+
+	<A HREF="http://blogs.gotdotnet.com/cbrumme/commentview.aspx/e55664b4-6471-48b9-b360-f0fa27ab6cc0">http://blogs.gotdotnet.com/cbrumme/commentview.aspx/e55664b4-6471-48b9-b360-f0fa27ab6cc0</A>
+
+Summary:
+
+Under .NET, with it's wonderfully accurate Garbage Collector, it's
+possible for an instance to be collected *while a method on that
+instance is still being executed*.  The article above gives an example
+of when this could occur.
+
+The short of it is that the GC will collect an instance when it
+*believes* that no instance members are being used.  For example:
+
+      class C {
+         // handle into unmanaged memory, for an unmanaged object
+         IntPtr _handle;
+
+         // performs some operation on h
+         [DllImport (&quot;...&quot;)]
+         static extern void OperateOnHandle (IntPtr h);
+
+         // frees resources of h
+         [DllImport (&quot;...&quot;)]
+         static extern void DeleteHandle (IntPtr h);
+
+         ~C() {
+            DeleteHandle(h);
+         }
+
+         public void m() {
+            OperateOnHandle(_handle);
+            // no further references to _handle
+         }
+      }
+
+      class Other {
+         void work() {
+            C c = new C();
+            c.m();
+         }
+      }
+
+Consider this: Other.work invokes C.m, which invokes the unmanaged code
+C.OperateOnHandle.  Note that Other.work doesn't use &quot;c&quot; anymore, so &quot;c&quot;
+is eligible to be collected, and is placed on the GC finalization queue.
+
+This would normally be reasonable, except for the interplay with
+unmanaged code.  The unmanaged code C.OperateOnHandle is still using a
+member held by the instance &quot;c&quot;, but the GC doesn't -- and can't -- know
+this.
+
+This introduces the possibility that, although unlikely, C.DeleteHandle
+could be invoked (from the GC finalization thread) while
+C.OperateOnHandle is still operating.
+
+It's fair to assume that the unmanaged code won't appreciate this.  It's
+fair to assume that this could cause major problems for the process, 
+including a segmentation fault.
+
+In fact, a bug very similar to this exists in .NET v1.0, in one of the 
+Registry wrapper classes.
+
+How do you avoid this problem?  Don't use raw IntPtrs.  With the IntPtr 
+being used, the GC has no way of knowing that the class still needs to
+hang around.
+
+Instead of using IntPtr, you can use
+System.Runtime.InteropServices.HandleRef.  This is a structure which
+holds both a reference to the containing class, as well as the pointer
+value.
+
+Next, instead of having the P/Invoke code accept IntPtr parameters, the
+P/Invoke code accepts HandleRefs.  HandleRefs are special to the runtime
+and GC system, and during a marshal operation they &quot;collapse&quot; into an
+IntPtr.
+
+This allows us to write the safe code:
+
+      class C {
+         // handle into unmanaged memory, for an unmanaged object
+         HandleRef _handle;
+
+         // performs some operation on h
+         [DllImport (&quot;...&quot;)]
+         static extern void OperateOnHandle (HandleRef h);
+
+         // frees resources of h
+         [DllImport (&quot;...&quot;)]
+         static extern void DeleteHandle (HandleRef h);
+
+         // Creates Resource
+         [DllImport (&quot;...&quot;)]
+         static extern IntPtr CreateHandle ();
+
+         public C() {
+            IntPtr h = CreateHandle();
+            _handle = new HandleRef(this, h);
+         }
+
+         ~C() {
+            DeleteHandle(h);
+         }
+
+         public void m() {
+            OperateOnHandle(_handle);
+            // no further references to _handle
+         }
+      }
+
+      class Other {
+         void work() {
+            // Note: no change to client
+            C c = new C();
+            c.m();
+         }
+      }
+
+In the case of Gtk#, this would require (at least!) modifying the
+generator code to emit HandleRef types instead of IntPtr (as well as
+cause cascading changes throughout the rest of Gtk#; fortunately lots of
+it is machine generated).
+
+So, to return to the original questions:
+
+1.  Do you think this is a possible problem with Gtk#?  Gtk# is
+sufficiently complicated that this may not be an issue, but if it *is*,
+it'll require a hell of a debugging session to figure out why someone's
+poor app is dying unexpectedly.
+
+2.  Should Gtk# do something about this potential problem?  In
+particular, use HandleRefs instead of IntPtrs internally?
+
+The obvious answer is &quot;if you provide a patch, we'll consider it.&quot;  I'm
+willing to look into creating a patch, but before I start working on
+such at thing, should I bother?  This requires answering question 1.
+
+Thanks,
+ - Jon
+
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="002597.html">[Gtk-sharp-list] Help!!!
+</A></li>
+	<LI> Next message: <A HREF="002601.html">[Gtk-sharp-list] GC-Safe P/Invoke
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2599">[ date ]</a>
+              <a href="thread.html#2599">[ thread ]</a>
+              <a href="subject.html#2599">[ subject ]</a>
+              <a href="author.html#2599">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

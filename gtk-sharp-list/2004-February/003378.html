@@ -1,0 +1,211 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Gtk-sharp-list] PATCH: speed up treeview and managed values
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:bmaurer%40users.sourceforge.net">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="003376.html">
+   <LINK REL="Next"  HREF="003379.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Gtk-sharp-list] PATCH: speed up treeview and managed values
+   </H1>
+    <B>Ben Maurer
+    </B> 
+    <A HREF="mailto:bmaurer%40users.sourceforge.net"
+       TITLE="[Gtk-sharp-list] PATCH: speed up treeview and managed values">bmaurer@users.sourceforge.net
+       </A><BR>
+    <I>Sun, 15 Feb 2004 11:38:28 -0500</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="003376.html">[Gtk-sharp-list] PATCH: speed up treeview and managed values
+</A></li>
+        <LI> Next message: <A HREF="003379.html">[Gtk-sharp-list] PATCH: speed up treeview and managed values
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3378">[ date ]</a>
+              <a href="thread.html#3378">[ thread ]</a>
+              <a href="subject.html#3378">[ subject ]</a>
+              <a href="author.html#3378">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Sun, 2004-02-15 at 11:00, Mike Kestner wrote:
+&gt;<i> I take code complexity seriously.  Before I'll approve an increase in
+</I>&gt;<i> complexity over working existing code on performance reasons, I will
+</I>&gt;<i> need to see more definitive information on the performance gained.
+</I>Yep, I totally agree :-).
+
+&gt;<i> Please don't do two things in one patch.  Especially in a performance
+</I>&gt;<i> improvement patch.  It just makes it harder to review the patch.  Also,
+</I>&gt;<i> as jluke mentioned, please attach patches instead of providing links to
+</I>&gt;<i> them.
+</I>Will attach two seperate patches in a seperate reply, with extra perf
+data.
+
+&gt;<i> &gt; The first one implements ManagedValue using GCHandles. The bulk of this
+</I>&gt;<i> &gt; code is now implemented in C to avoid some overhead (before, we were
+</I>&gt;<i> &gt; accessing a hashtable by an intptr which caused boxing). Also, this
+</I>&gt;<i> &gt; avoids the cost of invoking a C# delegate from C.
+</I>&gt;<i> 
+</I>&gt;<i> A couple of things on this part of the patch.  One, I don't think I
+</I>&gt;<i> really want to add a lot of glue code and complexity to the ManagedValue
+</I>&gt;<i> implementation, since it will be deprecated as soon as the NodeStore is
+</I>&gt;<i> completed. 
+</I>Actually, that code has alot of value, even outside the context of the
+TreeStore. For example, lets say you have a callback like
+
+DooFoo (..., gpointer user_data);
+
+In C#, the only way to add some data here would be to use ManagedValue.
+
+Also, it provides a great way to pass around C# objects in the managed
+code.
+
+I also hope that this can be the basis for any similar code in the
+NodeStore, as I am sure something similar needs to be done.
+
+&gt;<i> Second, this part of the patch is not written in a style consistent with
+</I>&gt;<i> the type declaration conventions in Gtk+.  For example, methods that
+</I>&gt;<i> return a GType are named my_type_name_get_type.  _init functions are
+</I>&gt;<i> used to initialize instances of a type. 
+</I>Ah, thank you. I will fix this.
+
+&gt;<i> &gt; The second patch avoids the allocation of Glib.Value's by implementing
+</I>&gt;<i> &gt; the code in C where the values are stored on the stack.
+</I>&gt;<i> 
+</I>&gt;<i> This is just a brute force attack.  I would prefer the brute force
+</I>&gt;<i> behind GValues be buried inside GLib.Value instead of duplicated in
+</I>&gt;<i> every API that uses GValues.  Did you consider caching and block
+</I>&gt;<i> allocation of GLib.Value wrappers if allocation is the issue?  
+</I>Well, the real issue is that GValues should be allocated in the stack,
+not inside the GC'd heap.
+
+In my C code I have this:
+	GValue value = { 0, };
+	const &lt;blah&gt; ret;
+	
+	gtk_tree_model_get_value (store, iter, column, &amp;value);
+	ret = &lt;get blah&gt;;
+	g_value_unset (&amp;value);
+	return ret;
+
+Note that there are no calls to a malloc function. However, in C# we end
+up allocating objects with pointers to GValues. It is possible to have
+the same syntax in C# for example, we could do:
+
+struct Glib.Value {
+}
+
+static extern void gtk_tree_model_get_value (..., out GLib.Value);
+
+bool GetBool ()
+{
+    GLib.Value v;
+    gtk_tree_model_get_value (..., out v);
+    bool b = (bool) v;
+    v.Unset ();
+    return b;
+}
+
+However, this would require major changes. For example, note that I had
+to explicitly call `Unset'. This is because you cant have a struct with
+a finalizer (because finalization is a GC related thing, and structs
+bypass the GC by design). We could implement IDisposeable, so the
+pattern would look like:
+
+bool GetBool ()
+{
+    using (GLib.Value v) {
+       gtk_tree_model_get_value (..., out v);
+       return (bool) b;
+    }
+}
+
+However, the problem is that you still end up forcing the use of this
+construct. Since GLib.Value should really only be used in the generated
+code and in .custom files, I think it is still an option. I would be
+happy to look into this.
+
+&gt;<i> &gt; Overall, this made a noticable difference when loading a large project
+</I>&gt;<i> &gt; (in this case, the MCS compiler) in MonoDevelop. The time improved and
+</I>&gt;<i> &gt; memory was down by a few MB (according to top).
+</I>&gt;<i> 
+</I>&gt;<i> Noticeable differences aren't the standard with performance issues. 
+</I>&gt;<i> Measurable differences are.  Time improved, but by how much?  &quot;It seems
+</I>&gt;<i> faster&quot; isn't a performance gain.
+</I>See my comments on the last paragraph.
+
+&gt;<i> The memory gain seems to imply leaks
+</I>&gt;<i> to me, since GLib.Values are transient.  Did you attempt to identify
+</I>&gt;<i> where the leaks are?
+</I>Actually, this was not the case. I looked in the profiler after a bit of
+execution time, the number of calls to GLib.Value ctors matched up with
+the calls to the dtors, which implies that we are freeing things
+correctly. Also, everything was eventually getting disposed in unmanaged
+(seen because the dispose queue was being emptied).
+
+The problem is that when we dispose a GLib.Value, we actually put it in
+a queue that waits for idle time to dispose the values. When I was doing
+sorting, there was no idle time. So, the values just sat there until it
+was done, increasing memory usage. Also, the GC was not kicking in very
+often (it was only doing it after a MB or two of allocation), so there
+were alot of dead GLib.Values sitting around waiting for the next
+collection.
+
+&gt;<i> Which part of the patch improved time?  Which part of the patch improved
+</I>&gt;<i> memory?  By combining two different &quot;fixes&quot; in one patch like this, it
+</I>&gt;<i> is hard to understand if/why both parts are necessary.
+</I>Actually, both of these patches fix memory. The speed benefit comes in
+two places. First, we reduce the amount of time spent allocating memory.
+Second, the time spent freeing memory is also reduced.
+
+The ManagedValue patch does one other thing to increase perfromance
+which is avoiding calls on an unmanaged delegate.
+
+
+&gt;<i> So, in summary, on performance improvement patches like this that add
+</I>&gt;<i> code complexity in order to improve performance, I will first need to
+</I>&gt;<i> see clear instrumented evidence of the problem.  I'm talking numeric
+</I>&gt;<i> profiled evidence, not &quot;tree view seems slow.&quot;  Also, I need to see
+</I>&gt;<i> measurements of the improvement, and by this I don't mean &quot;50%
+</I>&gt;<i> improvement&quot;.  I mean &quot;the profile prior to the patch showed 10% of
+</I>&gt;<i> execution time in GetValue, now it's 5%.&quot;
+</I>Actually, when I said `50%' what i meant was `the profile before showed
+10%, now it shows 5%'. I should have been more specific here.
+
+Also, remember that this number is not the entire story. There is some
+time spent in the GC directly due to the number of allocations, but it
+is not shown because it does not always land somewhere where I can see
+it in my profile.
+
+&gt;<i>   Finally, the above
+</I>&gt;<i> measurements should be made on atomic changes, not an aggregation of
+</I>&gt;<i> loosely related changes.
+</I>Sorry, will get this data for you. In fact I am thinking of abandoning
+the treemodel one and instead looking at the GLib.Value --&gt; struct
+change. Gimme a few minutes.
+
+-- Ben
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="003376.html">[Gtk-sharp-list] PATCH: speed up treeview and managed values
+</A></li>
+	<LI> Next message: <A HREF="003379.html">[Gtk-sharp-list] PATCH: speed up treeview and managed values
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3378">[ date ]</a>
+              <a href="thread.html#3378">[ thread ]</a>
+              <a href="subject.html#3378">[ subject ]</a>
+              <a href="author.html#3378">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

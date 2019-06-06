@@ -1,0 +1,243 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Gtk-sharp-list] GTypeInstances other than GObject (needed for
+	gst-sharp work I'm doing)
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:gtk-sharp-list%40lists.ximian.com?Subject=%5BGtk-sharp-list%5D%20GTypeInstances%20other%20than%20GObject%20%28needed%20for%0A%09gst-sharp%20work%20I%27m%20doing%29&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006992.html">
+   <LINK REL="Next"  HREF="006994.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Gtk-sharp-list] GTypeInstances other than GObject (needed for
+	gst-sharp work I'm doing)</H1>
+    <B>Peter Johanson</B> 
+    <A HREF="mailto:gtk-sharp-list%40lists.ximian.com?Subject=%5BGtk-sharp-list%5D%20GTypeInstances%20other%20than%20GObject%20%28needed%20for%0A%09gst-sharp%20work%20I%27m%20doing%29&In-Reply-To="
+       TITLE="[Gtk-sharp-list] GTypeInstances other than GObject (needed for
+	gst-sharp work I'm doing)">latexer at gentoo.org
+       </A><BR>
+    <I>Sun Mar  5 14:20:28 EST 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006992.html">[Gtk-sharp-list] Editable TreeView question
+</A></li>
+        <LI>Next message: <A HREF="006994.html">[Gtk-sharp-list] ui Xml problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6993">[ date ]</a>
+              <a href="thread.html#6993">[ thread ]</a>
+              <a href="subject.html#6993">[ subject ]</a>
+              <a href="author.html#6993">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>hey folks,
+
+So unbeknownst to me before, about a week and half ago, libgobject
+actually provides a mechanism for folks to create their own base object
+types other than GObject, via GTypeInstance:
+
+&lt;snip from gtype.h&gt;
+typedef struct _GTypeClass              GTypeClass;
+typedef struct _GTypeInstance           GTypeInstance;
+.
+.
+.
+/* Basic Type Structures
+ */
+struct _GTypeClass
+{ 
+  /*&lt; private &gt;*/
+  GType g_type;                                                            
+};                                                                         
+struct _GTypeInstance
+{
+  /*&lt; private &gt;*/
+  GTypeClass *g_class;
+};
+&lt;/snip&gt;
+
+And lo and behold, both GObject, and gstreamer's recently discovered
+&quot;GstMiniObject&quot; are GTypeInstances. GstMiniObject is used as a
+lightweight object base for a few types in gstreamer, GstMessage,
+GstBuffer, GstEvent, and GstQuery (so far).
+
+Why should gtk-sharp-list care? Well, GAPI2 needs some changes in order
+to properly generate code for classes with base GTypeInstance *other*
+than GObject. Mainly, there are places where &quot;GLib.Object.GetObject (raw)&quot;
+really needs to be &quot;Gst.MiniObject.GetObject (raw)&quot; as I've had to
+duplicate a lot of the GLib.Object logic for object instantiation,
+ref-ing, etc in Gst.MiniObject.
+
+The attached patch is the *wrong* way to do this in GAPI2, but I needed
+something to get to the 'is this actually gonna work' stage with my
+gst-sharp work.
+
+With that patch applied, my current work so far on gst-sharp (found in
+a bazaar branch for now, that's not going to be the final development
+home for this hopefully) found here:
+<A HREF="http://www.peterjohanson.com/bazaar/gst-sharp/gst-sharp--dev--0.10/">http://www.peterjohanson.com/bazaar/gst-sharp/gst-sharp--dev--0.10/</A> will
+compile, and the small sample runs with no issues. Folks without bazaar
+can get a snapshot tarball here:
+<A HREF="http://www.peterjohanson.com/files/gst-sharp-0.9.5.99.tar.gz">http://www.peterjohanson.com/files/gst-sharp-0.9.5.99.tar.gz</A>
+
+So, after a long and drawn out email: 
+
+What is the best way to go about providing this functionality in GAPI2?
+Is this beyond what should be offered? Some ideas from me where a
+&quot;IGTypeInstance&quot; interface in glib-sharp that both GObject and other
+GTypeInstances would implement, but one can't specify the static
+&quot;GetObject&quot; method there, so that's not perfect.
+
+Thoughts?
+
+-pete
+
+-- 
+Peter Johanson
+&lt;<A HREF="http://lists.ximian.com/mailman/listinfo/gtk-sharp-list">latexer at gentoo.org</A>&gt;
+-------------- next part --------------
+Index: generator/Parser.cs
+===================================================================
+--- generator/Parser.cs	(revision 57530)
++++ generator/Parser.cs	(working copy)
+@@ -142,13 +142,17 @@
+ 		{
+ 			string type = symbol.GetAttribute (&quot;type&quot;);
+ 			string cname = symbol.GetAttribute (&quot;cname&quot;);
++			string from_fmt = symbol.GetAttribute (&quot;from_fmt&quot;);
+ 			string name = symbol.GetAttribute (&quot;name&quot;);
+ 			IGeneratable result = null;
+ 
+ 			if (type == &quot;simple&quot;)
+ 				result = new SimpleGen (cname, name);
+ 			else if (type == &quot;manual&quot;)
+-				result = new ManualGen (cname, name);
++				if (from_fmt == &quot;&quot;)
++					result = new ManualGen (cname, name);
++				else
++					result = new ManualGen (cname, name, from_fmt);
+ 			else if (type == &quot;alias&quot;)
+ 				result = new AliasGen (cname, name);
+ 			else if (type == &quot;marshal&quot;) {
+Index: generator/ObjectBase.cs
+===================================================================
+--- generator/ObjectBase.cs	(revision 57530)
++++ generator/ObjectBase.cs	(working copy)
+@@ -27,10 +27,19 @@
+ 	public abstract class ObjectBase : HandleBase {
+ 
+ 		protected ObjectBase (XmlElement ns, XmlElement elem) : base (ns, elem) {}
++
++		public string BaseGTypeInstance {
++			get {
++				string base_gtype_instance = Elem.GetAttribute(&quot;base_gtype_instance&quot;);
++
++				return base_gtype_instance != &quot;&quot; ? base_gtype_instance : &quot;GLib.Object&quot;;
++			}
++		}
++
+ 					
+ 		public override string FromNative (string var, bool owned)
+ 		{
+-			return &quot;GLib.Object.GetObject(&quot; + var + (owned ? &quot;, true&quot; : &quot;&quot;) + &quot;) as &quot; + QualifiedName;
++			return BaseGTypeInstance + &quot;.GetObject(&quot; + var + (owned ? &quot;, true&quot; : &quot;&quot;) + &quot;) as &quot; + QualifiedName;
+ 		}
+ 	}
+ }
+Index: generator/Signal.cs
+===================================================================
+--- generator/Signal.cs	(revision 57530)
++++ generator/Signal.cs	(working copy)
+@@ -224,7 +224,14 @@
+ 					finish += &quot;\t\t\targ&quot; + idx + &quot; = &quot; + igen.ToNativeReturn (&quot;((&quot; + p.CSType + &quot;)args.Args[&quot; + (idx - 1) + &quot;])&quot;) + &quot;;\n&quot;;
+ 			}
+ 			sw.WriteLine(&quot;\t\t\t{0} handler = ({0}) sig.Handler;&quot;, EventHandlerQualifiedName);
+-			sw.WriteLine(&quot;\t\t\thandler (GLib.Object.GetObject (arg0), args);&quot;);
++			//sw.WriteLine(&quot;\t\t\thandler (GLib.Object.GetObject (arg0), args);&quot;);
++			ObjectBase obj_container_type = container_type as ObjectBase;
++			string base_gtype_instance =
++				obj_container_type != null ?
++				obj_container_type.BaseGTypeInstance :
++				&quot;GLib.Object&quot;;
++
++			sw.WriteLine(&quot;\t\t\thandler (&quot; + base_gtype_instance + &quot;.GetObject (arg0), args);&quot;);
+ 			sw.WriteLine (finish);
+ 			if (!IsVoid) {
+ 				sw.WriteLine (&quot;\t\t\tif (args.RetVal == null)&quot;);
+@@ -352,7 +359,14 @@
+ 			sw.WriteLine (&quot;\t\tstatic {0} {1};\n&quot;, Name + &quot;VMDelegate&quot;, Name + &quot;VMCallback&quot;);
+ 			sw.WriteLine (&quot;\t\tstatic &quot; + retval.ToNativeType + &quot; &quot; + Name.ToLower() + &quot;_cb (&quot; + isig.ToString () + &quot;)&quot;);
+ 			sw.WriteLine (&quot;\t\t{&quot;);
+-			sw.WriteLine (&quot;\t\t\t{0} {1}_managed = GLib.Object.GetObject ({1}, false) as {0};&quot;, implementor != null ? implementor.Name : container_type.Name, parms[0].Name);
++			//sw.WriteLine (&quot;\t\t\t{0} {1}_managed = GLib.Object.GetObject ({1}, false) as {0};&quot;, implementor != null ? implementor.Name : container_type.Name, parms[0].Name);
++			ObjectBase obj_container_type = container_type as ObjectBase;
++			string base_gtype_instance =
++				obj_container_type != null ?
++				obj_container_type.BaseGTypeInstance :
++				&quot;GLib.Object&quot;;
++
++			sw.WriteLine (&quot;\t\t\t{0} {1}_managed = &quot; + base_gtype_instance + &quot;.GetObject ({1}, false) as {0};&quot;, implementor != null ? implementor.Name : container_type.Name, parms[0].Name);
+ 			sw.Write (call.Setup (&quot;\t\t\t&quot;));
+ 			sw.Write (&quot;\t\t\t{0}&quot;, IsVoid ? &quot;&quot; : retval.CSType == retval.ToNativeType ? &quot;return &quot; : retval.CSType + &quot; raw_ret = &quot;);
+ 			sw.WriteLine (&quot;{2}_managed.{0} ({1});&quot;, &quot;On&quot; + Name, call.ToString (), parms[0].Name);
+Index: generator/VirtualMethod.cs
+===================================================================
+--- generator/VirtualMethod.cs	(revision 57530)
++++ generator/VirtualMethod.cs	(working copy)
+@@ -33,10 +33,12 @@
+ 		ReturnValue retval;
+ 		Parameters parms;
+ 		ImportSignature isig;
++		ClassBase container_type;
+ 
+ 		public VirtualMethod (XmlElement elem, ClassBase container_type) 
+ 		{
+ 			this.elem = elem;
++			this.container_type = container_type;
+ 			retval = new ReturnValue (elem [&quot;return-type&quot;]);
+ 			parms = new Parameters (elem[&quot;parameters&quot;]);
+ 			isig = new ImportSignature (parms);
+@@ -79,9 +81,15 @@
+ 			string type = parms [0].CSType;
+ 			string name = parms [0].Name;
+ 			string call_string = &quot;__obj.&quot; + Name + &quot; (&quot; + call + &quot;)&quot;;
++			ObjectBase obj_container_type = container_type as ObjectBase;
++			string base_gtype_instance =
++				obj_container_type != null ?
++				obj_container_type.BaseGTypeInstance :
++				&quot;GLib.Object&quot;;
++
+ 			sw.WriteLine (&quot;\t\tstatic &quot; + MarshalReturnType + &quot; &quot; + Name + &quot;Callback (&quot; + isig + &quot;)&quot;);
+ 			sw.WriteLine (&quot;\t\t{&quot;);
+-			sw.WriteLine (&quot;\t\t\t&quot; + type + &quot; __obj = GLib.Object.GetObject (&quot; + name + &quot;, false) as &quot; + type + &quot;;&quot;);
++			sw.WriteLine (&quot;\t\t\t&quot; + type + &quot; __obj = &quot; + base_gtype_instance + &quot;.GetObject (&quot; + name + &quot;, false) as &quot; + type + &quot;;&quot;);
+ 			sw.Write (call.Setup (&quot;\t\t\t&quot;));
+ 			if (retval.CSType == &quot;void&quot;)
+ 				sw.WriteLine (&quot;\t\t\t&quot; + call_string + &quot;;&quot;);
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006992.html">[Gtk-sharp-list] Editable TreeView question
+</A></li>
+	<LI>Next message: <A HREF="006994.html">[Gtk-sharp-list] ui Xml problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6993">[ date ]</a>
+              <a href="thread.html#6993">[ thread ]</a>
+              <a href="subject.html#6993">[ subject ]</a>
+              <a href="author.html#6993">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/gtk-sharp-list">More information about the Gtk-sharp-list
+mailing list</a><br>
+</body></html>

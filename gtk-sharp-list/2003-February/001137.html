@@ -1,0 +1,315 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Gtk-sharp-list] More on signals
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:gonzalo%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="001160.html">
+   <LINK REL="Next"  HREF="001138.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Gtk-sharp-list] More on signals
+   </H1>
+    <B>Gonzalo Paniagua Javier
+    </B> 
+    <A HREF="mailto:gonzalo%40ximian.com"
+       TITLE="[Gtk-sharp-list] More on signals">gonzalo@ximian.com
+       </A><BR>
+    <I>26 Feb 2003 00:39:53 +0100</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="001160.html">[Gtk-sharp-list] [Patch] gtk/TextBuffer.custom
+</A></li>
+        <LI> Next message: <A HREF="001138.html">[Gtk-sharp-list] More on signals
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1137">[ date ]</a>
+              <a href="thread.html#1137">[ thread ]</a>
+              <a href="subject.html#1137">[ subject ]</a>
+              <a href="author.html#1137">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>--=-V8MjVegXKqhHSJOY0Tif
+Content-Type: text/plain
+Content-Transfer-Encoding: 7bit
+
+Hi there!
+
+Radek provided a sample test case that registers and unregisters a
+handle for a signal, and the handler is being invoked after it has been
+unregistered (attachment Test.cs).
+
+Why does it invoke the handler?
+
+The class that handles this signal,
+GtkSharp.voidObjectTextIterstringintSignal has the _handler in its base
+class (SignalCallback) still being a valid delegate (a) *and* we are
+still connected to that signal (b).
+
+(a) Is fixed by doing:
+....
+((GtkSharp.SignalCallback) Signals [&quot;insert_text&quot;]).RemoveDelegate
+(value);
+.....
+Just before removing &quot;insert_text&quot; from Signals in
+TextBuffer.InsertText.
+
+Once this is done, the static method that handles the signal dies in
+this line:
+inst._handler.DynamicInvoke(argv);
+
+because _handler is null, which takes us to...
+
+(b) This can be fixed by implementing the IDisposable pattern in
+SignalCallback and its subclasses. The Dispose method in the subclasses
+should, if _Instances.Count reaches 0, disconnect the signal. The
+Dispose method is called when removing a handler from the event or when
+finalizing the instance.
+
+The patch that does this is attached. It works fine.
+
+Now I wonder...:
+        -Do we need EventList? We can make SignalCallback.RemoveDelegate
+        return the resulting delegate or a boolean to tell us if there
+        are any other handlers left and disconnect the signal if not.
+        
+        -Should we finalize, ie. call Dispose, on all the objects in
+        Signals hashtable (if any) when finalizing GLib.Objects?
+
+Ok to commit?
+
+-Gonzalo
+
+
+--=-V8MjVegXKqhHSJOY0Tif
+Content-Disposition: attachment; filename=Test.cs
+Content-Type: text/plain; name=Test.cs; charset=ISO-8859-1
+Content-Transfer-Encoding: 7bit
+
+using System;
+using Gtk;
+
+class Test : Application
+{
+	static GtkSharp.InsertTextHandler myEvent;
+
+	public static void Main() 
+	{
+		Init();
+
+		Gtk.TextBuffer buffer = new TextBuffer(new Gtk.TextTagTable());
+
+		buffer.InsertAtCursor(&quot;hello&quot;);
+
+		Console.WriteLine(&quot;buffer: {0}&quot;, buffer.Text);
+
+		//buffer.InsertText += new GtkSharp.InsertTextHandler(my_handler);
+		myEvent = new GtkSharp.InsertTextHandler (my_handler);
+		buffer.InsertText += myEvent;
+		buffer.InsertText -= myEvent;
+
+		buffer.InsertAtCursor(&quot; world&quot;);
+		
+		Console.WriteLine(&quot;buffer: {0}&quot;, buffer.Text);
+	}
+
+
+	static bool inside = false;
+
+	static void my_handler (object obj, GtkSharp.InsertTextArgs args)
+	{
+		Console.WriteLine(&quot;my_handler called inside: {0}&quot;, inside);
+		if (inside)
+			return; 
+	
+		inside = true;
+	
+		Gtk.TextBuffer buffer = (Gtk.TextBuffer) obj;
+		
+		Console.WriteLine(&quot;insert begin&quot;);
+		buffer.InsertText -= myEvent;
+		//buffer.InsertAtCursor(&quot;&lt;extra&gt;&quot;);
+		//buffer.InsertText += myEvent;
+		Console.WriteLine(&quot;insert end&quot;);
+
+		inside = false;
+	}
+}
+
+
+--=-V8MjVegXKqhHSJOY0Tif
+Content-Disposition: attachment; filename=signals-2.patch
+Content-Type: text/x-patch; name=signals-2.patch; charset=ISO-8859-1
+Content-Transfer-Encoding: 7bit
+
+Index: generator/Parser.cs
+===================================================================
+RCS file: /cvs/public/gtk-sharp/generator/Parser.cs,v
+retrieving revision 1.14
+diff -u -r1.14 Parser.cs
+--- generator/Parser.cs	26 Oct 2002 08:03:15 -0000	1.14
++++ generator/Parser.cs	25 Feb 2003 23:29:57 -0000
+@@ -8,6 +8,7 @@
+ 
+ 	using System;
+ 	using System.Collections;
++	using System.IO;
+ 	using System.Xml;
+ 
+ 	public class Parser  {
+@@ -20,7 +21,9 @@
+ 
+ 			try {
+ 
+-				doc.Load (filename);
++				Stream stream = File.OpenRead (filename);
++				doc.Load (stream);
++				stream.Close ();
+ 
+ 			} catch (XmlException e) {
+ 
+Index: generator/Signal.cs
+===================================================================
+RCS file: /cvs/public/gtk-sharp/generator/Signal.cs,v
+retrieving revision 1.12
+diff -u -r1.12 Signal.cs
+--- generator/Signal.cs	6 Feb 2003 00:58:02 -0000	1.12
++++ generator/Signal.cs	25 Feb 2003 23:29:57 -0000
+@@ -169,10 +169,16 @@
+ 			sw.WriteLine(&quot;\t\t\t}&quot;);
+ 			sw.WriteLine(&quot;\t\t\tremove {&quot;);
+ 			sw.WriteLine(&quot;\t\t\t\tEventList.RemoveHandler(&quot; + cname + &quot;, value);&quot;);
+-			sw.WriteLine(&quot;\t\t\t\tif (EventList[&quot; + cname + &quot;] == null)&quot;);
++			sw.WriteLine(&quot;\t\t\t\tGtkSharp.SignalCallback cb = Signals [{0}] as GtkSharp.SignalCallback;&quot;, cname);
++			sw.WriteLine(&quot;\t\t\t\tif (cb == null)&quot;);
++			sw.WriteLine(&quot;\t\t\t\t\treturn;&quot;);
++			sw.WriteLine();
++			sw.WriteLine(&quot;\t\t\t\tcb.RemoveDelegate (value);&quot;);
++			sw.WriteLine();
++			sw.WriteLine(&quot;\t\t\t\tif (EventList[&quot; + cname + &quot;] == null) {&quot;);
+ 			sw.WriteLine(&quot;\t\t\t\t\tSignals.Remove(&quot; + cname + &quot;);&quot;);
+-			sw.WriteLine(&quot;\t\t\t\telse&quot;);
+-			sw.WriteLine(&quot;\t\t\t\t\t((GtkSharp.SignalCallback) Signals [{0}]).RemoveDelegate (value);&quot;, cname);
++			sw.WriteLine(&quot;\t\t\t\t\tcb.Dispose ();&quot;);
++			sw.WriteLine(&quot;\t\t\t\t}&quot;);
+ 			sw.WriteLine(&quot;\t\t\t}&quot;);
+ 			sw.WriteLine(&quot;\t\t}&quot;);
+ 			sw.WriteLine();
+Index: generator/SignalHandler.cs
+===================================================================
+RCS file: /cvs/public/gtk-sharp/generator/SignalHandler.cs,v
+retrieving revision 1.20
+diff -u -r1.20 SignalHandler.cs
+--- generator/SignalHandler.cs	19 Feb 2003 06:23:36 -0000	1.20
++++ generator/SignalHandler.cs	25 Feb 2003 23:29:57 -0000
+@@ -109,6 +109,9 @@
+ 			sw.WriteLine();
+ 			sw.WriteLine(&quot;\t\tprivate static &quot; + dname + &quot; _Delegate;&quot;);
+ 			sw.WriteLine();
++			sw.WriteLine(&quot;\t\tprivate IntPtr _raw;&quot;);
++			sw.WriteLine(&quot;\t\tprivate uint _HandlerID;&quot;);
++			sw.WriteLine();
+ 			sw.Write(&quot;\t\tprivate static &quot; + p_ret + &quot; &quot;);
+ 			sw.WriteLine(cbname + &quot;(&quot; + pinv + &quot;, int key)&quot;);
+ 			sw.WriteLine(&quot;\t\t{&quot;);
+@@ -162,8 +165,8 @@
+ 				sw.WriteLine(&quot;\t\t}&quot;);
+ 				sw.WriteLine();
+ 			}
+-			sw.Write(&quot;\t\t[DllImport(\&quot;gobject-2.0\&quot;)]&quot;);
+-			sw.Write(&quot;\t\tstatic extern void g_signal_connect_data(&quot;);
++			sw.WriteLine(&quot;\t\t[DllImport(\&quot;gobject-2.0\&quot;)]&quot;);
++			sw.Write(&quot;\t\tstatic extern uint g_signal_connect_data(&quot;);
+ 			sw.Write(&quot;IntPtr obj, String name, &quot; + dname + &quot; cb, int key, IntPtr p,&quot;);
+ 			sw.WriteLine(&quot; int flags);&quot;);
+ 			sw.WriteLine();
+@@ -173,14 +176,19 @@
+ 			sw.WriteLine(&quot;\t\t\tif (_Delegate == null) {&quot;);
+ 			sw.WriteLine(&quot;\t\t\t\t_Delegate = new &quot; + dname + &quot;(&quot; + cbname + &quot;);&quot;);
+ 			sw.WriteLine(&quot;\t\t\t}&quot;);
+-			sw.Write(&quot;\t\t\tg_signal_connect_data(raw, name, &quot;);
++			sw.WriteLine(&quot;\t\t\t_raw = raw;&quot;);
++			sw.Write(&quot;\t\t\t_HandlerID = g_signal_connect_data(raw, name, &quot;);
+ 			sw.WriteLine(&quot;_Delegate, _key, new IntPtr(0), 0);&quot;);
+ 			sw.WriteLine(&quot;\t\t}&quot;);
+ 			sw.WriteLine();
+-			sw.WriteLine(&quot;\t\t~&quot; + sname + &quot;()&quot;);
++			sw.WriteLine(&quot;\t\t[DllImport(\&quot;gobject-2.0\&quot;)]&quot;);
++			sw.WriteLine(&quot;\t\tstatic extern void g_signal_handler_disconnect (IntPtr instance, uint handler);&quot;);
++			sw.WriteLine();
++			sw.WriteLine(&quot;\t\tprotected override void Dispose (bool disposing)&quot;);
+ 			sw.WriteLine(&quot;\t\t{&quot;);
+ 			sw.WriteLine(&quot;\t\t\t_Instances.Remove(_key);&quot;);
+ 			sw.WriteLine(&quot;\t\t\tif(_Instances.Count == 0) {&quot;);
++			sw.WriteLine(&quot;\t\t\t\tg_signal_handler_disconnect (_raw, _HandlerID);&quot;);
+ 			sw.WriteLine(&quot;\t\t\t\t_Delegate = null;&quot;);
+ 			sw.WriteLine(&quot;\t\t\t}&quot;);
+ 			sw.WriteLine(&quot;\t\t}&quot;);
+Index: glib/SignalCallback.cs
+===================================================================
+RCS file: /cvs/public/gtk-sharp/glib/SignalCallback.cs,v
+retrieving revision 1.5
+diff -u -r1.5 SignalCallback.cs
+--- glib/SignalCallback.cs	24 Feb 2003 06:39:30 -0000	1.5
++++ glib/SignalCallback.cs	25 Feb 2003 23:29:58 -0000
+@@ -18,7 +18,7 @@
+ 	///	Base Class for GSignal to C# event marshalling.
+ 	/// &lt;/remarks&gt;
+ 
+-	public abstract class SignalCallback {
++	public abstract class SignalCallback : IDisposable {
+ 
+ 		// A counter used to produce unique keys for instances.
+ 		protected static int _NextKey = 0;
+@@ -58,5 +58,26 @@
+ 		{
+ 			_handler = Delegate.Remove (_handler, d);
+ 		}
++
++		public void Dispose ()
++		{
++			Dispose (true);
++			GC.SuppressFinalize (this);
++		}
++
++		protected virtual void Dispose (bool disposing)
++		{
++			if (disposing) {
++				_obj = null;
++				_handler = null;
++				_argstype = null;
++			}
++		}
++
++		~SignalCallback ()
++		{
++			Dispose (false);
++		}
+ 	}
+ }
++
+
+--=-V8MjVegXKqhHSJOY0Tif--
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="001160.html">[Gtk-sharp-list] [Patch] gtk/TextBuffer.custom
+</A></li>
+	<LI> Next message: <A HREF="001138.html">[Gtk-sharp-list] More on signals
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1137">[ date ]</a>
+              <a href="thread.html#1137">[ thread ]</a>
+              <a href="subject.html#1137">[ subject ]</a>
+              <a href="author.html#1137">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>
