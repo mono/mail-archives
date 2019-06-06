@@ -1,0 +1,329 @@
+Index: src/core/Mono.Texteditor/Mono.TextEditor.Vi/ViMode.cs
+===================================================================
+--- src/core/Mono.Texteditor/Mono.TextEditor.Vi/ViMode.cs	(revision 151732)
++++ src/core/Mono.Texteditor/Mono.TextEditor.Vi/ViMode.cs	(working copy)
+@@ -33,8 +33,79 @@
+ 
+ namespace Mono.TextEditor.Vi
+ {
++	public class ViMark : Mono.TextEditor.TextMarker
++	{
+ 	
++		public char MarkCharacter {get; set;}
++		
++		/// <summary>
++		/// Only way to construct a ViMark.
++		/// </summary>
++		/// <param name="markCharacter">
++		/// The <see cref="System.Char"/> with which the ViMark object needs to be
++		/// associated.
++		/// </param>
++		public ViMark (char markCharacter) {
++			MarkCharacter = MarkCharacter;
++		}
++		
++		public void SaveMark (TextEditorData data) {
++		
++			if (base.LineSegment != null) {
++				// Remove the marker first
++				data.Document.RemoveMarker (base.LineSegment, this);
++			}
++		
++			// TODO: Is there a better way of doing this?
++			int lineNumber = data.IsSomethingSelected ? data.MainSelection.MinLine : data.Caret.Line;
++			base.LineSegment = data.Document.GetLine (lineNumber);
++			data.Document.AddMarker(lineNumber, this);
++			
++			data.Document.RequestUpdate (new UpdateAll ());
++			data.Document.CommitDocumentUpdate ();
++		}
++		
++		public void LoadMark (TextEditorData data) {
++			int x = data.Document.OffsetToLineNumber (base.LineSegment.Offset);
++			data.Caret.Line = x;
++		}
++		
++		public virtual ChunkStyle GetStyle (ChunkStyle baseStyle) {
++			return baseStyle;
++		}
++		
++	}
+ 	
++	/// <summary>
++	/// Implements a Vi macro. Only the keys pressed need to be stored. Though this class
++	/// is not exactly required, it provides a possible place to extend the code.
++	/// </summary>
++	public class ViMacro {
++	
++		/// <summary>
++		/// One of these determines a complete set of arguments passed to HandleKeyPress. I am
++		/// still not sure about whether each of these fields is indepedent in itself or may 
++		/// be eliminated and re-constructed later.
++		/// </summary>
++		public struct KeySet {
++			public Gdk.Key Key { get; set;}
++			public uint UnicodeKey {get; set;}
++			public Gdk.ModifierType Modifiers {get; set;}
++		}
++		
++		/// <summary>
++		/// This <see cref="System.Collections.Queue"/> of KeySets determine the ultimate functionality
++		/// of the macro this ViMacro object represents.
++		/// </summary>
++		public Queue<KeySet> KeysPressed {get; set;}
++		public char MacroCharacter {get; set;}
++		
++		public ViMacro (char macroCharacter) {
++			MacroCharacter = MacroCharacter;
++		}
++	
++	}
++	
+ 	public class ViEditMode : EditMode
+ 	{
+ 		bool searchBackward;
+@@ -43,9 +114,31 @@
+ 		State state;
+ 		const string substMatch = @"^:s(?<sep>.)(?<pattern>.+?)\k<sep>(?<replacement>.*?)(\k<sep>(?<trailer>i?))?$";
+ 		StringBuilder commandBuffer = new StringBuilder ();
++		Dictionary<char,ViMark> marks = new Dictionary<char, ViMark>();
++		Dictionary<char,ViMacro> macros = new Dictionary<char, ViMacro>();
++		string statusText = "";
+ 		
+-		public virtual string Status { get; protected set; }
++		/// <summary>
++		/// The macro currently being implemented. Will be set to null and checked as a flag when required.
++		/// </summary>
++		ViMacro currentMacro;
+ 		
++		public virtual string Status {
++		
++			get {
++				return statusText;
++			}
++			
++			protected set {
++				if (currentMacro == null) {
++					statusText = value;
++				} else {
++					statusText = value + " recording";
++				}
++			}
++		
++		}
++		
+ 		protected virtual string RunExCommand (string command)
+ 		{
+ 			switch (command[0]) {
+@@ -91,7 +184,7 @@
+ 					break;	
+ 				}
+ 				break;
+-
++				
+ 			case '?':
+ 			case '/':
+ 				searchBackward = ('?' == command[0]);
+@@ -102,7 +195,7 @@
+ 				}
+ 				return Search ();
+ 			}
+-
++			
+ 			return "Command not recognised";
+ 		}
+ 		
+@@ -157,14 +250,37 @@
+ 			return ViActionMaps.GetInsertKeyAction (key, modifier) ??
+ 				ViActionMaps.GetDirectionKeyAction (key, modifier);
+ 		}
+-		
++
+ 		protected override void HandleKeypress (Gdk.Key key, uint unicodeKey, Gdk.ModifierType modifier)
+ 		{
++		
++			Console.WriteLine ("statusText={0}, Status={1}", statusText, Status);
+ 			// Reset on Esc, Ctrl-C, Ctrl-[
+-			if (key == Gdk.Key.Escape || 
+-			    ((key == Gdk.Key.c || key == Gdk.Key.bracketleft) && (modifier & Gdk.ModifierType.ControlMask) != 0)) {
++			if (key == Gdk.Key.Escape) {
++				if (currentMacro != null) {
++					// Record Escapes into the Macro since it actually does something
++					ViMacro.KeySet toAdd = new ViMacro.KeySet();
++					toAdd.Key = key;
++					toAdd.Modifiers = modifier;
++					toAdd.UnicodeKey = unicodeKey;
++					currentMacro.KeysPressed.Enqueue(toAdd);
++				}
++				Reset(string.Empty);
++				return;
++			} else if (((key == Gdk.Key.c || key == Gdk.Key.bracketleft) && (modifier & Gdk.ModifierType.ControlMask) != 0)) {
+ 				Reset (string.Empty);
++				if (currentMacro != null) {
++					// Otherwise remove the macro from the pool
++					macros.Remove(currentMacro.MacroCharacter);
++					currentMacro = null;
++				}
+ 				return;
++			} else if (currentMacro != null && !((char)unicodeKey == 'q' && modifier == Gdk.ModifierType.None)) {
++				ViMacro.KeySet toAdd = new ViMacro.KeySet();
++				toAdd.Key = key;
++				toAdd.Modifiers = modifier;
++				toAdd.UnicodeKey = unicodeKey;
++				currentMacro.KeysPressed.Enqueue(toAdd);
+ 			}
+ 			
+ 			Action<TextEditorData> action = null;
+@@ -349,9 +465,36 @@
+ 						Status = "z";
+ 						state = State.Fold;
+ 						return;
++						
++					case 'm':
++						Status = "m";
++						state = State.Mark;
++						return;
++						
++					case '`':
++						Status = "`";
++						state = State.GoToMark;
++						return;
++						
++					case '@':
++						Status = "@";
++						state = State.PlayMacro;
++						return;
++	
++					case 'q':
++						if (currentMacro == null) {
++							Status = "q";
++							state = State.NameMacro;
++							return;
++						} else {
++							currentMacro = null;
++							Reset("Macro Recorded");
++							return;
++						}
++						break;
++						
+ 					}
+ 					
+-					
+ 				}
+ 				
+ 				action = ViActionMaps.GetNavCharAction ((char)unicodeKey);
+@@ -598,6 +741,65 @@
+ 				}
+ 				Reset ("Unknown command");
+ 				return;
++				
++			case State.Mark: {
++				char k = (char)unicodeKey;
++				ViMark mark = null;
++				if (!char.IsLetterOrDigit(k)) {
++					Reset ("Invalid Mark");
++					return;
++				}
++				if (marks.ContainsKey(k)) {
++					mark = marks [k];
++				} else {
++					mark = new ViMark(k);
++					marks [k] = mark;
++				}
++				RunAction(mark.SaveMark);
++				Reset("");
++				return;
++			}
++			
++			case State.NameMacro: {
++				char k = (char) unicodeKey;
++				if(!char.IsLetterOrDigit(k)) {
++					Reset("Invalid Macro Name");
++					return;
++				}
++				currentMacro = new ViMacro (k);
++				currentMacro.KeysPressed = new Queue<ViMacro.KeySet> ();
++				macros [k] = currentMacro;
++				Reset("");
++				return;
++			}
++			
++			case State.PlayMacro: {
++				char k = (char) unicodeKey;
++				if (macros.ContainsKey(k)) {
++					Reset ("");
++					ViMacro macroToPlay = macros [k];
++					foreach (ViMacro.KeySet keySet in macroToPlay.KeysPressed) {
++						HandleKeypress(keySet.Key, keySet.UnicodeKey, keySet.Modifiers);
++					}
++					/* Once all the keys have been played back, quickly exit. */
++					return;
++				} else {
++					Reset ("Invalid Macro Name");
++					return;
++				}
++			}
++			
++			case State.GoToMark: {
++				char k = (char)unicodeKey;
++				if (marks.ContainsKey(k)) {
++					RunAction(marks [k].LoadMark);
++					Reset ("");
++				} else {
++					Reset ("Unknown Mark");
++				}
++				return;
++			}
++				
+ 			case State.Fold:
+ 				if (((modifier & (Gdk.ModifierType.ControlMask)) == 0)) {
+ 					switch ((char)unicodeKey) {
+@@ -863,7 +1065,11 @@
+ 			Indent,
+ 			Unindent,
+ 			G,
+-			Fold
++			Fold,
++			Mark,
++			GoToMark,
++			NameMacro,
++			PlayMacro
+ 		}
+ 	}
+ }
+
+Index: src/addins/MonoDevelop.SourceEditor2/MonoDevelop.SourceEditor/IdeViMode.cs
+===================================================================
+--- src/addins/MonoDevelop.SourceEditor2/MonoDevelop.SourceEditor/IdeViMode.cs	(revision 151732)
++++ src/addins/MonoDevelop.SourceEditor2/MonoDevelop.SourceEditor/IdeViMode.cs	(working copy)
+@@ -50,7 +50,8 @@
+ 			get { return base.Status; }
+ 			protected set {
+ 				base.Status = value;
+-				IdeApp.Workbench.StatusBar.ShowMessage (value);
++				// For the (recording) display.
++				IdeApp.Workbench.StatusBar.ShowMessage (base.Status);
+ 			}
+ 		}
+ 		
+
+Index: src/core/MonoDevelop.Ide/ChangeLog
+===================================================================
+--- src/core/MonoDevelop.Ide/ChangeLog	(revision 151732)
++++ src/core/MonoDevelop.Ide/ChangeLog	(working copy)
+@@ -1,3 +1,15 @@
++2010-02-16  Sanjoy Das          <sanjoy@playingwithpointers.com>
++
++	* Mono.Texteditor/Mono.TextEditor.Vi/ViMode.cs:
++	* MonoDevelop.SourceEditor2/MonoDevelop.SourceEditor/IdeViMode.cs: Added
++	  support for Vi style macros (qq and then @q).
++
++2010-02-16  Sanjoy Das          <sanjoy@playingwithpointers.com>
++
++	* Mono.Texteditor/Mono.TextEditor.Vi/ViMode.cs: Added support
++	  for marks in Vi (ma and then `a), integrated with the TextMarker
++	  API.
++
+ 2010-02-12  Michael Hutchinson  <mhutchinson@novell.com>
+ 
+ 	* MonoDevelop.Ide.Gui/SdiWorkspaceWindow.cs: Fix path bar
