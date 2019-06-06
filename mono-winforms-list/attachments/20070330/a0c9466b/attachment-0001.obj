@@ -1,0 +1,827 @@
+Index: System.Windows.Forms.X11Internal/XplatUIX11-new.cs
+===================================================================
+--- System.Windows.Forms.X11Internal/XplatUIX11-new.cs	(revision 75184)
++++ System.Windows.Forms.X11Internal/XplatUIX11-new.cs	(working copy)
+@@ -290,21 +290,9 @@
+ 		}
+ 
+ 		// XXX this implementation should probably be shared between all non-win32 backends
+-		internal override bool CalculateWindowRect (ref Rectangle ClientRect, int Style, int ExStyle, Menu menu, out Rectangle WindowRect)
++		internal override bool CalculateWindowRect (ref Rectangle ClientRect, CreateParams cp, Menu menu, out Rectangle WindowRect)
+ 		{
+-			FormBorderStyle	border_style;
+-			TitleStyle	title_style;
+-			bool border_static;
+-			int caption_height;
+-			int tool_caption_height;
+-
+-			// XXX this method should be static on Hwnd, not X11Hwnd
+-			X11Hwnd.DeriveStyles (Style, ExStyle, out border_style, out border_static, out title_style,
+-					      out caption_height, out tool_caption_height);
+-
+-			WindowRect = Hwnd.GetWindowRectangle(border_style, border_static, menu, title_style,
+-							     caption_height, tool_caption_height,
+-							     ClientRect);
++			WindowRect = Hwnd.GetWindowRectangle (cp, menu, ClientRect);
+ 			return true;
+ 		}
+ 
+Index: System.Windows.Forms/ChangeLog
+===================================================================
+--- System.Windows.Forms/ChangeLog	(revision 75184)
++++ System.Windows.Forms/ChangeLog	(working copy)
+@@ -1,5 +1,48 @@
+ 2007-03-30  Rolf Bjarne Kvinge <RKvinge@novell.com> 
+ 
++	[ Fixes #80995 ]
++
++	* XplatUI.cs, XplatUIDriver.cs: Updated CalculateWindowRect parameters.
++	* CreateParams.cs: Fix IsSet, wasn't working correctly when the style to
++	  check for is a mix of several styles (such as WS_CAPTION for instance).
++	* Control.cs: Don't paint an area bigger than the client area when painting
++	  the background colour. Add an internal GetCreateParams. Update calls to
++	  XplatUI.CalculateWindowRect due to API change.
++	* XplatUIX11.cs: In PerformNCCalc set the initial size to the whole window's
++	  size, and handle WM_NCCALCSIZE in DefWndProc to calculate the size if it
++	  hasn't been handled by any windows. When creating and moving windows, X
++	  wants the location of the entire window, but the size of the client
++	  window, so add TranslateClientRectangleToXClientRectangle,
++	  TranslateWindowSizeToXWindowSIze and TranslatedXWindowSizeToWindowSize
++	  to cope with this, and call them before every window creation and move.
++	  Update CalculateWIndowRect to use Hwnd.GetWindowRect (one step towards
++	  removing DeriveStyles). In AddConfigureNotify don't do anything if the
++	  hwnd is a zombie (fixes the BadWindow we were getting while running the
++	  tests), always calculate the offsets when it's a parentless window, not
++	  only when reparented, and translate the window size, since we're getting
++	  the client size of the whole window, excluding entire window.
++	* Theme.cs: Added BorderSizableSize.
++	* XplatUIWin32.cs: Fix RECT Height and Width. Don't fake styles here
++	  anymore. Update calls to XplatUI.CalculateWindowRect due to API change.
++	* Form.cs: Update calls to XplatUI.CalculateWindowRect due to API change.
++	  Fake the window styles here instead of in XplatUIWin32 so that all
++	  back-ends get the same window styles (and it's Form that's deciding when
++	  to use wm, not the Win32 backend anyways)
++	* Hwnd.cs: Completely reworked GetWindowRectangle and GetClientRectangle -
++	  they are now passed a CreateParams and they only use Style and ExStyle
++	  to determine the rectangles (they should now work just like
++	  Win32AdjustWindowRectEx - though quite a few special cases are probably
++	  missing). They should also be 100% complimentary (i.e. GetWindowRectangle
++	  (GetClientRectangle (rect)) == rect), and all numbers (borders, menu
++	  sizes) are taken from the current theme. Added a GetBorders helper
++	  function that will return the borders for any given CreateParams
++	  (including captions and menus), and GetBorderSize that returns the given
++	  border size only.
++	* XplatUIOSX.cs: Update calls to CalculateWindowRect and
++	  Hwnd.GetClientRectangle.
++
++2007-03-30  Rolf Bjarne Kvinge <RKvinge@novell.com> 
++
+ 	* Form.cs: Don't layout mdi children on MdiParent creation, the initial
+ 	  layout of the mdi children is handled by CreateParams. Fixes
+ 	  #79964,
+Index: System.Windows.Forms/Control.cs
+===================================================================
+--- System.Windows.Forms/Control.cs	(revision 75184)
++++ System.Windows.Forms/Control.cs	(working copy)
+@@ -1364,7 +1364,9 @@
+ 			}
+ 
+ 			if (background_image == null) {
+-				pevent.Graphics.FillRectangle(ThemeEngine.Current.ResPool.GetSolidBrush(BackColor), new Rectangle(pevent.ClipRectangle.X - 1, pevent.ClipRectangle.Y - 1, pevent.ClipRectangle.Width + 2, pevent.ClipRectangle.Height + 2));
++				Rectangle paintRect = new Rectangle(pevent.ClipRectangle.X, pevent.ClipRectangle.Y, pevent.ClipRectangle.Width, pevent.ClipRectangle.Height);
++				Brush pen = ThemeEngine.Current.ResPool.GetSolidBrush(BackColor);
++				pevent.Graphics.FillRectangle(pen, paintRect);
+ 				return;
+ 			}
+ 
+@@ -1760,11 +1762,16 @@
+ 			ClientRect = new Rectangle (0, 0, clientSize.Width, clientSize.Height);
+ 			cp = this.CreateParams;
+ 
+-			if (XplatUI.CalculateWindowRect (ref ClientRect, cp.Style, cp.ExStyle, null, out WindowRect))
++			if (XplatUI.CalculateWindowRect (ref ClientRect, cp, null, out WindowRect))
+ 				return new Size (WindowRect.Width, WindowRect.Height);
+ 
+ 			return Size.Empty;
+ 		}
++		
++		internal CreateParams GetCreateParams ()
++		{
++			return CreateParams;
++		}
+ 
+ 		private void UpdateDistances() {
+ 			if (parent != null) {
+@@ -3155,6 +3162,8 @@
+ 						create_params.ExStyle |= (int) WindowExStyles.WS_EX_CLIENTEDGE;
+ 						break;
+ 				}
++				
++				create_params.control = this;
+ 
+ 				return create_params;
+ 			}
+@@ -4357,7 +4366,7 @@
+ 			rect = new Rectangle(0, 0, 0, 0);
+ 			cp = CreateParams;
+ 
+-			XplatUI.CalculateWindowRect(ref rect, cp.Style, cp.ExStyle, cp.menu, out rect);
++			XplatUI.CalculateWindowRect(ref rect, cp, cp.menu, out rect);
+ 			UpdateBounds(x, y, width, height, width - (rect.Right - rect.Left), height - (rect.Bottom - rect.Top));
+ 		}
+ 
+Index: System.Windows.Forms/CreateParams.cs
+===================================================================
+--- System.Windows.Forms/CreateParams.cs	(revision 75184)
++++ System.Windows.Forms/CreateParams.cs	(working copy)
+@@ -111,11 +111,11 @@
+ 
+ 		#region Internal Instance Methods
+ 		internal bool IsSet (WindowStyles Style) {
+-			return (this.style & (int) Style) != 0;
++			return (this.style & (int) Style) == (int) Style;
+ 		}
+ 		
+ 		internal bool IsSet (WindowExStyles ExStyle) {
+-			return (this.ex_style & (int)ExStyle) != 0;
++			return (this.ex_style & (int) ExStyle) == (int) ExStyle;
+ 		}
+ 		
+ 		internal bool HasWindowManager {
+Index: System.Windows.Forms/Form.cs
+===================================================================
+--- System.Windows.Forms/Form.cs	(revision 75184)
++++ System.Windows.Forms/Form.cs	(working copy)
+@@ -1279,6 +1279,15 @@
+ 					cp.WindowStyle &= ~WindowStyles.WS_DLGFRAME;
+ 				}
+ 				
++				// Fake the window styles for mdi, toolwindows and parented forms
++				if (cp.HasWindowManager) {
++					// Remove all styles but WS_VISIBLE.
++					cp.WindowStyle &= WindowStyles.WS_VISIBLE;
++					// Set styles that enables us to use the window manager.
++					cp.WindowStyle |= WindowStyles.WS_CHILD | WindowStyles.WS_CLIPCHILDREN | WindowStyles.WS_CLIPSIBLINGS;
++					cp.ExStyle = 0;
++				}
++				
+ 				return cp;
+ 			}
+ 		}
+@@ -2045,7 +2054,7 @@
+ 
+ 			clientsize_set = new Size(x, y);
+ 
+-			if (XplatUI.CalculateWindowRect(ref ClientRect, cp.Style, cp.ExStyle, cp.menu, out WindowRect)) {
++			if (XplatUI.CalculateWindowRect(ref ClientRect, cp, cp.menu, out WindowRect)) {
+ 				SetBounds(bounds.X, bounds.Y, WindowRect.Width, WindowRect.Height, BoundsSpecified.Size);
+ 			}
+ 		}
+Index: System.Windows.Forms/Hwnd.cs
+===================================================================
+--- System.Windows.Forms/Hwnd.cs	(revision 75184)
++++ System.Windows.Forms/Hwnd.cs	(working copy)
+@@ -79,6 +79,7 @@
+ 		internal static Graphics bmp_g = Graphics.FromImage (bmp);
+ 		internal XEventQueue	queue;
+ 		internal WindowExStyles	initial_ex_style;
++		internal WindowStyles	initial_style;
+ 		internal FormWindowState cached_window_state = (FormWindowState)(-1);  /* X11 only field */
+ 		internal Point		previous_child_startup_location = new Point (int.MinValue, int.MinValue);
+ 		static internal Point	previous_main_startup_location = new Point (int.MinValue, int.MinValue);
+@@ -173,81 +174,98 @@
+ 			}
+ 		}
+ 
+-		public static Rectangle GetWindowRectangle(FormBorderStyle border_style, bool border_static,
+-				Menu menu, TitleStyle title_style, int caption_height,
+-				int tool_caption_height, Rectangle client_rect)
++		public static Size GetBorderSize (CreateParams cp)
+ 		{
+-			Rectangle	rect;
++			Size border_size = new Size (0, 0);
+ 
+-			rect = new Rectangle(client_rect.Location, client_rect.Size);
+-
+-			if (menu != null) {
+-				int menu_height = menu.Rect.Height;
+-				if (menu_height == 0)
+-					menu_height = ThemeEngine.Current.CalcMenuBarSize(bmp_g, menu, client_rect.Width);
+-
+-				rect.Y -= menu_height;
+-				rect.Height += menu_height;
+-			}
+-
+-			// Adjust rect for borders
+-			Size border_size = new Size (0, 0);
+-			
+-			if (border_static)
++			if (cp.IsSet (WindowExStyles.WS_EX_STATICEDGE)) {
+ 				border_size = ThemeEngine.Current.BorderStaticSize;
+-			else if (border_style == FormBorderStyle.FixedSingle)
+-				border_size = ThemeEngine.Current.BorderSize;
+-			else if (border_style == FormBorderStyle.Fixed3D)
++			} else if (cp.IsSet (WindowExStyles.WS_EX_CLIENTEDGE)) {
+ 				border_size = ThemeEngine.Current.Border3DSize;
+-			else if (border_style == (FormBorderStyle) 0xFFFF)
+-				border_size = new Size(4, 4);
+-			
+-			if (border_size.Width != 0) {
+-				rect.X -= border_size.Width;
+-				rect.Width += border_size.Width * 2;
++			} else if (cp.IsSet (WindowStyles.WS_THICKFRAME)) {
++				border_size = ThemeEngine.Current.BorderSizableSize;
+ 			}
+ 
+-			if (border_size.Height != 0) {
+-				rect.Y -= border_size.Height;
+-				rect.Height += border_size.Height * 2;
+-			}
+-			
+-			rect.Y -= caption_height;
+-			rect.Height += caption_height;
++			if (cp.IsSet (WindowStyles.WS_BORDER)) {
++				border_size += ThemeEngine.Current.BorderSize;
++			} 
+ 
+-			return rect;
++			return border_size;
+ 		}
+ 
+-		public static Rectangle GetClientRectangle(FormBorderStyle border_style, bool border_static, Menu menu, TitleStyle title_style, int caption_height, int tool_caption_height, int width, int height) {
++		public static Rectangle	GetWindowRectangle (CreateParams cp, Menu menu)
++		{
++			return GetWindowRectangle (cp, menu, Rectangle.Empty);
++		}
++
++		public static Rectangle GetWindowRectangle (CreateParams cp, Menu menu, Rectangle client_rect)
++		{
+ 			Rectangle rect;
++			Borders borders;
+ 
+-			rect = new Rectangle(0, 0, width, height);
++			borders = GetBorders (cp, menu);
+ 
++			rect = new Rectangle (Point.Empty, client_rect.Size);
++			rect.Y -= borders.top;
++			rect.Height += borders.top + borders.bottom;
++			rect.X -= borders.left;
++			rect.Width += borders.left + borders.right;
++
++			return rect;
++		}
++		
++		public Rectangle GetClientRectangle (int width, int height)
++		{
++			CreateParams cp = new CreateParams ();
++			cp.WindowStyle = initial_style;
++			cp.WindowExStyle = initial_ex_style;
++			return GetClientRectangle (cp, menu, width, height);
++		}
++
++		public static Borders GetBorders (CreateParams cp, Menu menu)
++		{
++
++			Borders borders = new Borders ();
++
+ 			if (menu != null) {
+ 				int menu_height = menu.Rect.Height;
+-				rect.Y += menu_height;
+-				rect.Height -= menu_height;
++				if (menu_height == 0)
++					menu_height = ThemeEngine.Current.CalcMenuBarSize (bmp_g, menu, cp.Width);
++				borders.top += menu_height;
+ 			}
++			
++			if (cp.IsSet (WindowStyles.WS_CAPTION)) {
++				int caption_height;
++				if (cp.IsSet (WindowExStyles.WS_EX_TOOLWINDOW)) {
++					caption_height = ThemeEngine.Current.ToolWindowCaptionHeight;
++				} else {
++					caption_height = ThemeEngine.Current.CaptionHeight;
++				}
++				borders.top += caption_height;
++			}
+ 
+-			Size border_size = new Size (0, 0);
++			Size border_size = GetBorderSize (cp);
++
++			borders.left += border_size.Width;
++			borders.right += border_size.Width;
++			borders.top += border_size.Height;
++			borders.bottom += border_size.Height;
+ 			
+-			if (border_static)
+-				border_size = ThemeEngine.Current.BorderStaticSize;
+-			else if (border_style == FormBorderStyle.FixedSingle)
+-				border_size = ThemeEngine.Current.BorderSize;
+-			else if (border_style == FormBorderStyle.Fixed3D)
+-				border_size = ThemeEngine.Current.Border3DSize;
++			return borders;
++		}
+ 
+-			if (border_size.Width != 0) {
+-				rect.X += border_size.Width;
+-				rect.Width -= border_size.Width * 2;
+-			}
++		public static Rectangle GetClientRectangle(CreateParams cp, Menu menu, int width, int height) {
++			Rectangle rect;
++			Borders borders;
+ 
+-			if (border_size.Height != 0) {
+-				rect.Y += border_size.Height;
+-				rect.Height -= border_size.Height * 2;
+-			}
++			borders = GetBorders (cp, menu); 
+ 			
++			rect = new Rectangle(0, 0, width, height);
++			rect.Y += borders.top;
++			rect.Height -= borders.top + borders.bottom;
++			rect.X += borders.left;
++			rect.Width -= borders.left + borders.right;
++			
+ 			return rect;
+ 		}
+ 		#endregion	// Static Methods
+@@ -311,8 +329,15 @@
+ 			get {
+ 				// We pass a Zero for the menu handle so the menu size is
+ 				// not computed this is done via an WM_NCCALC
+-				return GetClientRectangle (border_style, border_static, null, title_style,
+-						caption_height, tool_caption_height, width, height);
++				CreateParams cp = new CreateParams ();
++				Rectangle rect;
++				
++				cp.WindowStyle = initial_style;
++				cp.WindowExStyle = initial_ex_style;
++
++				rect = GetClientRectangle (cp, null, width, height);
++
++				return rect;
+ 			}
+ 		}
+ 
+@@ -636,9 +661,22 @@
+ 		}
+ 
+ 		public override string ToString() {
+-			return String.Format("Hwnd, Mapped:{3} ClientWindow:0x{0:X}, WholeWindow:0x{1:X}, Parent:[{2:X}]", client_window.ToInt32(), whole_window.ToInt32(), parent != null ? parent.ToString() : "<null>", Mapped);
++			return String.Format("Hwnd, Mapped:{3} ClientWindow:0x{0:X}, WholeWindow:0x{1:X}, Zombie={4}, Parent:[{2:X}]", client_window.ToInt32(), whole_window.ToInt32(), parent != null ? parent.ToString() : "<null>", Mapped, zombie);
+ 		}
+ 
+ 		#endregion	// Methods
++		
++		internal struct Borders
++		{
++			public int top;
++			public int bottom;
++			public int left;
++			public int right;
++
++			public override string ToString ()
++			{
++				return string.Format("{{top={0}, bottom={1}, left={2}, right={3}}}", top, bottom, left, right);
++			}
++		}
+ 	}
+ }
+Index: System.Windows.Forms/NativeWindow.cs
+===================================================================
+--- System.Windows.Forms/NativeWindow.cs	(revision 75184)
++++ System.Windows.Forms/NativeWindow.cs	(working copy)
+@@ -165,6 +165,10 @@
+ 			Message		m = new Message();
+ 			NativeWindow	window = null;
+ 
++#if debug
++			Console.WriteLine("NativeWindow.cs ({0}, {1}, {2}, {3}): result {4}", hWnd, msg, wParam, lParam, m.Result);
++#endif
++
+ 			try {
+ 				lock (window_collection) {
+ 					window = (NativeWindow)window_collection[hWnd];
+Index: System.Windows.Forms/Theme.cs
+===================================================================
+--- System.Windows.Forms/Theme.cs	(revision 75184)
++++ System.Windows.Forms/Theme.cs	(working copy)
+@@ -398,6 +398,12 @@
+ 			}
+ 		}
+ 
++		public virtual Size BorderSizableSize {
++			get {
++				return new Size (3, 3);
++			}
++		}
++
+ 		public virtual Size Border3DSize {
+ 			get {
+ 				return new Size(2, 2);
+Index: System.Windows.Forms/XplatUI.cs
+===================================================================
+--- System.Windows.Forms/XplatUI.cs	(revision 75184)
++++ System.Windows.Forms/XplatUI.cs	(working copy)
+@@ -307,11 +307,11 @@
+ 			driver.AudibleAlert();
+ 		}
+ 
+-		internal static bool CalculateWindowRect(ref Rectangle ClientRect, int Style, int ExStyle, Menu menu, out Rectangle WindowRect) {
++		internal static bool CalculateWindowRect(ref Rectangle ClientRect, CreateParams cp, Menu menu, out Rectangle WindowRect) {
+ 			#if DriverDebug
+-				Console.WriteLine("CalculateWindowRect({0}, {1}, {2}, {3}): Called", ClientRect, Style, ExStyle, menu);
++				Console.WriteLine("CalculateWindowRect({0}, {1}, {2}): Called", ClientRect, cp, menu);
+ 			#endif
+-			return driver.CalculateWindowRect(ref ClientRect, Style, ExStyle, menu, out WindowRect);
++			return driver.CalculateWindowRect(ref ClientRect, cp, menu, out WindowRect);
+ 		}
+ 
+ 		internal static void CaretVisible(IntPtr handle, bool visible) {
+Index: System.Windows.Forms/XplatUIDriver.cs
+===================================================================
+--- System.Windows.Forms/XplatUIDriver.cs	(revision 75184)
++++ System.Windows.Forms/XplatUIDriver.cs	(working copy)
+@@ -216,7 +216,7 @@
+ 		internal abstract bool SetTopmost(IntPtr hWnd, bool Enabled);
+ 		internal abstract bool SetOwner(IntPtr hWnd, IntPtr hWndOwner);
+ 
+-		internal abstract bool CalculateWindowRect(ref Rectangle ClientRect, int Style, int ExStyle, Menu menu, out Rectangle WindowRect);
++		internal abstract bool CalculateWindowRect(ref Rectangle ClientRect, CreateParams cp, Menu menu, out Rectangle WindowRect);
+ 
+ 		internal abstract Region GetClipRegion(IntPtr hwnd);
+ 		internal abstract void SetClipRegion(IntPtr hwnd, Region region);
+Index: System.Windows.Forms/XplatUIOSX.cs
+===================================================================
+--- System.Windows.Forms/XplatUIOSX.cs	(revision 75184)
++++ System.Windows.Forms/XplatUIOSX.cs	(working copy)
+@@ -791,43 +791,8 @@
+ 			}
+ 		}
+ 		
+-		internal override bool CalculateWindowRect(ref Rectangle ClientRect, int Style, int ExStyle, Menu menu, out Rectangle WindowRect) {
+-			FormBorderStyle	border_style;
+-			TitleStyle	title_style;
+-			bool border_static = false;
+-
+-			title_style = TitleStyle.None;
+-			if ((Style & (int)WindowStyles.WS_CAPTION) != 0) {
+-				if ((ExStyle & (int)WindowExStyles.WS_EX_TOOLWINDOW) != 0) {
+-					title_style = TitleStyle.Tool;
+-				} else {
+-					title_style = TitleStyle.Normal;
+-				}
+-			}
+-
+-			border_style = FormBorderStyle.None;
+-			if ((ExStyle & (int)WindowExStyles.WS_EX_WINDOWEDGE) != 0) {
+-				if ((ExStyle & (int)WindowExStyles.WS_EX_TOOLWINDOW) != 0) {
+-					if ((Style & (int)WindowStyles.WS_THICKFRAME) != 0) {
+-						border_style = FormBorderStyle.SizableToolWindow;
+-					} else {
+-						border_style = FormBorderStyle.FixedToolWindow;
+-					}
+-				} else if ((ExStyle & (int)WindowExStyles.WS_EX_DLGMODALFRAME) != 0) {
+-					border_style = FormBorderStyle.FixedDialog;
+-				} else if ((ExStyle & (int)WindowStyles.WS_THICKFRAME) != 0) {
+-					border_style = FormBorderStyle.Sizable;
+-				} else {
+-					border_style = FormBorderStyle.FixedSingle;
+-				}
+-			} else {
+-				border_style = FormBorderStyle.Fixed3D;
+-			}
+-
+-			WindowRect = Hwnd.GetWindowRectangle(border_style, border_static, menu, title_style,
+-					SystemInformation.CaptionHeight,
+-					SystemInformation.ToolWindowCaptionHeight, ClientRect);
+-
++		internal override bool CalculateWindowRect(ref Rectangle ClientRect, CreateParams cp, Menu menu, out Rectangle WindowRect) {
++			WindowRect = Hwnd.GetWindowRectangle (cp, menu, ClientRect);
+ 			return true;
+ 		}
+ 		
+@@ -1643,9 +1608,7 @@
+ 
+ 		internal override void SetWindowPos(IntPtr handle, int x, int y, int width, int height) {
+ 			Hwnd hwnd = Hwnd.ObjectFromHandle (handle);
+-			Rectangle client_rect = Hwnd.GetClientRectangle(hwnd.border_style, hwnd.border_static, hwnd.menu,
+-					hwnd.title_style, SystemInformation.CaptionHeight,
+-					SystemInformation.ToolWindowCaptionHeight, width, height);
++			Rectangle client_rect = hwnd.GetClientRectangle (width, height);
+ 
+ 			// Save a server roundtrip (and prevent a feedback loop)
+ 			if ((hwnd.x == x) && (hwnd.y == y) && (hwnd.width == width) && (hwnd.height == height)) {
+Index: System.Windows.Forms/XplatUIWin32.cs
+===================================================================
+--- System.Windows.Forms/XplatUIWin32.cs	(revision 75184)
++++ System.Windows.Forms/XplatUIWin32.cs	(working copy)
+@@ -101,8 +101,8 @@
+ 			}
+ 
+ 			#region Instance Properties
+-			public int Height { get { return bottom - top + 1; } }
+-			public int Width { get { return right - left + 1; } }
++			public int Height { get { return bottom - top; } }
++			public int Width { get { return right - left; } }
+ 			public Size Size { get { return new Size (Width, Height); } }
+ 			public Point Location { get { return new Point (left, top); } }
+ 			#endregion
+@@ -1270,8 +1270,6 @@
+ 				ParentHandle = FosterParent;
+ 			}
+ 
+-			FakeStyles (cp);
+-
+ 			string class_name = RegisterWindowClass (cp.ClassStyle);
+ 			HwndCreating = hwnd;
+ 
+@@ -1357,8 +1355,6 @@
+ 
+ 		internal override void SetWindowStyle(IntPtr handle, CreateParams cp) {
+ 
+-			FakeStyles (cp);
+-
+ 			Win32SetWindowLong(handle, WindowLong.GWL_STYLE, (uint)cp.Style);
+ 			Win32SetWindowLong(handle, WindowLong.GWL_EXSTYLE, (uint)cp.ExStyle);
+ 
+@@ -1893,7 +1889,7 @@
+ 			grab_hwnd = IntPtr.Zero;
+ 		}
+ 
+-		internal override bool CalculateWindowRect(ref Rectangle ClientRect, int Style, int ExStyle, Menu menu, out Rectangle WindowRect) {
++		internal override bool CalculateWindowRect(ref Rectangle ClientRect, CreateParams cp, Menu menu, out Rectangle WindowRect) {
+ 			RECT	rect;
+ 
+ 			rect.left=ClientRect.Left;
+@@ -1901,7 +1897,7 @@
+ 			rect.right=ClientRect.Right;
+ 			rect.bottom=ClientRect.Bottom;
+ 
+-			if (!Win32AdjustWindowRectEx(ref rect, Style, menu != null, ExStyle)) {
++			if (!Win32AdjustWindowRectEx(ref rect, cp.Style, menu != null, cp.ExStyle)) {
+ 				WindowRect = new Rectangle(ClientRect.Left, ClientRect.Top, ClientRect.Width, ClientRect.Height);
+ 				return false;
+ 			}
+@@ -2138,17 +2134,6 @@
+ 			}
+ 		}
+ 		
+-		private void FakeStyles (CreateParams cp)
+-		{
+-			if (cp.HasWindowManager) {
+-				// Remove all styles but WS_VISIBLE.
+-				cp.WindowStyle &= WindowStyles.WS_VISIBLE;
+-				// Set styles that enables us to use the window manager.
+-				cp.WindowStyle |= WindowStyles.WS_CHILD | WindowStyles.WS_CLIPCHILDREN | WindowStyles.WS_CLIPSIBLINGS;
+-				cp.ExStyle = 0;
+-			}
+-		}
+-		
+ 		internal override void CreateCaret(IntPtr hwnd, int width, int height) {
+ 			Win32CreateCaret(hwnd, IntPtr.Zero, width, height);
+ 			caret_visible = false;
+Index: System.Windows.Forms/XplatUIX11.cs
+===================================================================
+--- System.Windows.Forms/XplatUIX11.cs	(revision 75184)
++++ System.Windows.Forms/XplatUIX11.cs	(working copy)
+@@ -763,6 +763,76 @@
+ 			return (ex & (int)exws) == (int)exws;
+ 		}
+ 
++		private Rectangle TranslateClientRectangleToXClientRectangle (Hwnd hwnd)
++		{
++			/* 
++			 * If this is a form with no window manager, X is handling all the border and caption painting
++			 * so remove that from the area (since the area we set of the window here is the part of the window 
++			 * we're painting in only)
++			 */
++			Rectangle rect = hwnd.ClientRect;
++			Form form = Control.FromHandle (hwnd.Handle) as Form;
++			if (form != null && form.window_manager == null) {
++				CreateParams cp = form.GetCreateParams ();
++				Hwnd.Borders borders = Hwnd.GetBorders (cp, null);
++				Rectangle xrect = rect;
++
++				xrect.Y -= borders.top;
++				xrect.X -= borders.left;
++				xrect.Width += borders.left + borders.right;
++				xrect.Height += borders.top + borders.bottom;
++
++				rect = xrect;
++			}
++			return rect;
++		}
++		
++		private Size TranslateWindowSizeToXWindowSize (CreateParams cp)
++		{
++			/* 
++			 * If this is a form with no window manager, X is handling all the border and caption painting
++			 * so remove that from the area (since the area we set of the window here is the part of the window 
++			 * we're painting in only)
++			 */
++			Size rect = new Size (cp.Width, cp.Height);
++			Form form = cp.control as Form;
++			if (form != null && form.window_manager == null) {
++				Hwnd.Borders borders = Hwnd.GetBorders (cp, null);
++				Size xrect = rect;
++
++				xrect.Width -= borders.left + borders.right;
++				xrect.Height -= borders.top + borders.bottom;
++
++				rect = xrect;
++			}
++			if (rect.Height == 0)
++				rect.Height = 1;
++			if (rect.Width == 0)
++				rect.Width = 1;
++			return rect;
++		}
++		
++		private Size TranslateXWindowSizeToWindowSize (CreateParams cp, int xWidth, int xHeight)
++		{
++			/* 
++			 * If this is a form with no window manager, X is handling all the border and caption painting
++			 * so remove that from the area (since the area we set of the window here is the part of the window 
++			 * we're painting in only)
++			 */
++			Size rect = new Size (xWidth, xHeight);
++			Form form = cp.control as Form;
++			if (form != null && form.window_manager == null) {
++				Hwnd.Borders borders = Hwnd.GetBorders (cp, null);
++				Size xrect = rect;
++
++				xrect.Width += borders.left + borders.right;
++				xrect.Height += borders.top + borders.bottom;
++
++				rect = xrect;
++			}
++			return rect;
++		}
++		
+ 		private void DeriveStyles(int Style, int ExStyle, out FormBorderStyle border_style, out bool border_static, out TitleStyle title_style, out int caption_height, out int tool_caption_height) {
+ 
+ 			caption_height = 0;
+@@ -980,6 +1050,7 @@
+ 				if ((client_rect.Width < 1) || (client_rect.Height < 1)) {
+ 					XMoveResizeWindow(DisplayHandle, hwnd.client_window, -5, -5, 1, 1);
+ 				} else {
++					client_rect = TranslateClientRectangleToXClientRectangle (hwnd);
+ 					XMoveResizeWindow(DisplayHandle, hwnd.client_window, client_rect.X, client_rect.Y, client_rect.Width, client_rect.Height);
+ 				}
+ 
+@@ -1158,15 +1229,12 @@
+ 			hwnd = Hwnd.GetObjectFromWindow(xevent.ConfigureEvent.window);
+ 
+ 			// Don't waste time
+-			if (hwnd == null) {
++			if (hwnd == null || hwnd.zombie) {
+ 				return;
+ 			}
+ 
+ 			if ((xevent.ConfigureEvent.window == hwnd.whole_window) && (xevent.ConfigureEvent.window == xevent.ConfigureEvent.xevent)) {
+-				if (!hwnd.reparented) {
+-					hwnd.x = xevent.ConfigureEvent.x;
+-					hwnd.y = xevent.ConfigureEvent.y;
+-				} else {
++				if (hwnd.parent == null) {
+ 					// This sucks ass, part 1
+ 					// Every WM does the ConfigureEvents of toplevel windows different, so there's
+ 					// no standard way of getting our adjustment. 
+@@ -1195,8 +1263,15 @@
+ 				}
+ 
+ 				// XXX this sucks.  this isn't thread safe
+-				hwnd.width = xevent.ConfigureEvent.width;
+-				hwnd.height = xevent.ConfigureEvent.height;
++				Control ctrl = Control.FromHandle (hwnd.Handle);
++				Size TranslatedSize;
++				if (ctrl != null) {
++					TranslatedSize = TranslateXWindowSizeToWindowSize (ctrl.GetCreateParams (), xevent.ConfigureEvent.width, xevent.ConfigureEvent.height);
++				} else {
++					TranslatedSize = new Size (xevent.ConfigureEvent.width, xevent.ConfigureEvent.height);
++				}
++				hwnd.width = TranslatedSize.Width;
++				hwnd.height = TranslatedSize.Height;
+ 				hwnd.ClientRect = Rectangle.Empty;
+ 
+ 				lock (hwnd.configure_lock) {
+@@ -1785,7 +1860,7 @@
+ 			IntPtr				ptr;
+ 			Rectangle			rect;
+ 
+-			rect = hwnd.DefaultClientRect;
++			rect = new Rectangle (0, 0, hwnd.Width, hwnd.Height);
+ 
+ 			ncp = new XplatUIWin32.NCCALCSIZE_PARAMS();
+ 			ptr = Marshal.AllocHGlobal(Marshal.SizeOf(ncp));
+@@ -1800,10 +1875,11 @@
+ 			ncp = (XplatUIWin32.NCCALCSIZE_PARAMS)Marshal.PtrToStructure(ptr, typeof(XplatUIWin32.NCCALCSIZE_PARAMS));
+ 			Marshal.FreeHGlobal(ptr);
+ 
+-			// FIXME - debug this with Menus
+ 
+ 			rect = new Rectangle(ncp.rgrc1.left, ncp.rgrc1.top, ncp.rgrc1.right - ncp.rgrc1.left, ncp.rgrc1.bottom - ncp.rgrc1.top);
+ 			hwnd.ClientRect = rect;
++		
++			rect = TranslateClientRectangleToXClientRectangle (hwnd);
+ 
+ 			if (hwnd.visible) {
+ 				if ((rect.Width < 1) || (rect.Height < 1)) {
+@@ -2258,19 +2334,8 @@
+ 			}
+ 		}
+ 
+-		internal override bool CalculateWindowRect(ref Rectangle ClientRect, int Style, int ExStyle, Menu menu, out Rectangle WindowRect) {
+-			FormBorderStyle	border_style;
+-			TitleStyle	title_style;
+-			bool border_static;
+-			int caption_height;
+-			int tool_caption_height;
+-
+-			DeriveStyles(Style, ExStyle, out border_style, out border_static, out title_style,
+-				out caption_height, out tool_caption_height);
+-
+-			WindowRect = Hwnd.GetWindowRectangle(border_style, border_static, menu, title_style,
+-					caption_height, tool_caption_height,
+-					ClientRect);
++		internal override bool CalculateWindowRect(ref Rectangle ClientRect, CreateParams cp, Menu menu, out Rectangle WindowRect) {
++			WindowRect = Hwnd.GetWindowRectangle (cp, menu, ClientRect);
+ 			return true;
+ 		}
+ 
+@@ -2511,7 +2576,8 @@
+ 			hwnd.width = Width;
+ 			hwnd.height = Height;
+ 			hwnd.parent = Hwnd.ObjectFromHandle(cp.Parent);
+-			hwnd.initial_ex_style = (WindowExStyles) cp.ExStyle;
++			hwnd.initial_style = cp.WindowStyle;
++			hwnd.initial_ex_style = cp.WindowExStyle;
+ 
+ 			if (StyleSet (cp.Style, WindowStyles.WS_DISABLED)) {
+ 				hwnd.enabled = false;
+@@ -2521,7 +2587,9 @@
+ 			ClientWindow = IntPtr.Zero;
+ 
+ 			lock (XlibLock) {
+-				WholeWindow = XCreateWindow(DisplayHandle, ParentHandle, X, Y, Width, Height, 0, (int)CreateWindowArgs.CopyFromParent, (int)CreateWindowArgs.InputOutput, IntPtr.Zero, new UIntPtr ((uint)ValueMask), ref Attributes);
++				Size TranslatedSize;
++				TranslatedSize = TranslateWindowSizeToXWindowSize (cp);	
++				WholeWindow = XCreateWindow(DisplayHandle, ParentHandle, X, Y, TranslatedSize.Width, TranslatedSize.Height, 0, (int)CreateWindowArgs.CopyFromParent, (int)CreateWindowArgs.InputOutput, IntPtr.Zero, new UIntPtr ((uint)ValueMask), ref Attributes);
+ 				if (WholeWindow != IntPtr.Zero) {
+ 					ValueMask &= ~(SetWindowValuemask.OverrideRedirect | SetWindowValuemask.SaveUnder);
+ 
+@@ -2529,7 +2597,12 @@
+ 						ValueMask = SetWindowValuemask.ColorMap;
+ 						Attributes.colormap = CustomColormap;
+ 					}
+-					ClientWindow = XCreateWindow(DisplayHandle, WholeWindow, ClientRect.X, ClientRect.Y, ClientRect.Width, ClientRect.Height, 0, (int)CreateWindowArgs.CopyFromParent, (int)CreateWindowArgs.InputOutput, CustomVisual, new UIntPtr ((uint)ValueMask), ref Attributes);
++					Rectangle XClientRect = ClientRect;
++					if (XClientRect.Height <= 0)
++						XClientRect.Height = 1;
++					if (XClientRect.Width <= 0)
++						XClientRect.Width = 1;
++					ClientWindow = XCreateWindow(DisplayHandle, WholeWindow, XClientRect.X, XClientRect.Y, XClientRect.Width, XClientRect.Height, 0, (int)CreateWindowArgs.CopyFromParent, (int)CreateWindowArgs.InputOutput, CustomVisual, new UIntPtr ((uint)ValueMask), ref Attributes);
+ 				}
+ 			}
+ 
+@@ -2902,6 +2975,30 @@
+ 					return IntPtr.Zero;
+ 				}
+ 
++				case Msg.WM_NCCALCSIZE: {
++					Hwnd hwnd;
++
++					if (msg.WParam == (IntPtr)1) {
++						hwnd = Hwnd.GetObjectFromWindow (msg.HWnd);
++						
++						XplatUIWin32.NCCALCSIZE_PARAMS ncp;
++						ncp = (XplatUIWin32.NCCALCSIZE_PARAMS)Marshal.PtrToStructure (msg.LParam, typeof (XplatUIWin32.NCCALCSIZE_PARAMS));
++
++						// Add all the stuff X is supposed to draw.
++						Control ctrl = Control.FromHandle (hwnd.Handle);
++						Hwnd.Borders rect = Hwnd.GetBorders (ctrl.GetCreateParams (), null);
++						
++						ncp.rgrc1.top += rect.top;
++						ncp.rgrc1.bottom -= rect.bottom;
++						ncp.rgrc1.left += rect.left;
++						ncp.rgrc1.right -= rect.right;
++						
++						Marshal.StructureToPtr (ncp, msg.LParam, true);
++					}
++
++					return IntPtr.Zero;
++				}
++
+ 				case Msg.WM_CONTEXTMENU: {
+ 					Hwnd hwnd;
+ 
+@@ -5127,7 +5224,9 @@
+ 				}
+ 
+ 				lock (XlibLock) {
+-					XMoveResizeWindow(DisplayHandle, hwnd.whole_window, x, y, width, height);
++					Control ctrl = Control.FromHandle (handle);
++					Size TranslatedSize = TranslateWindowSizeToXWindowSize (ctrl.GetCreateParams ());
++					XMoveResizeWindow (DisplayHandle, hwnd.whole_window, x, y, TranslatedSize.Width, TranslatedSize.Height);
+ 					PerformNCCalc(hwnd);
+ 				}
+ 			}

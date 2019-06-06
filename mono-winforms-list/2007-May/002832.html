@@ -1,0 +1,207 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-winforms-list] [PATCH] System.Windows.Forms.Clipboard	improvements
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-winforms-list%40lists.ximian.com?Subject=%5BMono-winforms-list%5D%20%5BPATCH%5D%20System.Windows.Forms.Clipboard%0A%09improvements&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002852.html">
+   <LINK REL="Next"  HREF="002853.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-winforms-list] [PATCH] System.Windows.Forms.Clipboard	improvements</H1>
+    <B>Sergey Volk</B> 
+    <A HREF="mailto:mono-winforms-list%40lists.ximian.com?Subject=%5BMono-winforms-list%5D%20%5BPATCH%5D%20System.Windows.Forms.Clipboard%0A%09improvements&In-Reply-To="
+       TITLE="[Mono-winforms-list] [PATCH] System.Windows.Forms.Clipboard	improvements">sergey.volk at gmail.com
+       </A><BR>
+    <I>Wed May  2 06:13:52 EDT 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002852.html">[Mono-winforms-list] Control.IsMirrored
+</A></li>
+        <LI>Next message: <A HREF="002853.html">[Mono-winforms-list] [PATCH]	System.Windows.Forms.Clipboard	improvements
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2832">[ date ]</a>
+              <a href="thread.html#2832">[ thread ]</a>
+              <a href="subject.html#2832">[ subject ]</a>
+              <a href="author.html#2832">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi, here is a patch, which improves System.Windows.Forms.Clipboard class:
+1. It implements static void SetDataObject(object data, bool copy, int
+retryTimes, int retryDelay) properly using supplied retryTimes and
+retryDelay (got rid of MonoTODO)
+2. It changes implementations of SetDataObject(object data),
+SetDataObject(object data, bool copy) to behave as described in MSDN
+(default parameter values are copy=false, retryTimes=10, retryDelay=100
+3. XplatUI.ClipboardStore implementation in drivers should check for errors
+and throw ExternalException if necessary
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <A HREF="http://lists.ximian.com/pipermail/mono-winforms-list/attachments/20070502/78fb518f/attachment.html">http://lists.ximian.com/pipermail/mono-winforms-list/attachments/20070502/78fb518f/attachment.html</A> 
+-------------- next part --------------
+Index: class/Managed.Windows.Forms/System.Windows.Forms/Clipboard.cs
+===================================================================
+--- class/Managed.Windows.Forms/System.Windows.Forms/Clipboard.cs	(revision 76555)
++++ class/Managed.Windows.Forms/System.Windows.Forms/Clipboard.cs	(working copy)
+@@ -200,11 +200,14 @@
+ #endif
+ 
+ 		public static void SetDataObject(object data) {
+-			SetDataObject(data, true);
+-			
++			SetDataObject(data, false);  // MSDN says default behavior is to place non-persistent data to clipboard
+ 		}
+ 
+ 		public static void SetDataObject(object data, bool copy) {
++			SetDataObject(data, copy, 10, 100);   // MSDN says default behavior is to try 10 times with 100 ms delay
++		}
++
++		internal static void SetDataObjectImpl(object data, bool copy) {
+ 			IntPtr			clipboard_handle;
+ 			XplatUI.ObjectToClipboard converter;
+ 			int			native_format;
+@@ -239,10 +242,13 @@
+ 			}
+ 			XplatUI.ClipboardClose(clipboard_handle);
+ 		}
+-		
++
+ #if NET_2_0
+-		[MonoTODO (&quot;Actually respect retryTimes, retryDelay.&quot;)]
+-		public static void SetDataObject (object data, bool copy, int retryTimes, int retryDelay)
++		public 
++#else
++		internal 
++#endif
++		static void SetDataObject(object data, bool copy, int retryTimes, int retryDelay)
+ 		{
+ 			if (data == null)
+ 				throw new ArgumentNullException(&quot;data&quot;);
+@@ -250,10 +256,26 @@
+ 				throw new ArgumentOutOfRangeException(&quot;retryTimes&quot;);
+ 			if (retryDelay &lt; 0)
+ 				throw new ArgumentOutOfRangeException(&quot;retryDelay&quot;);
+-				
+-			SetDataObject(data, copy);
++
++			// MS implementation actually puts data to clipboard even when retryTimes == 0
++			bool retry = true;
++			do
++			{
++				retry = false;
++				--retryTimes;
++				try
++				{
++					SetDataObjectImpl(data, copy);
++				} catch (ExternalException) {
++					if (retryTimes &lt;= 0)
++						throw;
++					retry = true;
++					Threading.Thread.Sleep(retryDelay);
++				}
++			} while (retry &amp;&amp; retryTimes &gt; 0);
+ 		}
+ 
++#if NET_2_0
+ 		[MonoInternalNote (&quot;Needs additional checks for valid paths, see MSDN&quot;)]
+ 		public static void SetFileDropList (StringCollection filePaths)
+ 		{
+Index: class/Managed.Windows.Forms/System.Windows.Forms/XplatUIWin32.cs
+===================================================================
+--- class/Managed.Windows.Forms/System.Windows.Forms/XplatUIWin32.cs	(revision 76555)
++++ class/Managed.Windows.Forms/System.Windows.Forms/XplatUIWin32.cs	(working copy)
+@@ -2552,7 +2552,8 @@
+ 
+ 			if (obj == null) {
+ 				// Just clear it
+-				Win32EmptyClipboard();
++				if (!Win32EmptyClipboard())
++					throw new ExternalException(&quot;Win32EmptyClipboard&quot;);
+ 				return;
+ 			}
+ 
+@@ -2566,18 +2567,21 @@
+ 
+ 			if (type == DataFormats.GetFormat(DataFormats.Rtf).Id) {
+ 				hmem = Marshal.StringToHGlobalAnsi((string)obj);
+-				Win32SetClipboardData((uint)type, hmem);
++				if (Win32SetClipboardData((uint)type, hmem) == IntPtr.Zero )
++					throw new ExternalException(&quot;Win32SetClipboardData&quot;);
+ 				return;
+ 			} else switch((ClipboardFormats)type) {
+ 				case ClipboardFormats.CF_UNICODETEXT: {
+ 					hmem = Marshal.StringToHGlobalUni((string)obj);
+-					Win32SetClipboardData((uint)type, hmem);
++					if (Win32SetClipboardData((uint)type, hmem) == IntPtr.Zero)
++						throw new ExternalException(&quot;Win32SetClipboardData&quot;);
+ 					return;
+ 				}
+ 
+ 				case ClipboardFormats.CF_TEXT: {
+ 					hmem = Marshal.StringToHGlobalAnsi((string)obj);
+-					Win32SetClipboardData((uint)type, hmem);
++					if (Win32SetClipboardData((uint)type, hmem) == IntPtr.Zero)
++						throw new ExternalException(&quot;Win32SetClipboardData&quot;);
+ 					return;
+ 				}
+ 
+@@ -2589,7 +2593,8 @@
+ 					hmem_ptr = Win32GlobalLock(hmem);
+ 					Marshal.Copy(data, 0, hmem_ptr, data.Length);
+ 					Win32GlobalUnlock(hmem);
+-					Win32SetClipboardData((uint)ClipboardFormats.CF_DIB, hmem);
++					if (Win32SetClipboardData((uint)ClipboardFormats.CF_DIB, hmem) == IntPtr.Zero)
++						throw new ExternalException(&quot;Win32SetClipboardData&quot;);
+ 					return;
+ 				}
+ 
+@@ -2599,7 +2604,8 @@
+ 						hmem_ptr = Win32GlobalLock(hmem);
+ 						Marshal.Copy(data, 0, hmem_ptr, data.Length);
+ 						Win32GlobalUnlock(hmem);
+-						Win32SetClipboardData((uint)type, hmem);
++						if (Win32SetClipboardData((uint)type, hmem) == IntPtr.Zero)
++							throw new ExternalException(&quot;Win32SetClipboardData&quot;);
+ 					}
+ 					return;
+ 				}
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002852.html">[Mono-winforms-list] Control.IsMirrored
+</A></li>
+	<LI>Next message: <A HREF="002853.html">[Mono-winforms-list] [PATCH]	System.Windows.Forms.Clipboard	improvements
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2832">[ date ]</a>
+              <a href="thread.html#2832">[ thread ]</a>
+              <a href="subject.html#2832">[ subject ]</a>
+              <a href="author.html#2832">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-winforms-list">More information about the Mono-winforms-list
+mailing list</a><br>
+</body></html>

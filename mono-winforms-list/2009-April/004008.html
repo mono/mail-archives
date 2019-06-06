@@ -1,0 +1,256 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-winforms-list] [PATCH] DrawImage alpha blend broken in libgdiplus
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-winforms-list%40lists.ximian.com?Subject=%5BMono-winforms-list%5D%20%5BPATCH%5D%20DrawImage%20alpha%20blend%20broken%20in%0A%20libgdiplus&In-Reply-To=49E73E40.7080404%40yessoftware.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003992.html">
+   <LINK REL="Next"  HREF="004009.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-winforms-list] [PATCH] DrawImage alpha blend broken in libgdiplus</H1>
+    <B>Alex Shulgin</B> 
+    <A HREF="mailto:mono-winforms-list%40lists.ximian.com?Subject=%5BMono-winforms-list%5D%20%5BPATCH%5D%20DrawImage%20alpha%20blend%20broken%20in%0A%20libgdiplus&In-Reply-To=49E73E40.7080404%40yessoftware.com"
+       TITLE="[Mono-winforms-list] [PATCH] DrawImage alpha blend broken in libgdiplus">alexander.shulgin at yessoftware.com
+       </A><BR>
+    <I>Sat Apr 25 08:38:19 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003992.html">[Mono-winforms-list] [Mono-osx] DrawImage alpha blend broken in	libgdiplus
+</A></li>
+        <LI>Next message: <A HREF="004009.html">[Mono-winforms-list] [PATCH] DrawImage alpha blend broken in libgdiplus
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4008">[ date ]</a>
+              <a href="thread.html#4008">[ thread ]</a>
+              <a href="subject.html#4008">[ subject ]</a>
+              <a href="author.html#4008">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Alex Shulgin wrote:
+&gt;<i> Sebastien Pouliot wrote:
+</I>&gt;&gt;<i> Sounds correct but will requires a lot of testing. Please open a bug
+</I>&gt;&gt;<i> report for this  and copy/paste the email info into it (otherwise we'll
+</I>&gt;&gt;<i> lose track of important data).
+</I>&gt;<i> 
+</I>&gt;<i> Thanks, filed a bug here: <A HREF="https://bugzilla.novell.com/show_bug.cgi?id=495516">https://bugzilla.novell.com/show_bug.cgi?id=495516</A>
+</I>&gt;<i> 
+</I>&gt;<i> Will prepare a patch soon.
+</I>
+Hi all again!
+
+I'm not posting this to the bug report, because there might be quite a 
+discussion about this patch.
+
+After in-depth research I've come to conclusion that to fix alpha
+blending code in all cases:
+
+- mask image loaded from file
+- mask bitmap created in memory (in ARGB or PARGB pixel format):
+   a. data set with SetPixel
+   b. data set using System.Drawing.Graphics drawing primitives
+
+or any combination of the above, we need to ensure coherency in
+bitmap's pixel format (ARGB or PARGB) and actual bitmap data in scan0.
+
+Currently, PARGB is never reported by libgdiplus (unless it's user's
+bitmap explicitly created with such pixel format).  But bitmap data is
+in PARGB format in the following cases:
+
+- 32bpp ARGB image loaded from png file
+- image created with Graphics drawing primitives
+
+If we manage to have the bitmap data in order with reported pixel
+format we'll only need to add pre-multiplication code in a several
+places where it's currently missing (GdipDrawImageRectRect,
+draw_clamp_texture, etc.).
+
+Most infamous is that we have to convert bitmap data to PARGB and
+change it's PixelFormat before any drawing by cairo is done.
+
+To see why it is so, consider this code which draws the same
+transparent green line from the left-top to the right-bottom corner of
+the bitmap:
+
+Color color = Color.FromArgb(127, 0, 255, 0);
+
+Bitmap bmp1 = new Bitmap(32, 32);
+for (int i = 0; i &lt; 32; ++i)
+     bmp1.SetPixel(i, i, color);
+
+Bitmap bmp2 = new Bitmap(32, 32);
+using (Graphics g = Graphics.FromImage(bmp2))
+     using (Pen p = new Pen(color, 1))
+         g.DrawLine(p, 0, 0, 31, 31);
+
+Console.WriteLine(&quot;bmp1[15, 15]: {0} ({1})&quot;, bmp1.GetPixel(15, 15), 
+bmp1.PixelFormat);
+Console.WriteLine(&quot;bmp2[15, 15]: {0} ({1})&quot;, bmp2.GetPixel(15, 15), 
+bmp2.PixelFormat);
+
+In the current version we'll get
+
+bmp1[15, 15]: Color [A=127, R=0, G=255, B=0] (Format32bppArgb)
+bmp2[15, 15]: Color [A=127, R=0, G=127, B=0] (Format32bppArgb)
+
+which is plain wrong.
+
+The PixelFormat of bmp2 is Format32bppArgb right after the bitmap is
+created.  But after we draw a line on it the bitmap data is actually
+in PARGB format because cairo works that way.
+
+If we now try to draw these &quot;mask&quot; bitmaps on two empty &quot;canvas&quot;
+bitmaps, we're doomed to get different resulting images.  The first
+bitmap needs pre-multiplication before drawing with cairo and the
+second one doesn't.  To corretly handle this situation we ought to
+change bmp2's PixelFormat to PARGB.
+
+However, it's not enough to just change the reported pixel format of
+the bitmap.  In a more complicated case where drawing techniques are
+mixed in the same bitmap we'll need to adjust image data before
+drawing with Graphics.
+
+Consider this code which draws a semi-transparent white rectangle in
+the top half of the bitmap using Bitmap.SetPixel and the same color
+rectangle at the bottom half using Graphics.FillRectangle:
+
+Color color = Color.FromArgb(127, 255, 255, 255);
+
+Bitmap mask = new Bitmap(32, 32);
+for (int y = 0; y &lt; 16; ++y)
+     for (int x = 0; x &lt; 32; ++x)
+         mask.SetPixel(x, y, color);
+
+using (Graphics g = Graphics.FromImage(mask))
+     using (SolidBrush b = new SolidBrush(color))
+         g.FillRectangle(b, new Rectangle(0, 16, 32, 32));
+
+Console.WriteLine(&quot;mixedmask: [10, 10]: {0}&quot;, mask.GetPixel(10, 10));
+Console.WriteLine(&quot;mixedmask: [20, 20]: {0}&quot;, mask.GetPixel(20, 20));
+
+Now if we run this code, we'll get something like this:
+
+mixedmask: [10, 10]: Color [A=127, R=255, G=255, B=255]
+mixedmask: [20, 20]: Color [A=127, R=127, G=127, B=127]
+
+No matter if we pre-multiply the image data before drawing this mask
+over background or not, we won't get the correct result.
+
+So the pixel format of ARGB bitmap should be adjusted before any
+drawing with cairo on the bitmap is done.  The most appropriate place
+for this change to happen I think is the call to Graphics.FromImage().
+
+This might be quite surprising for the user to have bitmap's pixel
+format change after using it in Graphics.FromImage, but to remedy this
+we would need to adjust all and every drawing primitive to change
+bitmap's pixel format to PARGB before the drawing and restore it to
+ARGB after that.  Another possibility is to have some internal flag
+set when AGRB-&gt;PARGB adjustment is done and then restore pixel format
+on the first call to Get/SetPixel.
+
+Both these remedy options seem like overkill to me.  And let's not
+forget current users get PARGB format upon loading any alpha-enabled
+PNG image and seem to be quite happy about it.
+
+I don't feel very good about such change and if there's possibility to
+handle all drawing cases without introducing such subtle semantics,
+I'm all ears.
+
+Unfortunately, as is, this patch breaks 6 tests where an icon is
+converted to bitmap and ARGB pixel format is expected (it's PARGB
+now due to the way Bitmap(Image) constructor works and my change
+in Graphics.FromImage).  Currently, I see no easy way to fix this
+_and_ preserve the patch semantics, so I believe we can drop these
+assertions.  I'm attaching a patch against mcs/class/System.Drawing trunk.
+
+---------------------------------------------------
+Here's the list of changes in libgdiplus, per-file:
+
+pngcodec.c: Discarded pre-multiplication when loading 32-bit ARGB
+   images.
+
+jpegcodec.c, pngcodec.c: Disabled direct saving of PARGB images,
+   reverse pre-multiplication is handled in image.c
+
+alpha-premul-table.inc, general-private.h: Added reverse
+   pre-multiplication table for saving images in PARGB pixel format.
+
+   Code to generate the table is attached in
+   gen-alpha-premul-rev-table.c
+
+bitmap.c, bitmap-private.h: Added
+   gdip_bitmap_format_needs_reverse_premultiplication,
+   gdip_bitmap_get_reverse_premultiplied_scan0,
+   gdip_bitmap_get_cairo_format_for_surface.
+
+imageattributes.c: Added reverse pre-multiplication in
+   gdip_process_bitmap_attributes to handle PARGB bitmaps; changed
+   return type to GpStatus as premul. code might fail with OutOfMemory.
+
+image.c, texturebrush.c: Added pre-multiplication where it was
+   missing.
+
+image.c: Added gdip_scan0_flip_x/y for better performance in
+   DrawImageRectRect (avoid numerous premuls).
+
+   GdipGetImageGraphicsContext will change image pixel format to PARGB
+   if needed.
+
+   Added reverse pre-multiplication before saving PARGB images.
+
+
+When this patch is hopefully accepted I plan to add more unit tests to
+cover various drawing methods.
+
+--
+Best regards,
+Alex
+
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: libgdiplus-alpha-blend.patch.gz
+Type: application/x-gzip
+Size: 22993 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-winforms-list/attachments/20090425/5af614f5/attachment-0001.gz">http://lists.ximian.com/pipermail/mono-winforms-list/attachments/20090425/5af614f5/attachment-0001.gz</A> 
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: gen-alpha-premul-rev-table.c
+Type: text/x-csrc
+Size: 488 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-winforms-list/attachments/20090425/5af614f5/attachment-0002.bin">http://lists.ximian.com/pipermail/mono-winforms-list/attachments/20090425/5af614f5/attachment-0002.bin</A> 
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: System.Drawing.Test.patch
+Type: text/x-patch
+Size: 3117 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-winforms-list/attachments/20090425/5af614f5/attachment-0003.bin">http://lists.ximian.com/pipermail/mono-winforms-list/attachments/20090425/5af614f5/attachment-0003.bin</A> 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003992.html">[Mono-winforms-list] [Mono-osx] DrawImage alpha blend broken in	libgdiplus
+</A></li>
+	<LI>Next message: <A HREF="004009.html">[Mono-winforms-list] [PATCH] DrawImage alpha blend broken in libgdiplus
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4008">[ date ]</a>
+              <a href="thread.html#4008">[ thread ]</a>
+              <a href="subject.html#4008">[ subject ]</a>
+              <a href="author.html#4008">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-winforms-list">More information about the Mono-winforms-list
+mailing list</a><br>
+</body></html>

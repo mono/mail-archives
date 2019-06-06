@@ -1,0 +1,277 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-winforms-list] [PATCH] Stack propagation for Control.BeginInvoke
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:sebastien%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="001634.html">
+   <LINK REL="Next"  HREF="001636.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-winforms-list] [PATCH] Stack propagation for Control.BeginInvoke
+   </H1>
+    <B>Sebastien Pouliot
+    </B> 
+    <A HREF="mailto:sebastien%40ximian.com"
+       TITLE="[Mono-winforms-list] [PATCH] Stack propagation for Control.BeginInvoke">sebastien@ximian.com
+       </A><BR>
+    <I>Wed, 11 May 2005 17:05:35 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="001634.html">[Mono-winforms-list] RE: Mono-winforms-list digest, Vol 1 #468 - 1 msg
+</A></li>
+        <LI> Next message: <A HREF="001636.html">[Mono-winforms-list] [PATCH] Stack propagation for Control.BeginInvoke
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1635">[ date ]</a>
+              <a href="thread.html#1635">[ thread ]</a>
+              <a href="subject.html#1635">[ subject ]</a>
+              <a href="author.html#1635">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>--Boundary_(ID_AlgDlZi1BwZk5FMwXHlW4g)
+Content-type: text/plain; CHARSET=US-ASCII
+Content-transfer-encoding: 7BIT
+
+Hello,
+
+Here's a patch to enabled stack propagation to work for
+Control.BeginInvoke. For people who wonder what stack propagation is,
+here's a short explanation...
+
+        Stack propagation ensure that Code Access Security (CAS)
+        permissions can work across threads for asynchronous calls. This
+        ensure that code cannot be given more privileges because it's
+        being executed by another thread (which wouldn't have all the
+        restrictions that the original thread may have).
+
+A test case is available in SVN under:
+	/mono/mono/tests/cas/threads/swf-control1.cs
+
+The sample code shows that the &quot;main&quot; code is restricted from reading
+the username. Which means that the &quot;invoked&quot; code (via Control.
+BeginInvoke) should also have the same restriction (even if it's being
+executed in the control's thread).
+
+
+* If you execute the sample &quot;normally&quot; you should see the
+SecurityManager status, the current time and your username for a few
+seconds.
+
+% mono swf-control1.exe
+
+
+* Additional debugging output can be displayed by adding a(ny)
+parameters on the command-line.
+
+% mono swf-control1.exe x
+
+
+* If you execute it with the security manager enabled the username will
+be replaced (well if the patch is applied ;-) by &quot;SecurityException&quot;.
+
+% mono --security swf-control1.exe x
+
+
+Notes:
+
+* The current patch is only for the X11 driver, but it shouldn't be hard
+to port to the other drivers (or to move elsewhere);
+
+* Stack propagation only occurs if the security manager is active (i.e.
+--security) so it's impact should be minimal (even invisible) for most
+users;
+
+* The code is a little different for the Fx 2.0 because propagation
+isn't only done for the security stack (a lot of other contexts are
+also, or will be, propagated). The code looks different but still the
+_stack_ propagation is only done if the security manager is active;
+
+* About the sample, it's window should close itself after
+Application.Exit is called. However it seems to wait for the next X
+event (mouse, keyboard) to do so. This works normally under Windows and
+isn't related to my patch;
+
+* The sample shouldn't hang after the Application.Exit call (and closing
+the Windows). However it does hang (for me) or, sometimes, display a
+NullReferenceException. This also works normally under Windows and I
+don't think it's related to the patch (but it may be related to recent
+thread shutdown problems);
+
+* Of course Control.BeginInvoke is only a (small) subset of the work
+required to complete stack propagation - but most of it will occur
+outside SWF.
+
+-- 
+Sebastien Pouliot  &lt;<A HREF="mailto:sebastien@ximian.com">sebastien@ximian.com</A>&gt;
+blog: <A HREF="http://pages.infinit.net/ctech/poupou.html">http://pages.infinit.net/ctech/poupou.html</A>
+
+--Boundary_(ID_AlgDlZi1BwZk5FMwXHlW4g)
+Content-type: text/x-patch; name=swf.20050511.diff; charset=UTF-8
+Content-transfer-encoding: 7BIT
+Content-disposition: attachment; filename=swf.20050511.diff
+
+Index: System.Windows.Forms/Control.cs
+===================================================================
+--- System.Windows.Forms/Control.cs	(revision 44381)
++++ System.Windows.Forms/Control.cs	(working copy)
+@@ -41,6 +41,7 @@
+ using System.Drawing;
+ using System.Reflection;
+ using System.Runtime.InteropServices;
++using System.Security;
+ using System.Threading;
+ 
+ 
+@@ -631,6 +632,20 @@
+ 			data.Args = args;
+ 			data.Result = new WeakReference (result);
+ 
++			// FIXME: propagation is required only if we switch threads, i.e. if
++			// the caller and the control owner are different threads. We could 
++			// skip this if InvokeRequired is false (but that requires more 
++			// changes to the existing code).
++#if NET_2_0
++			if (!ExecutionContext.IsFlowSuppressed ()) {
++				data.Context = ExecutionContext.Capture ();
++			}
++#else
++			if (SecurityManager.SecurityEnabled) {
++				data.Stack = CompressedStack.GetCompressedStack ();
++			}
++#endif
++
+ 			XplatUI.SendAsyncMethod (data);
+ 			return result;
+ 		}
+Index: System.Windows.Forms/XplatUIX11.cs
+===================================================================
+--- System.Windows.Forms/XplatUIX11.cs	(revision 44381)
++++ System.Windows.Forms/XplatUIX11.cs	(working copy)
+@@ -1946,6 +1946,64 @@
+ 			return Point.Empty;
+ 		}
+ 
++#if NET_2_0
++		internal void ExecutionCallback (object state)
++		{
++			AsyncMethodData data = (AsyncMethodData) state;
++			AsyncMethodResult result = data.Result.Target as AsyncMethodResult;
++			object ret = data.Method.DynamicInvoke (data.Args);
++			if (result != null) {
++				result.Complete (ret);
++			}
++		}
++
++		internal void ExecuteClientMessage (GCHandle gchandle)
++		{
++			AsyncMethodData data = (AsyncMethodData) gchandle.Target;
++			try {
++				if (data.Context == null) {
++					ExecutionCallback (data);
++				} else {
++					ExecutionContext.Run (data.Context, new ContextCallback (ExecutionCallback), data);
++				}
++			}
++			finally {
++				gchandle.Free ();
++			}
++		}
++#else
++		// for NET_1_0 and NET_1_1 no (public) ExecutionContext exists 
++		// so we must use the System.Threading.CompressedStack class
++		internal void ExecuteClientMessage (GCHandle gchandle)
++		{
++			AsyncMethodData data = (AsyncMethodData) gchandle.Target;
++			CompressedStack original = null;
++
++			// Stack is non-null only if the security manager is active
++			if (data.Stack != null) {
++				original = Thread.CurrentThread.GetCompressedStack ();
++				Thread.CurrentThread.SetCompressedStack (data.Stack);
++			}
++
++			try {
++				AsyncMethodResult result = data.Result.Target as AsyncMethodResult;
++				object ret = data.Method.DynamicInvoke (data.Args);
++
++				if (result != null) {
++					result.Complete (ret);
++				}
++			}
++			finally {
++				if (data.Stack != null) {
++					// whatever occurs we must revert to the original compressed
++					// stack (null being a valid, empty, value in this case).
++					Thread.CurrentThread.SetCompressedStack (original);
++				}
++				gchandle.Free ();
++			}
++		}
++#endif
++
+ 		internal override bool GetMessage(ref MSG msg, IntPtr handle, int wFilterMin, int wFilterMax) {
+ 			XEvent	xevent;
+ 			bool	client;
+@@ -2287,20 +2345,7 @@
+ 
+ 				case XEventName.ClientMessage: {
+ 					if (xevent.ClientMessageEvent.message_type == (IntPtr)AsyncAtom) {
+-						GCHandle		gchandle;
+-						AsyncMethodData		data;
+-						AsyncMethodResult	result;
+-						object			ret;
+-
+-						gchandle = (GCHandle)xevent.ClientMessageEvent.ptr1;
+-						data = (AsyncMethodData)gchandle.Target;
+-						result = data.Result.Target as AsyncMethodResult;
+-						ret = data.Method.DynamicInvoke (data.Args);
+-
+-						if (result != null) {
+-							result.Complete (ret);
+-						}
+-						gchandle.Free ();
++						ExecuteClientMessage ((GCHandle)xevent.ClientMessageEvent.ptr1);
+ 						break;
+ 					}
+ 
+Index: System.Windows.Forms/AsyncMethodData.cs
+===================================================================
+--- System.Windows.Forms/AsyncMethodData.cs	(revision 44381)
++++ System.Windows.Forms/AsyncMethodData.cs	(working copy)
+@@ -33,6 +33,11 @@
+ 		public Delegate Method;
+ 		public object [] Args;
+ 		public WeakReference Result;
++#if NET_2_0
++		public ExecutionContext Context;
++#else
++		public CompressedStack Stack;
++#endif
+ 	}
+ 
+ }
+
+--Boundary_(ID_AlgDlZi1BwZk5FMwXHlW4g)--
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="001634.html">[Mono-winforms-list] RE: Mono-winforms-list digest, Vol 1 #468 - 1 msg
+</A></li>
+	<LI> Next message: <A HREF="001636.html">[Mono-winforms-list] [PATCH] Stack propagation for Control.BeginInvoke
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1635">[ date ]</a>
+              <a href="thread.html#1635">[ thread ]</a>
+              <a href="subject.html#1635">[ subject ]</a>
+              <a href="author.html#1635">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

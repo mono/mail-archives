@@ -1,0 +1,417 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-winforms-list] Patch for bug 426305
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-winforms-list%40lists.ximian.com?Subject=%5BMono-winforms-list%5D%20Patch%20for%20bug%20426305&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004748.html">
+   <LINK REL="Next"  HREF="004750.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-winforms-list] Patch for bug 426305</H1>
+    <B>Dick Porter</B> 
+    <A HREF="mailto:mono-winforms-list%40lists.ximian.com?Subject=%5BMono-winforms-list%5D%20Patch%20for%20bug%20426305&In-Reply-To="
+       TITLE="[Mono-winforms-list] Patch for bug 426305">dporter at codicesoftware.com
+       </A><BR>
+    <I>Thu Mar 31 12:00:15 EDT 2011</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004748.html">[Mono-winforms-list] Introduction for GSoC
+</A></li>
+        <LI>Next message: <A HREF="004750.html">[Mono-winforms-list] Patch for bug 426305
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4749">[ date ]</a>
+              <a href="thread.html#4749">[ thread ]</a>
+              <a href="subject.html#4749">[ subject ]</a>
+              <a href="author.html#4749">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi all
+
+I've just added a patch to
+<A HREF="https://bugzilla.novell.com/show_bug.cgi?id=426305">https://bugzilla.novell.com/show_bug.cgi?id=426305</A> and am copying it
+here too for review.
+
+It removes the premultiplication when loading PNGs, as no other image
+format does the same.  It then adds premultiplication when calling
+assorted Draw*() functions in image.c, except when the graphics context
+is a memory bitmap (so that if an image is drawn onto another image, it
+doesn't get premultiplied multiple times.)
+
+I also added a C test case to the bug that demonstrates the various
+parts of the problem.
+
+This patch doesn't break the fix to bug 324503, which introduced the
+problem.
+
+OK to commit?
+
+- Dick
+
+-------------- next part --------------
+commit 59ca17e56adb8555e9b4e0960b771f2849f6366f
+Author: Dick Porter &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-winforms-list">dick at acm.org</A>&gt;
+Date:   Thu Mar 31 16:02:19 2011 +0100
+
+    Don't premultiply PNG images on loading, no other format does this.
+    
+    When drawing images, except when drawing onto a memory bitmap, premultiply
+    if needed.
+    
+    Fixes bug 426305, without breaking bug 324503.
+
+diff --git a/src/image.c b/src/image.c
+index bc02793..6ff58b7 100644
+--- a/src/image.c
++++ b/src/image.c
+@@ -381,6 +381,8 @@ GdipDrawImageRect (GpGraphics *graphics, GpImage *image, float x, float y, float
+ 	BOOL need_scaling = FALSE;
+ 	double scaled_width, scaled_height;
+ 	cairo_matrix_t orig_matrix;
++	BYTE *premul = NULL;
++	cairo_surface_t *original = NULL;
+ 
+ 	if (!graphics || !image)
+ 		return InvalidParameter;
+@@ -430,6 +432,20 @@ GdipDrawImageRect (GpGraphics *graphics, GpImage *image, float x, float y, float
+ 
+ 	/* Create a surface for this bitmap if one doesn't exist */
+ 	gdip_bitmap_ensure_surface (image);
++	
++	if (graphics-&gt;type != gtMemoryBitmap &amp;&amp;
++		gdip_bitmap_format_needs_premultiplication (image)) {
++		premul = gdip_bitmap_get_premultiplied_scan0 (image);
++		if (premul) {
++			BitmapData *data = image-&gt;active_bitmap;
++			original = cairo_image_surface_create_for_data (premul, CAIRO_FORMAT_ARGB32,
++															data-&gt;width, data-&gt;height, data-&gt;stride);
++		}
++	}
++	
++	/* if premul isn't required (or couldn't be computed, e.g. out of memory) */
++	if (!original)
++		original = image-&gt;surface;
+ 
+ 	if (width != image-&gt;active_bitmap-&gt;width || height != image-&gt;active_bitmap-&gt;height) {
+ 		scaled_width = (double) width / image-&gt;active_bitmap-&gt;width;
+@@ -437,7 +453,8 @@ GdipDrawImageRect (GpGraphics *graphics, GpImage *image, float x, float y, float
+ 		need_scaling = TRUE;
+ 	}
+ 
+-	pattern = cairo_pattern_create_for_surface (image-&gt;surface);
++	/* Use the original as a pattern */
++	pattern = cairo_pattern_create_for_surface (original);
+ 
+ 	cairo_pattern_set_filter (pattern, gdip_get_cairo_filter (graphics-&gt;interpolation));
+ 
+@@ -459,6 +476,11 @@ GdipDrawImageRect (GpGraphics *graphics, GpImage *image, float x, float y, float
+ 	cairo_pattern_destroy (org_pattern);
+ 	cairo_pattern_destroy (pattern);
+ 
++	if (premul) {
++		cairo_surface_destroy (original);
++		GdipFree (premul);
++	}
++
+ 	return Ok;
+ }
+ 
+@@ -472,6 +494,8 @@ GdipDrawImagePoints (GpGraphics *graphics, GpImage *image, GDIPCONST GpPointF *d
+ 	cairo_matrix_t orig_matrix;
+ 	GpRectF tRect;
+ 	MetafilePlayContext *metacontext = NULL;
++	BYTE *premul = NULL;
++	cairo_surface_t *original = NULL;
+ 	
+ 	if (!graphics || !image || !dstPoints || (count != 3))
+ 		return InvalidParameter;
+@@ -517,7 +541,21 @@ GdipDrawImagePoints (GpGraphics *graphics, GpImage *image, GDIPCONST GpPointF *d
+ 	/* Create a surface for this bitmap if one doesn't exist */
+ 	gdip_bitmap_ensure_surface (image);
+ 
+-	pattern = cairo_pattern_create_for_surface (image-&gt;surface);
++	if (graphics-&gt;type != gtMemoryBitmap &amp;&amp;
++		gdip_bitmap_format_needs_premultiplication (image)) {
++		premul = gdip_bitmap_get_premultiplied_scan0 (image);
++		if (premul) {
++			BitmapData *data = image-&gt;active_bitmap;
++			original = cairo_image_surface_create_for_data (premul, CAIRO_FORMAT_ARGB32,
++															data-&gt;width, data-&gt;height, data-&gt;stride);
++		}
++	}
++	
++	/* if premul isn't required (or couldn't be computed, e.g. out of memory) */
++	if (!original)
++		original = image-&gt;surface;
++
++	pattern = cairo_pattern_create_for_surface (original);
+ 	cairo_pattern_set_filter (pattern, gdip_get_cairo_filter (graphics-&gt;interpolation));
+ 
+ 	org_pattern = cairo_get_source(graphics-&gt;ct);
+@@ -535,6 +573,11 @@ GdipDrawImagePoints (GpGraphics *graphics, GpImage *image, GDIPCONST GpPointF *d
+ 	cairo_pattern_destroy (org_pattern);
+ 	cairo_pattern_destroy (pattern);
+ 
++	if (premul) {
++		cairo_surface_destroy (original);
++		GdipFree (premul);
++	}
++
+ 	return Ok;
+ }
+ 
+@@ -585,6 +628,8 @@ GdipDrawImageRectRect (GpGraphics *graphics, GpImage *image,
+ 	void		*org;
+ 	int		org_format;
+ 	BOOL		allocated = FALSE;
++	BYTE			*premul = NULL;
++	cairo_surface_t	*original = NULL;
+ 	
+ 	if (!graphics || !image)
+ 		return InvalidParameter;
+@@ -660,14 +705,22 @@ GdipDrawImageRectRect (GpGraphics *graphics, GpImage *image,
+ 		BOOL		flipYOn = (imageAttributes-&gt;wrapmode == WrapModeTileFlipY);
+ 		BOOL		flipX = FALSE;
+ 		BOOL		flipY = FALSE;
+-		GpBitmap	*cur_image;
+ 		GpBitmap	*imgflipX = NULL;
+ 		GpBitmap	*imgflipY = NULL;
+ 		GpBitmap	*imgflipXY = NULL;
+ 
+ 		float img_width = image-&gt;active_bitmap-&gt;width *  (dstwidth / srcwidth);
+ 		float img_height = image-&gt;active_bitmap-&gt;height * (dstheight / srcheight);
+-		
++		BYTE		*premul = NULL;
++		BYTE		*premulX = NULL;
++		BYTE		*premulY = NULL;
++		BYTE		*premulXY = NULL;
++		cairo_surface_t	*original = NULL;
++		cairo_surface_t	*originalX = NULL;
++		cairo_surface_t	*originalY = NULL;
++		cairo_surface_t	*originalXY = NULL;
++		cairo_surface_t *cur_surface;
++
+ 		if (imageAttributes-&gt;wrapmode == WrapModeTileFlipXY) {
+ 			flipXOn = flipYOn = TRUE;
+ 		}
+@@ -678,12 +731,38 @@ GdipDrawImageRectRect (GpGraphics *graphics, GpImage *image,
+ 			gdip_bitmap_clone (image, &amp;imgflipX);
+ 			gdip_flip_x (imgflipX);	
+ 			gdip_bitmap_ensure_surface (imgflipX);			
++
++			if (graphics-&gt;type != gtMemoryBitmap &amp;&amp;
++				gdip_bitmap_format_needs_premultiplication (imgflipX)) {
++				premulX = gdip_bitmap_get_premultiplied_scan0 (imgflipX);
++				if (premulX) {
++					BitmapData *data = imgflipX-&gt;active_bitmap;
++					originalX = cairo_image_surface_create_for_data (premulX, CAIRO_FORMAT_ARGB32, data-&gt;width, data-&gt;height, data-&gt;stride);
++				}
++			}
++
++			/* if premul isn't required (or couldn't be computed, e.g. out of memory) */
++			if (!originalX)
++				originalX = imgflipX-&gt;surface;
+ 		}
+ 		
+ 		if (flipYOn) {			
+ 			gdip_bitmap_clone (image, &amp;imgflipY);
+ 			gdip_flip_y (imgflipY);	
+ 			gdip_bitmap_ensure_surface (imgflipY);			
++			
++			if (graphics-&gt;type != gtMemoryBitmap &amp;&amp;
++				gdip_bitmap_format_needs_premultiplication (imgflipY)) {
++				premulY = gdip_bitmap_get_premultiplied_scan0 (imgflipY);
++				if (premulY) {
++					BitmapData *data = imgflipY-&gt;active_bitmap;
++					originalY = cairo_image_surface_create_for_data (premulY, CAIRO_FORMAT_ARGB32, data-&gt;width, data-&gt;height, data-&gt;stride);
++				}
++			}
++
++			/* if premul isn't required (or couldn't be computed, e.g. out of memory) */
++			if (!originalY)
++				originalY = imgflipY-&gt;surface;
+ 		}
+ 		
+ 		if (flipXOn &amp;&amp; flipYOn) {			
+@@ -691,22 +770,49 @@ GdipDrawImageRectRect (GpGraphics *graphics, GpImage *image,
+ 			gdip_flip_x (imgflipXY);	
+ 			gdip_flip_y (imgflipXY);	
+ 			gdip_bitmap_ensure_surface (imgflipXY);			
++
++			if (graphics-&gt;type != gtMemoryBitmap &amp;&amp;
++				gdip_bitmap_format_needs_premultiplication (imgflipXY)) {
++				premulXY = gdip_bitmap_get_premultiplied_scan0 (imgflipXY);
++				if (premulXY) {
++					BitmapData *data = imgflipXY-&gt;active_bitmap;
++					originalXY = cairo_image_surface_create_for_data (premulXY, CAIRO_FORMAT_ARGB32, data-&gt;width, data-&gt;height, data-&gt;stride);
++				}
++			}
++
++			/* if premul isn't required (or couldn't be computed, e.g. out of memory) */
++			if (!originalXY)
++				originalXY = imgflipXY-&gt;surface;
+ 		}
+ 		
+ 		gdip_bitmap_ensure_surface (image);
+ 
++		if (graphics-&gt;type != gtMemoryBitmap &amp;&amp;
++			gdip_bitmap_format_needs_premultiplication (image)) {
++			premul = gdip_bitmap_get_premultiplied_scan0 (image);
++			if (premul) {
++				BitmapData *data = image-&gt;active_bitmap;
++				original = cairo_image_surface_create_for_data (premul, CAIRO_FORMAT_ARGB32, data-&gt;width, data-&gt;height, data-&gt;stride);
++			}
++		}
++
++		/* if premul isn't required (or couldn't be computed, e.g. out of memory) */
++		if (!original)
++			original = image-&gt;surface;
++		
++
+ 		for (posy = 0; posy &lt; dstheight; posy += img_height) {
+ 			for (posx = 0; posx &lt; dstwidth; posx += img_width) {
+ 				if (flipX &amp;&amp; flipY) {
+-					cur_image = imgflipXY;
++					cur_surface = originalXY;
+ 				} else {
+ 					if (flipX) {
+-						cur_image = imgflipX;
++						cur_surface = originalX;
+ 					} else {
+ 						if (flipY) {
+-							cur_image = imgflipY;
++							cur_surface = originalY;
+ 						} else {
+-							cur_image = image;
++							cur_surface = original;
+ 						}
+ 					}
+ 				}
+@@ -715,7 +821,7 @@ GdipDrawImageRectRect (GpGraphics *graphics, GpImage *image,
+ 				cairo_matrix_scale (&amp;mat, srcwidth / dstwidth, srcheight / dstheight);
+ 				cairo_matrix_translate (&amp;mat, - (dstx + posx), - (dsty + posy));
+ 
+-				pattern = cairo_pattern_create_for_surface(cur_image-&gt;surface);
++				pattern = cairo_pattern_create_for_surface(cur_surface);
+ 				cairo_pattern_set_matrix (pattern, &amp;mat);
+ 
+ 				orig = cairo_get_source(graphics-&gt;ct);
+@@ -746,20 +852,51 @@ GdipDrawImageRectRect (GpGraphics *graphics, GpImage *image,
+ 		
+ 		if (imgflipX) {
+ 			GdipDisposeImage ((GpImage *) imgflipX);
++			if (premulX) {
++				cairo_surface_destroy (originalX);
++				GdipFree (premulX);
++			}
+ 		}
+ 			
+ 		if (imgflipY) {
+ 			GdipDisposeImage ((GpImage *) imgflipY);
++			if (premulY) {
++				cairo_surface_destroy (originalY);
++				GdipFree (premulY);
++			}
+ 		}
+ 
+ 		if (imgflipXY) {
+ 			GdipDisposeImage ((GpImage *) imgflipXY);
++			if (premulXY) {
++				cairo_surface_destroy (originalXY);
++				GdipFree (premulXY);
++			}
++		}
++
++		if (premul) {
++			cairo_surface_destroy (original);
++			GdipFree (premul);
+ 		}
+ 	} else {
+ 		cairo_pattern_t *filter;
+ 
+ 		gdip_bitmap_ensure_surface (image);
+-		filter = cairo_pattern_create_for_surface (image-&gt;surface);
++
++		if (graphics-&gt;type != gtMemoryBitmap &amp;&amp;
++			gdip_bitmap_format_needs_premultiplication (image)) {
++			premul = gdip_bitmap_get_premultiplied_scan0 (image);
++			if (premul) {
++				BitmapData *data = image-&gt;active_bitmap;
++				original = cairo_image_surface_create_for_data (premul, CAIRO_FORMAT_ARGB32, data-&gt;width, data-&gt;height, data-&gt;stride);
++			}
++		}
++	
++		/* if premul isn't required (or couldn't be computed, e.g. out of memory) */
++		if (!original)
++			original = image-&gt;surface;
++
++		filter = cairo_pattern_create_for_surface (original);
+ 		cairo_pattern_set_filter (filter, gdip_get_cairo_filter (graphics-&gt;interpolation));
+ 
+ 		cairo_matrix_translate (&amp;mat, srcx, srcy);
+@@ -769,7 +906,7 @@ GdipDrawImageRectRect (GpGraphics *graphics, GpImage *image,
+ 
+ 		cairo_matrix_translate (&amp;mat, -dstx, -dsty);
+ 
+-		pattern = cairo_pattern_create_for_surface(image-&gt;surface);
++		pattern = cairo_pattern_create_for_surface(original);
+ 		cairo_pattern_set_matrix (pattern, &amp;mat);
+ 
+ 		orig = cairo_get_source(graphics-&gt;ct);
+@@ -786,6 +923,11 @@ GdipDrawImageRectRect (GpGraphics *graphics, GpImage *image,
+ 		cairo_pattern_set_matrix (pattern, &amp;mat);
+ 		cairo_pattern_destroy (pattern);
+ 		cairo_pattern_destroy (filter);
++
++		if (premul) {
++			cairo_surface_destroy (original);
++			GdipFree (premul);
++		}
+ 	}
+ 
+ 	/* The current surface is no longer valid if we had attributes applied */
+diff --git a/src/pngcodec.c b/src/pngcodec.c
+index 0038f82..15c608a 100644
+--- a/src/pngcodec.c
++++ b/src/pngcodec.c
+@@ -454,12 +454,6 @@ gdip_load_png_image_from_file_or_stream (FILE *fp, GetBytesDelegate getBytesFunc
+ 							BYTE g = rowp[1];
+ 							BYTE r = rowp[0];
+ 
+-							if (a &lt; 0xff) {
+-								r = pre_multiplied_table [r][a];
+-								g = pre_multiplied_table [g][a];
+-								b = pre_multiplied_table [b][a];
+-							}
+-
+ 							set_pixel_bgra (rawptr, 0, b, g, r, a);
+ 						}
+ 						rowp += 4;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004748.html">[Mono-winforms-list] Introduction for GSoC
+</A></li>
+	<LI>Next message: <A HREF="004750.html">[Mono-winforms-list] Patch for bug 426305
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4749">[ date ]</a>
+              <a href="thread.html#4749">[ thread ]</a>
+              <a href="subject.html#4749">[ subject ]</a>
+              <a href="author.html#4749">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-winforms-list">More information about the Mono-winforms-list
+mailing list</a><br>
+</body></html>

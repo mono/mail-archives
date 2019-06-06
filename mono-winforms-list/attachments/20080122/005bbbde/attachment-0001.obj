@@ -1,0 +1,190 @@
+=== Managed.Windows.Forms/System.Windows.Forms/XplatUI.cs
+==================================================================
+--- Managed.Windows.Forms/System.Windows.Forms/XplatUI.cs	(revision 93905)
++++ Managed.Windows.Forms/System.Windows.Forms/XplatUI.cs	(local)
+@@ -84,12 +84,22 @@
+ 			default_class_name = "SWFClass" + System.Threading.Thread.GetDomainID().ToString();
+ 
+ 			if (RunningOnUnix) {
+-				if (Environment.GetEnvironmentVariable ("MONO_MWF_USE_CARBON_BACKEND") != null)
+-					driver=XplatUICarbon.GetInstance ();
+-				else if (Environment.GetEnvironmentVariable ("not_supported_MONO_MWF_USE_NEW_X11_BACKEND") != null)
++				if (Environment.GetEnvironmentVariable ("not_supported_MONO_MWF_USE_NEW_X11_BACKEND") != null) {
+ 					driver=XplatUIX11_new.GetInstance ();
+-				else
+-					driver=XplatUIX11.GetInstance ();
++				} else {
++					IntPtr buf = Marshal.AllocHGlobal (8192);
++					if (uname (buf) != 0) {
++						// WTF: We cannot run uname
++						driver=XplatUIX11.GetInstance ();
++					} else {
++						string os = Marshal.PtrToStringAnsi (buf);
++						if (os == "Darwin")
++							driver=XplatUICarbon.GetInstance ();
++						else
++							driver=XplatUIX11.GetInstance ();
++					}
++					Marshal.FreeHGlobal (buf);
++				}
+ 			} else {
+ 				driver=XplatUIWin32.GetInstance();
+ 			}
+@@ -1218,5 +1228,7 @@
+ 		public delegate bool ObjectToClipboard(ref int type, object obj, out byte[] data);
+ 		#endregion	// Delegates
+ 
++		[DllImport ("libc")]
++		static extern int uname (IntPtr buf);
+ 	}
+ }
+=== System.Drawing/System.Drawing/Graphics.cs
+==================================================================
+--- System.Drawing/System.Drawing/Graphics.cs	(revision 93905)
++++ System.Drawing/System.Drawing/Graphics.cs	(local)
+@@ -188,7 +188,7 @@
+ 
+ 			if (GDIPlus.UseX11Drawable) {
+ 				CopyFromScreenX11 (sourceX, sourceY, destinationX, destinationY, blockRegionSize, copyPixelOperation);
+-			} else if (GDIPlus.UseCocoaDrawable || GDIPlus.UseQuartzDrawable) {
++			} else if (GDIPlus.UseCarbonDrawable) {
+ 				CopyFromScreenMac (sourceX, sourceY, destinationX, destinationY, blockRegionSize, copyPixelOperation);
+ 			} else {
+ 				CopyFromScreenWin32 (sourceX, sourceY, destinationX, destinationY, blockRegionSize, copyPixelOperation);
+@@ -274,7 +274,7 @@
+ 		{
+ 			Status status;
+ 			if (! disposed) {
+-				if ((GDIPlus.UseQuartzDrawable || GDIPlus.UseCocoaDrawable) && context.ctx != IntPtr.Zero) {
++				if (GDIPlus.UseCarbonDrawable && context.ctx != IntPtr.Zero) {
+ 					Flush ();
+ 					Carbon.CGContextSynchronize (context.ctx);
+ 					Carbon.ReleaseContext (context.port, context.ctx);
+@@ -1665,7 +1665,7 @@
+ 
+ 			Status status = GDIPlus.GdipFlush (nativeObject, intention);
+                         GDIPlus.CheckStatus (status);                    
+-			if ((GDIPlus.UseQuartzDrawable || GDIPlus.UseCocoaDrawable) && context.ctx != IntPtr.Zero)
++			if (GDIPlus.UseCarbonDrawable && context.ctx != IntPtr.Zero)
+ 				Carbon.CGContextSynchronize (context.ctx);
+ 		}
+ 
+@@ -1698,21 +1698,9 @@
+ 		{
+ 			IntPtr graphics;
+ 
+-			if (GDIPlus.UseCocoaDrawable) {
+-				throw new NotImplementedException ();
+-/* TODO: Fix this code to handle the new libgdiplus
+-				CarbonContext context = Carbon.GetCGContextForNSView (hwnd);
+-				GDIPlus.GdipCreateFromQuartz_macosx (context.ctx, context.width, context.height, out graphics);
+-				
+-				Graphics g = new Graphics (graphics);
+-				g.context = context;
+-				
+-				return g;
+-*/
+-			}
+-			if (GDIPlus.UseQuartzDrawable) {
++			if (GDIPlus.UseCarbonDrawable) {
+ 				CarbonContext context = Carbon.GetCGContextForView (hwnd);
+-				GDIPlus.GdipCreateFromQuartz_macosx (context.ctx, context.width, context.height, out graphics);
++				GDIPlus.GdipCreateFromContext_macosx (context.ctx, context.width, context.height, out graphics);
+ 				
+ 				Graphics g = new Graphics (graphics);
+ 				g.context = context;
+=== System.Drawing/System.Drawing/carbonFunctions.cs
+==================================================================
+--- System.Drawing/System.Drawing/carbonFunctions.cs	(revision 93905)
++++ System.Drawing/System.Drawing/carbonFunctions.cs	(local)
+@@ -51,15 +51,6 @@
+ 			}
+ 		}
+ 
+-		internal static CarbonContext GetCGContextForNSView (IntPtr handle) {
+-			IntPtr context = IntPtr.Zero;
+-			Rect view_bounds = new Rect ();
+-
+-			context = objc_msgSend (objc_msgSend (objc_getClass ("NSGraphicsContext"), sel_registerName ("currentContext")), sel_registerName ("graphicsPort"));
+-			objc_msgSend_stret (ref view_bounds, handle, sel_registerName ("bounds"));
+-			return new CarbonContext (IntPtr.Zero, context, (int)view_bounds.size.width, (int)view_bounds.size.height);
+-		}
+-
+ 		internal static CarbonContext GetCGContextForView (IntPtr handle) {
+ 			IntPtr context = IntPtr.Zero;
+ 			IntPtr port = IntPtr.Zero;
+=== System.Drawing/System.Drawing/gdipFunctions.cs
+==================================================================
+--- System.Drawing/System.Drawing/gdipFunctions.cs	(revision 93905)
++++ System.Drawing/System.Drawing/gdipFunctions.cs	(local)
+@@ -59,9 +59,8 @@
+ 		public const int FACESIZE = 32;
+ 		public const int LANG_NEUTRAL = 0;
+ 		public static IntPtr Display = IntPtr.Zero;
+-		public static bool UseX11Drawable;
+-		public static bool UseQuartzDrawable = (Environment.GetEnvironmentVariable ("MONO_MWF_USE_CARBON_BACKEND") != null);
+-		public static bool UseCocoaDrawable = (Environment.GetEnvironmentVariable ("MONO_GDIP_USE_COCOA_BACKEND") != null);
++		public static bool UseX11Drawable = false;
++		public static bool UseCarbonDrawable = false;
+ 
+ 		#region gdiplus.dll functions
+ 
+@@ -99,10 +98,21 @@
+ 
+ 		static GDIPlus ()
+ 		{
+-			// check for Unix platforms - see FAQ for more details
+-			// http://www.mono-project.com/FAQ:_Technical#How_to_detect_the_execution_platform_.3F
+ 			int platform = (int) Environment.OSVersion.Platform;
+-			UseX11Drawable = ((platform == 4) || (platform == 128));
++			if ((platform == 4) || (platform == 128)) {
++				IntPtr buf = Marshal.AllocHGlobal (8192);
++				if (uname (buf) != 0) {
++					// WTH: We couldn't detect the OS; lets default to X11
++					UseX11Drawable = true;
++				} else {
++					string os = Marshal.PtrToStringAnsi (buf);
++					if (os == "Darwin")
++						UseCarbonDrawable = true;
++					else
++						UseX11Drawable = true;
++				}
++				Marshal.FreeHGlobal (buf);
++			}
+ 
+ 			GdiplusStartupInput input = GdiplusStartupInput.MakeGdiplusStartupInput();
+ 			GdiplusStartupOutput output = GdiplusStartupOutput.MakeGdiplusStartupOutput();
+@@ -122,12 +132,12 @@
+ 
+ 		static public bool RunningOnWindows ()
+ 		{
+-			return !UseX11Drawable;
++			return !UseX11Drawable && !UseCarbonDrawable;
+ 		}
+ 
+ 		static public bool RunningOnUnix ()
+ 		{
+-			return UseX11Drawable;
++			return UseX11Drawable || UseCarbonDrawable;
+ 		}
+ 		
+ 		// Copies a Ptr to an array of Points and releases the memory
+@@ -1922,7 +1932,7 @@
+ 		
+ 		/* Mac only function calls */
+ 		[DllImport("gdiplus.dll")]
+-		internal static extern Status GdipCreateFromQuartz_macosx (IntPtr cgref, int width, int height, out IntPtr graphics);
++		internal static extern Status GdipCreateFromContext_macosx (IntPtr cgref, int width, int height, out IntPtr graphics);
+ 
+ 		/* Linux only function calls*/
+ 		[DllImport("gdiplus.dll")]
+@@ -1963,6 +1973,9 @@
+ 			StreamGetBytesDelegate getBytes, StreamPutBytesDelegate putBytes, StreamSeekDelegate doSeek, 
+ 			StreamCloseDelegate close, StreamSizeDelegate size, IntPtr hdc, EmfType type, ref Rectangle frameRect, 
+ 			MetafileFrameUnit frameUnit, [MarshalAs (UnmanagedType.LPWStr)] string description, out IntPtr metafile);
++
++		[DllImport ("libc")]
++		static extern int uname (IntPtr buf);
+ #endregion
+ 	}
+ }

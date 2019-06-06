@@ -1,0 +1,706 @@
+Index: src/customlinecap-private.h
+===================================================================
+--- src/customlinecap-private.h	(revision 160043)
++++ src/customlinecap-private.h	(working copy)
+@@ -42,6 +42,7 @@
+ 	GpStatus (*setup) (GpGraphics *graphics, GpCustomLineCap *cap);
+ 	GpStatus (*clone_cap) (GpCustomLineCap *cap, GpCustomLineCap **clonedCap);
+ 	GpStatus (*destroy) (GpCustomLineCap *cap);
++	GpStatus (*draw) (GpGraphics *graphics, GpPen *pen, GpCustomLineCap *cap, float x, float y, float otherend_x, float otherend_y);
+ } CapClass;
+ 
+ typedef struct _CustomLineCap {
+@@ -58,6 +59,8 @@
+ 
+ void gdip_custom_linecap_init (GpCustomLineCap *cap, CapClass *vt) GDIP_INTERNAL;
+ GpStatus gdip_linecap_setup (GpGraphics *graphics, GpCustomLineCap *customCap) GDIP_INTERNAL;
++GpStatus gdip_linecap_draw (GpGraphics *graphics, GpPen *pen, GpCustomLineCap *customCap, float x, float y, float otherend_x, float otherend_y) GDIP_INTERNAL;
++double gdip_custom_linecap_angle (float x, float y, float otherend_x, float otherend_y);
+ 
+ #include "customlinecap.h"
+ 
+Index: src/pen-private.h
+===================================================================
+--- src/pen-private.h	(revision 160043)
++++ src/pen-private.h	(working copy)
+@@ -59,9 +59,13 @@
+         GpUnit		unit;		/* Always set to UnitWorld. */
+ 	cairo_matrix_t	matrix;
+         BOOL		changed;	/* flag to mark if pen is changed and needs setup */
++	GpCustomLineCap *custom_start_cap;
++	GpCustomLineCap *custom_end_cap;
+ };
+ 
+ GpStatus gdip_pen_setup (GpGraphics *graphics, GpPen *pen) GDIP_INTERNAL;
++GpStatus gdip_pen_draw_custom_start_cap (GpGraphics *graphics, GpPen *pen, float x1, float y1, float x2, float y2);
++GpStatus gdip_pen_draw_custom_end_cap (GpGraphics *graphics, GpPen *pen, float x1, float y1, float x2, float y2);
+ 
+ #include "pen.h"
+ 
+Index: src/adjustablearrowcap.c
+===================================================================
+--- src/adjustablearrowcap.c	(revision 160043)
++++ src/adjustablearrowcap.c	(working copy)
+@@ -23,10 +23,12 @@
+  */
+ 
+ #include "adjustablearrowcap-private.h"
++#include "graphics-private.h"
+ 
+ static GpStatus gdip_adjust_arrowcap_setup (GpGraphics *graphics, GpCustomLineCap *cap);
+ static GpStatus gdip_adjust_arrowcap_clone_cap (GpCustomLineCap *cap, GpCustomLineCap **clonedCap);
+ static GpStatus gdip_adjust_arrowcap_destroy (GpCustomLineCap *cap);
++static GpStatus gdip_adjust_arrowcap_draw (GpGraphics *graphics, GpPen *pen, GpCustomLineCap *Cap, float x, float y, float otherend_x, float otherend_y);
+ 
+ /*
+  * we have a single copy of vtable for
+@@ -36,7 +38,8 @@
+ static CapClass vtable = { CustomLineCapTypeAdjustableArrow,
+ 			   gdip_adjust_arrowcap_setup,
+ 			   gdip_adjust_arrowcap_clone_cap,
+-			   gdip_adjust_arrowcap_destroy };
++			   gdip_adjust_arrowcap_destroy,
++			   gdip_adjust_arrowcap_draw };
+ 
+ static void
+ gdip_adjust_arrowcap_init (GpAdjustableArrowCap *arrow)
+@@ -44,6 +47,8 @@
+ 	gdip_custom_linecap_init (&arrow->base, &vtable);
+ 	arrow->fill_state = TRUE;
+ 	arrow->middle_inset = 0.0;
++	arrow->width = 0.0;
++	arrow->height = 0.0;
+ }
+ 
+ static GpAdjustableArrowCap*
+@@ -96,6 +101,59 @@
+ 	return NotImplemented;
+ }
+ 
++GpStatus
++gdip_adjust_arrowcap_draw (GpGraphics *graphics, GpPen *pen, GpCustomLineCap *customCap, float x, float y, float otherend_x, float otherend_y)
++{
++	double angle;
++	GpAdjustableArrowCap *arrowcap;
++	float w;
++	float h;
++	float penwidth;
++
++	if (!graphics || !customCap)
++		return InvalidParameter;
++
++	penwidth = pen->width;
++	if (penwidth < 2.0) {
++		/* Seems to be a minimum */
++		penwidth = 2.0;
++	}
++
++	arrowcap = (GpAdjustableArrowCap *)customCap;
++	w = arrowcap->width / 2;
++	h = arrowcap->height;
++
++	/* Vertical lines need some assistance to point the arrowhead correctly */
++	if ((x == otherend_x) &&
++	    (y < otherend_y)) {
++		h = -h;
++	}
++
++	angle = gdip_custom_linecap_angle (x, y, otherend_x, otherend_y);
++
++	cairo_save (graphics->ct);
++
++	/* FIXME: handle base_inset (including set/get!) */
++	cairo_translate (graphics->ct, x, y);
++	cairo_rotate (graphics->ct, angle);
++
++	gdip_cairo_move_to (graphics, 0, 0, TRUE, TRUE);
++	gdip_cairo_line_to (graphics, -w * penwidth, -h * penwidth, TRUE, TRUE);
++	gdip_cairo_line_to (graphics, w * penwidth, -h * penwidth, TRUE, TRUE);
++	gdip_cairo_line_to (graphics, 0, 0, TRUE, TRUE);
++
++	if (arrowcap->fill_state) {
++		/* FIXME: handle middle_inset */
++		cairo_fill_preserve (graphics->ct);
++	}
++
++	cairo_stroke (graphics->ct);
++
++	cairo_restore (graphics->ct);
++
++	return Ok;
++}
++
+ /* AdjustableArrowCap functions */
+ 
+ // coverity[+alloc : arg-*3]
+Index: src/customlinecap.c
+===================================================================
+--- src/customlinecap.c	(revision 160043)
++++ src/customlinecap.c	(working copy)
+@@ -25,10 +25,14 @@
+  */
+ 
+ #include "customlinecap-private.h"
++#include "graphics-path-private.h"
++#include "graphics-private.h"
++#include "graphics-cairo-private.h"
+ 
+ static GpStatus gdip_custom_linecap_setup (GpGraphics *graphics, GpCustomLineCap *cap);
+ static GpStatus gdip_custom_linecap_clone_cap (GpCustomLineCap *cap, GpCustomLineCap **clonedCap);
+ static GpStatus gdip_custom_linecap_destroy (GpCustomLineCap *cap);
++static GpStatus gdip_custom_linecap_draw (GpGraphics *graphics, GpPen *pen, GpCustomLineCap *cap, float x, float y, float otherend_x, float otherend_y);
+ 
+ /*
+  * we have a single copy of vtable for
+@@ -38,7 +42,8 @@
+ static CapClass vtable = { CustomLineCapTypeDefault,
+ 			   gdip_custom_linecap_setup,
+ 			   gdip_custom_linecap_clone_cap,
+-			   gdip_custom_linecap_destroy };
++			   gdip_custom_linecap_destroy,
++			   gdip_custom_linecap_draw };
+ 
+ void
+ gdip_custom_linecap_init (GpCustomLineCap *cap, CapClass *vt)
+@@ -51,6 +56,8 @@
+ 	cap->base_inset = 0.0;
+ 	/* LAMESPEC: Default value is documented as 1.0, but actually it is 0.0 */
+ 	cap->width_scale = 0.0;
++	cap->fill_path = NULL;
++	cap->stroke_path = NULL;
+ }
+ 
+ static GpCustomLineCap*
+@@ -68,6 +75,7 @@
+ gdip_custom_linecap_clone_cap (GpCustomLineCap *cap, GpCustomLineCap **clonedCap)
+ {
+ 	GpCustomLineCap *newcap;
++	GpPath *fillpath = NULL, *strokepath = NULL;
+ 
+ 	if (!cap || !clonedCap)
+ 		return InvalidParameter;
+@@ -84,6 +92,27 @@
+ 	newcap->base_inset = cap->base_inset;
+ 	newcap->width_scale = cap->width_scale;
+ 
++	if (cap->fill_path) {
++		if (GdipClonePath (cap->fill_path, &fillpath) != Ok) {
++			if (fillpath != NULL)
++				GdipFree (fillpath);
++			GdipFree (newcap);
++			return OutOfMemory;
++		}
++	}
++	newcap->fill_path = fillpath;
++	
++	if (cap->stroke_path) {
++		if (GdipClonePath (cap->stroke_path, &strokepath) != Ok) {
++			if (strokepath != NULL)
++				GdipFree (strokepath);
++			GdipFree (fillpath);
++			GdipFree (newcap);
++			return OutOfMemory;
++		}
++	}
++	newcap->stroke_path = strokepath;
++
+ 	*clonedCap = newcap;
+ 
+ 	return Ok;
+@@ -95,6 +124,14 @@
+ 	if (!cap)
+ 		return InvalidParameter;
+ 
++	if (cap->fill_path) {
++		GdipDeletePath (cap->fill_path);
++		cap->fill_path = NULL;
++	}
++	if (cap->stroke_path) {
++		GdipDeletePath (cap->stroke_path);
++		cap->stroke_path = NULL;
++	}
+ 	GdipFree (cap);
+ 
+ 	return Ok;
+@@ -110,6 +147,105 @@
+ 	return NotImplemented;
+ }
+ 
++double
++gdip_custom_linecap_angle (float x, float y, float otherend_x, float otherend_y)
++{
++	float slope;
++	double angle;
++	
++	if (y < otherend_y) {
++		slope = (otherend_y - y) / (otherend_x - x);
++		if (x < otherend_x) {
++			angle = PI/2;
++		} else {
++			angle = PI/-2;
++		}
++	} else {
++		slope = (otherend_x - x) / (y - otherend_y);
++		angle = 0;
++	}
++	angle += atan (slope);
++
++	return angle;
++}
++
++GpStatus
++gdip_custom_linecap_draw (GpGraphics *graphics, GpPen *pen, GpCustomLineCap *customCap, float x, float y, float otherend_x, float otherend_y)
++{
++	double angle;
++	int points;
++	int i, idx = 0;
++	float penwidth;
++	
++	if (!graphics || !pen || !customCap)
++		return InvalidParameter;
++
++	penwidth = pen->width;
++	angle = gdip_custom_linecap_angle (x, y, otherend_x, otherend_y);
++
++	cairo_save (graphics->ct);
++
++	/* FIXME: handle base_inset (including set/get!) */
++	cairo_translate (graphics->ct, x, y);
++	cairo_rotate (graphics->ct, angle);
++
++	if (customCap->stroke_path) {
++		GpPath *path = customCap->stroke_path;
++		points = path->count;
++
++		for (i = 0; i < points; i++) {
++			/* Adapted from gdip_plot_path() */
++			GpPointF point = g_array_index (path->points, GpPointF, i);
++			BYTE type = g_array_index (path->types, BYTE, i);
++			GpPointF pts [3];
++
++			/* mask the bits so that we get only the type value not the other flags */
++			switch (type & PathPointTypePathTypeMask) {
++			case PathPointTypeStart:
++				gdip_cairo_move_to (graphics, point.X * penwidth, point.Y * penwidth, TRUE, TRUE);
++				break;
++
++			case PathPointTypeLine:
++				gdip_cairo_line_to (graphics, point.X * penwidth, point.Y * penwidth, TRUE, TRUE);
++				break;
++
++			case PathPointTypeBezier:
++				/* make sure we only add at most 3 points to pts */
++				if (idx < 3) {
++					pts [idx] = point;
++					idx ++;
++				}
++
++				/* once we've added 3 pts, we can draw the curve */
++				if (idx == 3) {
++					gdip_cairo_curve_to (graphics, pts[0].X * penwidth, pts[0].Y * penwidth, pts[1].X * penwidth, pts[1].Y * penwidth, pts[2].X * penwidth, pts[2].Y * penwidth, TRUE, TRUE);
++					idx = 0;
++				}
++				break;
++
++			default:
++				g_warning ("Unknown PathPointType %d", type);
++				return NotImplemented;
++			}
++
++			/* close the subpath */
++			if (type & PathPointTypeCloseSubpath) {
++				cairo_close_path (graphics->ct);
++			}
++		}
++
++		gdip_pen_setup (graphics, pen);
++		cairo_stroke (graphics->ct);
++		cairo_set_matrix (graphics->ct, graphics->copy_of_ctm);
++	}
++
++	/* FIXME: handle fill_path */
++
++	cairo_restore (graphics->ct);
++
++	return gdip_get_status (cairo_status (graphics->ct));
++}
++
+ /* this setup function gets called from pen */
+ 
+ GpStatus
+@@ -121,6 +257,17 @@
+ 	return customCap->vtable->setup (graphics, customCap);
+ }
+ 
++/* this draw function gets called from pen */
++
++GpStatus
++gdip_linecap_draw (GpGraphics *graphics, GpPen *pen, GpCustomLineCap *customCap, float x, float y, float otherend_x, float otherend_y)
++{
++	if (!graphics || !pen || !customCap)
++		return InvalidParameter;
++	
++	return customCap->vtable->draw (graphics, pen, customCap, x, y, otherend_x, otherend_y);
++}
++
+ /* CustomLineCap functions */
+ 
+ // coverity[+alloc : arg-*4]
+@@ -128,6 +275,7 @@
+ GdipCreateCustomLineCap (GpPath *fillPath, GpPath *strokePath, GpLineCap baseCap, float baseInset, GpCustomLineCap **customCap)
+ {
+ 	GpCustomLineCap *cap;
++	GpPath *fillpath_clone = NULL, *strokepath_clone = NULL;
+ 
+ 	if ((!fillPath && !strokePath) || !customCap)
+ 		return InvalidParameter;
+@@ -136,8 +284,27 @@
+ 	if (!cap)
+ 		return OutOfMemory;
+ 
+-	cap->fill_path = fillPath;
+-	cap->stroke_path = strokePath;
++	if (fillPath) {
++		if (GdipClonePath (fillPath, &fillpath_clone) != Ok) {
++			if (fillpath_clone != NULL)
++				GdipFree (fillpath_clone);
++			GdipFree (cap);
++			return OutOfMemory;
++		}
++	}
++	cap->fill_path = fillpath_clone;
++
++	if (strokePath) {
++		if (GdipClonePath (strokePath, &strokepath_clone) != Ok) {
++			if (strokepath_clone != NULL)
++				GdipFree (strokepath_clone);
++			GdipFree (fillpath_clone);
++			GdipFree (cap);
++			return OutOfMemory;
++		}
++	}
++	cap->stroke_path = strokepath_clone;
++
+ 	cap->base_cap = baseCap;
+ 	cap->base_inset = baseInset;
+ 
+Index: src/pen.c
+===================================================================
+--- src/pen.c	(revision 160043)
++++ src/pen.c	(working copy)
+@@ -30,6 +30,7 @@
+ #include "solidbrush-private.h"
+ #include "matrix-private.h"
+ #include "graphics-private.h"
++#include "customlinecap-private.h"
+ 
+ static void 
+ gdip_pen_init (GpPen *pen)
+@@ -53,6 +54,8 @@
+ 	pen->compound_array = NULL;
+ 	pen->unit = UnitWorld;
+ 	pen->changed = TRUE;
++	pen->custom_start_cap = NULL;
++	pen->custom_end_cap = NULL;
+ 	cairo_matrix_init_identity (&pen->matrix);
+ }
+ 
+@@ -204,6 +207,34 @@
+ 	return gdip_get_status (cairo_status (graphics->ct));
+ }
+ 
++GpStatus
++gdip_pen_draw_custom_start_cap (GpGraphics *graphics, GpPen *pen, float x1, float y1, float x2, float y2)
++{
++	if (!graphics || !pen)
++		return InvalidParameter;
++	
++	if (pen->custom_start_cap) {
++		/* Draw the end cap */
++		gdip_linecap_draw (graphics, pen, pen->custom_start_cap, x1, y1, x2, y2);
++	}
++
++	return gdip_get_status (cairo_status (graphics->ct));
++}
++
++GpStatus
++gdip_pen_draw_custom_end_cap (GpGraphics *graphics, GpPen *pen, float x1, float y1, float x2, float y2)
++{
++	if (!graphics || !pen)
++		return InvalidParameter;
++	
++	if (pen->custom_end_cap) {
++		/* Draw the end cap */
++		gdip_linecap_draw (graphics, pen, pen->custom_end_cap, x1, y1, x2, y2);
++	}
++
++	return gdip_get_status (cairo_status (graphics->ct));
++}
++
+ // coverity[+alloc : arg-*3]
+ GpStatus 
+ GdipCreatePen1 (ARGB argb, float width, GpUnit unit, GpPen **pen)
+@@ -319,6 +350,8 @@
+         GpPen *result;
+         float *dashes;                  /* copy off pen->dash_array */
+         float *compound_array = NULL;   /* copy off pen->compound_array */
++	GpCustomLineCap *custom_start_cap = NULL;
++	GpCustomLineCap *custom_end_cap = NULL;
+ 
+ 	if (!pen || !clonepen)
+ 		return InvalidParameter;
+@@ -345,6 +378,34 @@
+ 		clone_dash_array (compound_array, pen->compound_array, pen->compound_count);
+ 	}
+ 
++	if (pen->custom_start_cap != NULL) {
++		GpStatus status = GdipCloneCustomLineCap (pen->custom_start_cap, &custom_start_cap);
++		if (status != Ok) {
++			if (custom_start_cap)
++				GdipDeleteCustomLineCap (custom_start_cap);
++			if (compound_array != NULL)
++				GdipFree (compound_array);
++			if (pen->dash_count > 0)
++				GdipFree (dashes);
++			return OutOfMemory;
++		}
++	}
++
++	if (pen->custom_end_cap != NULL) {
++		GpStatus status = GdipCloneCustomLineCap (pen->custom_end_cap, &custom_end_cap);
++		if (status != Ok) {
++			if (custom_end_cap)
++				GdipDeleteCustomLineCap (custom_end_cap);
++			if (custom_start_cap)
++				GdipDeleteCustomLineCap (custom_start_cap);
++			if (compound_array != NULL)
++				GdipFree (compound_array);
++			if (pen->dash_count > 0)
++				GdipFree (dashes);
++			return OutOfMemory;
++		}
++	}
++
+ 	result = gdip_pen_new ();
+ 	if (result == NULL) {
+ 		if (pen->dash_count > 0)
+@@ -382,6 +443,8 @@
+ 	result->unit = pen->unit;
+ 	gdip_cairo_matrix_copy (&result->matrix, &pen->matrix);
+ 	result->changed = pen->changed;
++	result->custom_start_cap = custom_start_cap;
++	result->custom_end_cap = custom_end_cap;
+ 
+         *clonepen = result;
+ 
+@@ -411,6 +474,16 @@
+ 		pen->compound_count = 0;
+ 	}
+ 
++	if (pen->custom_start_cap != NULL) {
++		GdipDeleteCustomLineCap (pen->custom_start_cap);
++		pen->custom_start_cap = NULL;
++	}
++
++	if (pen->custom_end_cap != NULL) {
++		GdipDeleteCustomLineCap (pen->custom_end_cap);
++		pen->custom_end_cap = NULL;
++	}
++
+         GdipFree (pen);
+ 	return Ok;
+ }
+@@ -1004,52 +1077,38 @@
+ 	return Ok;
+ }
+ 
+-/* MonoTODO - not implemented */
+ GpStatus
+ GdipSetPenCustomStartCap (GpPen *pen, GpCustomLineCap *customCap)
+ {
+-	static BOOL called = FALSE;
+-	if (!called) {
+-		g_warning ("GdipSetPenCustomStartCap isn't implemented");
+-		called = TRUE;
+-	}
+-	return Ok;
++	if (!pen)
++		return InvalidParameter;
++	
++	return GdipCloneCustomLineCap (customCap, &pen->custom_start_cap);
+ }
+ 
+-/* MonoTODO - not implemented */
+ GpStatus
+ GdipGetPenCustomStartCap (GpPen *pen, GpCustomLineCap **customCap)
+ {
+-	static BOOL called = FALSE;
+-	if (!called) {
+-		g_warning ("GdipGetPenCustomStartCap isn't implemented");
+-		called = TRUE;
+-	}
+-	*customCap = NULL;
+-	return Ok;
++	if (!pen || !customCap)
++		return InvalidParameter;
++
++	return GdipCloneCustomLineCap (pen->custom_start_cap, customCap);
+ }
+ 
+-/* MonoTODO - not implemented */
+ GpStatus
+ GdipSetPenCustomEndCap (GpPen *pen, GpCustomLineCap *customCap)
+ {
+-	static BOOL called = FALSE;
+-	if (!called) {
+-		g_warning ("GdipSetPenCustomEndCap isn't implemented");
+-		called = TRUE;
+-	}
+-	return Ok;
++	if (!pen)
++		return InvalidParameter;
++	
++	return GdipCloneCustomLineCap (customCap, &pen->custom_end_cap);
+ }
+ 
+-/* MonoTODO - not implemented */
+ GpStatus
+ GdipGetPenCustomEndCap (GpPen *pen, GpCustomLineCap **customCap)
+ {
+-	static BOOL called = FALSE;
+-	if (!called) {
+-		g_warning ("GdipGetPenCustomEndCap isn't implemented");
+-		called = TRUE;
+-	}
+-	*customCap = NULL;
+-	return Ok;
++	if (!pen || !customCap)
++		return InvalidParameter;
++
++	return GdipCloneCustomLineCap (pen->custom_end_cap, customCap);
+ }
+Index: src/graphics-cairo.c
+===================================================================
+--- src/graphics-cairo.c	(revision 160043)
++++ src/graphics-cairo.c	(working copy)
+@@ -485,41 +485,74 @@
+ GpStatus
+ cairo_DrawLine (GpGraphics *graphics, GpPen *pen, float x1, float y1, float x2, float y2)
+ {
++	GpStatus ret;
++
+ 	/* We use graphics->copy_of_ctm matrix for path creation. We should have it set already. */
+ 	gdip_cairo_move_to (graphics, x1, y1, TRUE, TRUE);
+ 	gdip_cairo_line_to (graphics, x2, y2, TRUE, TRUE);
+ 
+-	return stroke_graphics_with_pen (graphics, pen);
++	ret = stroke_graphics_with_pen (graphics, pen);
++
++	gdip_pen_draw_custom_start_cap (graphics, pen, x1, y1, x2, y2);
++	gdip_pen_draw_custom_end_cap (graphics, pen, x2, y2, x1, y1);
++
++	return ret;
+ }
+ 
+ GpStatus 
+ cairo_DrawLines (GpGraphics *graphics, GpPen *pen, GDIPCONST GpPointF *points, int count)
+ {
+ 	int i;
++	float last_x, last_y, prev_x, prev_y;
++	GpStatus ret;
+ 
+ 	/* We use graphics->copy_of_ctm matrix for path creation. We should have it set already. */
+ 	gdip_cairo_move_to (graphics, points [0].X, points [0].Y, TRUE, TRUE);
+ 
+ 	for (i = 1; i < count; i++) {
+ 		gdip_cairo_line_to (graphics, points [i].X, points [i].Y, TRUE, TRUE);
++		prev_x = points [i - 1].X;
++		prev_y = points [i - 1].Y;
++		last_x = points [i].X;
++		last_y = points [i].Y;
+ 	}
+ 
+-	return stroke_graphics_with_pen (graphics, pen);
++	ret = stroke_graphics_with_pen (graphics, pen);
++
++	if (count > 1) {
++		gdip_pen_draw_custom_start_cap (graphics, pen, points [0].X, points [0].Y, points [1].X, points [1].Y);
++		gdip_pen_draw_custom_end_cap (graphics, pen, last_x, last_y, prev_x, prev_y);
++	}
++
++	return ret;
+ }
+ 
+ GpStatus 
+ cairo_DrawLinesI (GpGraphics *graphics, GpPen *pen, GDIPCONST GpPoint *points, int count)
+ {
+ 	int i;
++	float last_x, last_y, prev_x, prev_y;
++	GpStatus ret;
+ 
+ 	/* We use graphics->copy_of_ctm matrix for path creation. We should have it set already. */
+ 	gdip_cairo_move_to (graphics, points [0].X, points [0].Y, TRUE, TRUE);
+ 
+ 	for (i = 1; i < count; i++) {
+ 		gdip_cairo_line_to (graphics, points [i].X, points [i].Y, TRUE, TRUE);
++		prev_x = points [i - 1].X;
++		prev_y = points [i - 1].Y;
++		last_x = points [i].X;
++		last_y = points [i].Y;
+ 	}
+ 
+-	return stroke_graphics_with_pen (graphics, pen);
++	ret = stroke_graphics_with_pen (graphics, pen);
++
++	if (count > 1) {
++		gdip_pen_draw_custom_start_cap (graphics, pen, points [0].X, points [0].Y, points [1].X, points [1].Y);
++		gdip_pen_draw_custom_end_cap (graphics, pen, last_x, last_y, prev_x, prev_y);
++	}
++
++	return ret;
+ }
+ 
+ GpStatus
+@@ -574,12 +607,41 @@
+ GpStatus
+ cairo_DrawPath (GpGraphics *graphics, GpPen *pen, GpPath *path)
+ {
++	GpStatus ret;
++	int count;
++	GpPointF *points;
++
+ 	/* We use graphics->copy_of_ctm matrix for path creation. We should have it set already. */
+ 	GpStatus status = gdip_plot_path (graphics, path, TRUE);
+ 	if (status != Ok)
+ 		return status;
+ 
+-	return stroke_graphics_with_pen (graphics, pen);
++	ret = stroke_graphics_with_pen (graphics, pen);
++
++	/* Draw any custom pen end caps */
++
++	status = GdipGetPointCount (path, &count);
++
++	/* To know the angle of the end cap, we need the penultimate point.
++	   Unfortunately there's no way of getting it without getting all
++	   the points :-(
++	 */
++	if (status == Ok && count > 1) {
++		points = gdip_calloc (count, sizeof(GpPointF));
++		if (points == NULL) {
++			return OutOfMemory;
++		}
++		status = GdipGetPathPoints (path, points, count);
++
++		if (status == Ok) {
++			gdip_pen_draw_custom_start_cap (graphics, pen, points [0].X, points [0].Y, points [1].X, points [1].Y);
++			gdip_pen_draw_custom_end_cap (graphics, pen, points [count - 1].X, points [count - 1].Y, points [count - 2].X, points [count - 2].Y);
++		}
++
++		GdipFree (points);
++	}
++
++	return ret;
+ }
+ 
+ /* FIXME - this doesn't match MS behaviour when we use really complex paths with internal intersections */

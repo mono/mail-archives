@@ -1,0 +1,199 @@
+Index: System.Windows.Forms/X11Keyboard.cs
+===================================================================
+--- System.Windows.Forms/X11Keyboard.cs	(revision 100091)
++++ System.Windows.Forms/X11Keyboard.cs	(working copy)
+@@ -32,6 +32,7 @@
+ // 
+ using System;
+ using System.Collections;
++using System.Drawing;
+ using System.Text;
+ using System.Globalization;
+ using System.Runtime.InteropServices;
+@@ -43,6 +44,9 @@
+ 		private IntPtr display;
+ 		private IntPtr window;
+ 		private IntPtr xic;
++		private XIMPositionContext positionContext;
++		private XIMCallbackContext callbackContext;
++		private XIMProperties ximStyle;
+ 		private EventMask xic_event_mask = EventMask.NoEventMask;
+ 		private StringBuilder lookup_buffer;
+ 		private byte [] utf8_buffer;
+@@ -787,6 +791,7 @@
+ 		private IntPtr CreateXic (IntPtr window, IntPtr xim)
+ 		{
+ 			foreach (XIMProperties targetStyle in GetMatchingStylesInPreferredOrder (xim)) {
++				ximStyle = targetStyle;
+ 				// FIXME: use __arglist when it gets working. See bug #321686
+ 				switch (targetStyle) {
+ 				case styleOverTheSpot:
+@@ -812,12 +817,14 @@
+ 				}
+ 			}
+ 			// fall back to root mode if all modes failed
+-			if (xic == IntPtr.Zero)
++			if (xic == IntPtr.Zero) {
++				ximStyle = styleRoot;
+ 				xic = XCreateIC (xim,
+ 					XNames.XNInputStyle, styleRoot,
+ 					XNames.XNClientWindow, window,
+ 					XNames.XNFocusWindow, window,
+ 					IntPtr.Zero);
++			}
+ 			return xic;
+ 		}
+ 
+@@ -826,10 +833,9 @@
+ 			IntPtr list;
+ 			int count;
+ 			IntPtr fontSet = XCreateFontSet (display, "*", out list, out count, IntPtr.Zero);
+-			// FIXME: give appropriate corrdinate.
+ 			XPoint spot = new XPoint ();
+ 			spot.X = 0;
+-			spot.Y = 100;
++			spot.Y = 0;
+ 			IntPtr pSL = IntPtr.Zero, pFS = IntPtr.Zero;
+ 			try {
+ 				pSL = Marshal.StringToHGlobalAnsi (XNames.XNSpotLocation);
+@@ -861,8 +867,6 @@
+ 			return callbackContext.CreateXic (window, xim);
+ 		}
+ 
+-		XIMCallbackContext callbackContext;
+-
+ 		class XIMCallbackContext
+ 		{
+ 			XIMCallback startCB, doneCB, drawCB, caretCB;
+@@ -951,6 +955,55 @@
+ 			}
+ 		}
+ 
++		class XIMPositionContext
++		{
++			public CaretStruct Caret;
++			public int X;
++			public int Y;
++		}
++
++		internal void SetCaretPos (CaretStruct caret, IntPtr handle, int x, int y)
++		{
++			if (ximStyle != styleOverTheSpot)
++				return;
++
++			if (positionContext == null)
++				this.positionContext = new XIMPositionContext ();
++
++			positionContext.Caret = caret;
++			positionContext.X = x;
++			positionContext.Y = y;
++
++			MoveCurrentCaretPos ();
++		}
++
++		internal void MoveCurrentCaretPos ()
++		{
++			if (positionContext == null || ximStyle != styleOverTheSpot)
++				return;
++
++			int x = positionContext.X;
++			int y = positionContext.Y;
++			CaretStruct caret = positionContext.Caret;
++			int dx, dy;
++			IntPtr child;
++			XplatUIX11.XTranslateCoordinates (display, Control.FromHandle (caret.Hwnd).window.Handle, window, x, y, out dx, out dy, out child);
++
++			XPoint spot = new XPoint ();
++			spot.X = (short) dx;
++			spot.Y = (short) dy;
++
++			IntPtr pSL = IntPtr.Zero;
++			try {
++				pSL = Marshal.StringToHGlobalAnsi (XNames.XNSpotLocation);
++				IntPtr preedit = XVaCreateNestedList (0, pSL, spot, IntPtr.Zero);
++				XSetICValues (xic, XNames.XNPreeditAttributes, preedit, IntPtr.Zero);
++			} finally {
++				if (pSL != IntPtr.Zero)
++					Marshal.FreeHGlobal (pSL);
++			}
++		}
++
+ 		private int LookupString (ref XEvent xevent, int len, out XKeySym keysym, out IntPtr status)
+ 		{
+ 			IntPtr keysym_res;
+@@ -985,6 +1038,8 @@
+ 		private static extern IntPtr XCreateIC (IntPtr xim, string name, XIMProperties im_style, string name2, IntPtr value2, string name3, IntPtr value3, string name4, IntPtr value4, IntPtr terminator);
+ 
+ 		[DllImport ("libX11", CallingConvention = CallingConvention.Cdecl)]
++		private static extern IntPtr XVaCreateNestedList (int dummy, IntPtr name0, XPoint value0, IntPtr terminator);
++		[DllImport ("libX11", CallingConvention = CallingConvention.Cdecl)]
+ 		private static extern IntPtr XVaCreateNestedList (int dummy, IntPtr name0, XPoint value0, IntPtr name1, IntPtr value1, IntPtr terminator);
+ 		[DllImport ("libX11", CallingConvention = CallingConvention.Cdecl)]
+ 		private static extern IntPtr XVaCreateNestedList (int dummy, IntPtr name0, IntPtr value0, IntPtr name1, IntPtr value1, IntPtr name2, IntPtr value2, IntPtr name3, IntPtr value3, IntPtr terminator);
+@@ -1013,6 +1068,9 @@
+ 		[DllImport ("libX11")]
+ 		private static extern string XGetICValues (IntPtr xic, string name, out EventMask value, IntPtr terminator);
+ 
++		[DllImport ("libX11", CallingConvention = CallingConvention.Cdecl)]
++		private static extern void XSetICValues (IntPtr xic, string name, IntPtr value, IntPtr terminator);
++
+ 		[DllImport ("libX11")]
+ 		private static extern void XSetICFocus (IntPtr xic);
+ 
+Index: System.Windows.Forms/XplatUIX11.cs
+===================================================================
+--- System.Windows.Forms/XplatUIX11.cs	(revision 100091)
++++ System.Windows.Forms/XplatUIX11.cs	(working copy)
+@@ -1112,7 +1112,7 @@
+ 					XSetTransientForHint (DisplayHandle, hwnd.whole_window, transient_for_parent);
+ 				}
+ 
+-				XMoveResizeWindow(DisplayHandle, hwnd.client_window, client_rect.X, client_rect.Y, client_rect.Width, client_rect.Height);
++				MoveResizeWindow(DisplayHandle, hwnd.client_window, client_rect.X, client_rect.Y, client_rect.Width, client_rect.Height);
+ 
+ 				if (hide_from_taskbar) {
+ 					/* this line keeps the window from showing up in gnome's taskbar */
+@@ -1948,7 +1948,7 @@
+ 			rect = TranslateClientRectangleToXClientRectangle (hwnd);
+ 
+ 			if (hwnd.visible) {
+-				XMoveResizeWindow (DisplayHandle, hwnd.client_window, rect.X, rect.Y, rect.Width, rect.Height);
++				MoveResizeWindow (DisplayHandle, hwnd.client_window, rect.X, rect.Y, rect.Width, rect.Height);
+ 			}
+ 
+ 			AddExpose (hwnd, false, 0, 0, hwnd.Width, hwnd.Height);
+@@ -4989,6 +4989,8 @@
+ 				Caret.X = x;
+ 				Caret.Y = y;
+ 
++				Keyboard.SetCaretPos (Caret, handle, x, y);
++
+ 				if (Caret.Visible == true) {
+ 					ShowCaret();
+ 					Caret.Timer.Start();
+@@ -5410,7 +5412,7 @@
+ 				lock (XlibLock) {
+ 					Control ctrl = Control.FromHandle (handle);
+ 					Size TranslatedSize = TranslateWindowSizeToXWindowSize (ctrl.GetCreateParams (), new Size (width, height));
+-					XMoveResizeWindow (DisplayHandle, hwnd.whole_window, x, y, TranslatedSize.Width, TranslatedSize.Height);
++					MoveResizeWindow (DisplayHandle, hwnd.whole_window, x, y, TranslatedSize.Width, TranslatedSize.Height);
+ 					PerformNCCalc(hwnd);
+ 				}
+ 			}
+@@ -5821,8 +5823,15 @@
+ 		[DllImport ("libX11", EntryPoint="XReparentWindow")]
+ 		internal extern static int XReparentWindow(IntPtr display, IntPtr window, IntPtr parent, int x, int y);
+ 		[DllImport ("libX11", EntryPoint="XMoveResizeWindow")]
+-		internal extern static int XMoveResizeWindow(IntPtr display, IntPtr window, int x, int y, int width, int height);
++		private extern static int XMoveResizeWindow(IntPtr display, IntPtr window, int x, int y, int width, int height);
+ 
++		internal static int MoveResizeWindow(IntPtr display, IntPtr window, int x, int y, int width, int height)
++		{
++			int ret = XMoveResizeWindow (display, window, x, y, width, height);
++			Keyboard.MoveCurrentCaretPos ();
++			return ret;
++		}
++
+ 		[DllImport ("libX11", EntryPoint="XResizeWindow")]
+ 		internal extern static int XResizeWindow(IntPtr display, IntPtr window, int width, int height);
+ 

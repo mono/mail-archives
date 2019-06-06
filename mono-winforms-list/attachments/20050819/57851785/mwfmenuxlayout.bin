@@ -1,0 +1,183 @@
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 48500)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,16 @@
++2005-08-19  Rafael Teixeira <rafaelteixeirabr@hotmail.com> 
++	-- Making Windows with Menus layout correctly --
++	* XplatUI.cs : Just an update console reminder
++	* Form.cs : The first leg of the fix
++		Menu setter - adjust Client Size as needed to make space for the menu
++		SetClientSizeCore - doesn't call base version to be able to pass the 
++			menu handle to XplatUI.CalculateWindowRect
++	* Hwnd.cs: Fix for menu_height, now gets from MenuAPI.MENU
++	* XplatUIX11.cs: The critical second leg of the fix
++		GetWindowPos needs to use a recalculated client_rect
++		so that resizing the window doesn't break layout of child controls. 
++		Also a more complete rule to avoid X Server roundtrips in SetWindowPos
++
+ 2005-08-18  Jordi Mas i Hernandez <jordi@ximian.com>
+ 
+ 	* MenuAPI.cs: fixes bug 75716
+Index: XplatUI.cs
+===================================================================
+--- XplatUI.cs	(revision 48500)
++++ XplatUI.cs	(working copy)
+@@ -67,7 +67,7 @@
+ 
+ 		#region Constructor & Destructor
+ 		static XplatUI() {
+-			Console.WriteLine("Mono System.Windows.Forms Assembly [Revision: 44786; built: 2005/5/25 22:34:45]");
++			Console.WriteLine("Mono System.Windows.Forms Assembly [Revision: 48500; built: 2005/08/19]");
+ 
+ 			// Don't forget to throw the mac in here somewhere, too
+ 			default_class_name="SWFClass";
+Index: XplatUIX11.cs
+===================================================================
+--- XplatUIX11.cs	(revision 48500)
++++ XplatUIX11.cs	(working copy)
+@@ -1447,7 +1447,7 @@
+ 			}
+ 		}
+ 
+-		internal override bool CalculateWindowRect(IntPtr handle, ref Rectangle ClientRect, int Style, int ExStyle, IntPtr MenuHandle, out Rectangle WindowRect) {
++		internal override bool CalculateWindowRect(IntPtr handle, ref Rectangle ClientRect, int Style, int ExStyle, IntPtr MenuHandle, out Rectangle WindowRect) {			
+ 			BorderStyle	border_style;
+ 			TitleStyle	title_style;
+ 
+@@ -2604,13 +2604,13 @@
+ 			hwnd = Hwnd.ObjectFromHandle(handle);
+ 
+ 			if (hwnd != null) {
+-				rect = hwnd.ClientRect;
+-
+ 				x = hwnd.x;
+ 				y = hwnd.y;
+ 				width = hwnd.width;
+ 				height = hwnd.height;
+ 
++				rect = Hwnd.GetClientRectangle(hwnd.border_style, hwnd.menu_handle, hwnd.title_style, width, height);
++
+ 				client_width = rect.Width;
+ 				client_height = rect.Height;
+ 
+@@ -3188,11 +3188,7 @@
+ 			Rectangle	client_rect;
+ 
+ 			hwnd = Hwnd.ObjectFromHandle(handle);
+-			// Save a server roundtrip (and prevent a feedback loop)
+-			if ((hwnd.x == x) && (hwnd.y == y) && (hwnd.width == width) && (hwnd.height == height)) {
+-				return;
+-			}
+-
++			
+ 			// X requires a sanity check for width & height; otherwise it dies
+ 			if (width < 1) {
+ 				width = 1;
+@@ -3204,6 +3200,13 @@
+ 
+ 			client_rect = Hwnd.GetClientRectangle(hwnd.border_style, hwnd.menu_handle, hwnd.title_style, width, height);
+ 
++			// Save a server roundtrip (and prevent a feedback loop)
++			if ((hwnd.x == x) && (hwnd.y == y) && 
++				(hwnd.width == width) && (hwnd.height == height) &&
++				(hwnd.ClientRect == client_rect)) {
++				return;
++			}
++
+ 			lock (XlibLock) {
+ 				XMoveResizeWindow(DisplayHandle, hwnd.whole_window, x, y, width, height);
+ 				XMoveResizeWindow(DisplayHandle, hwnd.client_window, client_rect.X, client_rect.Y, client_rect.Width, client_rect.Height);
+Index: Hwnd.cs
+===================================================================
+--- Hwnd.cs	(revision 48500)
++++ Hwnd.cs	(working copy)
+@@ -39,7 +39,7 @@
+ 	internal class Hwnd : IDisposable {
+ 		#region Local Variables
+ 		private static Hashtable	windows	= new Hashtable(100, 0.5f);
+-		private const int	menu_height = 14;			// FIXME - Read this value from somewhere
++		//private const int	menu_height = 14;			// FIXME - Read this value from somewhere
+ 		private const int	caption_height = 0;			// FIXME - Read this value from somewhere
+ 		private const int	tool_caption_height = 0;		// FIXME - Read this value from somewhere
+ 
+@@ -139,8 +139,13 @@
+ 			rect = new Rectangle(client_rect.Location, client_rect.Size);
+ 
+ 			if (menu_handle != IntPtr.Zero) {
+-				rect.Y -= menu_height;
+-				rect.Height += menu_height;
++				MenuAPI.MENU menu = MenuAPI.GetMenuFromID (menu_handle);
++				if (menu != null) {
++					int menu_height = menu.Height;
++					rect.Y -= menu_height;
++					rect.Height += menu_height;
++				} else
++					Console.WriteLine("Hwnd.GetWindowRectangle: No MENU for menu_handle = {0}", menu_handle);
+ 			}
+ 
+ 			if (border_style == BorderStyle.Fixed3D) {
+@@ -172,8 +177,13 @@
+ 			rect = new Rectangle(0, 0, width, height);
+ 
+ 			if (menu_handle != IntPtr.Zero) {
+-				rect.Y += menu_height;
+-				rect.Height -= menu_height;
++				MenuAPI.MENU menu = MenuAPI.GetMenuFromID (menu_handle);
++				if (menu != null) {
++					int menu_height = menu.Height;
++					rect.Y += menu_height;
++					rect.Height -= menu_height;
++				} else
++					Console.WriteLine("Hwnd.GetClientRectangle: No MENU for menu_handle = {0}", menu_handle);
+ 			}
+ 
+ 			if (border_style == BorderStyle.Fixed3D) {
+Index: Form.cs
+===================================================================
+--- Form.cs	(revision 48500)
++++ Form.cs	(working copy)
+@@ -484,17 +484,18 @@
+ 				if (menu != value) {					
+ 					menu = value;
+ 
+-					menu.SetForm (this);
+-					MenuAPI.SetMenuBarWindow (menu.Handle, this);
++					if (menu != null) {
++						menu.SetForm (this);
++						MenuAPI.SetMenuBarWindow (menu.Handle, this);
+ 				
+-					if (IsHandleCreated && menu != null) {	
+-						XplatUI.SetMenu(window.Handle, menu.Handle);
+-					}
++						if (IsHandleCreated) {	
++							XplatUI.SetMenu(window.Handle, menu.Handle);
++						}
+ 
+-					// FIXME - Do we still need this?
+-					this.SetBoundsCore(0, 0, 0, 0, BoundsSpecified.None);
+-
+-					ThemeEngine.Current.CalcMenuBarSize (DeviceContext, menu.Handle, ClientSize.Width);
++						int menuHeight = ThemeEngine.Current.CalcMenuBarSize (DeviceContext, menu.Handle, ClientSize.Width);
++						UpdateBounds(bounds.X, bounds.Y, bounds.Width, bounds.Height, ClientSize.Width, ClientSize.Height - menuHeight);
++					} else
++						UpdateBounds();
+ 				}
+ 			}
+ 		}
+@@ -1274,7 +1275,14 @@
+ 				y = maximum_size.Height;
+ 			}
+ 
+-			base.SetClientSizeCore (x, y);
++			Rectangle ClientRect = new Rectangle(0, 0, x, y);
++			Rectangle WindowRect;
++			CreateParams cp = this.CreateParams;
++			
++			IntPtr menu_handle = (menu == null)?IntPtr.Zero:menu.Handle;
++
++			if (XplatUI.CalculateWindowRect(Handle, ref ClientRect, cp.Style, cp.ExStyle, menu_handle, out WindowRect) )
++				SetBoundsCore(bounds.X, bounds.Y, WindowRect.Width, WindowRect.Height, BoundsSpecified.Size);
+ 		}
+ 
+ 		[EditorBrowsable(EditorBrowsableState.Advanced)]

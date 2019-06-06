@@ -1,0 +1,656 @@
+Index: System.Windows.Forms/ChangeLog
+===================================================================
+--- System.Windows.Forms/ChangeLog	(revision 71941)
++++ System.Windows.Forms/ChangeLog	(working copy)
+@@ -1,3 +1,42 @@
++2007-01-29  Chris Toshok  <toshok@ximian.com>
++
++	* AccessibleObject.cs: we need to make owner internal again to fix
++	some of ControlAccessibleObject.
++
++	* Control.cs: lots of changes here.  add support for WM_CREATE,
++	for which we generate OnHandleCreated.  Remove the OnHandleCreated
++	call from CreateHandle.  Also add support for WM_SHOWWINDOW where
++	we create child controls.  leave the MonoTODO's for the
++	accessibility calls, but fix the exceptions so the tests pass.
++
++	Add the InvalidOperationExceptions to Invoke methods, and remove a
++	couple of InvokeInternal methods we aren't using.
++	
++	Also, add a couple of CreateHandle calls in places where we know
++	the handles are being created but our code doesn't reference
++	.Handle.
++
++	* XplatUIX11.cs: Map/Unmap X events correspond to WM_SHOWWINDOW,
++	although we don't populate the wParam properly.
++	(CreateWindow): generate WM_CREATE and, if WS_VISIBLE is set,
++	WM_SHOWWINDOW.
++
++	* Form.cs (.ctor): remove the call to UpdateBounds. we don't need
++	to call it.
++	(set_MdiParent): don't recreate the handle unless it's been
++	created already.
++	(get_CreateParams):
++	
++	* MdiClient.cs (OnResize): don't InvalidateNC Parent.Handle unless
++	it's created.
++
++	* NativeWindow.cs: this is probably the weirdest part of the
++	patch.  We need a way to link up the window being created to the
++	WM_CREATE message.  Since we can only be creating one window at a
++	time on a given thread, we keep track of a per-thread reference so
++	we can dispatch it properly.
++	
++
+ x2007-01-29  Chris Toshok  <toshok@ximian.com>
+ 
+ 	* XplatUIX11.cs: don't crash, and remove the icon if the user has
+Index: System.Windows.Forms/NativeWindow.cs
+===================================================================
+--- System.Windows.Forms/NativeWindow.cs	(revision 71941)
++++ System.Windows.Forms/NativeWindow.cs	(working copy)
+@@ -31,6 +31,7 @@
+ using System.Runtime.Remoting;
+ using System.Runtime.InteropServices;
+ using System.Runtime.CompilerServices;
++using System.Threading;
+ using System.Collections;
+ using System.Diagnostics;
+ 
+@@ -40,6 +41,9 @@
+ 		internal IntPtr			window_handle;
+ 		static internal Hashtable	window_collection = new Hashtable();
+ 
++		[ThreadStatic]
++		static NativeWindow WindowCreating;
++
+ 		#region Public Constructors
+ 		public NativeWindow()
+ 		{
+@@ -88,9 +92,8 @@
+ 		public void AssignHandle(IntPtr handle)
+ 		{
+ 			lock (window_collection) {
+-				if (window_handle != IntPtr.Zero) {
++				if (window_handle != IntPtr.Zero)
+ 					window_collection.Remove(window_handle);
+-				}
+ 				window_handle=handle;
+ 				window_collection.Add(window_handle, this);
+ 			}
+@@ -100,14 +103,19 @@
+ 		public virtual void CreateHandle(CreateParams create_params)
+ 		{
+ 			if (create_params != null) {
++				WindowCreating = this;
++
+ 				window_handle=XplatUI.CreateWindow(create_params);
+ 
++				WindowCreating = null;
++
+ 				if (window_handle != IntPtr.Zero) {
+ 					lock (window_collection) {
+-						window_collection.Add(window_handle, this);
++						window_collection[window_handle] = this;
+ 					}
+ 				}
+ 			}
++
+ 		}
+ 
+ 		public void DefWndProc(ref Message m)
+@@ -169,6 +177,16 @@
+ 
+ 				if (window != null)
+ 					window.WndProc(ref m);
++				else if (WindowCreating != null) {
++					// we need to do this AssignHandle here instead of relying on
++					// Control.WndProc to do it, because subclasses can override
++					// WndProc, install their own WM_CREATE block, and look at
++					// this.Handle, and it needs to be set.  Otherwise, we end up
++					// recursively creating windows and emitting WM_CREATE.
++					if (WindowCreating.window_handle == IntPtr.Zero)
++						WindowCreating.AssignHandle (hWnd);
++					WindowCreating.WndProc (ref m);
++				}
+ 				else
+ 					m.Result=XplatUI.DefWndProc(ref m);
+ 			}
+Index: System.Windows.Forms/MdiClient.cs
+===================================================================
+--- System.Windows.Forms/MdiClient.cs	(revision 71941)
++++ System.Windows.Forms/MdiClient.cs	(working copy)
+@@ -189,7 +189,7 @@
+ 		{
+ 			base.OnResize (e);
+ 
+-			if (Parent != null)
++			if (Parent != null && Parent.IsHandleCreated)
+ 				XplatUI.InvalidateNC (Parent.Handle);
+ 			// Should probably make this into one loop
+ 			SizeScrollBars ();
+Index: System.Windows.Forms/Form.cs
+===================================================================
+--- System.Windows.Forms/Form.cs	(revision 71941)
++++ System.Windows.Forms/Form.cs	(working copy)
+@@ -248,9 +248,6 @@
+ 			owned_forms = new Form.ControlCollection(this);
+ 			transparency_key = Color.Empty;
+ 
+-			// FIXME: this should disappear just as soon as the handle creation is done in the right place (here is too soon()
+-			UpdateBounds();
+-
+ 		}
+ 		#endregion	// Public Constructor & Destructor
+ 
+@@ -677,7 +674,8 @@
+ 					mdi_parent.MdiContainer.Controls.Add (this);
+ 					mdi_parent.MdiContainer.Controls.SetChildIndex (this, 0);
+ 
+-					RecreateHandle ();
++					if (IsHandleCreated)
++						RecreateHandle ();
+ 
+ 				} else if (mdi_parent != null) {
+ 					mdi_parent = null;
+@@ -686,7 +684,8 @@
+ 					window_manager = null;
+ 					FormBorderStyle = form_border_style;
+ 
+-					RecreateHandle ();
++					if (IsHandleCreated)
++						RecreateHandle ();
+ 				}
+ 			}
+ 		}
+@@ -1966,7 +1965,8 @@
+ 		}
+ 
+ 		[EditorBrowsable(EditorBrowsableState.Advanced)]
+-		protected override void SetVisibleCore(bool value) {
++		protected override void SetVisibleCore(bool value)
++		{
+ 			is_changing_visible_state = true;
+ 			has_been_visible = value || has_been_visible;
+ 			base.SetVisibleCore (value);
+Index: System.Windows.Forms/XplatUIX11.cs
+===================================================================
+--- System.Windows.Forms/XplatUIX11.cs	(revision 71941)
++++ System.Windows.Forms/XplatUIX11.cs	(working copy)
+@@ -1488,6 +1488,7 @@
+ 					if (hwnd.client_window == xevent.MapEvent.window) {
+ 						hwnd.mapped = true;
+ 					}
++					hwnd.Queue.EnqueueLocked (xevent);
+ 					break;
+ 				}
+ 
+@@ -1495,6 +1496,7 @@
+ 					if (hwnd.client_window == xevent.MapEvent.window) {
+ 						hwnd.mapped = false;
+ 					}
++					hwnd.Queue.EnqueueLocked (xevent);
+ 					break;
+ 				}
+ 
+@@ -2455,9 +2457,13 @@
+ 
+ 			// Set caption/window title
+ 			Text(hwnd.Handle, cp.Caption);
+-			
++
++			SendMessage (hwnd.Handle, Msg.WM_CREATE, (IntPtr)1, IntPtr.Zero /* XXX unused */);
+ 			SendParentNotify (hwnd.Handle, Msg.WM_CREATE, int.MaxValue, int.MaxValue);
+ 
++			if (StyleSet (cp.Style, WindowStyles.WS_VISIBLE))
++				SendMessage (hwnd.Handle, Msg.WM_SHOWWINDOW, IntPtr.Zero, (IntPtr)1);
++
+ 			return hwnd.Handle;
+ 		}
+ 
+@@ -3690,6 +3696,28 @@
+ 					goto ProcessNextMessage;
+ 				}
+ 
++				case XEventName.MapNotify: {
++					if (client) {
++						hwnd.mapped = true;
++						msg.message = Msg.WM_SHOWWINDOW;
++						msg.lParam = (IntPtr) 1;
++						// XXX we're missing the wParam..
++						break;
++					}
++					goto ProcessNextMessage;
++				}
++
++				case XEventName.UnmapNotify: {
++					if (client) {
++						hwnd.mapped = false;
++						msg.message = Msg.WM_SHOWWINDOW;
++						msg.lParam = (IntPtr) 0;
++						// XXX we're missing the wParam..
++						break;
++					}
++					goto ProcessNextMessage;
++				}
++
+ 				case XEventName.Expose: {
+ 					if (ThreadQueue(Thread.CurrentThread).PostQuitState || !hwnd.Mapped) {
+ 						if (client) {
+Index: System.Windows.Forms/Control.cs
+===================================================================
+--- System.Windows.Forms/Control.cs	(revision 71941)
++++ System.Windows.Forms/Control.cs	(working copy)
+@@ -201,13 +201,16 @@
+ 		#region Public Classes
+ 		[ComVisible(true)]
+ 		public class ControlAccessibleObject : AccessibleObject {
+-			Control owner;
++			IntPtr handle;
+ 
+ 			#region ControlAccessibleObject Constructors
+ 			public ControlAccessibleObject(Control ownerControl)
+ 				: base (ownerControl)
+ 			{
+-				this.owner = ownerControl;
++				if (ownerControl == null)
++					throw new ArgumentNullException ("owner");
++
++				handle = ownerControl.Handle;
+ 			}
+ 			#endregion	// ControlAccessibleObject Constructors
+ 
+@@ -226,7 +229,7 @@
+ 
+ 			public IntPtr Handle {
+ 				get {
+-					return owner.Handle;
++					return handle;
+ 				}
+ 
+ 				set {
+@@ -258,7 +261,7 @@
+ 
+ 			public Control Owner {
+ 				get {
+-					return owner;
++					return base.owner;
+ 				}
+ 			}
+ 
+@@ -281,14 +284,13 @@
+ 				return base.GetHelpTopic (out FileName);
+ 			}
+ 
+-			[MonoTODO("Implement this and tie it into Control.AccessibilityNotifyClients")]
++			[MonoTODO ("Implement this")]
+ 			public void NotifyClients(AccessibleEvents accEvent) {
+ 				throw new NotImplementedException();
+ 			}
+ 
+-			[MonoTODO("Implement this and tie it into Control.AccessibilityNotifyClients")]
++			[MonoTODO ("Implement this")]
+ 			public void NotifyClients(AccessibleEvents accEvent, int childID) {
+-				throw new NotImplementedException();
+ 			}
+ 
+ 			public override string ToString() {
+@@ -1130,9 +1132,8 @@
+ 			if (!disposing) {
+ 				Control p = this;
+ 				do {
+-					if (!p.IsHandleCreated) {
+-						throw new InvalidOperationException("Cannot call Invoke or InvokeAsync on a control until the window handle is created");
+-					}
++					if (!p.IsHandleCreated)
++						throw new InvalidOperationException("Cannot call Invoke or BeginInvoke on a control until the window handle is created");
+ 					p = p.parent;
+ 				} while (p != null);
+ 			}
+@@ -1808,11 +1809,15 @@
+ 		[DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+ 		public string AccessibleDefaultActionDescription {
+ 			get {
+-				return AccessibilityObject.default_action;
++				if (accessibility_object != null)
++					return accessibility_object.default_action;
++				else
++					return null;
+ 			}
+ 
+ 			set {
+-				AccessibilityObject.default_action=value;
++				if (accessibility_object != null)
++					accessibility_object.default_action = value;
+ 			}
+ 		}
+ 
+@@ -1821,11 +1826,15 @@
+ 		[MWFCategory("Accessibility")]
+ 		public string AccessibleDescription {
+ 			get {
+-				return AccessibilityObject.description;
++				if (accessibility_object != null)
++					return accessibility_object.description;
++				else
++					return null;
+ 			}
+ 
+ 			set {
+-				AccessibilityObject.description=value;
++				if (accessibility_object != null)
++					accessibility_object.description = value;
+ 			}
+ 		}
+ 
+@@ -1834,11 +1843,15 @@
+ 		[MWFCategory("Accessibility")]
+ 		public string AccessibleName {
+ 			get {
+-				return AccessibilityObject.Name;
++				if (accessibility_object != null)
++					return accessibility_object.Name;
++				else
++					return null;
+ 			}
+ 
+ 			set {
+-				AccessibilityObject.Name=value;
++				if (accessibility_object != null)
++					accessibility_object.Name = value;
+ 			}
+ 		}
+ 
+@@ -1846,11 +1859,15 @@
+ 		[MWFDescription("Role of the control"), MWFCategory("Accessibility")]
+ 		public AccessibleRole AccessibleRole {
+ 			get {
+-				return AccessibilityObject.role;
++				if (accessibility_object != null)
++					return accessibility_object.role;
++				else
++					return AccessibleRole.Default;
+ 			}
+ 
+ 			set {
+-				AccessibilityObject.role=value;
++				if (accessibility_object != null)
++					accessibility_object.role = value;
+ 			}
+ 		}
+ 
+@@ -2110,12 +2127,13 @@
+ 			}
+ 
+ 			set {
+-				if (this.IsHandleCreated && value != is_captured) {
++				if (value != is_captured) {
+ 					if (value) {
+ 						is_captured = true;
+-						XplatUI.GrabWindow(this.window.Handle, IntPtr.Zero);
++						XplatUI.GrabWindow(Handle, IntPtr.Zero);
+ 					} else {
+-						XplatUI.UngrabWindow(this.window.Handle);
++						if (IsHandleCreated)
++							XplatUI.UngrabWindow(Handle);
+ 						is_captured = false;
+ 					}
+ 				}
+@@ -3197,7 +3215,8 @@
+ 			if (parent != null) {
+ 				parent.child_controls.SetChildIndex(this, 0);
+ 				parent.Refresh();
+-			} else {
++			}
++			else if (IsHandleCreated) {
+ 				XplatUI.SetZOrder(Handle, IntPtr.Zero, false, false);
+ 			}
+ 		}
+@@ -3229,14 +3248,6 @@
+ 				is_created = true;
+ 			}
+ 
+-			Control [] controls = child_controls.GetAllControls ();
+-			for (int i=0; i<controls.Length; i++) {
+-				if (controls [i].is_visible)
+-					controls [i].CreateControl ();
+-			}
+-
+-			UpdateChildrenZOrder();
+-
+ 			if (binding_context == null) {	// seem to be sent whenever it's null?
+ 				OnBindingContextChanged(EventArgs.Empty);
+ 			}
+@@ -3252,7 +3263,10 @@
+ 		}
+ 
+ 		public DragDropEffects DoDragDrop(object data, DragDropEffects allowedEffects) {
+-			return XplatUI.StartDrag(this.window.Handle, data, allowedEffects);
++			if (IsHandleCreated)
++				return XplatUI.StartDrag(Handle, data, allowedEffects);
++			else
++				return DragDropEffects.None;
+ 		}
+ 
+ 		[EditorBrowsable(EditorBrowsableState.Advanced)]
+@@ -3293,6 +3307,10 @@
+ 		}
+ 
+ 		public Control GetChildAtPoint(Point pt) {
++			// MS's version causes the handle to be created.  The stack trace shows that get_Handle is called here, but
++			// we'll just call CreateHandle instead.
++			CreateHandle ();
++			
+ 			// Microsoft's version of this function doesn't seem to work, so I can't check
+ 			// if we only consider children or also grandchildren, etc.
+ 			// I'm gonna say 'children only'
+@@ -3412,6 +3430,13 @@
+ 		}
+ 
+ 		public object Invoke (Delegate method, object[] args) {
++			Control p = this;
++			do {
++				if (!p.IsHandleCreated)
++					throw new InvalidOperationException("Cannot call Invoke or BeginInvoke on a control until the window handle is created");
++				p = p.parent;
++			} while (p != null);
++			
+ 			if (!this.InvokeRequired) {
+ 				return method.DynamicInvoke(args);
+ 			}
+@@ -3420,19 +3445,6 @@
+ 			return EndInvoke(result);
+ 		}
+ 
+-		internal object InvokeInternal (Delegate method, bool disposing) {
+-			return InvokeInternal(method, null, disposing);
+-		}
+-
+-		internal object InvokeInternal (Delegate method, object[] args, bool disposing) {
+-			if (!this.InvokeRequired) {
+-				return method.DynamicInvoke(args);
+-			}
+-
+-			IAsyncResult result = BeginInvokeInternal (method, args, disposing);
+-			return EndInvoke(result);
+-		}
+-
+ 		[EditorBrowsable(EditorBrowsableState.Advanced)]
+ 		public void PerformLayout() {
+ 			PerformLayout(null, null);
+@@ -3546,7 +3558,8 @@
+ 
+ 		[EditorBrowsable(EditorBrowsableState.Never)]
+ 		public void ResetBindings() {
+-			data_bindings.Clear();
++			if (data_bindings != null)
++				data_bindings.Clear();
+ 		}
+ 
+ 		[EditorBrowsable(EditorBrowsableState.Never)]
+@@ -3623,8 +3636,8 @@
+ #if DebugFocus
+ 		private void printTree(Control c, string t) {
+ 			foreach(Control i in c.child_controls) {
+-				Console.WriteLine("{2}{0}.TabIndex={1}", i, i.tab_index, t);
+-				printTree(i, t+"\t");
++				Console.WriteLine ("{2}{0}.TabIndex={1}", i, i.tab_index, t);
++				printTree (i, t+"\t");
+ 			}
+ 		}
+ #endif
+@@ -3687,18 +3700,13 @@
+ 			}
+ 
+ 			SetBoundsCore(x, y, width, height, specified);
+-			if (parent != null) {
++			if (parent != null)
+ 				parent.PerformLayout(this, "Bounds");
+-			}
+ 		}
+ 
+ 		public void Show ()
+ 		{
+-			if (!is_created) {
+-				this.CreateControl();
+-			}
+-
+-			this.Visible=true;
++			this.Visible = true;
+ 		}
+ 
+ 		public void SuspendLayout() {
+@@ -3714,9 +3722,9 @@
+ 
+ 		#region Protected Instance Methods
+ 		[EditorBrowsable(EditorBrowsableState.Advanced)]
+-		[MonoTODO("Implement this and tie it into Control.ControlAccessibleObject.NotifyClients")]
+ 		protected void AccessibilityNotifyClients(AccessibleEvents accEvent, int childID) {
+-			throw new NotImplementedException();
++			if (accessibility_object != null && accessibility_object is ControlAccessibleObject)
++				((ControlAccessibleObject)accessibility_object).NotifyClients (accEvent, childID);
+ 		}
+ 
+ 		[EditorBrowsable(EditorBrowsableState.Advanced)]
+@@ -3761,8 +3769,8 @@
+ 
+ 				children = child_controls.GetAllControls ();
+ 				for (int i = 0; i < children.Length; i++ ) {
+-					if (!children[i].RecreatingHandle)
+-						XplatUI.SetParent(children[i].Handle, window.Handle); 
++					if (!children[i].RecreatingHandle && children[i].IsHandleCreated)
++						XplatUI.SetParent(children[i].Handle, Handle); 
+ 				}
+ 
+ 				UpdateStyles();
+@@ -3773,8 +3781,6 @@
+ 					XplatUI.SetBorderStyle(window.Handle, (FormBorderStyle)border_style);
+ 				}
+ 				UpdateBounds();
+-
+-				OnHandleCreated(EventArgs.Empty);
+ 			}
+ 		}
+ 
+@@ -3795,7 +3801,8 @@
+ #if NET_2_0
+ 		protected virtual AccessibleObject GetAccessibilityObjectById (int objectId)
+ 		{
+-			throw new NotImplementedException ();
++			// XXX need to implement this.
++			return null;
+ 		}
+ #endif
+ 
+@@ -3836,6 +3843,9 @@
+ 		}
+ 
+ 		protected virtual bool IsInputChar (char charCode) {
++			// XXX on MS.NET this method causes the handle to be created..
++			CreateHandle ();
++
+ 			return true;
+ 		}
+ 
+@@ -3970,6 +3980,9 @@
+ 
+ 		[EditorBrowsable(EditorBrowsableState.Advanced)]
+ 		protected void RecreateHandle() {
++			if (!IsHandleCreated)
++				return;
++
+ #if DebugRecreate
+ 			Console.WriteLine("Recreating control {0}", XplatUI.Window(window.Handle));
+ #endif
+@@ -4170,6 +4183,9 @@
+ 				throw new ArgumentException ("Cannot change toplevel style of a parented control.");
+ 			}
+ 
++			// XXX MS.NET causes handle to be created here
++			CreateHandle ();
++
+ 			if (this is Form) {
+ 				if (value == true) {
+ 					if (!Visible) {
+@@ -4245,6 +4261,9 @@
+ 
+ 		[EditorBrowsable(EditorBrowsableState.Advanced)]
+ 		protected void UpdateBounds() {
++			if (!IsHandleCreated)
++				return;
++
+ 			int	x;
+ 			int	y;
+ 			int	width;
+@@ -4252,10 +4271,6 @@
+ 			int	client_width;
+ 			int	client_height;
+ 
+-			if (!IsHandleCreated) {
+-				CreateHandle();
+-			}
+-
+ 			XplatUI.GetWindowPos(this.Handle, this is Form, out x, out y, out width, out height, out client_width, out client_height);
+ 
+ 			UpdateBounds(x, y, width, height, client_width, client_height);
+@@ -4456,7 +4471,26 @@
+ 
+ 				return;
+ 			}
+-					
++
++			case Msg.WM_SHOWWINDOW: {
++				if (m.LParam.ToInt32() != 0) {
++					/* if we're being shown, make sure our child controls all have their handles created */
++					Control [] controls = child_controls.GetAllControls ();
++					for (int i=0; i<controls.Length; i++) {
++						if (controls [i].is_visible)
++							controls [i].CreateControl ();
++					}
++
++					UpdateChildrenZOrder ();
++				}
++				break;
++			}
++
++			case Msg.WM_CREATE: {
++				OnHandleCreated(EventArgs.Empty);
++				break;
++			}
++
+ 			case Msg.WM_ERASEBKGND: {
+ 				// The DefWndProc will never have to handle this, we always paint the background in managed code
+ 				// In theory this code would look at ControlStyles.AllPaintingInWmPaint and and call OnPaintBackground
+Index: System.Windows.Forms/AccessibleObject.cs
+===================================================================
+--- System.Windows.Forms/AccessibleObject.cs	(revision 71941)
++++ System.Windows.Forms/AccessibleObject.cs	(working copy)
+@@ -38,7 +38,7 @@
+ 		#region Private Variables
+ 		internal string		name;
+ 		internal string		value;
+-		private Control owner;
++		internal Control owner;
+ 		internal AccessibleRole	role;
+ 		internal AccessibleStates	state;
+ 		internal string		default_action;
