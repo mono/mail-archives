@@ -1,0 +1,1774 @@
+Index: Core/src/MonoDevelop.Core.Gui/MonoDevelop.Core.Gui.Codons/CommandCodon.cs
+===================================================================
+--- Core/src/MonoDevelop.Core.Gui/MonoDevelop.Core.Gui.Codons/CommandCodon.cs	(revision 81952)
++++ Core/src/MonoDevelop.Core.Gui/MonoDevelop.Core.Gui.Codons/CommandCodon.cs	(working copy)
+@@ -48,7 +48,7 @@
+ 		[NodeAttribute ("_description", "Description of the command")]
+ 		string _description;
+ 		
+-		[NodeAttribute ("shortcut", "Key combination that triggers the command. Control and Alt modifiers can be specified using '|' as separator. For example 'Control|d'")]
++		[NodeAttribute ("shortcut", "Key combination that triggers the command. Control, Alt and Shift modifiers can be specified using '+' as a separator. Multi-state key bindings can be specified using a '|' between the mode and accel. For example 'Control+d' or 'Control+x|Control+s'")]
+ 		string shortcut;
+ 		
+ 		[NodeAttribute("icon", "Icon of the command. The provided value must be a registered stock icon. A resource icon can also be specified using 'res:' as prefix for the name, for example: 'res:customIcon.png'")]
+@@ -152,7 +152,9 @@
+ 			
+ 			if (icon != null)
+ 				cmd.Icon = ResourceService.GetStockId (Addin, icon);
+-			cmd.AccelKey = shortcut;
++			
++			cmd.AccelKey = KeyBindingManager.CanonicalizeBinding (shortcut);
++			
+ 			cmd.DisabledVisible = disabledVisible;
+ 			
+ 			return cmd;
+Index: Core/src/MonoDevelop.Core.Gui/MonoDevelop.Core.Gui/CommandService.cs
+===================================================================
+--- Core/src/MonoDevelop.Core.Gui/MonoDevelop.Core.Gui/CommandService.cs	(revision 81952)
++++ Core/src/MonoDevelop.Core.Gui/MonoDevelop.Core.Gui/CommandService.cs	(working copy)
+@@ -54,7 +54,7 @@
+ 		void OnExtensionChange (object s, ExtensionNodeEventArgs args)
+ 		{
+ 			if (args.Change == ExtensionChange.Add)
+-				manager.RegisterCommand (args.ExtensionObject as Command, null);
++				manager.RegisterCommand (args.ExtensionObject as Command);
+ 			else
+ 				manager.UnregisterCommand (args.ExtensionObject as Command);
+ 		}
+Index: Core/src/MonoDevelop.Ide/MonoDevelop.Ide.Gui.OptionPanels/KeyBindingsPanel.cs
+===================================================================
+--- Core/src/MonoDevelop.Ide/MonoDevelop.Ide.Gui.OptionPanels/KeyBindingsPanel.cs	(revision 0)
++++ Core/src/MonoDevelop.Ide/MonoDevelop.Ide.Gui.OptionPanels/KeyBindingsPanel.cs	(revision 0)
+@@ -0,0 +1,308 @@
++//
++// KeyBindingPanel.cs
++//
++// Authors: Jeffrey Stedfast <fejj@novell.com>
++//          Balaji Rao <balajirrao@gmail.com>
++//
++// Copyright (C) 2007 Novell, Inc (http://www.novell.com)
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++
++using MonoDevelop.Core.Gui.Dialogs;
++using MonoDevelop.Components.Commands;
++using Mono.Addins;
++using Gtk;
++
++namespace MonoDevelop.Ide.Gui.OptionPanels {
++	public partial class KeyBindingsPanel : Gtk.Bin, IDialogPanel {
++		static readonly int commandCol = 0;
++		static readonly int labelCol = 1;
++		static readonly int bindingCol = 2;
++		static readonly int descCol = 3;
++		
++		bool accelIncomplete = false;
++		bool accelComplete = false;
++		ListStore keyStore;
++		string mode;
++		
++		public KeyBindingsPanel ()
++		{
++			this.Build ();
++			
++			keyStore = new ListStore (typeof (Command), typeof (string), typeof (string), typeof (string));
++			keyTreeView.Model = keyStore;
++			keyTreeView.AppendColumn ("Command", new CellRendererText (), "text", labelCol);
++			keyTreeView.AppendColumn ("Key Binding", new CellRendererText (), "text", bindingCol);
++			keyTreeView.AppendColumn ("Description", new CellRendererText (), "text", descCol);
++			
++			keyTreeView.Selection.Changed += new EventHandler (OnKeysTreeViewSelectionChange);
++			
++			accelEntry.KeyPressEvent += new KeyPressEventHandler (OnAccelEntryKeyPress);
++			accelEntry.KeyReleaseEvent += new KeyReleaseEventHandler (OnAccelEntryKeyRelease);
++			updateButton.Clicked += new EventHandler (OnUpdateButtonClick);
++			
++			// TODO: implement a KeyBindingService
++			
++			schemeCombo.AppendText ("Current");
++			
++			// TODO: query the KeyBindingService for available keybinding templates (Emacs, VisualStudio.Net, etc)
++			// and fill in the schemeCombo with them.
++			
++			schemeCombo.Active = 0;
++			schemeCombo.Changed += new EventHandler (OnKeyBindingSchemeChanged);
++		}
++		
++		public bool StorePanelContents ()
++		{
++			TreeModel model = (TreeModel) keyStore;
++			Command command;
++			TreeIter iter;
++			
++			if (!model.GetIterFirst (out iter))
++				return true;
++			
++			do {
++				// FIXME: we need to save to a config file too... handled by KeyBindingService?
++				command = (Command) model.GetValue (iter, commandCol);
++				command.AccelKey = (string) model.GetValue (iter, bindingCol);
++			} while (model.IterNext (ref iter));
++			
++			return true;
++		}
++		
++		public void LoadPanelContents ()
++		{
++			SortedDictionary<string, Command> commands = new SortedDictionary<string, Command> ();
++			object[] cmds = AddinManager.GetExtensionObjects ("/SharpDevelop/Commands");
++			
++			foreach (object c in cmds) {
++				if (c is Command) {
++					Command cmd = c as Command;
++					string label = cmd.Text.Replace ("_", String.Empty);
++					
++					if (commands.ContainsKey (label)) {
++						if (commands[label].AccelKey == null)
++							commands[label] = cmd;
++					} else {
++						commands.Add (label, cmd);
++					}
++				}
++			}
++			
++			foreach (KeyValuePair<string, Command> pair in commands) {
++				Command cmd = pair.Value;
++				string label = pair.Key;
++				
++				keyStore.AppendValues (cmd, label, cmd.AccelKey != null ? cmd.AccelKey : String.Empty, cmd.Description);
++			}
++		}
++		
++		void OnKeyBindingSchemeChanged (object sender, EventArgs e)
++		{
++//			TreeModel model = (TreeModel) keyStore;
++//			ComboBox combo = (ComboBox) sender;
++//			Command command;
++//			string binding;
++//			TreeIter iter;
++//			
++//			if (!model.GetIterFirst (out iter))
++//				return;
++//			
++//			if (combo.Active > 0) {
++//				// Load a key binding template
++//				KeyBindingService.LoadTemplate (combo.ActiveText);
++//				
++//				do {
++//					command = (Command) model.GetValue (iter, commandCol);
++//					binding = KeyBindingService.TemplateBinding (command);
++//					model.SetValue (iter, bindingCol, binding);
++//				} while (model.IterNext (ref iter));
++//				
++//				KeyBindingService.UnloadTemplate ();
++//			} else {
++//				// Restore back to current settings...
++//				
++//				do {
++//					command = (Command) model.GetValue (iter, commandCol);
++//					model.SetValue (iter, bindingCol, command.AccelKey != null ? command.AccelKey : String.Empty);
++//				} while (model.IterNext (ref iter));
++//			}
++		}
++		
++		void OnKeysTreeViewSelectionChange (object sender, EventArgs e)
++		{
++			TreeSelection sel = sender as TreeSelection;
++			TreeModel model;
++			TreeIter iter;
++			
++			accelComplete = false;
++			
++			if (sel.GetSelected (out model, out iter)) {
++				accelEntry.Text = (string) model.GetValue (iter, bindingCol);
++				accelIncomplete = false;
++				accelComplete = true;
++			}
++		}
++		
++		[GLib.ConnectBefore]
++		void OnAccelEntryKeyPress (object sender, KeyPressEventArgs e)
++		{
++			Gdk.ModifierType mod = e.Event.State;
++			Gdk.Key key = e.Event.Key;
++			string accel;
++			
++			e.RetVal = true;
++			
++			if (accelComplete) {
++				accelEntry.Text = String.Empty;
++				accelIncomplete = false;
++				accelComplete = false;
++				mode = null;
++				
++				if (key.Equals (Gdk.Key.BackSpace))
++					return;
++			}
++			
++			accelComplete = false;
++			if ((accel = KeyBindingManager.AccelFromKey (key, mod)) != null) {
++				accelEntry.Text = KeyBindingManager.Binding (mode, accel);
++				accelIncomplete = false;
++				if (mode != null)
++					accelComplete = true;
++				else
++					mode = accel;
++			} else {
++				accel = mode != null ? mode + "|" : String.Empty;
++				accelIncomplete = true;
++				
++				if ((mod & Gdk.ModifierType.ControlMask) != 0)
++					accel += "Control+";
++				if ((mod & Gdk.ModifierType.Mod1Mask) != 0 ||
++				    (key.Equals (Gdk.Key.Meta_L) || key.Equals (Gdk.Key.Meta_R)))
++					accel += "Alt+";
++				if ((mod & Gdk.ModifierType.ShiftMask) != 0)
++					accel += "Shift+";
++				
++				if (key.Equals (Gdk.Key.Control_L) || key.Equals (Gdk.Key.Control_R))
++					accel += "Control+";
++				else if (key.Equals (Gdk.Key.Alt_L) || key.Equals (Gdk.Key.Alt_R))
++					accel += "Alt+";
++				else if (key.Equals (Gdk.Key.Shift_L) || key.Equals (Gdk.Key.Shift_R))
++					accel += "Shift+";
++				
++				accelEntry.Text = accel;
++			}
++		}
++		
++		void OnAccelEntryKeyRelease (object sender, KeyReleaseEventArgs e)
++		{
++			if (accelIncomplete)
++				accelEntry.Text = mode != null ? mode : String.Empty;
++		}
++		
++		void OnUpdateButtonClick (object sender, EventArgs e)
++		{
++			TreeSelection sel = keyTreeView.Selection;
++			TreeModel model;
++			TreeIter iter;
++			
++			if (sel.GetSelected (out model, out iter))
++				keyStore.SetValue (iter, bindingCol, accelEntry.Text);
++		}
++		
++#region Cut & Paste from abstract option panel
++		object customizationObject = null;
++		bool wasActivated = false;
++		bool isFinished = true;
++		
++		public Widget Control {
++			get { return this; }
++		}
++		
++		public virtual Gtk.Image Icon {
++			get { return null; }
++		}
++		
++		public bool WasActivated {
++			get { return wasActivated; }
++		}
++		
++		public virtual object CustomizationObject {
++			get { return customizationObject; }
++			set {
++				customizationObject = value;
++				OnCustomizationObjectChanged ();
++			}
++		}
++		
++		public virtual bool EnableFinish {
++			get { return isFinished; }
++			set {
++				if (isFinished != value) {
++					isFinished = value;
++					OnEnableFinishChanged ();
++				}
++			}
++		}
++		
++		public virtual bool ReceiveDialogMessage (DialogMessage message)
++		{
++			try {
++				switch (message) {
++				case DialogMessage.Activated:
++					if (!wasActivated) {
++						LoadPanelContents ();
++						wasActivated = true;
++					}
++					break;
++				case DialogMessage.OK:
++					if (wasActivated)
++						return StorePanelContents ();
++					break;
++				}
++			} catch (Exception ex) {
++				Services.MessageService.ShowError (ex);
++			}
++			
++			return true;
++		}
++		
++		protected virtual void OnEnableFinishChanged ()
++		{
++			if (EnableFinishChanged != null)
++				EnableFinishChanged (this, null);
++		}
++		
++		protected virtual void OnCustomizationObjectChanged ()
++		{
++			if (CustomizationObjectChanged != null)
++				CustomizationObjectChanged (this, null);
++		}
++		
++		public event EventHandler CustomizationObjectChanged;
++		public event EventHandler EnableFinishChanged;
++#endregion
++	}
++}
+Index: Core/src/MonoDevelop.Ide/MonoDevelop.Ide.addin.xml
+===================================================================
+--- Core/src/MonoDevelop.Ide/MonoDevelop.Ide.addin.xml	(revision 81952)
++++ Core/src/MonoDevelop.Ide/MonoDevelop.Ide.addin.xml	(working copy)
+@@ -903,6 +903,9 @@
+ 			<DialogPanel id = "SelectStyle"
+ 				         _label = "Visual Style"
+ 				         class = "MonoDevelop.Ide.Gui.OptionPanels.SelectStylePanel"/>
++			<DialogPanel id = "KeysBinding"
++				         _label = "Key Bindings"
++				         class = "MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel"/>				         
+ 			<DialogPanel id = "LoadSave"
+ 			             _label = "Load/Save"
+ 			             class = "MonoDevelop.Ide.Gui.OptionPanels.LoadSavePanel"/>
+Index: Core/src/MonoDevelop.Ide/MonoDevelop.Ide.mdp
+===================================================================
+--- Core/src/MonoDevelop.Ide/MonoDevelop.Ide.mdp	(revision 81952)
++++ Core/src/MonoDevelop.Ide/MonoDevelop.Ide.mdp	(working copy)
+@@ -300,6 +300,8 @@
+     <File name="./MonoDevelop.Ide.CodeTemplates/CodeTemplatePanel.cs" subtype="Code" buildaction="Compile" />
+     <File name="./MonoDevelop.Ide.CodeTemplates/EditTemplateGroupDialog.cs" subtype="Code" buildaction="Compile" />
+     <File name="./MonoDevelop.Ide.Gui.Pads/ILocationListPad.cs" subtype="Code" buildaction="Compile" />
++    <File name="./MonoDevelop.Ide.Gui.OptionPanels/KeyBindingsPanel.cs" subtype="Code" buildaction="Compile" />
++    <File name="./gtk-gui/MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel.cs" subtype="Code" buildaction="Compile" />
+   </Contents>
+   <References>
+     <ProjectReference type="Gac" localcopy="False" refto="gecko-sharp, Version=2.0.0.0, Culture=neutral, PublicKeyToken=ccf7d78a55e9f021" />
+@@ -322,10 +324,6 @@
+     <ProjectReference type="Project" localcopy="False" refto="MonoDevelop.Core.Gui" />
+     <ProjectReference type="Project" localcopy="False" refto="MonoDevelop.Projects" />
+     <ProjectReference type="Assembly" localcopy="False" refto="../../../contrib/Mono.Addins.dll" />
+-    <ProjectReference type="Gac" localcopy="True" refto="gtk-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
+-    <ProjectReference type="Gac" localcopy="True" refto="gdk-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
+-    <ProjectReference type="Gac" localcopy="True" refto="pango-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
+-    <ProjectReference type="Gac" localcopy="True" refto="atk-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
+     <ProjectReference type="Assembly" localcopy="False" refto="../../../contrib/log4net.dll" />
+     <ProjectReference type="Assembly" localcopy="False" refto="../../../contrib/Mono.Addins.Gui.dll" />
+     <ProjectReference type="Assembly" localcopy="False" refto="../../../contrib/Mono.Addins.Setup.dll" />
+@@ -334,7 +332,19 @@
+     <ProjectReference type="Gac" localcopy="True" refto="gnome-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
+     <ProjectReference type="Gac" localcopy="True" refto="gnome-vfs-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
+     <ProjectReference type="Gac" localcopy="True" refto="gtkhtml-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
++    <ProjectReference type="Gac" localcopy="True" refto="glib-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
++    <ProjectReference type="Gac" localcopy="True" refto="pango-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
++    <ProjectReference type="Gac" localcopy="True" refto="atk-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
++    <ProjectReference type="Gac" localcopy="True" refto="gdk-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
++    <ProjectReference type="Gac" localcopy="True" refto="gtk-sharp, Version=2.8.0.0, Culture=neutral, PublicKeyToken=35e10195dab3c99f" />
+   </References>
++  <GtkDesignInfo partialTypes="True">
++    <ExportedWidgets>
++      <Widget>MonoDevelop.Ide.Gui.Dialogs.CombineEntryFeatureSelector</Widget>
++      <Widget>MonoDevelop.Ide.StandardHeaders.StandardHeaderPanel</Widget>
++      <Widget>MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel</Widget>
++    </ExportedWidgets>
++  </GtkDesignInfo>
+   <MonoDevelop.Autotools.MakefileInfo IntegrationEnabled="True" RelativeMakefileName="./Makefile.am" BuildTargetName="" CleanTargetName="" SyncReferences="True" IsAutotoolsProject="True" RelativeConfigureInPath="../../../">
+     <ExcludedFiles>
+       <File>./AssemblyInfo.cs</File>
+@@ -347,12 +357,6 @@
+     <AsmRefVar Sync="True" Name="REFS" Prefix="-r:" />
+     <ProjectRefVar Sync="True" Name="REFS" Prefix="-r:" />
+   </MonoDevelop.Autotools.MakefileInfo>
+-  <GtkDesignInfo partialTypes="True">
+-    <ExportedWidgets>
+-      <Widget>MonoDevelop.Ide.Gui.Dialogs.CombineEntryFeatureSelector</Widget>
+-      <Widget>MonoDevelop.Ide.StandardHeaders.StandardHeaderPanel</Widget>
+-    </ExportedWidgets>
+-  </GtkDesignInfo>
+   <MonoDevelop.Gettext.TranslationInfo />
+   <DeploymentInformation strategy="File">
+     <excludeFiles />
+Index: Core/src/MonoDevelop.Ide/gtk-gui/objects.xml
+===================================================================
+--- Core/src/MonoDevelop.Ide/gtk-gui/objects.xml	(revision 81952)
++++ Core/src/MonoDevelop.Ide/gtk-gui/objects.xml	(working copy)
+@@ -18,4 +18,17 @@
+       </itemgroup>
+     </signals>
+   </object>
++  <object type="MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel" palette-category="widget" allow-children="false" base-type="Gtk.Bin">
++    <itemgroups>
++      <itemgroup label="KeyBindingsPanel Properties">
++        <property name="EnableFinish" />
++      </itemgroup>
++    </itemgroups>
++    <signals>
++      <itemgroup label="KeyBindingsPanel Signals">
++        <signal name="CustomizationObjectChanged" />
++        <signal name="EnableFinishChanged" />
++      </itemgroup>
++    </signals>
++  </object>
+ </objects>
+\ No newline at end of file
+Index: Core/src/MonoDevelop.Ide/gtk-gui/MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel.cs
+===================================================================
+--- Core/src/MonoDevelop.Ide/gtk-gui/MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel.cs	(revision 0)
++++ Core/src/MonoDevelop.Ide/gtk-gui/MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel.cs	(revision 0)
+@@ -0,0 +1,151 @@
++// ------------------------------------------------------------------------------
++//  <autogenerated>
++//      This code was generated by a tool.
++//      Mono Runtime Version: 2.0.50727.42
++// 
++//      Changes to this file may cause incorrect behavior and will be lost if 
++//      the code is regenerated.
++//  </autogenerated>
++// ------------------------------------------------------------------------------
++
++namespace MonoDevelop.Ide.Gui.OptionPanels {
++    
++    
++    public partial class KeyBindingsPanel {
++        
++        private Gtk.VBox vbox;
++        
++        private Gtk.HBox hbox1;
++        
++        private Gtk.Label labelScheme;
++        
++        private Gtk.ComboBox schemeCombo;
++        
++        private Gtk.ScrolledWindow scrolledwindow;
++        
++        private Gtk.TreeView keyTreeView;
++        
++        private Gtk.HBox hbox;
++        
++        private Gtk.Label labelEditBinding;
++        
++        private Gtk.Entry accelEntry;
++        
++        private Gtk.Button updateButton;
++        
++        protected virtual void Build() {
++            Stetic.Gui.Initialize();
++            // Widget MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel
++            Stetic.BinContainer.Attach(this);
++            this.Name = "MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel";
++            // Container child MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel.Gtk.Container+ContainerChild
++            this.vbox = new Gtk.VBox();
++            this.vbox.Name = "vbox";
++            this.vbox.Spacing = 6;
++            // Container child vbox.Gtk.Box+BoxChild
++            this.hbox1 = new Gtk.HBox();
++            this.hbox1.Name = "hbox1";
++            this.hbox1.Spacing = 6;
++            // Container child hbox1.Gtk.Box+BoxChild
++            this.labelScheme = new Gtk.Label();
++            this.labelScheme.Name = "labelScheme";
++            this.labelScheme.Xalign = 0F;
++            this.labelScheme.LabelProp = Mono.Unix.Catalog.GetString("Scheme:");
++            this.hbox1.Add(this.labelScheme);
++            Gtk.Box.BoxChild w1 = ((Gtk.Box.BoxChild)(this.hbox1[this.labelScheme]));
++            w1.Position = 0;
++            w1.Expand = false;
++            w1.Fill = false;
++            // Container child hbox1.Gtk.Box+BoxChild
++            this.schemeCombo = Gtk.ComboBox.NewText();
++            this.schemeCombo.Name = "schemeCombo";
++            this.hbox1.Add(this.schemeCombo);
++            Gtk.Box.BoxChild w2 = ((Gtk.Box.BoxChild)(this.hbox1[this.schemeCombo]));
++            w2.Position = 1;
++            w2.Expand = false;
++            w2.Fill = false;
++            this.vbox.Add(this.hbox1);
++            Gtk.Box.BoxChild w3 = ((Gtk.Box.BoxChild)(this.vbox[this.hbox1]));
++            w3.Position = 0;
++            w3.Expand = false;
++            w3.Fill = false;
++            // Container child vbox.Gtk.Box+BoxChild
++            this.scrolledwindow = new Gtk.ScrolledWindow();
++            this.scrolledwindow.CanFocus = true;
++            this.scrolledwindow.Name = "scrolledwindow";
++            this.scrolledwindow.VscrollbarPolicy = ((Gtk.PolicyType)(1));
++            this.scrolledwindow.HscrollbarPolicy = ((Gtk.PolicyType)(1));
++            this.scrolledwindow.ShadowType = ((Gtk.ShadowType)(1));
++            // Container child scrolledwindow.Gtk.Container+ContainerChild
++            this.keyTreeView = new Gtk.TreeView();
++            this.keyTreeView.CanFocus = true;
++            this.keyTreeView.Name = "keyTreeView";
++            this.scrolledwindow.Add(this.keyTreeView);
++            this.vbox.Add(this.scrolledwindow);
++            Gtk.Box.BoxChild w5 = ((Gtk.Box.BoxChild)(this.vbox[this.scrolledwindow]));
++            w5.Position = 1;
++            // Container child vbox.Gtk.Box+BoxChild
++            this.hbox = new Gtk.HBox();
++            this.hbox.Name = "hbox";
++            this.hbox.Spacing = 6;
++            // Container child hbox.Gtk.Box+BoxChild
++            this.labelEditBinding = new Gtk.Label();
++            this.labelEditBinding.Name = "labelEditBinding";
++            this.labelEditBinding.LabelProp = Mono.Unix.Catalog.GetString("Edit Binding");
++            this.hbox.Add(this.labelEditBinding);
++            Gtk.Box.BoxChild w6 = ((Gtk.Box.BoxChild)(this.hbox[this.labelEditBinding]));
++            w6.Position = 0;
++            w6.Expand = false;
++            w6.Fill = false;
++            // Container child hbox.Gtk.Box+BoxChild
++            this.accelEntry = new Gtk.Entry();
++            this.accelEntry.CanFocus = true;
++            this.accelEntry.Name = "accelEntry";
++            this.accelEntry.IsEditable = true;
++            this.accelEntry.InvisibleChar = '●';
++            this.hbox.Add(this.accelEntry);
++            Gtk.Box.BoxChild w7 = ((Gtk.Box.BoxChild)(this.hbox[this.accelEntry]));
++            w7.Position = 1;
++            // Container child hbox.Gtk.Box+BoxChild
++            this.updateButton = new Gtk.Button();
++            this.updateButton.CanFocus = true;
++            this.updateButton.Name = "updateButton";
++            this.updateButton.UseUnderline = true;
++            // Container child updateButton.Gtk.Container+ContainerChild
++            Gtk.Alignment w8 = new Gtk.Alignment(0.5F, 0.5F, 0F, 0F);
++            w8.Name = "GtkAlignment";
++            // Container child GtkAlignment.Gtk.Container+ContainerChild
++            Gtk.HBox w9 = new Gtk.HBox();
++            w9.Name = "GtkHBox1";
++            w9.Spacing = 2;
++            // Container child GtkHBox1.Gtk.Container+ContainerChild
++            Gtk.Image w10 = new Gtk.Image();
++            w10.Name = "image3";
++            w10.Pixbuf = Stetic.IconLoader.LoadIcon("gtk-apply", 20);
++            w9.Add(w10);
++            // Container child GtkHBox1.Gtk.Container+ContainerChild
++            Gtk.Label w12 = new Gtk.Label();
++            w12.Name = "GtkLabel";
++            w12.LabelProp = Mono.Unix.Catalog.GetString("Apply");
++            w12.UseUnderline = true;
++            w9.Add(w12);
++            w8.Add(w9);
++            this.updateButton.Add(w8);
++            this.hbox.Add(this.updateButton);
++            Gtk.Box.BoxChild w16 = ((Gtk.Box.BoxChild)(this.hbox[this.updateButton]));
++            w16.Position = 2;
++            w16.Expand = false;
++            w16.Fill = false;
++            this.vbox.Add(this.hbox);
++            Gtk.Box.BoxChild w17 = ((Gtk.Box.BoxChild)(this.vbox[this.hbox]));
++            w17.Position = 2;
++            w17.Expand = false;
++            w17.Fill = false;
++            this.Add(this.vbox);
++            if ((this.Child != null)) {
++                this.Child.ShowAll();
++            }
++            this.Show();
++        }
++    }
++}
+Index: Core/src/MonoDevelop.Ide/gtk-gui/gui.stetic
+===================================================================
+--- Core/src/MonoDevelop.Ide/gtk-gui/gui.stetic	(revision 81952)
++++ Core/src/MonoDevelop.Ide/gtk-gui/gui.stetic	(working copy)
+@@ -1700,4 +1700,124 @@
+       </widget>
+     </child>
+   </widget>
++  <widget class="Gtk.Bin" id="MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel" design-size="322 296">
++    <property name="MemberName" />
++    <child>
++      <widget class="Gtk.VBox" id="vbox">
++        <property name="MemberName" />
++        <property name="Spacing">6</property>
++        <child>
++          <widget class="Gtk.HBox" id="hbox1">
++            <property name="MemberName" />
++            <property name="Spacing">6</property>
++            <child>
++              <widget class="Gtk.Label" id="labelScheme">
++                <property name="MemberName" />
++                <property name="Xalign">0</property>
++                <property name="LabelProp" translatable="yes">Scheme:</property>
++              </widget>
++              <packing>
++                <property name="Position">0</property>
++                <property name="AutoSize">True</property>
++                <property name="Expand">False</property>
++                <property name="Fill">False</property>
++              </packing>
++            </child>
++            <child>
++              <widget class="Gtk.ComboBox" id="schemeCombo">
++                <property name="MemberName" />
++                <property name="IsTextCombo">True</property>
++                <property name="Items" translatable="yes" />
++              </widget>
++              <packing>
++                <property name="Position">1</property>
++                <property name="AutoSize">True</property>
++                <property name="Expand">False</property>
++                <property name="Fill">False</property>
++              </packing>
++            </child>
++          </widget>
++          <packing>
++            <property name="Position">0</property>
++            <property name="AutoSize">True</property>
++            <property name="Expand">False</property>
++            <property name="Fill">False</property>
++          </packing>
++        </child>
++        <child>
++          <widget class="Gtk.ScrolledWindow" id="scrolledwindow">
++            <property name="MemberName" />
++            <property name="CanFocus">True</property>
++            <property name="VscrollbarPolicy">Automatic</property>
++            <property name="HscrollbarPolicy">Automatic</property>
++            <property name="ShadowType">In</property>
++            <child>
++              <widget class="Gtk.TreeView" id="keyTreeView">
++                <property name="MemberName" />
++                <property name="CanFocus">True</property>
++                <property name="HeadersClickable">True</property>
++              </widget>
++            </child>
++          </widget>
++          <packing>
++            <property name="Position">1</property>
++            <property name="AutoSize">True</property>
++          </packing>
++        </child>
++        <child>
++          <widget class="Gtk.HBox" id="hbox">
++            <property name="MemberName" />
++            <property name="Spacing">6</property>
++            <child>
++              <widget class="Gtk.Label" id="labelEditBinding">
++                <property name="MemberName" />
++                <property name="LabelProp" translatable="yes">Edit Binding</property>
++              </widget>
++              <packing>
++                <property name="Position">0</property>
++                <property name="AutoSize">True</property>
++                <property name="Expand">False</property>
++                <property name="Fill">False</property>
++              </packing>
++            </child>
++            <child>
++              <widget class="Gtk.Entry" id="accelEntry">
++                <property name="MemberName" />
++                <property name="CanFocus">True</property>
++                <property name="IsEditable">True</property>
++                <property name="InvisibleChar">●</property>
++              </widget>
++              <packing>
++                <property name="Position">1</property>
++                <property name="AutoSize">True</property>
++              </packing>
++            </child>
++            <child>
++              <widget class="Gtk.Button" id="updateButton">
++                <property name="MemberName" />
++                <property name="CanFocus">True</property>
++                <property name="Type">TextAndIcon</property>
++                <property name="Icon">stock:gtk-apply Button</property>
++                <property name="Label" translatable="yes">Apply</property>
++                <property name="UseUnderline">True</property>
++                <property name="IsDialogButton">False</property>
++              </widget>
++              <packing>
++                <property name="Position">2</property>
++                <property name="AutoSize">True</property>
++                <property name="Expand">False</property>
++                <property name="Fill">False</property>
++              </packing>
++            </child>
++          </widget>
++          <packing>
++            <property name="Position">2</property>
++            <property name="AutoSize">True</property>
++            <property name="Expand">False</property>
++            <property name="Fill">False</property>
++          </packing>
++        </child>
++      </widget>
++    </child>
++  </widget>
+ </stetic-interface>
+\ No newline at end of file
+Index: Core/src/MonoDevelop.Ide/Makefile.am
+===================================================================
+--- Core/src/MonoDevelop.Ide/Makefile.am	(revision 81952)
++++ Core/src/MonoDevelop.Ide/Makefile.am	(working copy)
+@@ -4,6 +4,7 @@
+ 	$(GCONF_SHARP_LIBS) \
+ 	$(GECKO_SHARP_LIBS) \
+ 	$(GLADE_SHARP_LIBS) \
++	$(GLIB_SHARP_LIBS) \
+ 	$(GNOME_SHARP_LIBS) \
+ 	$(GNOME_VFS_SHARP_LIBS) \
+ 	$(GTK_SHARP_LIBS) \
+@@ -40,6 +41,7 @@
+ 	gtk-gui/MonoDevelop.Ide.Gui.Dialogs.NewProjectDialog.cs \
+ 	gtk-gui/MonoDevelop.Ide.Gui.Dialogs.OpenFileInSolutionDialog.cs \
+ 	gtk-gui/MonoDevelop.Ide.Gui.Dialogs.RenameItemDialog.cs \
++	gtk-gui/MonoDevelop.Ide.Gui.OptionPanels.KeyBindingsPanel.cs \
+ 	gtk-gui/MonoDevelop.Ide.NewHeaderTemplateDialog.cs \
+ 	gtk-gui/MonoDevelop.Ide.StandardHeaders.StandardHeaderPanel.cs \
+ 	MonoDevelop.Ide.CodeTemplates/CodeTemplate.cs \
+@@ -130,6 +132,7 @@
+ 	MonoDevelop.Ide.Gui.OptionPanels/BuildPanel.cs \
+ 	MonoDevelop.Ide.Gui.OptionPanels/CodeGenerationPanel.cs \
+ 	MonoDevelop.Ide.Gui.OptionPanels/ExternalToolPanel.cs \
++	MonoDevelop.Ide.Gui.OptionPanels/KeyBindingsPanel.cs \
+ 	MonoDevelop.Ide.Gui.OptionPanels/LoadSavePanel.cs \
+ 	MonoDevelop.Ide.Gui.OptionPanels/SelectStylePanel.cs \
+ 	MonoDevelop.Ide.Gui.OptionPanels/TasksOptionsPanel.cs \
+Index: Core/src/MonoDevelop.Components/Makefile.am
+===================================================================
+--- Core/src/MonoDevelop.Components/Makefile.am	(revision 81952)
++++ Core/src/MonoDevelop.Components/Makefile.am	(working copy)
+@@ -54,6 +54,7 @@
+ 	MonoDevelop.Components.Commands/ICommandRouter.cs \
+ 	MonoDevelop.Components.Commands/ICommandTargetVisitor.cs \
+ 	MonoDevelop.Components.Commands/ICommandUserItem.cs \
++	MonoDevelop.Components.Commands/KeyBindingManager.cs \
+ 	MonoDevelop.Components.Commands/LinkCommandEntry.cs \
+ 	MonoDevelop.Components.Commands/LocalCommandEntry.cs \
+ 	MonoDevelop.Components.Commands/MenuToolButton.cs \
+Index: Core/src/MonoDevelop.Components/MonoDevelop.Components.mdp
+===================================================================
+--- Core/src/MonoDevelop.Components/MonoDevelop.Components.mdp	(revision 81952)
++++ Core/src/MonoDevelop.Components/MonoDevelop.Components.mdp	(working copy)
+@@ -1,13 +1,13 @@
+ <Project name="MonoDevelop.Components" fileversion="2.0" language="C#" clr-version="Net_2_0" ctype="DotNetProject">
+   <Configurations active="Debug">
+     <Configuration name="Debug" ctype="DotNetProjectConfiguration">
+-      <Output directory="../../../build/AddIns/" assembly="MonoDevelop.Components" signAssembly="False" />
++      <Output directory="../../../build/AddIns/" assembly="MonoDevelop.Components" />
+       <Build debugmode="True" target="Library" />
+       <Execution runwithwarnings="True" consolepause="True" runtime="MsNet" clr-version="Net_2_0" />
+       <CodeGeneration compiler="Csc" warninglevel="4" optimize="False" unsafecodeallowed="False" generateoverflowchecks="True" mainclass="" generatexmldocumentation="False" ctype="CSharpCompilerParameters" />
+     </Configuration>
+     <Configuration name="Release" ctype="DotNetProjectConfiguration">
+-      <Output directory="../../../build/AddIns/" assembly="MonoDevelop.Components" signAssembly="False" />
++      <Output directory="../../../build/AddIns/" assembly="MonoDevelop.Components" />
+       <Build debugmode="False" target="Library" />
+       <Execution runwithwarnings="True" consolepause="True" runtime="MsNet" clr-version="Net_2_0" />
+       <CodeGeneration compiler="Csc" warninglevel="4" optimize="True" unsafecodeallowed="False" generateoverflowchecks="True" mainclass="" generatexmldocumentation="False" ctype="CSharpCompilerParameters" />
+@@ -96,6 +96,7 @@
+     <File name="./gtk-gui/generated.cs" subtype="Code" buildaction="Compile" />
+     <File name="./MonoDevelop.Components.Commands/ICommandTargetVisitor.cs" subtype="Code" buildaction="Compile" />
+     <File name="./AssemblyInfo.cs" subtype="Code" buildaction="Compile" />
++    <File name="./MonoDevelop.Components.Commands/KeyBindingManager.cs" subtype="Code" buildaction="Compile" />
+   </Contents>
+   <References>
+     <ProjectReference type="Gac" localcopy="False" refto="gecko-sharp, Version=2.0.0.0, Culture=neutral, PublicKeyToken=ccf7d78a55e9f021" />
+@@ -113,6 +114,12 @@
+     <ProjectReference type="Gac" localcopy="True" refto="System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089" />
+     <ProjectReference type="Gac" localcopy="True" refto="Mono.Posix, Version=2.0.0.0, Culture=neutral, PublicKeyToken=0738eb9f132ed756" />
+   </References>
++  <GtkDesignInfo partialTypes="True" isWidgetLibrary="True" gettextClass="MonoDevelop.Core.GettextCatalog">
++    <ExportedWidgets>
++      <Widget>MonoDevelop.Components.FileEntry</Widget>
++      <Widget>MonoDevelop.Components.FolderEntry</Widget>
++    </ExportedWidgets>
++  </GtkDesignInfo>
+   <MonoDevelop.Autotools.MakefileInfo IntegrationEnabled="True" RelativeMakefileName="./Makefile.am" BuildTargetName="" CleanTargetName="" SyncReferences="True" IsAutotoolsProject="True" RelativeConfigureInPath="../../../">
+     <ExcludedFiles>
+       <File>./AssemblyInfo.cs</File>
+@@ -125,12 +132,6 @@
+     <AsmRefVar Sync="True" Name="REFS" Prefix="-r:" />
+     <ProjectRefVar Sync="True" Name="REFS" Prefix="-r:" />
+   </MonoDevelop.Autotools.MakefileInfo>
+-  <GtkDesignInfo partialTypes="True" isWidgetLibrary="True" gettextClass="MonoDevelop.Core.GettextCatalog">
+-    <ExportedWidgets>
+-      <Widget>MonoDevelop.Components.FileEntry</Widget>
+-      <Widget>MonoDevelop.Components.FolderEntry</Widget>
+-    </ExportedWidgets>
+-  </GtkDesignInfo>
+   <MonoDevelop.Gettext.TranslationInfo />
+   <DeploymentInformation strategy="File">
+     <excludeFiles />
+Index: Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/LocalCommandEntry.cs
+===================================================================
+--- Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/LocalCommandEntry.cs	(revision 81952)
++++ Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/LocalCommandEntry.cs	(working copy)
+@@ -49,7 +49,7 @@
+ 		internal protected override Gtk.MenuItem CreateMenuItem (CommandManager manager)
+ 		{
+ 			if (manager.GetCommand (CommandId) == null)
+-				manager.RegisterCommand (cmd, "");
++				manager.RegisterCommand (cmd);
+ 
+ 			return base.CreateMenuItem (manager);
+ 		}
+@@ -57,7 +57,7 @@
+ 		internal protected override Gtk.ToolItem CreateToolItem (CommandManager manager)
+ 		{
+ 			if (manager.GetCommand (CommandId) == null)
+-				manager.RegisterCommand (cmd, "");
++				manager.RegisterCommand (cmd);
+ 
+ 			return base.CreateToolItem (manager);
+ 		}
+Index: Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/Command.cs
+===================================================================
+--- Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/Command.cs	(revision 81952)
++++ Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/Command.cs	(working copy)
+@@ -30,6 +30,8 @@
+ 
+ namespace MonoDevelop.Components.Commands
+ {
++	public delegate void KeyBindingChangedEventHandler (object s, KeyBindingChangedEventArgs args);
++	
+ 	public abstract class Command
+ 	{
+ 		public static readonly object Separator = new Object ();
+@@ -69,7 +71,13 @@
+ 		
+ 		public string AccelKey {
+ 			get { return accelKey; }
+-			set { accelKey = value; }
++			set {
++				string binding = accelKey;
++				accelKey = value == String.Empty ? null : value;
++				
++				if (KeyBindingChanged != null && accelKey != binding)
++					KeyBindingChanged (this, new KeyBindingChangedEventArgs (this, binding));
++			}
+ 		}
+ 		
+ 		public bool DisabledVisible {
+@@ -81,6 +89,31 @@
+ 			get { return description; }
+ 			set { description = value; }
+ 		}
++		
++		public event KeyBindingChangedEventHandler KeyBindingChanged;
+ 	}
++	
++	public class KeyBindingChangedEventArgs {
++		Command command;
++		string binding;
++		
++		public KeyBindingChangedEventArgs (Command command, string oldBinding)
++		{
++			this.command = command;
++			this.binding = oldBinding;
++		}
++		
++		public Command Command {
++			get { return command; }
++		}
++		
++		public string OldKeyBinding {
++			get { return binding; }
++		}
++		
++		public string NewKeyBinding {
++			get { return command.AccelKey; }
++		}
++	}
+ }
+ 
+Index: Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/CommandMenuItem.cs
+===================================================================
+--- Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/CommandMenuItem.cs	(revision 81952)
++++ Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/CommandMenuItem.cs	(working copy)
+@@ -77,7 +77,7 @@
+ 			((ICommandUserItem)this).Update (null);
+ 			
+ 			if (!isArrayItem) {
+-				// Make sure the accelerators allways work for this item
++				// Make sure the accelerators always work for this item
+ 				// while the menu is hidden
+ 				Sensitive = true;
+ 				Visible = true;
+@@ -155,7 +155,7 @@
+ 				this.Sensitive = cmdInfo.Enabled;
+ 				this.Visible = cmdInfo.Visible;
+ 				
+-				if (cmdInfo.AccelKey != null && cmdInfo.AccelKey != "")
++				if (cmdInfo.AccelKey != null)
+ 					this.AccelPath = commandManager.GetAccelPath (cmdInfo.AccelKey);
+ 				
+ 				if (cmdInfo.Icon != null && cmdInfo.Icon != "" && cmdInfo.Icon != lastIcon) {
+Index: Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/CommandManager.cs
+===================================================================
+--- Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/CommandManager.cs	(revision 81952)
++++ Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/CommandManager.cs	(working copy)
+@@ -26,9 +26,11 @@
+ // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ //
+ 
++
+ using System;
+ using System.Reflection;
+ using System.Collections;
++using System.Collections.Generic;
+ 
+ namespace MonoDevelop.Components.Commands
+ {
+@@ -36,6 +38,9 @@
+ 	{
+ 		public static CommandManager Main = new CommandManager ();
+ 		Gtk.Window rootWidget;
++		KeyBindingManager bindings;
++		Gtk.AccelGroup accelGroup;
++		string mode;
+ 		
+ 		Hashtable cmds = new Hashtable ();
+ 		Hashtable handlerInfo = new Hashtable ();
+@@ -43,15 +48,12 @@
+ 		ArrayList globalHandlers = new ArrayList ();
+ 		ArrayList commandUpdateErrors = new ArrayList ();
+ 		ArrayList visitors = new ArrayList ();
+-		Hashtable overloadedAccelCommands = new Hashtable ();
+ 		Stack delegatorStack = new Stack ();
+ 		bool disposed;
+ 		bool toolbarUpdaterRunning;
+ 		bool enableToolbarUpdate;
+ 		int guiLock;
+ 		
+-		Gtk.AccelGroup accelGroup;
+-		
+ 		public CommandManager (): this (null)
+ 		{
+ 		}
+@@ -59,15 +61,83 @@
+ 		public CommandManager (Gtk.Window root)
+ 		{
+ 			rootWidget = root;
++			bindings = new KeyBindingManager ();
+ 			ActionCommand c = new ActionCommand (CommandSystemCommands.ToolbarList, "Toolbar List", null, null, ActionType.Check);
+ 			c.CommandArray = true;
+-			RegisterCommand (c, "");
++			RegisterCommand (c);
+ 		}
+ 		
++		bool CanUseBinding (string mode, string binding)
++		{
++			if (!bindings.BindingExists (binding))
++				return false;
++			
++			if (mode == null && bindings.ModeExists (binding)) {
++				// binding is a simple accel and is registered as a mode... modes take precedence
++				return false;
++			}
++			
++			return true;
++		}
++		
++		[GLib.ConnectBefore]
++		void OnKeyPressed (object o, Gtk.KeyPressEventArgs e)
++		{
++			string accel = KeyBindingManager.AccelFromKey (e.Event.Key, e.Event.State);
++			
++			if (accel == null) {
++				// incomplete accel
++				e.RetVal = true;
++				return;
++			}
++			
++			string binding = KeyBindingManager.Binding (mode, accel);
++			List<Command> commands = null;
++			
++			if (CanUseBinding (mode, binding)) {
++				commands = bindings.Commands (binding);
++				e.RetVal = true;
++				mode = null;
++			} else if (mode != null && CanUseBinding (null, accel)) {
++				// fall back to accel
++				commands = bindings.Commands (accel);
++				binding = accel; // only done for debugging purposes down below
++				e.RetVal = true;
++				mode = null;
++			} else if (bindings.ModeExists (accel)) {
++				e.RetVal = true;
++				mode = accel;
++				return;
++			} else {
++				e.RetVal = false;
++				mode = null;
++				return;
++			}
++			
++			Command command = null;
++			
++			if (commands.Count != 1) {
++				// FIXME: figure out which of the commands to run based on active widget?
++				Console.WriteLine ("FIXME: need to choose proper command based on {0}", binding);
++				command = commands[0];
++			} else {
++				command = commands[0];
++			}
++			
++			Console.WriteLine ("Executing command for {0}: {1}", binding, command != null ? command.Id : "(null)");
++			
++			if (command != null)
++				DispatchCommand (command.Id);
++		}
++		
+ 		public void SetRootWindow (Gtk.Window root)
+ 		{
++			if (rootWidget != null)
++				rootWidget.KeyPressEvent -= OnKeyPressed;
++			
+ 			rootWidget = root;
+ 			rootWidget.AddAccelGroup (AccelGroup);
++			rootWidget.KeyPressEvent += new Gtk.KeyPressEventHandler (OnKeyPressed);
+ 		}
+ 		
+ 		public void Dispose ()
+@@ -113,45 +183,16 @@
+ 				}
+ 			}
+ 		}
+-
+ 		
+ 		public void RegisterCommand (Command cmd)
+ 		{
+-			RegisterCommand (cmd, "");
+-		}
+-		
+-		public void RegisterCommand (Command cmd, string category)
+-		{
+ 			cmds [cmd.Id] = cmd;
+-			
+-			if (cmd.AccelKey != null && cmd.AccelKey != "") {
+-				// Register overloaded key bindings
+-				foreach (Command ac in cmds.Values) {
+-					if (ac.AccelKey == cmd.AccelKey) {
+-						ArrayList list = (ArrayList) overloadedAccelCommands [ac.AccelKey];
+-						if (list == null) {
+-							list = new ArrayList ();
+-							overloadedAccelCommands [ac.AccelKey] = list;
+-							list.Add (ac.Id);
+-						}
+-						list.Add (cmd.Id);
+-						break;
+-					}
+-				}
+-			}
++			bindings.RegisterCommand (cmd);
+ 		}
+ 		
+ 		public void UnregisterCommand (Command cmd)
+ 		{
+-			if (cmd.AccelKey != null && cmd.AccelKey != "") {
+-				// Unregister overloaded key bindings
+-				ArrayList list = (ArrayList) overloadedAccelCommands [cmd.AccelKey];
+-				if (list != null) {
+-					list.Remove (cmd.Id);
+-					if (list.Count < 2)
+-						overloadedAccelCommands.Remove (cmd.AccelKey);
+-				}
+-			}
++			bindings.UnregisterCommand (cmd);
+ 			cmds.Remove (cmd.Id);
+ 		}
+ 		
+@@ -269,7 +310,7 @@
+ 		{
+ 			if (guiLock > 0)
+ 				return false;
+-
++			
+ 			ActionCommand cmd = null;
+ 			try {
+ 				cmd = GetActionCommand (commandId);
+@@ -300,14 +341,18 @@
+ 										break;
+ 									}
+ 								}
+-								if (!found) return false;
++								
++								if (!found)
++									return false;
+ 							} else
+ 								bypass = true;
+ 						} else {
+ 							info.Bypass = false;
+ 							cui.Run (cmdTarget, info);
+ 							bypass = info.Bypass;
+-							if (!bypass && (!info.Enabled || !info.Visible)) return false;
++							
++							if (!bypass && (!info.Enabled || !info.Visible))
++								return false;
+ 						}
+ 					}
+ 					
+@@ -416,11 +461,6 @@
+ 			return null;
+ 		}
+ 		
+-		internal ArrayList FindAlternateAccelCommands (object commandId)
+-		{
+-			return (ArrayList) overloadedAccelCommands [commandId];
+-		}
+-		
+ 		internal bool DispatchCommandFromAccel (object commandId, object dataItem, object initialTarget)
+ 		{
+ 			// Dispatches a command that has been fired by an accelerator.
+@@ -437,11 +477,11 @@
+ 				return false;
+ 			
+ 			string accel = cmd.AccelKey;
+-			if (accel == null || accel == "")
++			if (accel == null)
+ 				return DispatchCommand (commandId, dataItem, initialTarget);
+ 			
+-			ArrayList list = (ArrayList) overloadedAccelCommands [accel];
+-			if (list == null)
++			List<Command> list = bindings.Commands (accel);
++			if (list == null || list.Count == 1)
+ 				// The command is not overloaded, so it can be handled normally.
+ 				return DispatchCommand (commandId, dataItem, initialTarget);
+ 			
+@@ -456,38 +496,42 @@
+ 			// Execution failed. Now try to execute alternate commands
+ 			// bound to the same key.
+ 			
+-			foreach (object altId in list) {
+-				if (altId == commandId)	// already handled above.
++			for (int i = 0; i < list.Count; i++) {
++				if (list[i].Id == commandId) // already handled above.
+ 					continue;
+-				CommandInfo cinfo = GetCommandInfo (altId, initialTarget);
+-				if (cinfo.AccelKey != accel)	// Key changed by a handler, just ignore the command.
++				
++				CommandInfo cinfo = GetCommandInfo (list[i].Id, initialTarget);
++				if (cinfo.AccelKey != accel) // Key changed by a handler, just ignore the command.
+ 					continue;
+-				if (DispatchCommand (altId, cinfo.DataItem, initialTarget))
++				
++				if (DispatchCommand (list[i].Id, cinfo.DataItem, initialTarget))
+ 					return true;
+ 			}
++			
+ 			return false;
+ 		}
+ 		
+-		internal string GetAccelPath (string key)
++		internal string GetAccelPath (string binding)
+ 		{
+-			string path = "<MonoDevelop>/MainWindow/" + key;
+-			if (!Gtk.AccelMap.LookupEntry (path, new Gtk.AccelKey()) ) {
+-				string[] keys = key.Split ('|');
+-				Gdk.ModifierType mod = 0;
+-				uint ckey = 0;
+-				foreach (string keyp in keys) {
+-					if (keyp == "Control") {
+-						mod |= Gdk.ModifierType.ControlMask;
+-					} else if (keyp == "Shift") {
+-						mod |= Gdk.ModifierType.ShiftMask;
+-					} else if (keyp == "Alt") {
+-						mod |= Gdk.ModifierType.Mod1Mask;
++			string path = "<MonoDevelop>/MainWindow/" + binding;
++			
++			if (!Gtk.AccelMap.LookupEntry (path, new Gtk.AccelKey ()) ) {
++				Gdk.ModifierType modeMod, mod;
++				uint modeKey, key;
++				
++				if (KeyBindingManager.BindingToKeys (binding, out modeKey, out modeMod, out key, out mod)) {
++					if (modeKey == 0) {
++						// this binding has no mode component, gtk can actually handle this
++						Gtk.AccelMap.AddEntry (path, key, mod);
+ 					} else {
+-						ckey = Gdk.Keyval.FromName (keyp);
++						//Console.WriteLine ("WARNING: cannot add {0} to Gtk.AccelMap", binding);
++						return null;
+ 					}
++				} else {
++					//Console.WriteLine ("WARNING: failed to parse {0}", binding);
+ 				}
+-				Gtk.AccelMap.AddEntry (path, ckey, mod);
+ 			}
++			
+ 			return path;
+ 		}
+ 		
+@@ -536,7 +580,8 @@
+ 			object cmdTarget = GetActiveWidget (rootWidget);
+ 			if (cmdTarget == null) {
+ 				globalPos = 0;
+-				if (globalHandlers.Count == 0) return null;
++				if (globalHandlers.Count == 0)
++					return null;
+ 				return globalHandlers [0];
+ 			} else {
+ 				globalPos = -1;
+@@ -571,7 +616,8 @@
+ 					if (cmdTarget != null)
+ 						return cmdTarget;
+ 				}
+-				if (globalHandlers.Count == 0) return null;
++				if (globalHandlers.Count == 0)
++					return null;
+ 				globalPos = 0;
+ 				return globalHandlers [0];
+ 			} else
+Index: Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/KeyBindingManager.cs
+===================================================================
+--- Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/KeyBindingManager.cs	(revision 0)
++++ Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/KeyBindingManager.cs	(revision 0)
+@@ -0,0 +1,513 @@
++//
++// KeyBindingManager.cs
++//
++// Author: Jeffrey Stedfast <fejj@novell.com>
++//
++// Copyright (C) 2007 Novell, Inc (http://www.novell.com)
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.Collections;
++using System.Collections.Generic;
++
++// Terminology:
++//   mode: A 'mode' is a key binding prefix / modifier meant to allow a
++//         wider set of key bindings to exist. If you are familiar with
++//         GNU/Emacs, you might be familiar with the key binding for
++//         'Save'. This key binding would have a 'mode' of 'Control+x'
++//         and an accel of 'Control+s' - the full binding being:
++//         'Control+x Control+s'.
++//
++//   accel: A (possibly partial) key binding for some command/action.
++//          When combined with the mode prefix, results in the full key
++//          binding.
++//
++//   binding: The full key binding for a command/action.
++//
++
++namespace MonoDevelop.Components.Commands {
++	public class KeyBindingManager {
++		Dictionary<string, List<Command>> bindings;
++		Dictionary<string, int> modes;
++		List<Command> commands;
++		
++#region Constructors
++		public KeyBindingManager ()
++		{
++			bindings = new Dictionary<string, List<Command>> ();
++			modes = new Dictionary<string, int> ();
++			commands = new List<Command> ();
++		}
++		
++		~KeyBindingManager ()
++		{
++			for (int i = 0; i < commands.Count; i++)
++				commands[i].KeyBindingChanged -= OnKeyBindingChanged;
++		}
++#endregion
++		
++#region Static Public Helpers For Building Key-Binding Strings
++		public static string AccelFromKey (Gdk.Key key, Gdk.ModifierType modifier)
++		{
++			string accel = String.Empty;
++			char c;
++			
++			switch (key) {
++			case Gdk.Key.Alt_L:
++				// incomplete accel
++				return null;
++			case Gdk.Key.Alt_R:
++				// incomplete accel
++				return null;
++			case Gdk.Key.Meta_L:
++				// incomplete accel
++				return null;
++			case Gdk.Key.Meta_R:
++				// incomplete accel
++				return null;
++			case Gdk.Key.Shift_L:
++				// incomplete accel
++				return null;
++			case Gdk.Key.Shift_R:
++				// incomplete accel
++				return null;
++			case Gdk.Key.Control_L:
++				// incomplete accel
++				return null;
++			case Gdk.Key.Control_R:
++				// incomplete accel
++				return null;
++			}
++			
++			if (((int) modifier & (int) Gdk.ModifierType.ControlMask) != 0)
++				accel += "Control+";
++			
++			if (((int) modifier & (int) Gdk.ModifierType.Mod1Mask) != 0)
++				accel += "Alt+";
++			
++			if (((int) modifier & (int) Gdk.ModifierType.ShiftMask) != 0)
++				accel += "Shift+";
++			
++			if ((c = (char) Gdk.Keyval.ToUnicode ((uint) key)) != 0)
++				accel += Char.ToLower (c);
++			else
++				accel += key;
++			
++			return accel;
++		}
++		
++		static bool AccelToKey (string accel, ref int i, out uint key, out Gdk.ModifierType modifier)
++		{
++			Gdk.ModifierType mod, mask = 0;
++			string str;
++			uint k = 0;
++			int j = i;
++			
++			modifier = Gdk.ModifierType.None;
++			key = 0;
++			
++			if (accel == null || i >= accel.Length)
++				return false;
++			
++			while (i < accel.Length) {
++				for (j = i + 1; j < accel.Length; j++) {
++					if (accel[j] == '+' || accel[j] == '|')
++						break;
++				}
++				
++				str = accel.Substring (i, j - i);
++				if ((mod = ModifierMask (str)) == Gdk.ModifierType.None) {
++					k = Gdk.Keyval.FromName (str);
++					break;
++				}
++				
++				mask |= mod;
++				i = j + 1;
++			}
++			
++			i = j;
++			
++			if (k == 0)
++				return false;
++			
++			modifier = mask;
++			key = k;
++			
++			return true;
++		}
++		
++		public static bool AccelToKey (string accel, out uint key, out Gdk.ModifierType modifier)
++		{
++			int i = 0;
++			
++			modifier = Gdk.ModifierType.None;
++			key = 0;
++			
++			if (accel == null || accel == String.Empty)
++				return false;
++			
++			if (AccelToKey (accel, ref i, out key, out modifier) && i == accel.Length)
++				return true;
++			
++			modifier = Gdk.ModifierType.None;
++			key = 0;
++			
++			return false;
++		}
++		
++		public static bool BindingToKeys (string binding, out uint modeKey, out Gdk.ModifierType modeModifier, out uint key, out Gdk.ModifierType modifier)
++		{
++			int i = 0;
++			
++			modeModifier = Gdk.ModifierType.None;
++			modeKey = 0;
++			modifier = Gdk.ModifierType.None;
++			key = 0;
++			
++			if (binding == null || binding == String.Empty)
++				return false;
++			
++			if (!AccelToKey (binding, ref i, out key, out modifier))
++				return false;
++			
++			if (i == binding.Length) {
++				// no mode in this binding, we're done
++				return true;
++			}
++			
++			if (binding[i] != '|') {
++				// bad format
++				return false;
++			}
++			
++			modeModifier = modifier;
++			modeKey = key;
++			i++;
++			
++			return AccelToKey (binding, ref i, out key, out modifier) && i == binding.Length;
++		}
++		
++		public static string BindingFromKey (string mode, Gdk.Key key, Gdk.ModifierType modifier)
++		{
++			return Binding (mode, AccelFromKey (key, modifier));
++		}
++		
++		public static string Binding (string mode, string accel)
++		{
++			if (mode == null) {
++				if (accel == String.Empty)
++					return null;
++				
++				return accel;
++			}
++			
++			if (accel == String.Empty)
++				return mode;
++			
++			return mode + "|" + accel;
++		}
++		
++		static Gdk.ModifierType ModifierMask (string name)
++		{
++			switch (name) {
++			case "Alt":
++				return Gdk.ModifierType.Mod1Mask;
++			case "Shift":
++				return Gdk.ModifierType.ShiftMask;
++			case "Control":
++				return Gdk.ModifierType.ControlMask;
++			default:
++				return Gdk.ModifierType.None;
++			}
++		}
++		
++		///
++		/// Converts the old shortcut format into the new "key binding" format
++		///
++		static string ShortcutToBinding (string shortcut)
++		{
++			Gdk.ModifierType mod, mask = 0;
++			int i = 0, j;
++			Gdk.Key key;
++			string str;
++			
++			if (shortcut == null || shortcut == String.Empty)
++				return null;
++			
++			while (i < shortcut.Length) {
++				if ((j = shortcut.IndexOf ('|', i + 1)) == -1) {
++					// we are at the last part of the shortcut, the Gdk.Key
++					j = shortcut.Length;
++				}
++				
++				str = shortcut.Substring (i, j - i);
++				if ((mod = ModifierMask (str)) == Gdk.ModifierType.None) {
++					key = (Gdk.Key) Gdk.Key.Parse (typeof (Gdk.Key), str);
++					
++					if (j < shortcut.Length)
++						Console.WriteLine ("WARNING: trailing data after Gdk.Key portion of shortcut {0}", shortcut);
++					
++					return AccelFromKey (key, mask);
++				}
++				
++				mask |= mod;
++				i = j + 1;
++			}
++			
++			Console.WriteLine ("WARNING: Incomplete shortcut '{0}'?", shortcut);
++			
++			return null;
++		}
++		
++		///
++		/// Returns true if @shortcut is in the old string format or false if it is the newer string format.
++		///
++		static bool IsShortcutFormat (string shortcut)
++		{
++			int i = 0;
++			
++			if (shortcut == null || shortcut == String.Empty)
++				return false;
++			
++			if (shortcut.Length == 1 && (shortcut[0] == '|' || shortcut[0] == '+')) {
++				// single-key binding
++				return false;
++			}
++			
++			while (i < shortcut.Length && (shortcut[i] != '|' && shortcut[i] != '+'))
++				i++;
++			
++			return i < shortcut.Length && shortcut[i] == '|' && ModifierMask (shortcut.Substring (0, i)) != Gdk.ModifierType.None;
++		}
++		
++		public static string CanonicalizeBinding (string binding)
++		{
++			Gdk.ModifierType modeMod, mod;
++			string accel, mode = null;
++			uint modeKey, key;
++			
++			if (binding == null || binding == String.Empty)
++				return null;
++			
++			if (IsShortcutFormat (binding))
++				return ShortcutToBinding (binding);
++			
++			if (!BindingToKeys (binding, out modeKey, out modeMod, out key, out mod)) {
++				Console.WriteLine ("WARNING: failed to canonicalize binding {0}", binding);
++				return null;
++			}
++			
++			if (modeKey != 0)
++				mode = AccelFromKey ((Gdk.Key) modeKey, modeMod);
++			
++			accel = AccelFromKey ((Gdk.Key) key, mod);
++			
++			return Binding (mode, accel);
++		}
++#endregion
++		
++#region Public Methods
++		public bool BindingExists (string binding)
++		{
++			return bindings.ContainsKey (binding);
++		}
++		
++		public bool BindingExists (string mode, string accel)
++		{
++			return BindingExists (Binding (mode, accel));
++		}
++		
++		public bool ModeExists (string mode)
++		{
++			return modes.ContainsKey (mode);
++		}
++		
++		string BindingMode (string binding)
++		{
++			bool plus = false;
++			int i;
++			
++			if (binding == null)
++				return null;
++			
++			for (i = 0; i < binding.Length; i++) {
++				if (!plus && binding[i] == '|')
++					return binding.Substring (0, i);
++				
++				if (binding[i] == '+')
++					plus = !plus;
++				else
++					plus = false;
++			}
++			
++			return null;
++		}
++		
++		void SetBinding (Command command, string oldMode, string oldBinding, string newMode, string newBinding)
++		{
++			List<Command> list;
++			int refs;
++			
++			if (newMode != oldMode) {
++				// keep track of valid modes
++				if (oldMode != null) {
++					if ((refs = modes[oldMode] - 1) == 0)
++						modes.Remove (oldMode);
++					else
++						modes[oldMode] = refs;
++				}
++				
++				if (newMode != null) {
++					if (modes.ContainsKey (newMode)) {
++						modes[newMode]++;
++					} else
++						modes.Add (newMode, 1);
++				}
++			}
++			
++			if (oldBinding != null) {
++				list = bindings[oldBinding];
++				list.Remove (command);
++				
++				if (list.Count == 0)
++					bindings.Remove (oldBinding);
++			}
++			
++			if (newBinding != null) {
++				if (!bindings.ContainsKey (newBinding)) {
++					list = new List<Command> ();
++					list.Add (command);
++					
++					bindings.Add (newBinding, list);
++				} else {
++					list = bindings[newBinding];
++					list.Add (command);
++				}
++			}
++		}
++		
++		void SetBinding (Command command, string oldBinding, string newBinding)
++		{
++			SetBinding (command, BindingMode (oldBinding), oldBinding, BindingMode (newBinding), newBinding);
++		}
++		
++		void OnKeyBindingChanged (object o, KeyBindingChangedEventArgs args)
++		{
++			SetBinding (args.Command, args.OldKeyBinding, args.NewKeyBinding);
++		}
++		
++		public bool CommandIsRegistered (Command command)
++		{
++			return commands.Contains (command);
++		}
++		
++		public void RegisterCommand (Command command)
++		{
++			if (commands.Contains (command)) {
++				Console.WriteLine ("WARNING: trying to re-register command {0}", command);
++				return;
++			}
++			
++			SetBinding (command, null, null, BindingMode (command.AccelKey), command.AccelKey);
++			command.KeyBindingChanged += new KeyBindingChangedEventHandler (OnKeyBindingChanged);
++			commands.Add (command);
++		}
++		
++		public void UnregisterCommand (Command command)
++		{
++			List<Command> list;
++			string mode;
++			int refs;
++			
++			if (!commands.Contains (command)) {
++				Console.WriteLine ("WARNING: trying to unregister unknown command {0}", command);
++				return;
++			}
++			
++			command.KeyBindingChanged -= OnKeyBindingChanged;
++			commands.Remove (command);
++			
++			list = bindings[command.AccelKey];
++			list.Remove (command);
++			if (list.Count == 0)
++				bindings.Remove (command.AccelKey);
++			
++			mode = BindingMode (command.AccelKey);
++			if (modes.ContainsKey (mode)) {
++				if ((refs = modes[mode] - 1) == 0)
++					modes.Remove (mode);
++				else
++					modes[mode] = refs;
++			}
++		}
++		
++		///
++		/// Returns the oldest registered command with the specified key binding.
++		///
++		public Command Command (string binding)
++		{
++			List<Command> list;
++			
++			if (!BindingExists (binding))
++				return null;
++			
++			list = bindings[binding];
++			
++			return list[0];
++		}
++		
++		///
++		/// Returns the list of commands registered for the specified key binding.
++		///
++		public List<Command> Commands (string binding)
++		{
++			if (!BindingExists (binding))
++				return null;
++			
++			return bindings[binding];
++		}
++#endregion
++	}
++	
++//#region KeyBindingException
++//	public class KeyBindingConflictException : Exception {
++//		Command command;
++//		string binding;
++//		
++//		public KeyBindingConflictException (Command command, string binding)
++//			: base (String.Format ("An existing command, {0}, is already bound to {1}",
++//			                       command, binding))
++//		{
++//			this.command = command;
++//			this.binding = binding;
++//		}
++//		
++//		public Command Command {
++//			get { return command; }
++//		}
++//		
++//		public string Binding {
++//			get { return binding; }
++//		}
++//	}
++//#endregion
++}
+Index: Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/CommandCheckMenuItem.cs
+===================================================================
+--- Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/CommandCheckMenuItem.cs	(revision 81952)
++++ Core/src/MonoDevelop.Components/MonoDevelop.Components.Commands/CommandCheckMenuItem.cs	(working copy)
+@@ -108,7 +109,7 @@
+ 			child.ShowAll ();
+ 			Visible = cmdInfo.Visible;
+ 			Active = cmdInfo.Checked;
+-			if (cmdInfo.AccelKey != null && cmdInfo.AccelKey != "")
++			if (cmdInfo.AccelKey != null)
+ 				this.AccelPath = commandManager.GetAccelPath (cmdInfo.AccelKey);
+ 				
+ 			updating = false;

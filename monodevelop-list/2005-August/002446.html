@@ -1,0 +1,613 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [MonoDevelop] [PATCH] SqlQueryView execution modes
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:monodevelop-list%40lists.ximian.com?Subject=%5BMonoDevelop%5D%20%5BPATCH%5D%20SqlQueryView%20execution%20modes&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002444.html">
+   <LINK REL="Next"  HREF="002447.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[MonoDevelop] [PATCH] SqlQueryView execution modes</H1>
+    <B>Daniel Morgan</B> 
+    <A HREF="mailto:monodevelop-list%40lists.ximian.com?Subject=%5BMonoDevelop%5D%20%5BPATCH%5D%20SqlQueryView%20execution%20modes&In-Reply-To="
+       TITLE="[MonoDevelop] [PATCH] SqlQueryView execution modes">monodanmorg at yahoo.com
+       </A><BR>
+    <I>Thu Aug 25 02:14:29 EDT 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002444.html">[MonoDevelop] Database Browser
+</A></li>
+        <LI>Next message: <A HREF="002447.html">[MonoDevelop] Database connections Repository
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2446">[ date ]</a>
+              <a href="thread.html#2446">[ thread ]</a>
+              <a href="subject.html#2446">[ subject ]</a>
+              <a href="author.html#2446">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Can someone commit this to MonoDevelop svn please?
+
+Chrish01 has already given permission.  svn was not
+working for me tonight.
+
+
+		
+____________________________________________________
+Start your day with Yahoo! - make it your home page 
+<A HREF="http://www.yahoo.com/r/hs">http://www.yahoo.com/r/hs</A> 
+ 
+-------------- next part --------------
+Index: Extras/MonoQuery/ChangeLog
+===================================================================
+--- Extras/MonoQuery/ChangeLog	(revision 2779)
++++ Extras/MonoQuery/ChangeLog	(working copy)
+@@ -1,3 +1,21 @@
++2005-08-25  Daniel Morgan &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-list">danielmorgan at verizon.net</A>&gt;
++
++	* Extras/MonoQuery/MonoQuery/Gui/SqlQueryView.cs: implement
++	execution of SQL statements in different modes: if text
++	selected then execute as-is, execute one statement starting at
++	cursor, and execute multiple statements one-at-a-time starting
++	at cursor
++
++	* Mono.Data.Sql/Providers/OracleDbProvider.cs: only show 
++	what can be browsed
++
++	* Extras/MonoQuery/Mono.Data.Sql/Providers/SqlDbProvider.cs: add
++	ColumnSchema and remove others not used.  Remove constraints since
++	they are not working
++
++	* Extras/MonoQuery/Mono.Data.Sql/Providers/SybaseDbProvider.cs: add
++	ColumnSchema and remove others not used.
++
+ 2005-08-22  Daniel Morgan &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-list">danielmorgan at verizon.net</A>&gt;
+ 
+ 	* Mono.Data.Sql/Providers/OracleDbProvider.cs: fix ExecuteSQL
+Index: Extras/MonoQuery/MonoQuery/Gui/SqlQueryView.cs
+===================================================================
+--- Extras/MonoQuery/MonoQuery/Gui/SqlQueryView.cs	(revision 2778)
++++ Extras/MonoQuery/MonoQuery/Gui/SqlQueryView.cs	(working copy)
+@@ -1,10 +1,12 @@
+ //
+ // SqlQueryView.cs
+ //
+-// Author:
++// Authors:
+ //   Christian Hergert &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-list">chris at mosaix.net</A>&gt;
++//   Daniel Morgan &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-list">danielmorgan at verizon.net</A>&gt;
+ //
+ // Copyright (C) 2005 Christian Hergert
++// Copyright (C) 2005 Daniel Morgan
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining
+ // a copy of this software and associated documentation files (the
+@@ -51,6 +53,9 @@
+ 		protected EventHandler changedHandler;
+ 		
+ 		protected MonoQueryService service;
++
++		private int executeMode = 0;
++		private int offset = 0;
+ 		
+ 		public SqlQueryView () : base ()
+ 		{
+@@ -197,63 +202,267 @@
+ 				return (DbProviderBase) model.GetValue (iter, 1);
+ 			}
+ 		}
+-		
++
+ 		void OnExecute (object sender, EventArgs args)
+ 		{
+-			Runtime.Gui.StatusBar.BeginProgress (
+-				GettextCatalog.GetString(&quot;Execuing sql query on&quot;)
+-				+ String.Format (&quot; {0}&quot;, Connection.Name));
+-			Runtime.Gui.StatusBar.SetProgressFraction (0.1);
++			TextBuffer buf = (TextBuffer) sourceView.Buffer;
++			TextIter iter = buf.StartIter;
++			TextIter end_iter = buf.EndIter;
++			string query = String.Empty;
++
++			if (buf.GetSelectionBounds (out iter, out end_iter) == true) {
++				query = buf.GetText (iter, end_iter, false);
++				executeMode = 2; // as-is
++			} else {
++				query = GetSqlStatementAtCursor (buf, out iter);
++				executeMode = 0; // one single statement at cursor
++			}
++
++			if (query.Trim ().Length &gt; 0) {
++				Runtime.Gui.StatusBar.BeginProgress (
++					GettextCatalog.GetString(&quot;Execuing sql query on&quot;)
++					+ String.Format (&quot; {0}&quot;, Connection.Name));
++				Runtime.Gui.StatusBar.SetProgressFraction (0.1);
++
++				Runtime.Gui.StatusBar.SetMessage (
++					GettextCatalog.GetString (&quot;Query sent, waiting for response.&quot;));
++				Runtime.Gui.StatusBar.SetProgressFraction (0.5);
++
++				SQLCallback callback = (SQLCallback)
++					Runtime.DispatchService.GuiDispatch (
++					new SQLCallback (OnExecuteReturn));
++
++				buf.MoveMark (buf.InsertMark, iter);
++				buf.MoveMark (buf.SelectionBound, iter);
+ 			
+-			string query = sourceView.Buffer.Text;
+-			SQLCallback callback = (SQLCallback)
+-				Runtime.DispatchService.GuiDispatch (
+-				new SQLCallback (OnExecuteReturn));
+-			
+-			Runtime.Gui.StatusBar.SetMessage (
+-				GettextCatalog.GetString (&quot;Query sent, waiting for response.&quot;));
+-			Runtime.Gui.StatusBar.SetProgressFraction (0.5);
+-			
+-			Connection.ExecuteSQL (query, callback);
++				offset = 0;
++				Connection.ExecuteSQL (query, callback);
++			}
+ 		}
+ 		
++		void OnRunFromCursor (object sender, EventArgs args)
++		{
++			TextBuffer buf = (TextBuffer) sourceView.Buffer;
++			TextIter iter = buf.StartIter;
++			TextIter end_iter = buf.EndIter;
++			string query = String.Empty;
++
++			if (buf.GetSelectionBounds (out iter, out end_iter) == true) {
++				query = buf.GetText (iter, end_iter, false);
++				executeMode = 2; // as-is
++			} else {
++				query = GetSqlStatementAtCursor (buf, out iter);
++				executeMode = 1; // one multiple statements one-at-a-time starting at cursor
++			}
++
++			if (query.Trim ().Length &gt; 0) {
++				Runtime.Gui.StatusBar.BeginProgress (
++					GettextCatalog.GetString(&quot;Execuing sql query on&quot;)
++					+ String.Format (&quot; {0}&quot;, Connection.Name));
++				Runtime.Gui.StatusBar.SetProgressFraction (0.1);
++
++				Runtime.Gui.StatusBar.SetMessage (
++					GettextCatalog.GetString (&quot;Query sent, waiting for response.&quot;));
++				Runtime.Gui.StatusBar.SetProgressFraction (0.5);
++
++				SQLCallback callback = (SQLCallback)
++					Runtime.DispatchService.GuiDispatch (
++					new SQLCallback (OnExecuteReturn));
++
++				buf.MoveMark (buf.InsertMark, iter);
++				buf.MoveMark (buf.SelectionBound, iter);
++
++				executeMode = 1; // Execute multiple statements one-at-a-time starting at cursor
++				offset = iter.Offset;
++				Connection.ExecuteSQL (query, callback);
++			}
++		}
++		
+ 		void OnExecuteReturn (object sender, object results)
+ 		{
+ 			Runtime.Gui.StatusBar.SetMessage (
+ 				GettextCatalog.GetString (&quot;Query results received&quot;));
+ 			Runtime.Gui.StatusBar.SetProgressFraction (0.9);
+ 			
++			TextBuffer buf = (TextBuffer) sourceView.Buffer;
+ 			if (results == null) {
+ 				Runtime.Gui.StatusBar.ShowErrorMessage (
+ 					GettextCatalog.GetString (&quot;Invalid select query&quot;));
++				if (executeMode == 1)
++					sourceView.ScrollToMark (buf.InsertMark, 0.4, true, 0.0, 1.0);
+ 			} else {
+ 				DataGridView dataView = new DataGridView (results as DataTable);
+ 				Runtime.Gui.Workbench.ShowView (dataView, true);
++
++				if (executeMode == 1) { 
++					// execute multiple SQL
++					TextIter iter = buf.StartIter;
++ 					iter.Offset = offset;
++					string query = GetNextSqlStatement (buf, ref iter);
++					if (query.Trim ().Length &gt; 0) {
++						SQLCallback callback = (SQLCallback)
++							Runtime.DispatchService.GuiDispatch (
++							new SQLCallback (OnExecuteReturn));
++
++						// move insert mark to end of SQL statement to be executed
++						buf.MoveMark (buf.InsertMark, iter);
++						buf.MoveMark (buf.SelectionBound, iter);
++
++						Runtime.Gui.StatusBar.SetMessage (
++							GettextCatalog.GetString (&quot;Query sent, waiting for response.&quot;));
++						Runtime.Gui.StatusBar.SetProgressFraction (0.5);
++
++						executeMode = 1;
++						offset = iter.Offset;
++						Connection.ExecuteSQL (query, callback);
++					}
++					else {
++						sourceView.ScrollToMark (buf.InsertMark, 0.4, true, 0.0, 1.0);
++						Runtime.Gui.StatusBar.EndProgress ();
++					}
++				}
++				else {
++					sourceView.ScrollToMark (buf.InsertMark, 0.4, true, 0.0, 1.0);
++					Runtime.Gui.StatusBar.EndProgress ();
++				}			
+ 			}
+-			
+-			Runtime.Gui.StatusBar.EndProgress ();
+ 		}
+-		
+-		void OnRunFromCursor (object sender, EventArgs args)
++
++		// Execute first SQL statement at cursor
++		public string GetSqlStatementAtCursor (TextBuffer sqlTextBuffer, out TextIter iter) 
+ 		{
+-			Runtime.Gui.StatusBar.BeginProgress (
+-				GettextCatalog.GetString(&quot;Execuing sql query on&quot;)
+-				+ String.Format (&quot; {0}&quot;, Connection.Name));
+-			Runtime.Gui.StatusBar.SetProgressFraction (0.1);
++			TextIter start_iter, end_iter, insert_iter;
++			TextIter match_start1, match_end1, match_start2, match_end2;
++			TextIter begin_iter, finish_iter;
++			string text = String.Empty;
++			int char_count = 0;
++			TextMark insert_mark;
++
++			insert_mark = sqlTextBuffer.InsertMark;
++			insert_iter = sqlTextBuffer.GetIterAtMark (insert_mark);
++			start_iter = sqlTextBuffer.GetIterAtOffset (0);
+ 			
+-			string query = sourceView.Buffer.GetSlice (
+-				sourceView.Buffer.GetIterAtMark (sourceView.Buffer.InsertMark),
+-				sourceView.Buffer.EndIter, false);
+-			SQLCallback callback = (SQLCallback)
+-				Runtime.DispatchService.GuiDispatch (
+-				new SQLCallback (OnExecuteReturn));
+-			
+-			Runtime.Gui.StatusBar.SetMessage (
+-				GettextCatalog.GetString (&quot;Query sent, waiting for response.&quot;));
+-			Runtime.Gui.StatusBar.SetProgressFraction (0.5);
+-			
+-			Connection.ExecuteSQL (query, callback);
++			char_count = sqlTextBuffer.CharCount;
++			end_iter = sqlTextBuffer.GetIterAtOffset (char_count);
++			iter = end_iter;
++
++			match_start1 = sqlTextBuffer.GetIterAtOffset (0);
++			match_end1 = sqlTextBuffer.GetIterAtOffset (char_count);
++			match_start2 = sqlTextBuffer.GetIterAtOffset (0);
++			match_end2 = sqlTextBuffer.GetIterAtOffset (char_count);
++
++			begin_iter = sqlTextBuffer.GetIterAtOffset (0);
++			finish_iter = sqlTextBuffer.GetIterAtOffset (char_count);
++
++			if (start_iter.IsEnd == false) 
++			{
++				if (insert_iter.BackwardSearch (&quot;;&quot;, TextSearchFlags.TextOnly, 
++						out match_start1, out match_end1, start_iter) == true) {
++					begin_iter = match_start1;
++					begin_iter.ForwardChars (1);
++				}
++				
++				if (insert_iter.ForwardSearch (&quot;;&quot;,	TextSearchFlags.TextOnly,
++						out match_start2, out match_end2, end_iter) == true) {
++					finish_iter = match_end2;
++					finish_iter.BackwardChars (1);
++				}
++				iter = finish_iter;
++				text = sqlTextBuffer.GetText (begin_iter, finish_iter, false);	
++
++				// FIXME: for this to work.  GetSqlStatement has to rewritten to be line-based
++				if (text.Length &gt; 0) {
++					// search does not work if what you are searching for is 
++					// at the end of the buffer,
++					// this compensates for this
++					int j = text.Length;
++					int cont = 1;
++					for(int i = text.Length - 1; cont == 1 &amp;&amp; i &gt;= 0; i--) {
++						char ch = text[i];
++						switch(ch) {
++						case ' ':
++						case ';':
++							j--;
++							break;
++						default:
++							cont = 0;
++							break;
++						}
++					}
++					
++					if (j != text.Length) {
++						string t = text.Substring(0, j);
++						text = t;
++					}
++				}
++			}
++
++			return text;
+ 		}
++
++		// get next SQL statement.  Requires GetSqlStatementAtCursor having been called first
++		public string GetNextSqlStatement (TextBuffer sqlTextBuffer, ref TextIter iter) 
++		{
++			TextIter start_iter, end_iter;
++			TextIter match_start2, match_end2;
++			TextIter finish_iter;
++			string text = String.Empty;
++			int char_count = 0;
++
++			char_count = sqlTextBuffer.CharCount;
++			end_iter = sqlTextBuffer.GetIterAtOffset (char_count);
++			if (iter.IsEnd == false) {
++				iter.ForwardChars (1);
++				if (sqlTextBuffer.GetText (iter, end_iter, false).Equals (&quot;;&quot;))
++					iter.ForwardChars (1);
++			}
++
++			if (iter.IsEnd == true) 
++				return &quot;&quot;;
++
++			start_iter = iter;
++			match_start2 = iter;
++			match_end2 = sqlTextBuffer.GetIterAtOffset (char_count);
++			finish_iter = sqlTextBuffer.GetIterAtOffset (char_count);
++
++			if (start_iter.IsEnd == false) {
++				if (iter.ForwardSearch (&quot;;&quot;, TextSearchFlags.TextOnly,
++						out match_start2, out match_end2, end_iter) == true) 	{
++					finish_iter = match_end2;
++					finish_iter.BackwardChars (1);
++				}
++
++				text = sqlTextBuffer.GetText (iter, finish_iter, false);
++				iter = finish_iter;
++
++				if(text.Length &gt; 0) {
++					// search does not work if what you are searching for is 
++					// at the end of the buffer,
++					// this compensates for this
++					int j = text.Length;
++					int cont = 1;
++					for(int i = text.Length - 1; cont == 1 &amp;&amp; i &gt;= 0; i--) {
++						char ch = text[i];
++						switch(ch) {
++						case ' ':
++						case ';':
++							j--;
++							break;
++						default:
++							cont = 0;
++							break;
++						}
++					}
++					
++					if(j != text.Length) {
++						string t = text.Substring(0, j);
++						text = t;
++					}
++				}
++			}
++
++			return text;
++		}
+ 		
+ 		void OnExplain (object sender, EventArgs args)
+ 		{
+Index: Extras/MonoQuery/Mono.Data.Sql/Providers/SqlDbProvider.cs
+===================================================================
+--- Extras/MonoQuery/Mono.Data.Sql/Providers/SqlDbProvider.cs	(revision 2778)
++++ Extras/MonoQuery/Mono.Data.Sql/Providers/SqlDbProvider.cs	(working copy)
+@@ -144,30 +144,18 @@
+ 		{
+ 			if (type == typeof(TableSchema))
+ 				return true;
++			else if (type == typeof(ColumnSchema))
++				return true;
+ 			else if (type == typeof(ViewSchema))
+ 				return true;
+ 			else if (type == typeof(ProcedureSchema))
+ 				return true;
+-			else if (type == typeof(AggregateSchema))
+-				return true;
+-			else if (type == typeof(GroupSchema))
+-				return true;
+ 			else if (type == typeof(UserSchema))
+ 				return true;
+-			else if (type == typeof(LanguageSchema))
+-				return true;
+-			else if (type == typeof(OperatorSchema))
+-				return true;
+-			else if (type == typeof(RoleSchema))
+-				return true;
+ 			else if (type == typeof(SequenceSchema))
+ 				return true;
+-			else if (type == typeof(DataTypeSchema))
+-				return true;
+ 			else if (type == typeof(TriggerSchema))
+ 				return true;
+-			else if (type == typeof(RuleSchema))
+-				return true;
+ 			else
+ 				return false;
+ 		}
+@@ -454,71 +442,6 @@
+ 			
+ 			ArrayList collection = new ArrayList ();
+ 			
+-			SqlConnection con2 = (SqlConnection) (((ICloneable) connection).Clone ());
+-			if (con2.State == ConnectionState.Closed)
+-				con2.Open();
+-			SqlCommand command = con2.CreateCommand ();
+-			command.CommandText = 
+-				String.Format (
+-					&quot;select sox.name, sox.xtype, &quot; +
+-					&quot;   so.name as table_name, sc.name as column_name,  &quot; +
+-					&quot;   sx.constid as constid, sx.id, sx.colid &quot; +
+-					&quot;from dbo.sysconstraints sx, dbo.sysobjects so, dbo.syscolumns sc, &quot; +
+-					&quot;     dbo.sysobjects sox &quot; +
+-					&quot;where so.id = sx.id &quot; +
+-					&quot;and sc.id = so.id &quot; +
+-					&quot;and sc.colid = sx.colid &quot; +
+-					&quot;and sox.id = sx.constid &quot; +
+-					&quot;union &quot; +
+-					&quot;select si.name,  so.xtype,  &quot; +
+-					&quot;  sot.name as table_name, sc.name as column_name,  &quot; +
+-					&quot;  si.indid as constraintid, si.id as tableid, sc.colid as columnid  &quot; +
+-					&quot;from sysindexes si, sysindexkeys sk, syscolumns sc, sysobjects so, &quot; +
+-					&quot;  sysobjects sot &quot; +
+-					&quot;where si.id = 405576483 &quot; +
+-					&quot;and sot.id = so.parent_obj &quot; +
+-					&quot;and sk.id = si.id &quot; +
+-					&quot;and sc.id = si.id &quot; +
+-					&quot;and sk.id = sc.id &quot; +
+-					&quot;and sk.indid = si.indid &quot; +
+-					&quot;and sk.colid = sc.colid &quot; +
+-					&quot;and so.name = si.name &quot; +
+-					&quot;order by 3, 1, 7&quot;,
+-					table.Name, table.OwnerName);
+-			SqlDataReader r = command.ExecuteReader ();
+-			
+-			while (r.Read ()) {
+-				ConstraintSchema constraint = null;
+-				switch (r.GetString(1)) {
+-				case &quot;D&quot;: // default constraint
+-					break;
+-				case &quot;C&quot;: // check constraint
+-					break;
+-				case &quot;PK&quot;: // Primary Key
+-					constraint = new PrimaryKeyConstraintSchema();
+-					constraint.Name = r.GetString (0);
+-					break;
+-				case &quot;F&quot;: // Foreign key
+-					break;
+-				case &quot;UQ&quot;: // Unique constraint
+-					break;
+-				default:
+-					break;
+-				}
+-				
+-				
+-				//constraint.Definition = r.GetString (1);
+-				
+-				if (constraint != null)
+-					collection.Add (constraint);
+-			}
+-			r.Close ();
+-			r = null;
+-			command.Dispose ();
+-			command = null;
+-			con2.Close ();
+-			con2 = null;
+-			
+ 			return (ConstraintSchema[]) collection.ToArray (typeof(ConstraintSchema));
+ 		}
+ 		
+@@ -529,8 +452,6 @@
+ 			
+ 			ArrayList collection = new ArrayList ();
+ 			
+-			
+-			
+ 			return (UserSchema[]) collection.ToArray (typeof (UserSchema));
+ 		}
+ 	}
+Index: Extras/MonoQuery/Mono.Data.Sql/Providers/OracleDbProvider.cs
+===================================================================
+--- Extras/MonoQuery/Mono.Data.Sql/Providers/OracleDbProvider.cs	(revision 2779)
++++ Extras/MonoQuery/Mono.Data.Sql/Providers/OracleDbProvider.cs	(working copy)
+@@ -137,28 +137,12 @@
+ 				return true;
+ 			else if (type == typeof(ProcedureSchema))
+ 				return true;
+-			/*
+-			else if (type == typeof(AggregateSchema))
+-				return true;
+-			else if (type == typeof(GroupSchema))
+-				return true;
+ 			else if (type == typeof(UserSchema))
+ 				return true;
+-			else if (type == typeof(LanguageSchema))
+-				return true;
+-			else if (type == typeof(OperatorSchema))
+-				return true;
+-			else if (type == typeof(RoleSchema))
+-				return true;
+ 			else if (type == typeof(SequenceSchema))
+ 				return true;
+-			else if (type == typeof(DataTypeSchema))
+-				return true;
+ 			else if (type == typeof(TriggerSchema))
+ 				return true;
+-			else if (type == typeof(RuleSchema))
+-				return true;
+-			*/
+ 			else
+ 				return false;
+ 		}
+Index: Extras/MonoQuery/Mono.Data.Sql/Providers/SybaseDbProvider.cs
+===================================================================
+--- Extras/MonoQuery/Mono.Data.Sql/Providers/SybaseDbProvider.cs	(revision 2778)
++++ Extras/MonoQuery/Mono.Data.Sql/Providers/SybaseDbProvider.cs	(working copy)
+@@ -144,30 +144,18 @@
+ 		{
+ 			if (type == typeof(TableSchema))
+ 				return true;
++			else if (type == typeof(ColumnSchema))
++				return true;
+ 			else if (type == typeof(ViewSchema))
+ 				return true;
+ 			else if (type == typeof(ProcedureSchema))
+ 				return true;
+-			else if (type == typeof(AggregateSchema))
+-				return true;
+-			else if (type == typeof(GroupSchema))
+-				return true;
+ 			else if (type == typeof(UserSchema))
+ 				return true;
+-			else if (type == typeof(LanguageSchema))
+-				return true;
+-			else if (type == typeof(OperatorSchema))
+-				return true;
+-			else if (type == typeof(RoleSchema))
+-				return true;
+ 			else if (type == typeof(SequenceSchema))
+ 				return true;
+-			else if (type == typeof(DataTypeSchema))
+-				return true;
+ 			else if (type == typeof(TriggerSchema))
+ 				return true;
+-			else if (type == typeof(RuleSchema))
+-				return true;
+ 			else
+ 				return false;
+ 		}
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002444.html">[MonoDevelop] Database Browser
+</A></li>
+	<LI>Next message: <A HREF="002447.html">[MonoDevelop] Database connections Repository
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2446">[ date ]</a>
+              <a href="thread.html#2446">[ thread ]</a>
+              <a href="subject.html#2446">[ subject ]</a>
+              <a href="author.html#2446">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/monodevelop-list">More information about the Monodevelop-list
+mailing list</a><br>
+</body></html>

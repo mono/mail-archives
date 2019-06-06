@@ -1,0 +1,459 @@
+Index: Core/src/MonoDevelop.Base/Makefile.am
+===================================================================
+--- Core/src/MonoDevelop.Base/Makefile.am	(revision 2569)
++++ Core/src/MonoDevelop.Base/Makefile.am	(working copy)
+@@ -363,6 +363,7 @@
+ Internal/Parser/IExpressionFinder.cs \
+ Internal/Parser/IField.cs \
+ Internal/Parser/IProperty.cs \
++Internal/Parser/ISourceCodeElement.cs \
+ Internal/Parser/PersistenceLayer/PersistentIndexer.cs \
+ Internal/Parser/PersistenceLayer/PersistentField.cs \
+ Internal/Parser/PersistenceLayer/PersistentMethod.cs \
+Index: Core/src/MonoDevelop.Base/Internal/Parser/IClass.cs
+===================================================================
+--- Core/src/MonoDevelop.Base/Internal/Parser/IClass.cs	(revision 2569)
++++ Core/src/MonoDevelop.Base/Internal/Parser/IClass.cs	(working copy)
+@@ -12,12 +12,8 @@
+ 
+ namespace MonoDevelop.Internal.Parser
+ {
+-	public interface IClass : IDecoration
++	public interface IClass : IDecoration, ISourceCodeElement
+ 	{
+-		string FullyQualifiedName {
+-			get;
+-		}
+-		
+ 		string Name {
+ 			get;
+ 		}
+@@ -34,10 +30,6 @@
+ 			get;
+ 		}
+ 		
+-		IRegion Region {
+-			get;
+-		}
+-		
+ 		IRegion BodyRegion {
+ 			get;
+ 		}
+Index: Core/src/MonoDevelop.Base/Internal/Parser/IMember.cs
+===================================================================
+--- Core/src/MonoDevelop.Base/Internal/Parser/IMember.cs	(revision 2569)
++++ Core/src/MonoDevelop.Base/Internal/Parser/IMember.cs	(working copy)
+@@ -9,14 +9,8 @@
+ 
+ namespace MonoDevelop.Internal.Parser
+ {
+-	public interface IMember : IDecoration
++	public interface IMember : IDecoration, ISourceCodeElement
+ 	{
+-		string FullyQualifiedName {
+-			get;
+-		}
+-		IRegion Region {
+-			get;
+-		}
+ 
+ 		string Name {
+ 			get;
+Index: Core/src/AddIns/BackendBindings/CSharpBinding/Makefile.am
+===================================================================
+--- Core/src/AddIns/BackendBindings/CSharpBinding/Makefile.am	(revision 2569)
++++ Core/src/AddIns/BackendBindings/CSharpBinding/Makefile.am	(working copy)
+@@ -30,6 +30,7 @@
+ Parser/TypeVisitor.cs \
+ Parser/CSharpVisitor.cs \
+ Parser/Resolver.cs \
++Parser/SourceCodeElement.cs \
+ Parser/Parser.cs \
+ Parser/ExpressionFinder.cs \
+ CSharpAmbience.cs \
+Index: Core/src/AddIns/BackendBindings/CSharpBinding/Parser/TypeVisitor.cs
+===================================================================
+--- Core/src/AddIns/BackendBindings/CSharpBinding/Parser/TypeVisitor.cs	(revision 2569)
++++ Core/src/AddIns/BackendBindings/CSharpBinding/Parser/TypeVisitor.cs	(working copy)
+@@ -99,7 +99,7 @@
+ 					return new ReturnType(((TypeReferenceExpression)fieldReferenceExpression.TargetObject).TypeReference);
+ 				}
+ 			}
+-			IReturnType returnType = fieldReferenceExpression.TargetObject.AcceptVisitor(this, data) as IReturnType;
++			ISourceCodeElement returnType = fieldReferenceExpression.TargetObject.AcceptVisitor(this, data) as ISourceCodeElement;
+ 			if (returnType != null) {
+ 				string name = resolver.SearchNamespace(returnType.FullyQualifiedName, resolver.CompilationUnit);
+ 				if (name != null) {
+@@ -110,7 +110,7 @@
+ 					IClass c = resolver.SearchType(string.Concat(name, ".", fieldReferenceExpression.FieldName), resolver.CompilationUnit);
+ 					if (c != null) {
+ 						resolver.ShowStatic = true;
+-						return new ReturnType(c.FullyQualifiedName);
++						return c;
+ 					}
+ 					return null;
+ 				}
+@@ -122,16 +122,19 @@
+ 		
+ 		public override object Visit(PointerReferenceExpression pointerReferenceExpression, object data)
+ 		{
+-			ReturnType type = pointerReferenceExpression.Expression.AcceptVisitor(this, data) as ReturnType;
+-			if (type == null) {
++			IMember member = pointerReferenceExpression.Expression.AcceptVisitor(this, data) as IMember;
++			if (member == null) {
+ 				return null;
+ 			}
++
++			ReturnType type = (ReturnType)member.ReturnType;
++
+ 			type = type.Clone();
+ 			--type.PointerNestingLevel;
+ 			if (type.PointerNestingLevel != 0) {
+ 				return null;
+ 			}
+-			return resolver.SearchMember(type, pointerReferenceExpression.Identifier);
++			return resolver.SearchMember(member, pointerReferenceExpression.Identifier);
+ 		}
+ 		
+ 		public override object Visit(IdentifierExpression identifierExpression, object data)
+@@ -142,12 +145,12 @@
+ 			}
+ 			string name = resolver.SearchNamespace(identifierExpression.Identifier, resolver.CompilationUnit);
+ 			if (name != null) {
+-				return new ReturnType(name);
++				return new SourceCodeElement(name, null);
+ 			}
+ 			IClass c = resolver.SearchType(identifierExpression.Identifier, resolver.CompilationUnit);
+ 			if (c != null) {
+ 				resolver.ShowStatic = true;
+-				return new ReturnType(c.FullyQualifiedName);
++				return c;
+ 			}
+ 			return resolver.DynamicLookup(identifierExpression.Identifier);
+ 		}
+Index: Core/src/AddIns/BackendBindings/CSharpBinding/Parser/Resolver.cs
+===================================================================
+--- Core/src/AddIns/BackendBindings/CSharpBinding/Parser/Resolver.cs	(revision 2569)
++++ Core/src/AddIns/BackendBindings/CSharpBinding/Parser/Resolver.cs	(working copy)
+@@ -66,7 +66,7 @@
+ 		int caretLine;
+ 		int caretColumn;
+ 		
+-		public IReturnType internalResolve(IParserService parserService, string expression, int caretLineNumber, int caretColumn, string fileName, string fileContent)
++		ISourceCodeElement internalResolve(IParserService parserService, string expression, int caretLineNumber, int caretColumn, string fileName, string fileContent)
+ 		{
+ 			//Console.WriteLine("Start Resolving");
+ 			if (expression == null) {
+@@ -132,8 +132,17 @@
+ //				Console.WriteLine("CallingClass is " + callingClass == null ? "null" : callingClass.Name);
+ 			}
+ 			//Console.WriteLine("expression = " + expr.ToString());
+-			IReturnType type = expr.AcceptVisitor(typeVisitor, null) as IReturnType;
++			ISourceCodeElement sourceCodeElement = expr.AcceptVisitor(typeVisitor, null) as ISourceCodeElement;
+ 			//Console.WriteLine("type visited");
++
++			IReturnType type = null;
++
++			if (sourceCodeElement is IMember)
++			{
++				type = ((IMember)sourceCodeElement).ReturnType;
++			}
++			
++			
+ 			if (type == null || type.PointerNestingLevel != 0) {
+ //				Console.WriteLine("Type == null || type.PointerNestingLevel != 0");
+ 				if (type != null) {
+@@ -149,14 +158,23 @@
+ 				if (cu != null) {
+ 					callingClass = GetInnermostClass();
+ 				}
+-				type=expr.AcceptVisitor(typeVisitor,null) as IReturnType;
+-				if (type==null)	return null;
++				
++				sourceCodeElement = expr.AcceptVisitor(typeVisitor,null) as ISourceCodeElement;
++				if (sourceCodeElement==null) return null;
+ 			}
+-			if (type.ArrayDimensions != null && type.ArrayDimensions.Length > 0) {
+-				type = new ReturnType("System.Array");
++
++			if (sourceCodeElement is IMember)
++			{
++				type = ((IMember)sourceCodeElement).ReturnType;
+ 			}
+-			Console.WriteLine("Here: Type is " + type.FullyQualifiedName);
+-			return type;
++
++			if (type != null && type.ArrayDimensions != null && type.ArrayDimensions.Length > 0) {
++				
++				sourceCodeElement = new SourceCodeElement ("System.Array", null);
++			}
++
++			Console.WriteLine("Here: Type is " + sourceCodeElement.FullyQualifiedName);
++			return sourceCodeElement;
+ 		}
+ 
+ 		public string MonodocResolver (IParserService parserService, string expression, int caretLineNumber, int caretColumn, string fileName, string fileContent) 
+@@ -168,15 +186,23 @@
+ 			if (expression == "") {
+ 				return null;
+ 			}
+-			IReturnType retType = internalResolve (parserService, expression, caretLineNumber, caretColumn, fileName, fileContent);
+-			IClass retClass = parserService.SearchType (project, retType.FullyQualifiedName, null, cu);
+-			if (retClass == null) {
+-				Console.WriteLine ("Retclass was null");
+-				return null;
++
++			ISourceCodeElement retType = internalResolve (parserService, expression, caretLineNumber, caretColumn, fileName, fileContent);
++			
++			string monodocPrefix = "T";
++
++			if (retType as IProperty != null)
++			{
++				monodocPrefix = "P";
+ 			}
+-			
+-			Console.WriteLine (retClass.FullyQualifiedName);
+-			return "T:" + retClass.FullyQualifiedName;
++
++			if (retType as IField != null)
++			{
++				monodocPrefix = "F";
++			}
++
++			Console.WriteLine (retType.FullyQualifiedName);
++			return monodocPrefix + ":" + retType.FullyQualifiedName;
+ 		}
+ 		
+ 		public ResolveResult Resolve(IParserService parserService, string expression, int caretLineNumber, int caretColumn, string fileName, string fileContent) 
+@@ -227,8 +253,25 @@
+ 			}
+ 			
+ 			//Console.WriteLine("Not in Using");
+-			IReturnType type = internalResolve (parserService, expression, caretLineNumber, caretColumn, fileName, fileContent);
+-			IClass returnClass = SearchType (type.FullyQualifiedName, cu);
++
++			ISourceCodeElement type = internalResolve (parserService, expression, caretLineNumber, caretColumn, fileName, fileContent);
++
++			IClass returnClass = null;
++
++			if (type is IClass)
++			{
++				returnClass = (IClass)type;
++			}
++			else if (type is IMember)
++			{
++				returnClass = SearchType (((IMember)type).ReturnType.FullyQualifiedName, cu);
++			}
++			else
++			{
++				returnClass = SearchType (type.FullyQualifiedName, cu);
++			}
++
++
+ 			if (returnClass == null) {
+ 				// Try if type is Namespace:
+ 				string n = SearchNamespace(type.FullyQualifiedName, cu);
+@@ -431,36 +474,43 @@
+ 		}
+ 		
+ 		// no methods or indexer
+-		public IReturnType SearchMember(IReturnType type, string memberName)
++		public ISourceCodeElement SearchMember(ISourceCodeElement type, string memberName)
+ 		{
+ 			if (type == null || memberName == null || memberName == "") {
+ 				return null;
+ 			}
+-//			Console.WriteLine("searching member {0} in {1}", memberName, type.Name);
++//			Console.WriteLine("searching member {0} in {1}", memberName, type.FullyQualifiedName);
+ 			IClass curType = SearchType(type.FullyQualifiedName, cu);
+ 			if (curType == null) {
+ //				Console.WriteLine("Type not found in SearchMember");
+ 				return null;
+ 			}
+-			if (type.PointerNestingLevel != 0) {
+-				return null;
+-			}
+-			if (type.ArrayDimensions != null && type.ArrayDimensions.Length > 0) {
+-				curType = SearchType("System.Array", null);
+-			}
+-			if (curType.ClassType == ClassType.Enum) {
+-				foreach (IField f in curType.Fields) {
+-					if (f.Name == memberName && MustBeShowen(curType, f)) {
+-						showStatic = false;
+-						return type; // enum members have the type of the enum
++			
++			if (type is IMember) {			
++
++				IReturnType retType = ((IMember)type).ReturnType;;
++
++				if (retType.PointerNestingLevel != 0) {
++					return null;
++				}
++				if (retType.ArrayDimensions != null && retType.ArrayDimensions.Length > 0) {
++					curType = SearchType("System.Array", null);
++				}
++				if (curType.ClassType == ClassType.Enum) {
++					foreach (IField f in curType.Fields) {
++						if (f.Name == memberName && MustBeShowen(curType, f)) {
++							showStatic = false;
++							return curType; // enum members have the type of the enum
++						}
+ 					}
+ 				}
+ 			}
++
+ 			if (showStatic) {
+ //				Console.WriteLine("showStatic == true");
+ 				foreach (IClass c in curType.InnerClasses) {
+ 					if (c.Name == memberName && IsAccessible(curType, c)) {
+-						return new ReturnType(c.FullyQualifiedName);
++						return c;
+ 					}
+ 				}
+ 			}
+@@ -471,7 +521,7 @@
+ 				if (p.Name == memberName && MustBeShowen(curType, p)) {
+ //					Console.WriteLine("Property found " + p.Name);
+ 					showStatic = false;
+-					return p.ReturnType;
++					return p;
+ 				}
+ 			}
+ 			foreach (IField f in curType.Fields) {
+@@ -480,19 +530,19 @@
+ 				if (f.Name == memberName && MustBeShowen(curType, f)) {
+ //					Console.WriteLine("Field found " + f.Name);
+ 					showStatic = false;
+-					return f.ReturnType;
++					return f;
+ 				}
+ 			}
+ 			foreach (IEvent e in curType.Events) {
+ 				if (e.Name == memberName && MustBeShowen(curType, e)) {
+ 					showStatic = false;
+-					return e.ReturnType;
++					return e;
+ 				}
+ 			}
+ 			foreach (string baseType in curType.BaseTypes) {
+ 				IClass c = parserService.GetClass (project, baseType, true, true);
+ 				if (c != null) {
+-					IReturnType erg = SearchMember(new ReturnType(c.FullyQualifiedName), memberName);
++					ISourceCodeElement erg = SearchMember (c, memberName);
+ 					if (erg != null) {
+ 						return erg;
+ 					}
+@@ -525,7 +575,7 @@
+ 			return between.Y < end.Y || between.X <= end.X;
+ 		}
+ 		
+-		ReturnType SearchVariable(string name)
++		ISourceCodeElement SearchVariable(string name)
+ 		{
+ //			Console.WriteLine("Searching Variable");
+ //			
+@@ -542,11 +592,11 @@
+ 				return null;
+ 			}
+ 			
+-			ReturnType found = null;
++			ISourceCodeElement found = null;
+ 			foreach (LocalLookupVariable v in variables) {
+ //				Console.WriteLine("Position: ({0}/{1})", v.StartPos, v.EndPos);
+ 				if (IsInside(new Point(caretColumn, caretLine), v.StartPos, v.EndPos)) {
+-					found = new ReturnType(v.TypeRef);
++					found = new SourceCodeElement(v.TypeRef.SystemType, null);
+ //					Console.WriteLine("Variable found");
+ 					break;
+ 				}
+@@ -561,13 +611,13 @@
+ 		/// <remarks>
+ 		/// does the dynamic lookup for the typeName
+ 		/// </remarks>
+-		public IReturnType DynamicLookup(string typeName)
++		public ISourceCodeElement DynamicLookup(string typeName)
+ 		{
+ //			Console.WriteLine("starting dynamic lookup");
+ //			Console.WriteLine("name == " + typeName);
+ 			
+ 			// try if it exists a variable named typeName
+-			ReturnType variable = SearchVariable(typeName);
++			ISourceCodeElement variable = SearchVariable(typeName);
+ 			if (variable != null) {
+ 				showStatic = false;
+ 				return variable;
+@@ -581,13 +631,13 @@
+ 			foreach (IField f in callingClass.Fields) {
+ 				if (f.Name == typeName) {
+ //					Console.WriteLine("Field found " + f.Name);
+-					return f.ReturnType;
++					return f;
+ 				}
+ 			}
+ 			//// end of mod for search in Fields
+ 		
+ 			// try if typeName is a method parameter
+-			IReturnType p = SearchMethodParameter(typeName);
++			ISourceCodeElement p = SearchMethodParameter(typeName);
+ 			if (p != null) {
+ //				Console.WriteLine("MethodParameter Found");
+ 				showStatic = false;
+@@ -607,7 +657,7 @@
+ 			
+ 			// try if there exists a nonstatic member named typeName
+ 			showStatic = false;
+-			IReturnType t = SearchMember(callingClass == null ? null : new ReturnType(callingClass.FullyQualifiedName), typeName);
++			ISourceCodeElement t = SearchMember(callingClass == null ? null : callingClass, typeName);
+ 			if (t != null) {
+ 				return t;
+ 			}
+@@ -615,7 +665,7 @@
+ 			
+ 			// try if there exists a static member named typeName
+ 			showStatic = true;
+-			t = SearchMember(callingClass == null ? null : new ReturnType(callingClass.FullyQualifiedName), typeName);
++			t = SearchMember(callingClass == null ? null : callingClass, typeName);
+ 			if (t != null) {
+ 				showStatic = false;
+ 				return t;
+@@ -624,7 +674,7 @@
+ 			
+ 			// try if there exists a static member in outer classes named typeName
+ 			foreach (IClass c in GetOuterClasses()) {
+-				t = SearchMember(callingClass == null ? null : new ReturnType(c.FullyQualifiedName), typeName);
++				t = SearchMember(callingClass == null ? null : c, typeName);
+ 				if (t != null) {
+ 					showStatic = false;
+ 					return t;
+@@ -655,19 +705,19 @@
+ 			return null;
+ 		}
+ 		
+-		IReturnType SearchProperty()
++		ISourceCodeElement SearchProperty()
+ 		{
+ 			IProperty property = GetProperty();
+ 			if (property == null) {
+ 				return null;
+ 			}
+ 			if (property.SetterRegion != null && property.SetterRegion.IsInside(caretLine, caretColumn)) {
+-				return property.ReturnType;
++				return property;
+ 			}
+ 			return null;
+ 		}
+ 		
+-		IReturnType SearchMethodParameter(string parameter)
++		ISourceCodeElement SearchMethodParameter(string parameter)
+ 		{
+ 			IMethod method = GetMethod();
+ 			if (method == null) {
+@@ -677,7 +727,7 @@
+ 			foreach (IParameter p in method.Parameters) {
+ 				if (p.Name == parameter) {
+ 					Console.WriteLine("Parameter found");
+-					return p.ReturnType;
++					return new SourceCodeElement(p.Name, null);
+ 				}
+ 			}
+ 			return null;

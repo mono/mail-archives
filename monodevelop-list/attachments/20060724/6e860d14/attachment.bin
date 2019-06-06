@@ -1,0 +1,776 @@
+Index: Core/src/MonoDevelop.Projects/ChangeLog
+===================================================================
+--- Core/src/MonoDevelop.Projects/ChangeLog	(revision 62894)
++++ Core/src/MonoDevelop.Projects/ChangeLog	(working copy)
+@@ -1,3 +1,32 @@
++2006-07-23 Matej Urbas <matej.urbas@gmail.com>
++
++	* MonoDevelop.Projects.Parser/ReflectionReturnType.cs: Added generics
++	  support and entirely changed the process of visiting Mono.Cecil return
++	  types.
++	* MonoDevelop.Projects.Parser/ReflectionMethod.cs:
++	* MonoDevelop.Projects.Parser/ReflectionClass.cs: Added generics support -
++	  now generic types get correctly parsed from Mono assemblies.
++	* MonoDevelop.Projects.Parser/ReflectionParameter.cs: Changed the way we
++	  figure out if the parameter is passed ByRef.
++	* MonoDevelop.Projects.Parser/IReturnType.cs: Added the ByRef property
++	  which tells whether the type is passed by reference (as a method
++	  parameter).
++	* MonoDevelop.Projects.Parser/AbstractReturnType.cs: Added ByRef
++	  implementation.
++	* MonoDevelop.Projects.Parser/CodeCompletionDatabase.cs: Increased the
++	  version number.
++	* MonoDevelop.Projects.Parser/GenericParameter.cs: GenericParameter now uses
++	  special constraints as provided by Mono.Cecil - it is much cleaner so.
++	* MonoDevelop.Projects.Parser/PersistentMethod.cs: Added support for
++	  generic methods.
++	* MonoDevelop.Projects.Parser/PersistentReturnType.cs: Added generics
++	  support and implemented ByRef (de)serialization. With special thanks to Jb
++	  Evain (author of Cecil).
++	* MonoDevelop.Projects.Parser/PersistentGenericParamater.cs: Added this
++	  file to the project. It handles (de)serialization of generic parameters
++	  from/to the code completion databases.
++	* MonoDevelop.Projects.mdp: Added a new file to the build process.
++
+ 2006-07-17 Lluis Sanchez Gual  <lluis@novell.com>
+ 
+ 	* MonoDevelop.Projects/DotNetProject.cs: Copy files with BuildAction.FileCopy.
+@@ -89,7 +118,7 @@
+ 	* MonoDevelop.Projects.CodeGeneration/CodeRefactorer.cs: Updated to use 
+ 	  ReturnType as BaseTypes in IClass instances.
+ 	
+-	* MonoDevelop.Projects.mdp: Added new file to the build process.
++	* MonoDevelop.Projects.mdp: Added new files to the build process.
+ 	
+ 	* Makefile.am: Added new files to the build process.
+ 
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.mdp
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.mdp	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.mdp	(working copy)
+@@ -14,9 +14,6 @@
+     </Configuration>
+   </Configurations>
+   <DeployTargets />
+-  <DeploymentInformation strategy="File">
+-    <excludeFiles />
+-  </DeploymentInformation>
+   <Contents>
+     <File name="./AssemblyInfo.cs" subtype="Code" buildaction="Compile" />
+     <File name="./MonoDevelop.Projects.Ambience/AbstractAmbience.cs" subtype="Code" buildaction="Compile" />
+@@ -232,6 +229,7 @@
+     <File name="./MonoDevelop.Projects.Deployment/UnknownDeployTarget.cs" subtype="Code" buildaction="Compile" />
+     <File name="./MonoDevelop.Projects.Deployment/FileDeployTarget.cs" subtype="Code" buildaction="Compile" />
+     <File name="./MonoDevelop.Projects.Deployment/DirectoryDeployTarget.cs" subtype="Code" buildaction="Compile" />
++    <File name="./MonoDevelop.Projects.Parser/PersistentGenericParamater.cs" subtype="Code" buildaction="Compile" />
+   </Contents>
+   <References>
+     <ProjectReference type="Project" localcopy="True" refto="ICSharpCode.SharpRefactory" />
+@@ -242,4 +240,7 @@
+     <ProjectReference type="Gac" localcopy="True" refto="System.Drawing, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a" />
+     <ProjectReference type="Gac" localcopy="True" refto="Mono.Posix, Version=2.0.0.0, Culture=neutral, PublicKeyToken=0738eb9f132ed756" />
+   </References>
++  <DeploymentInformation strategy="File">
++    <excludeFiles />
++  </DeploymentInformation>
+ </Project>
+\ No newline at end of file
+Index: Core/src/MonoDevelop.Projects/Makefile.am
+===================================================================
+--- Core/src/MonoDevelop.Projects/Makefile.am	(revision 62894)
++++ Core/src/MonoDevelop.Projects/Makefile.am	(working copy)
+@@ -217,6 +217,7 @@
+ MonoDevelop.Projects.Parser/GenericParameter.cs \
+ MonoDevelop.Projects.Parser/ReturnTypeList.cs \
+ MonoDevelop.Projects.Parser/GenericParameterList.cs \
++MonoDevelop.Projects.Parser/PersistentGenericParamater.cs \
+ MonoDevelop.Projects/UnknownCombineEntry.cs \
+ MonoDevelop.Projects.Documentation/IDocumentationService.cs
+ 
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/GenericParameter.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/GenericParameter.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/GenericParameter.cs	(working copy)
+@@ -11,6 +11,8 @@
+ using System;
+ using System.Collections.Generic;
+ using MonoDevelop.Projects.Parser;
++using Mono.Cecil;
++using System.Reflection;
+ 
+ namespace MonoDevelop.Projects.Parser
+ {
+@@ -29,16 +31,16 @@
+ 	/// </summary>
+ 	public class GenericParameter
+ 	{
+-		string                    name;
+-		ReturnTypeList            baseTypes;
+-		SpecialConstraintType     specialConstraints;
++		string                      name;
++		ReturnTypeList              baseTypes;
++		GenericParameterAttributes  specialConstraints;
+ 		
+ 		public GenericParameter() {
+ 		}
+ 		
+ 		public GenericParameter(string name
+ 		                      , ReturnTypeList baseTypes
+-		                      , SpecialConstraintType specialConstraints) {
++		                      , GenericParameterAttributes specialConstraints) {
+ 			this.name               = name;
+ 			this.baseTypes          = baseTypes;
+ 			this.specialConstraints = specialConstraints;
+@@ -78,13 +80,13 @@
+ 		/// </summary>
+ 		public bool HasNewConstraint {
+ 			get {
+-				return (specialConstraints & SpecialConstraintType.New) > 0;
++				return (specialConstraints & GenericParameterAttributes.DefaultConstructorConstraint) > 0;
+ 			}
+ 			set {
+ 				if (value)
+-					specialConstraints |= SpecialConstraintType.New;
++					specialConstraints |= GenericParameterAttributes.DefaultConstructorConstraint;
+ 				else
+-					specialConstraints &= ~SpecialConstraintType.New;
++					specialConstraints &= ~GenericParameterAttributes.DefaultConstructorConstraint;
+ 			}
+ 		}
+ 		
+@@ -95,13 +97,13 @@
+ 		/// </summary>
+ 		public bool HasStructConstraint {
+ 			get {
+-				return (specialConstraints & SpecialConstraintType.Struct) > 0;
++				return (specialConstraints & GenericParameterAttributes.NotNullableValueTypeConstraint) > 0;
+ 			}
+ 			set {
+ 				if (value)
+-					specialConstraints |= SpecialConstraintType.Struct;
++					specialConstraints |= GenericParameterAttributes.NotNullableValueTypeConstraint;
+ 				else
+-					specialConstraints &= ~SpecialConstraintType.Struct;
++					specialConstraints &= ~GenericParameterAttributes.NotNullableValueTypeConstraint;
+ 			}
+ 		}
+ 		
+@@ -112,13 +114,13 @@
+ 		/// </summary>
+ 		public bool HasClassConstraint {
+ 			get {
+-				return (specialConstraints & SpecialConstraintType.Class) > 0;
++				return (specialConstraints & GenericParameterAttributes.ReferenceTypeConstraint) > 0;
+ 			}
+ 			set {
+ 				if (value)
+-					specialConstraints |= SpecialConstraintType.Class;
++					specialConstraints |= GenericParameterAttributes.ReferenceTypeConstraint;
+ 				else
+-					specialConstraints &= ~SpecialConstraintType.Class;
++					specialConstraints &= ~GenericParameterAttributes.ReferenceTypeConstraint;
+ 			}
+ 		}
+ 		
+@@ -128,13 +130,13 @@
+ 		/// </summary>
+ 		public bool HasCovariantConstraint {
+ 			get {
+-				return (specialConstraints & SpecialConstraintType.Covariant) > 0;
++				return (specialConstraints & GenericParameterAttributes.Covariant) > 0;
+ 			}
+ 			set {
+ 				if (value)
+-					specialConstraints |= SpecialConstraintType.Covariant;
++					specialConstraints |= GenericParameterAttributes.Covariant;
+ 				else
+-					specialConstraints &= ~SpecialConstraintType.Covariant;
++					specialConstraints &= ~GenericParameterAttributes.Covariant;
+ 			}
+ 		}
+ 		
+@@ -144,13 +146,13 @@
+ 		/// </summary>
+ 		public bool HasContravariantConstraint {
+ 			get {
+-				return (specialConstraints & SpecialConstraintType.Contravariant) > 0;
++				return (specialConstraints & GenericParameterAttributes.Contravariant) > 0;
+ 			}
+ 			set {
+ 				if (value)
+-					specialConstraints |= SpecialConstraintType.Contravariant;
++					specialConstraints |= GenericParameterAttributes.Contravariant;
+ 				else
+-					specialConstraints &= ~SpecialConstraintType.Contravariant;
++					specialConstraints &= ~GenericParameterAttributes.Contravariant;
+ 			}
+ 		}
+ 		
+@@ -158,7 +160,7 @@
+ 		/// Gets or sets a value that indicates what kind of special constraints
+ 		/// this parameter has applied to it.
+ 		/// </summary>
+-		public SpecialConstraintType SpecialConstraints {
++		public GenericParameterAttributes SpecialConstraints {
+ 			get {
+ 				return specialConstraints;
+ 			}
+@@ -167,13 +169,4 @@
+ 			}
+ 		}
+ 	}
+-	
+-	public enum SpecialConstraintType : byte
+-	{
+-		Class = 0x01,
+-		Struct = 0x02,
+-		New = 0x04,
+-		Covariant = 0x08,
+-		Contravariant = 0x10
+-	}
+ }
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionClass.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionClass.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionClass.cs	(working copy)
+@@ -12,6 +12,7 @@
+ using System.Xml;
+ using System.Collections.Specialized;
+ using Mono.Cecil;
++using MDGenericParameter = MonoDevelop.Projects.Parser.GenericParameter;
+ 
+ namespace MonoDevelop.Projects.Parser
+ {
+@@ -86,6 +87,25 @@
+ 			
+ 			modifiers |= GetModifiers (type.Attributes);
+ 			
++			// Add generic parameters to the type
++			if (type.GenericParameters != null && type.GenericParameters.Count > 0) {
++				this.GenericParameters = new GenericParameterList();
++				
++				foreach (Mono.Cecil.GenericParameter par in type.GenericParameters) {
++					// Fill out the type constraints for generic parameters 
++					ReturnTypeList rtl = null;
++					if (par.Constraints != null && par.Constraints.Count > 0) {
++						rtl = new ReturnTypeList();
++						foreach (Mono.Cecil.TypeReference typeRef in par.Constraints) {
++							rtl.Add(new ReflectionReturnType(typeRef));
++						}
++					}
++					
++					// Add the parameter to the generic parameter list
++					this.GenericParameters.Add(new MDGenericParameter(par.Name, rtl, (System.Reflection.GenericParameterAttributes)par.Attributes));
++				}
++			}
++			
+ 			// set base classes
+ 			if (type.BaseType != null) { // it's null for System.Object ONLY !!!
+ 				baseTypes.Add(new ReflectionReturnType(type.BaseType));
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/PersistentClass.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/PersistentClass.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/PersistentClass.cs	(working copy)
+@@ -76,6 +76,13 @@
+ 				cls.indexer.Add (pi);
+ 			}
+ 			
++			if (sclass.GenericParameters != null && sclass.GenericParameters.Count > 0) {
++				cls.GenericParameters = new GenericParameterList();
++				foreach (GenericParameter gp in sclass.GenericParameters) {
++					cls.GenericParameters.Add(PersistentGenericParamater.Resolve(gp, typeResolver));
++				}
++			}
++			
+ 			cls.region = sclass.Region;
+ 			cls.bodyRegion = sclass.BodyRegion;
+ 			cls.attributes = PersistentAttributeSectionCollection.Resolve (sclass.Attributes, typeResolver);
+@@ -139,6 +146,17 @@
+ 				cls.indexer.Add (ind);
+ 			}
+ 			
++			// Read the generic parameters
++			count = reader.ReadUInt32();
++			if (count > 0) {
++				cls.GenericParameters = new GenericParameterList();
++				// Add the generic parameters one by one
++				for (uint i = 0; i < count; ++i) {
++					cls.GenericParameters.Add(PersistentGenericParamater.Read(reader, nameTable));
++				}
++				// All the generic parameters have been added...
++			}
++			
+ 			cls.region = PersistentRegion.Read (reader, nameTable);
+ 			cls.bodyRegion = PersistentRegion.Read (reader, nameTable);
+ 			cls.attributes = PersistentAttributeSectionCollection.Read (reader, nameTable);
+@@ -187,6 +205,17 @@
+ 				PersistentIndexer.WriteTo (ind, writer, nameTable);
+ 			}
+ 			
++			// Write the generic parameters to the database file
++			if (cls.GenericParameters == null || cls.GenericParameters.Count < 1)
++				writer.Write((uint)0);
++			else {
++				writer.Write((uint)cls.GenericParameters.Count);
++				foreach (GenericParameter gp in cls.GenericParameters) {
++					PersistentGenericParamater.WriteTo(gp, writer, nameTable);
++				}
++			}
++			
++			
+ 			PersistentRegion.WriteTo (cls.Region, writer, nameTable);
+ 			PersistentRegion.WriteTo (cls.BodyRegion, writer, nameTable);
+ 			PersistentAttributeSectionCollection.WriteTo (cls.Attributes, writer, nameTable);
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/PersistentMethod.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/PersistentMethod.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/PersistentMethod.cs	(working copy)
+@@ -29,6 +29,14 @@
+ 			met.region = source.Region;
+ 			met.bodyRegion = source.BodyRegion;
+ 			met.attributes = PersistentAttributeSectionCollection.Resolve (source.Attributes, typeResolver);
++			
++			if (source.GenericParameters != null && source.GenericParameters.Count > 0) {
++				met.GenericParameters = new GenericParameterList();
++				foreach (GenericParameter gp in source.GenericParameters) {
++					met.GenericParameters.Add(PersistentGenericParamater.Resolve(gp, typeResolver));
++				}
++			}
++			
+ 			return met;
+ 		}
+ 		
+@@ -48,6 +56,18 @@
+ 			met.region = PersistentRegion.Read (reader, nameTable);
+ 			met.bodyRegion = PersistentRegion.Read (reader, nameTable);
+ 			met.attributes = PersistentAttributeSectionCollection.Read (reader, nameTable);
++			
++			// Read the generic parameters
++			count = reader.ReadUInt32();
++			if (count > 0) {
++				met.GenericParameters = new GenericParameterList();
++				// Add the generic parameters one by one
++				for (uint i = 0; i < count; ++i) {
++					met.GenericParameters.Add(PersistentGenericParamater.Read(reader, nameTable));
++				}
++				// All the generic parameters have been added...
++			}
++			
+ 			return met;
+ 		}
+ 		
+@@ -66,6 +86,16 @@
+ 			PersistentRegion.WriteTo (met.Region, writer, nameTable);
+ 			PersistentRegion.WriteTo (met.BodyRegion, writer, nameTable);
+ 			PersistentAttributeSectionCollection.WriteTo (met.Attributes, writer, nameTable);
++			
++			// Write the generic parameters to the database file
++			if (met.GenericParameters == null || met.GenericParameters.Count < 1)
++				writer.Write((uint)0);
++			else {
++				writer.Write((uint)met.GenericParameters.Count);
++				foreach (GenericParameter gp in met.GenericParameters) {
++					PersistentGenericParamater.WriteTo(gp, writer, nameTable);
++				}
++			}
+ 		}
+ 	}
+ }
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/AbstractReturnType.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/AbstractReturnType.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/AbstractReturnType.cs	(working copy)
+@@ -16,6 +16,7 @@
+ 		protected int[]  arrayDimensions;
+ 		protected object declaredin = null;
+ 		protected ReturnTypeList genericArguments;
++		protected bool   byRef;
+ 		string fname;
+ 		
+ 		public virtual string FullyQualifiedName {
+@@ -77,6 +78,15 @@
+ 		}
+ 		 		
+ 		/// <summary>
++		/// Indicates whether the return type is passed by reference.
++		/// </summary>
++		public virtual bool ByRef {
++			get {
++				return byRef;
++			}
++		}
++		 		
++		/// <summary>
+ 		/// Contains values (types) of actual parameters (arguments) to a
+ 		/// generic type.
+ 		/// </summary>
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/IReturnType.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/IReturnType.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/IReturnType.cs	(working copy)
+@@ -35,6 +35,10 @@
+ 		object DeclaredIn {
+ 			get;
+ 		}
++		
++		bool ByRef {
++			get;
++		}
+ 		 		
+ 		/// <summary>
+ 		/// Contains values (types) of actual parameters (arguments) to a
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionParameter.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionParameter.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionParameter.cs	(working copy)
+@@ -29,8 +29,9 @@
+ 			
+ 			if ((parameterInfo.Attributes & ParamAttributes.Out) != 0) {
+ 				modifier |= ParameterModifier.Out;
+-			} else if (type.Name.EndsWith("&")) {
+-				// seems there is no other way to determine a ref parameter
++			} else if (returnType.ByRef) {
++				// FIX: We should look at the return type of this parameter to
++				// determine whether a parameter is 'ref'
+ 				modifier |= ParameterModifier.Ref;
+ 			}
+ 			
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/PersistentReturnType.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/PersistentReturnType.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/PersistentReturnType.cs	(working copy)
+@@ -19,8 +19,17 @@
+ 			
+ 			PersistentReturnType rt = new PersistentReturnType ();
+ 			rt.FullyQualifiedName = typeResolver.Resolve (source.FullyQualifiedName);
++			rt.byRef = source.ByRef;
+ 			rt.pointerNestingLevel = source.PointerNestingLevel;
+ 			rt.arrayDimensions = source.ArrayDimensions;
++			
++			if (rt.GenericArguments != null && rt.GenericArguments.Count > 0) {
++				rt.GenericArguments = new ReturnTypeList();
++				foreach (IReturnType ga in rt.GenericArguments) {
++					rt.GenericArguments.Add(PersistentReturnType.Resolve(ga, typeResolver));
++				}
++			}
++			
+ 			return rt;
+ 		}
+ 
+@@ -30,6 +39,8 @@
+ 			
+ 			PersistentReturnType rt = new PersistentReturnType ();
+ 			rt.FullyQualifiedName = PersistentHelper.ReadString (reader, nameTable);
++			
++			rt.byRef = reader.ReadBoolean();
+ 
+ 			rt.pointerNestingLevel = reader.ReadInt32();
+ 
+@@ -38,6 +49,18 @@
+ 			for (uint i = 0; i < rt.arrayDimensions.Length; ++i) {
+ 				rt.arrayDimensions[i] = reader.ReadInt32();
+ 			}
++			
++			// Read the generic arguments
++			count = reader.ReadUInt32();
++			if (count > 0) {
++				rt.GenericArguments = new ReturnTypeList();
++				// Add the generic arguments one by one
++				for (uint i = 0; i < count; ++i) {
++					rt.GenericArguments.Add(PersistentReturnType.Read(reader, nameTable));
++				}
++				// All the generic arguments have been added...
++			}
++			
+ 			return rt;
+ 		}
+ 
+@@ -46,6 +69,8 @@
+ 			if (PersistentHelper.WriteNull (rt, writer)) return;
+ 			
+ 			PersistentHelper.WriteString (rt.FullyQualifiedName, writer, nameTable);
++			
++			writer.Write(rt.ByRef);
+ 
+ 			writer.Write (rt.PointerNestingLevel);
+ 			if (rt.ArrayDimensions == null) {
+@@ -56,6 +81,16 @@
+ 					writer.Write (rt.ArrayDimensions[i]);
+ 				}
+ 			}
++			
++			// Write generic arguments of this return type
++			if (rt.GenericArguments == null || rt.GenericArguments.Count < 1)
++				writer.Write((uint)0);
++			else {
++				writer.Write((uint)rt.GenericArguments.Count);
++				foreach (IReturnType ga in rt.GenericArguments) {
++					PersistentReturnType.WriteTo(ga, writer, nameTable);
++				}
++			}
+ 		}
+ 	}
+ }
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionMethod.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionMethod.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionMethod.cs	(working copy)
+@@ -9,6 +9,7 @@
+ using System.Collections;
+ using System.Xml;
+ using Mono.Cecil;
++using MDGenericParameter = MonoDevelop.Projects.Parser.GenericParameter;
+ 
+ namespace MonoDevelop.Projects.Parser
+ {
+@@ -95,6 +96,22 @@
+ 			}
+ 			
+ 			returnType = new ReflectionReturnType (methodBase.ReturnType.ReturnType);
++			
++			if (methodBase.GenericParameters != null && methodBase.GenericParameters.Count > 0) {
++				GenericParameters = new GenericParameterList();
++				foreach (Mono.Cecil.GenericParameter par in methodBase.GenericParameters) {
++					// Fill out the type constraints for generic parameters 
++					ReturnTypeList rtl = null;
++					if (par.Constraints != null && par.Constraints.Count > 0) {
++						rtl = new ReturnTypeList();
++						foreach (Mono.Cecil.TypeReference typeRef in par.Constraints) {
++							rtl.Add(new ReflectionReturnType(typeRef));
++						}
++					}
++					// Add the parameter to the generic parameter list
++					GenericParameters.Add(new MDGenericParameter(par.Name, rtl, (System.Reflection.GenericParameterAttributes)par.Attributes));
++				}
++			}
+ 		}
+ 		
+ 		public static ModifierEnum GetModifiers (MethodAttributes attributes)
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/CodeCompletionDatabase.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/CodeCompletionDatabase.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/CodeCompletionDatabase.cs	(working copy)
+@@ -47,7 +47,7 @@
+ 	{
+ 		static readonly int MAX_ACTIVE_COUNT = 100;
+ 		static readonly int MIN_ACTIVE_COUNT = 50;
+-		static protected readonly int FORMAT_VERSION = 8;
++		static protected readonly int FORMAT_VERSION = 13;
+ 		
+ 		NamespaceEntry rootNamespace;
+ 		protected ArrayList references;
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionReturnType.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionReturnType.cs	(revision 62894)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ReflectionReturnType.cs	(working copy)
+@@ -5,7 +5,7 @@
+ //     <version value="$version"/>
+ // </file>
+ using System;
+-using System.Collections;
++using System.Collections.Generic;
+ using Mono.Cecil;
+ 
+ namespace MonoDevelop.Projects.Parser
+@@ -15,38 +15,83 @@
+ 	{
+ 		public ReflectionReturnType(TypeReference type)
+ 		{
+-			string fullyQualifiedName = type.FullName.Replace("+", ".").Trim('&');
+-			
+-			while (fullyQualifiedName.EndsWith("[") ||
+-			       fullyQualifiedName.EndsWith("]") ||
+-			       fullyQualifiedName.EndsWith(",") ||
+-			       fullyQualifiedName.EndsWith("*")) {
+-				fullyQualifiedName = fullyQualifiedName.Substring(0, fullyQualifiedName.Length - 1);
+-			}
+-			base.FullyQualifiedName = fullyQualifiedName;
+-			
+-			SetPointerNestingLevel(type);
+-			SetArrayDimensions(type);
+-			arrayDimensions = (int[])arrays.ToArray(typeof(int));
++			// The following method extracts array, pointer, byref and generic
++			// info. It also extracts the name of the type without array,
++			// pointer, byref and generic decorations
++			Stack<int> arrays = CheckType(type);
++			// Convert to '.' delimited names
++			FullyQualifiedName = FullyQualifiedName.Replace("+", ".").Replace("/", ".");
++			arrayDimensions = (arrays == null) ? new int[0] : arrays.ToArray();
+ 		}
+ 		
+-		ArrayList arrays = new ArrayList();
+-		void SetArrayDimensions(TypeReference type)
++		/// <summary>Extracts all relevant info about a return type (as returned
++        /// by Mono.Cecil).
++        /// </summary>
++        /// <remarks>
++        /// Relevant info is:
++       	/// <ul>
++        /// <li>array dimensions and ranks</li>
++	   	/// <li>generic arguments</li>
++	   	/// <li>level of pointer nesting</li>
++	   	/// </ul>
++	   	/// </remarks>
++	   	/// <returns>
++	   	/// An array of ranks. The length of the return value is the dimension
++	   	/// of the array.
++	   	/// </returns>
++		Stack<int> CheckType(TypeReference type)
+ 		{
+-			if (type is ArrayType) {
+-				ArrayType at = (ArrayType) type;
+-				SetArrayDimensions (at.ElementType);
+-				arrays.Insert(0, at.Rank);
+-			}
++			// Create the ArrayList on demand
++			Stack<int> arrays = null;
++			do
++			{
++				// Check if 'type' has some decorations applied to it
++				if (type is Mono.Cecil.TypeSpecification) {
++					// Go through all levels of 'indirection', 'array dimensions'
++					// and 'generic types' - in the end, we should get the actual
++					// type of the ReturnType (but all data about its array
++					// dimensions, levels of indirection and even its generic
++					// parameters is correctly stored within ArrayCount and
++					// ArrayDimensions, PointerNestingLevel and GenericArguments
++					// respectively).
++					if (type is ArrayType) {
++						// This return type is obviously an array - add the rank
++						ArrayType at = (ArrayType) type;
++						if (arrays == null)
++							arrays = new Stack<int>();
++						arrays.Push(at.Rank);
++						type = at.ElementType;
++					} else if (type is GenericInstanceType) {
++						// This return type is obviously a generic type - add its
++						// generic arguments
++						GenericInstanceType git = (GenericInstanceType) type;
++						GenericArguments = new ReturnTypeList();
++						foreach (TypeReference tr in git.GenericArguments) {
++							GenericArguments.Add(new ReflectionReturnType(tr));
++						}
++						// Go down one level... we have the generic info
++						type = git.ElementType;
++					} else if (type is Mono.Cecil.ReferenceType) {
++						Mono.Cecil.ReferenceType rt = (Mono.Cecil.ReferenceType) type;
++						byRef = true;
++						type = rt.ElementType;
++					} else if (type is PointerType) {
++						// The type is a pointer
++						PointerType pt = (PointerType) type;
++						++pointerNestingLevel;
++						type = pt.ElementType;
++						// Go down one level
++					} else {
++						// TODO: Check if we loose some relevant info here
++						type = ((TypeSpecification)type).ElementType;
++					}
++				} else {
++					// At any event - we should end here
++					FullyQualifiedName = type.FullName;
++					// The method returns the stripped type...
++					return arrays;
++				}
++			} while (true);
+ 		}
+-		
+-		void SetPointerNestingLevel(TypeReference type)
+-		{
+-			if (type is PointerType) {
+-				PointerType pt = (PointerType) type;
+-				SetPointerNestingLevel (pt.ElementType);
+-				++pointerNestingLevel;
+-			}
+-		}
+ 	}
+ }
+Index: Extras/NemerleBinding/ChangeLog
+===================================================================
+--- Extras/NemerleBinding/ChangeLog	(revision 62894)
++++ Extras/NemerleBinding/ChangeLog	(working copy)
+@@ -1,3 +1,9 @@
++2006-07-23 Matej Urbas <matej.urbas@gmail.com>
++
++	* Parser/SharpDevelopTree/Class.cs: A change in GenericParameter allowed to
++	  merely copy an attribute (when converting from Nemerle's parsed type-info
++	  to MonoDevelop's completion-info).
++
+ 2006-07-10 Alejandro Serrano <trupill@yahoo.es>
+ 
+ 	* Parser/SharpDevelopTree/Class.cs:
+Index: Extras/NemerleBinding/Parser/SharpDevelopTree/Class.cs
+===================================================================
+--- Extras/NemerleBinding/Parser/SharpDevelopTree/Class.cs	(revision 62894)
++++ Extras/NemerleBinding/Parser/SharpDevelopTree/Class.cs	(working copy)
+@@ -264,20 +264,8 @@
+             ReturnTypeList constraints = new ReturnTypeList ();
+             foreach (NCC.MType constraint in tyvar.Constraints)
+                 constraints.Add (new ReturnType (constraint));
+-
+-            SpecialConstraintType special = (SpecialConstraintType)0;
+-            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.ReferenceTypeConstraint) != 0)
+-                special |= SpecialConstraintType.Class;
+-            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0)
+-                special |= SpecialConstraintType.Struct;
+-            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.DefaultConstructorConstraint) != 0)
+-                special |= SpecialConstraintType.New;
+-            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.Contravariant) != 0)
+-                special |= SpecialConstraintType.Contravariant;
+-            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.Covariant) != 0)
+-                special |= SpecialConstraintType.Covariant;
+                 
+-            return new GenericParameter (tyvar.Name, constraints, special);
++            return new GenericParameter (tyvar.Name, constraints, tyvar.SpecialConstraints);
+         }
+         
+         public override ICompilationUnit CompilationUnit
+Index: Extras/CSharpBinding/ChangeLog
+===================================================================
+--- Extras/CSharpBinding/ChangeLog	(revision 62901)
++++ Extras/CSharpBinding/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2006-07-23 Matej Urbas <matej.urbas@gmail.com>
++
++	* CSharpAmbience.cs: Small cosmetic corrections when converting generic
++	  types
++
+ 2006-07-17 Lluis Sanchez Gual  <lluis@novell.com>
+ 
+ 	* Autotools/CSharpAutotoolsSetup.cs: Support compilation with gmcs.
+Index: Extras/CSharpBinding/CSharpAmbience.cs
+===================================================================
+--- Extras/CSharpBinding/CSharpAmbience.cs	(revision 62894)
++++ Extras/CSharpBinding/CSharpAmbience.cs	(working copy)
+@@ -154,10 +154,9 @@
+ 				AppendPangoHtmlTag (builder, c.FullyQualifiedName, "b");
+ 			else
+ 				AppendPangoHtmlTag (builder, c.Name, "b");
+-				
+-			if (c.GenericParameters != null && c.GenericParameters.Count > 0)
+-			{
+-				builder.Append("&lt;");
++
++			if (c.GenericParameters != null && c.GenericParameters.Count > 0) {
++				builder.Append(" &lt;");
+ 				for (int i = 0; i < c.GenericParameters.Count; i++)
+ 				{
+ 					builder.Append(c.GenericParameters[i].Name);
+@@ -381,7 +380,7 @@
+ 			
+ 			if (m.GenericParameters != null && m.GenericParameters.Count > 0)
+ 			{
+-				builder.Append("&lt;");
++				builder.Append(" &lt;");
+ 				for (int i = 0; i < m.GenericParameters.Count; i++)
+ 				{
+ 					builder.Append(m.GenericParameters[i].Name);
+@@ -455,7 +454,7 @@
+ 			
+ 			if (returnType.GenericArguments != null && returnType.GenericArguments.Count > 0)
+ 			{
+-				builder.Append("&lt;");
++				builder.Append(" &lt;");
+ 				for (int i = 0; i < returnType.GenericArguments.Count; i++)
+ 				{
+ 					builder.Append(Convert(returnType.GenericArguments[i]));

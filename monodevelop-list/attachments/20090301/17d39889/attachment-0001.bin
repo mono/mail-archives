@@ -1,0 +1,168 @@
+Index: main/src/addins/CSharpBinding/Parser/CodeGenerator.cs
+===================================================================
+--- main/src/addins/CSharpBinding/Parser/CodeGenerator.cs	(revision 128271)
++++ main/src/addins/CSharpBinding/Parser/CodeGenerator.cs	(working copy)
+@@ -124,8 +124,20 @@
+ 			
+ 			return GetGeneratedClass (ctx, file, cls);
+ 		}
++
++		public override string DeleteClass (RefactorerContext ctx, IType cls)
++		{
++			// TODO: move documentation too
++			// TODO: move attributes
++			IEditableTextFile file = ctx.GetFile(cls.CompilationUnit.FileName);
++			int start = file.GetPositionFromLineColumn(cls.Location.Line, cls.Location.Column);
++			int end = file.GetPositionFromLineColumn(cls.BodyRegion.End.Line, cls.BodyRegion.End.Column);
++			string result = file.GetText(start, end);
++			file.DeleteText(start, end - start);
++			return result;
++		}
++
+ 		
+-		
+ 		//TODO
+ 		//static CodeStatement ThrowNewNotImplementedException ()
+ 		//{
+Index: main/src/core/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/IRefactorer.cs
+===================================================================
+--- main/src/core/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/IRefactorer.cs	(revision 128271)
++++ main/src/core/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/IRefactorer.cs	(working copy)
+@@ -42,7 +42,9 @@
+ 		void AddAttribute (RefactorerContext ctx, IType cls, CodeAttributeDeclaration attr);
+ 
+ 		IType CreateClass (RefactorerContext ctx, string directory, string namspace, CodeTypeDeclaration type);
++		IType CreateClass (RefactorerContext ctx, string directory, string className, string namspace, string classText);
+ 		IType RenameClass (RefactorerContext ctx, IType cls, string newName);
++		string DeleteClass(RefactorerContext ctx, IType cls);
+ 		IEnumerable<MemberReference> FindClassReferences (RefactorerContext ctx, string fileName, IType cls);
+ 		
+ 		IMember AddMember (RefactorerContext ctx, IType cls, CodeTypeMember memberInfo);
+Index: main/src/core/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/BaseRefactorer.cs
+===================================================================
+--- main/src/core/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/BaseRefactorer.cs	(revision 128271)
++++ main/src/core/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/BaseRefactorer.cs	(working copy)
+@@ -94,11 +94,34 @@
+ 			else
+ 				throw new Exception ("Class creation failed. The parser did not find the created class.");
+ 		}
++
++		public IType CreateClass (RefactorerContext ctx, string directory, string className, string namspace, string classText) 
++		{
++			string fileName = Path.Combine(directory, className+".cs");
++			// TODO: align indentation
++			// TODO: ask what to do if file already exist
++			File.WriteAllText(fileName, 
++			                  string.Format("using System;{0}namespace {1}{0}{{{0}{2}{0}}}",
++			                  	Environment.NewLine,
++			                  	namspace,
++			                  	classText));
++			ICompilationUnit pi = ProjectDomService.Parse (ctx.ParserContext.Project, fileName, null).CompilationUnit;
++			IList<IType> clss = pi.Types;
++			if (clss.Count > 0)
++				return clss [0];
++			else
++				throw new Exception ("Class creation failed. The parser did not find the created class.");
++		}
+ 		
+ 		public virtual IType RenameClass (RefactorerContext ctx, IType cls, string newName)
+ 		{
+ 			return null;
+ 		}
++
++		public virtual string DeleteClass(RefactorerContext ctx, IType cls) 
++		{
++			throw new NotSupportedException();
++		}
+ 		
+ 		public virtual IEnumerable<MemberReference> FindClassReferences (RefactorerContext ctx, string file, IType cls)
+ 		{
+Index: main/src/core/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/CodeRefactorer.cs
+===================================================================
+--- main/src/core/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/CodeRefactorer.cs	(revision 128271)
++++ main/src/core/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/CodeRefactorer.cs	(working copy)
+@@ -33,6 +33,7 @@
+ using System.Linq;
+ 
+ using System.Text;
++using System.IO;
+ using MonoDevelop.Core;
+ using MonoDevelop.Projects.Text;
+ using MonoDevelop.Projects.Dom;
+@@ -138,7 +139,24 @@
+ 				return null;
+ 			}
+ 		}
+-		
++
++		public IType MoveToFile(IProgressMonitor mon, Project proj, IType cls) 
++		{
++			// delete class
++			IRefactorer generator = GetGeneratorForClass(cls);
++			RefactorerContext gctx = GetGeneratorContext(cls);
++			string classText = generator.DeleteClass(gctx, cls);
++			// add file
++			//ProjectDom ctx = ProjectDomService.GetProjectDom (project);
++			//RefactorerContext gctx = new RefactorerContext (ctx, fileProvider, null); //can I use context above?
++			string directory = Path.GetDirectoryName(cls.CompilationUnit.FileName);
++			IType c = generator.CreateClass (gctx, directory, cls.Name, cls.Namespace, classText);
++			gctx.Save ();
++			proj.AddFile(c.CompilationUnit.FileName);
++			proj.Save(mon);
++			return c;
++		}
++
+ 		public MemberReferenceCollection FindClassReferences (IProgressMonitor monitor, IType cls, RefactoryScope scope)
+ 		{
+ 			MemberReferenceCollection refs = new MemberReferenceCollection ();
+Index: main/src/core/MonoDevelop.Ide/MonoDevelop.Ide.Commands/RefactoryCommands.cs
+===================================================================
+--- main/src/core/MonoDevelop.Ide/MonoDevelop.Ide.Commands/RefactoryCommands.cs	(revision 128271)
++++ main/src/core/MonoDevelop.Ide/MonoDevelop.Ide.Commands/RefactoryCommands.cs	(working copy)
+@@ -301,8 +291,9 @@
+ 			} else {
+ 				flags |= OutputFlags.IncludeParameters;
+ 			}
+-				
+-			string itemName = EscapeName (ambience.GetString (item, flags));
++
++			string itemRawName = ambience.GetString (item, flags);
++			string itemName = EscapeName (itemRawName);
+ 			bool canRename = false;
+ 			string txt;
+ 			if (IdeApp.ProjectOperations.CanJumpToDeclaration (item)) {
+@@ -406,6 +397,11 @@
+ 						ciset.CommandInfos.Add (expset, null);
+ 					}
+ 				}
++				
++				// Do not offer to move inner classes
++				if(cls.DeclaringType == null && System.IO.Path.GetFileNameWithoutExtension(cls.CompilationUnit.FileName) != itemRawName)
++					ciset.CommandInfos.Add(GettextCatalog.GetString("Move to {0}.cs", itemName), new RefactoryOperation(refactorer.MoveToFile));
++				
+ 			} else if ((item is IField) && includeModifyCommands) {
+ 				txt = GettextCatalog.GetString ("Field <b>{0}</b>", itemName);
+ 				if (canRename)
+@@ -657,5 +653,22 @@
+ 			RenameItemDialog dialog = new RenameItemDialog (ctx, item);
+ 			dialog.Show ();
+ 		}
++
++		public void MoveToFile() 
++		{
++			CodeRefactorer refactorer = IdeApp.Workspace.GetCodeRefactorer (IdeApp.ProjectOperations.CurrentSelectedSolution);
++			IEditableTextBuffer editor = IdeApp.Workbench.ActiveDocument.GetContent <IEditableTextBuffer>();
++			if (editor != null)
++				editor.BeginAtomicUndo ();
++
++			try {
++				IProgressMonitor mon = IdeApp.Workbench.ProgressMonitors.GetBackgroundProgressMonitor("Refactoring..." ,null);
++				refactorer.MoveToFile(mon, this.ctx.Project, this.klass);
++			} finally {
++				if (editor != null)
++					editor.EndAtomicUndo ();
++			}
++			
++		}
+ 	}
+ }

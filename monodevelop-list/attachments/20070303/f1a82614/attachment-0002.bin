@@ -1,0 +1,457 @@
+Index: AUTHORS
+===================================================================
+--- AUTHORS	(revision 73519)
++++ AUTHORS	(working copy)
+@@ -27,6 +27,7 @@
+ Jacob Ilsø Christensen
+ Scott Ellington
+ Michael Hutchinson
++James Fitzsimons
+ 
+ and Mike Krueger and the SharpDevelop team
+ 
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 73519)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,13 @@
++2007-03-03 James Fitzsimons <james.fitzsimons@gmail.com>
++
++	* MonoDevelop.SourceEditor.Gui/SourceEditorDisplayBinding.cs: Added class 
++	  and method browser combos. Added ascx to list in CanCreateContentForMimeType().
++	* EditorBindings.glade: Added checkbox for Class & Method combos to GeneralTextEditorPanel.
++	* MonoDevelop.SourceEditor.Gui.OptionPanels/GeneralTextEditorPanel.cs: 
++	  Added support for turning on  and off the class and method browser combos in the editor.
++	* MonoDevelop.SourceEditor.Properties/TextEditorProperties.cs: Added 
++	   ShowClassBrowser property.
++
+ 2007-02-16 Lluis Sanchez Gual  <lluis@novell.com> 
+ 
+ 	* configure.in: Changed version to 0.13. Removed NUnit dependency.
+Index: Extras/MonoDevelop.SourceEditor/EditorBindings.glade
+===================================================================
+--- Extras/MonoDevelop.SourceEditor/EditorBindings.glade	(revision 73519)
++++ Extras/MonoDevelop.SourceEditor/EditorBindings.glade	(working copy)
+@@ -423,6 +423,25 @@
+ 		      <property name="fill">False</property>
+ 		    </packing>
+ 		  </child>
++
++		  <child>
++		    <widget class="GtkCheckButton" id="showClassMethodCheckBox">
++		      <property name="visible">True</property>
++		      <property name="can_focus">True</property>
++		      <property name="label" translatable="yes">_Show Class &amp; Method combos</property>
++		      <property name="use_underline">True</property>
++		      <property name="relief">GTK_RELIEF_NORMAL</property>
++		      <property name="focus_on_click">True</property>
++		      <property name="active">False</property>
++		      <property name="inconsistent">False</property>
++		      <property name="draw_indicator">True</property>
++		    </widget>
++		    <packing>
++		      <property name="padding">0</property>
++		      <property name="expand">False</property>
++		      <property name="fill">False</property>
++		    </packing>
++		  </child>
+ 		</widget>
+ 		<packing>
+ 		  <property name="padding">0</property>
+Index: Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui/SourceEditorDisplayBinding.cs
+===================================================================
+--- Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui/SourceEditorDisplayBinding.cs	(revision 73519)
++++ Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui/SourceEditorDisplayBinding.cs	(working copy)
+@@ -1,6 +1,9 @@
+ using System;
++using System.Collections;
++using System.Collections.Specialized;
+ using System.IO;
+ using System.Runtime.InteropServices;
++using System.Text;
+ 
+ using MonoDevelop.Core.Execution;
+ using MonoDevelop.Core.Gui;
+@@ -16,6 +19,7 @@
+ using MonoDevelop.Ide.Gui.Search;
+ using MonoDevelop.Ide.Codons;
+ using MonoDevelop.Projects.Text;
++using MonoDevelop.Projects.Parser;
+ using MonoDevelop.SourceEditor.FormattingStrategy;
+ 
+ using Gtk;
+@@ -53,6 +57,8 @@
+ 				return true;
+ 			if (mimetype == "application/x-aspx")
+ 				return true;
++			if (mimetype == "application/x-ascx")
++				return true;
+ 
+ 			// If gedit can open the file, this editor also can do it
+ 			foreach (DesktopApplication app in DesktopApplication.GetApplications (mimetype))
+@@ -85,10 +91,18 @@
+ 		IDocumentInformation, IEncodedTextContent
+ 	{
+ 		VBox mainBox;
+-		HBox editorBar;
++		VBox editorBar;
+ 		HBox reloadBar;
++		HBox classBrowser;
++		Gtk.ComboBox classCombo;
++		Gtk.ComboBox membersCombo;
++		ListStore classStore;
++		ListStore memberStore;
++		bool classBrowserVisible = true;
+ 		internal FileSystemWatcher fsw;
+ 		IProperties properties;
++		IParseInformation memberParseInfo;
++		bool handlingParseEvent = false;
+ 		
+ 		BreakpointEventHandler breakpointAddedHandler;
+ 		BreakpointEventHandler breakpointRemovedHandler;
+@@ -155,11 +169,55 @@
+ 			}
+ 		}
+ 		
++		public bool ClassBrowserVisible {
++			get {
++				return classBrowserVisible;
++			}
++			set {
++				if (value && !classBrowserVisible)
++					editorBar.PackStart(classBrowser, true, true, 3);
++				if (!value && classBrowserVisible)
++					editorBar.Remove(classBrowser);
++				classBrowserVisible = value;
++			}
++		}
++		
+ 		public SourceEditorDisplayBindingWrapper ()
+-		{
++		{			
+ 			mainBox = new VBox ();
+-			editorBar = new HBox ();
+-			mainBox.PackStart (editorBar, false, false, 0);
++			editorBar = new VBox ();
++			mainBox.PackStart (editorBar, false, true, 0);
++			
++			classBrowser = new HBox(true, 2);
++			classCombo = new Gtk.ComboBox(); 
++			membersCombo = new Gtk.ComboBox();	
++			
++			// Setup the columns and column renders for the comboboxes
++			CellRendererPixbuf pixr = new CellRendererPixbuf();
++			classCombo.PackStart(pixr, false);
++			classCombo.AddAttribute(pixr, "pixbuf", 0);
++			CellRenderer colr = new CellRendererText();
++			classCombo.PackStart(colr, true);
++			classCombo.AddAttribute(colr, "text", 1);
++			
++			pixr = new CellRendererPixbuf();
++			membersCombo.PackStart(pixr, false);
++			membersCombo.AddAttribute(pixr, "pixbuf", 0);
++			colr = new CellRendererText();
++			membersCombo.PackStart(colr, true);
++			membersCombo.AddAttribute(colr, "text", 1);
++			
++			// Pack the controls into the editorbar just below the file name tabs.
++			classBrowser.PackStart(classCombo, true, true, 0);
++			classBrowser.PackStart(membersCombo, true, true, 0);
++			editorBar.PackStart(classBrowser, false, true, 1);
++			
++			// Set up the data stores for the comboboxes
++			classStore = new ListStore(typeof(Gdk.Pixbuf), typeof(string), typeof(IClass));
++			classCombo.Model = classStore;	
++			memberStore = new ListStore(typeof(Gdk.Pixbuf), typeof(string), typeof(IMember));
++			membersCombo.Model = memberStore;
++ 
+ 			se = new SourceEditor (this);
+ 			se.Buffer.ModifiedChanged += new EventHandler (OnModifiedChanged);
+ 			se.Buffer.MarkSet += new MarkSetHandler (OnMarkSet);
+@@ -245,6 +303,7 @@
+ 			se.Buffer.Changed -= new EventHandler (OnChanged);
+ 			se.View.ToggleOverwrite -= new EventHandler (CaretModeChanged);
+ 			ContentNameChanged -= new EventHandler (UpdateFSW);
++			IdeApp.ProjectOperations.ParserDatabase.ParseInformationChanged -= new ParseInformationEventHandler(UpdateClassBrowser);
+ 			se.Dispose ();
+ 			fsw.Dispose ();
+ 			se = null;
+@@ -325,8 +384,201 @@
+ 					
+ 				UpdateExecutionLocation ();
+ 			}
++			
++			IFileParserContext context = IdeApp.ProjectOperations.ParserDatabase.GetFileParserContext(fileName);
++			memberParseInfo = context.ParseFile(fileName);
++			BindClassCombo();
++			
++			IdeApp.ProjectOperations.ParserDatabase.ParseInformationChanged += new ParseInformationEventHandler(UpdateClassBrowser);
+ 		}
+ 		
++		private void UpdateClassBrowser(object sender, ParseInformationEventArgs args)
++		{
++			// This event handler can get called when files other than the current content are updated. eg.
++			// when loading a new document. If we didn't do this check the member combo for this tab would have
++			// methods for a different class in it!
++			if (ContentName == args.FileName && !handlingParseEvent) {
++				handlingParseEvent = true;
++				memberParseInfo = args.ParseInformation;
++				GLib.Timeout.Add (1000, new GLib.TimeoutHandler (BindClassCombo));
++			}
++		}
++		
++		private bool BindClassCombo()
++		{	
++			classCombo.Changed -= new EventHandler (ClassChanged);
++			// Clear down all our local stores.
++			classStore.Clear();				
++			
++			// check the IParseInformation member variable to see if we could get ParseInformation for the 
++			// current docuement. If not we can't display class and member info so hide the browser bar.
++			if (memberParseInfo == null) {
++				ClassBrowserVisible = false;
++				return false;
++			}
++			
++			if (!ClassBrowserVisible)
++				ClassBrowserVisible = true;
++				
++			ClassCollection cls = ((ICompilationUnit)memberParseInfo.BestCompilationUnit).Classes;
++			foreach (IClass c in cls) {
++				// Get the appropriate icon from the Icon service for the current IClass.
++				Gdk.Pixbuf pix = IdeApp.Services.Resources.GetIcon (IdeApp.Services.Icons.GetIcon (c));
++				classStore.AppendValues (pix, c.Name, c);
++			}
++			
++			// find out where the current cursor position is and set the combos.
++			int line;
++			int column;
++			this.GetLineColumnFromPosition(this.CursorPosition, out line, out column);
++			for(int i = 0; i < cls.Count; i++) {
++				IClass c = cls[i];
++				if (c.BodyRegion.BeginLine <= line && c.BodyRegion.EndLine >= line)	{
++					// found the right class. Now need right method
++					classCombo.Active = i;
++					BindMemberCombo(c);
++					
++					handlingParseEvent = false;
++					classCombo.Changed += new EventHandler (ClassChanged);
++					
++					// return false to stop the GLib.Timeout
++					return false;
++				}
++			}
++			classCombo.Active = 0;
++			BindMemberCombo(cls[0]);
++			
++			classCombo.Changed += new EventHandler (ClassChanged);
++			
++			handlingParseEvent = false;
++
++			// return false to stop the GLib.Timeout
++			return false;
++		}
++		
++		
++		private void BindMemberCombo(IClass c)
++		{
++			int position = 0;
++			int activeIndex = 0;
++			// find out where the current cursor position is and set the combos.
++			int line;
++			int column;
++			this.GetLineColumnFromPosition(this.CursorPosition, out line, out column);
++			
++			membersCombo.Changed -= new EventHandler (MemberChanged);
++			// Clear down all our local stores.
++			memberStore.Clear();
++				
++			HybridDictionary methodMap = new HybridDictionary();
++			
++			Gdk.Pixbuf pix;
++			// Add items to the member drop down 
++			MethodCollection sortedMethods = c.Methods;
++			ArrayList.Adapter (sortedMethods).Sort (new CaseInsensitiveComparer ());
++			
++			foreach (IMethod method in sortedMethods) {
++				pix = IdeApp.Services.Resources.GetIcon(IdeApp.Services.Icons.GetIcon(method)); 
++				// For methods we append their parameter types too. This is a nice feature,
++				// and it is also necessay to avoid problems with overloaded methods having
++				// the same name
++				StringBuilder methodName = new StringBuilder();
++				methodName.Append(method.Name + "(");
++				for (int i = 0; i < method.Parameters.Count; i++) {
++					methodName.Append(method.Parameters [i].ReturnType.Name);
++					if (i < method.Parameters.Count - 1) methodName.Append (", ");
++				}
++				methodName.Append(")"); 
++				
++				memberStore.AppendValues(pix, methodName.ToString (), method);
++			
++				// Check if the current cursor position in inside this method
++				if (method.BodyRegion.BeginLine <= line && line <= method.BodyRegion.EndLine) {
++					activeIndex = position;
++				}
++				++position;
++			}
++			foreach (IProperty property in c.Properties) {
++				pix = IdeApp.Services.Resources.GetIcon (IdeApp.Services.Icons.GetIcon (property));
++				if (methodMap [property.Name] != null) {
++					// The unlikely case that two properties have the same name has occured.
++					// We use the fully qualified name for each subsequent property to avoid
++					// problems.
++					memberStore.AppendValues (pix, property.FullyQualifiedName, property);
++				}
++				else {
++					memberStore.AppendValues (pix, property.Name, property);
++				}
++				
++				// Check if the current cursor position in inside this property
++				if (property.BodyRegion.BeginLine <= line && line <= property.BodyRegion.EndLine) {
++					activeIndex = position;
++				}
++				++position;
++			}
++			foreach(IField member in c.Fields) {
++				pix = IdeApp.Services.Resources.GetIcon (IdeApp.Services.Icons.GetIcon (member));
++				memberStore.AppendValues (pix, member.Name, member);
++				
++				// Check if the current cursor position in inside this field
++				if (member.Region.BeginLine <= line && line <= member.Region.EndLine) {
++					activeIndex = position;
++				}
++				++position;
++			}
++			// don't need method map anymore
++			methodMap.Clear ();
++			
++			// set active the method the cursor is in
++			membersCombo.Active = activeIndex;
++			membersCombo.Changed += new EventHandler (MemberChanged);
++		}
++		
++		
++		private void MemberChanged(object sender, EventArgs e)
++		{
++			Gtk.TreeIter iter;
++		    if (membersCombo.GetActiveIter (out iter)) {	    
++		    	// Find the IMember object in our list store by name from the member combo
++		    	IMember member = (IMember) memberStore.GetValue (iter, 2);
++				int line = member.Region.BeginLine;
++				
++				// Get a handle to the current document
++				if (IdeApp.Workbench.ActiveDocument == null) {
++					return;
++				}
++			
++				// If we can we navigate to the line location of the IMember.
++				IViewContent content = (IViewContent) IdeApp.Workbench.ActiveDocument.GetContent(typeof(IViewContent));
++				if (content is IPositionable) {
++					((IPositionable)content).JumpTo (Math.Max (1, line), 1);
++				}
++		    }
++		}
++
++		
++		private void ClassChanged(object sender, EventArgs e)
++		{
++			Gtk.TreeIter iter;
++			if (classCombo.GetActiveIter(out iter)) 	{
++				IClass selectedClass = (IClass)classStore.GetValue(iter, 2);
++				int line = selectedClass.Region.BeginLine;
++				
++				// Get a handle to the current document
++				if (IdeApp.Workbench.ActiveDocument == null) {
++					return;
++				}
++				
++				// If we can we navigate to the line location of the IMember.
++				IViewContent content = (IViewContent)IdeApp.Workbench.ActiveDocument.GetContent(typeof(IViewContent));
++				if (content is IPositionable) {
++					((IPositionable)content).JumpTo (Math.Max (1, line), 1);
++				}
++				
++				BindMemberCombo(selectedClass);
++			}
++		}
++		
+ 		void OnBreakpointAdded (object sender, BreakpointEventArgs args)
+ 		{
+ 			if (args.Breakpoint.FileName == ContentName)
+@@ -385,7 +637,7 @@
+ 				reloadBar.ShowAll ();
+ 			}
+ 			warnOverwrite = true;
+-			editorBar.PackStart (reloadBar);
++			editorBar.PackStart (reloadBar, false, true, 1);
+ 			reloadBar.ShowAll ();
+ 			WorkbenchWindow.ShowNotification = true;
+ 		}
+@@ -785,6 +1037,7 @@
+ 			se.View.AutoInsertTemplates = TextEditorProperties.AutoInsertTemplates;
+ 			se.Buffer.UnderlineErrors = TextEditorProperties.UnderlineErrors;
+ 			se.Buffer.Highlight = TextEditorProperties.SyntaxHighlight;
++			se.DisplayBinding.ClassBrowserVisible = TextEditorProperties.ShowClassBrowser;
+ 
+ 			if (TextEditorProperties.VerticalRulerRow > -1)
+ 				se.View.Margin = (uint) TextEditorProperties.VerticalRulerRow;
+@@ -851,6 +1104,9 @@
+ 				case "WrapMode":
+ 					se.View.WrapMode = TextEditorProperties.WrapMode;
+ 					break;
++				case "ShowClassBrowser":
++					se.DisplayBinding.ClassBrowserVisible = TextEditorProperties.ShowClassBrowser;
++					break;
+ 				default:
+ 					Console.WriteLine ("unhandled property change: {0}", e.Key);
+ 					break;
+Index: Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Properties/TextEditorProperties.cs
+===================================================================
+--- Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Properties/TextEditorProperties.cs	(revision 73519)
++++ Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Properties/TextEditorProperties.cs	(working copy)
+@@ -374,5 +374,14 @@
+ 				properties.SetProperty ("DefaultFont", value.ToString ());
+ 			}
+ 		}
++		
++		public static bool ShowClassBrowser {
++			get {
++				return properties.GetProperty("ShowClassBrowser", true);
++			}
++			set {
++				properties.SetProperty("ShowClassBrowser", value);
++			}
++		}
+ 	}
+ }
+Index: Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui.OptionPanels/GeneralTextEditorPanel.cs
+===================================================================
+--- Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui.OptionPanels/GeneralTextEditorPanel.cs	(revision 73519)
++++ Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui.OptionPanels/GeneralTextEditorPanel.cs	(working copy)
+@@ -42,6 +42,7 @@
+ 		{	
+ 			[Glade.Widget] CheckButton enableCodeCompletionCheckBox;
+ 			[Glade.Widget] CheckButton enableFoldingCheckBox;
++			[Glade.Widget] CheckButton showClassMethodCheckBox;
+ 			[Glade.Widget] FontButton fontNameDisplayTextBox;
+ 			[Glade.Widget] VBox encodingBox;
+ 			[Glade.Widget] RadioButton use_monospace;
+@@ -54,7 +55,9 @@
+ 				enableCodeCompletionCheckBox.Active = TextEditorProperties.EnableCodeCompletion;
+ 				
+  				enableFoldingCheckBox.Active = TextEditorProperties.EnableFolding;
+-				
++ 				
++ 				showClassMethodCheckBox.Active = TextEditorProperties.ShowClassBrowser;
++ 				
+ 				switch (TextEditorProperties.FontType) {
+ 				case EditorFontType.DefaultMonospace:
+ 					use_monospace.Active = true;
+@@ -104,6 +107,7 @@
+ 			{
+ 				TextEditorProperties.EnableCodeCompletion = enableCodeCompletionCheckBox.Active;
+ 				TextEditorProperties.EnableFolding = enableFoldingCheckBox.Active;
++				TextEditorProperties.ShowClassBrowser = showClassMethodCheckBox.Active;
+ 				
+ 				if (use_monospace.Active) {
+ 					TextEditorProperties.FontType = EditorFontType.DefaultMonospace;

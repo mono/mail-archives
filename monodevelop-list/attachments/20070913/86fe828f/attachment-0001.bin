@@ -1,0 +1,314 @@
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ICompilationUnitBase.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ICompilationUnitBase.cs	(révision 85735)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.Parser/ICompilationUnitBase.cs	(copie de travail)
+@@ -30,5 +30,23 @@
+ 	
+ 	public class ErrorInfo
+ 	{
++		public int Line;
++		public int Col;
++		public string Message;
++		public ErrorType Type;
++		
++		public ErrorInfo(int line, int col, string message, ErrorType type)
++		{
++			Line = line;
++			Col = col;
++			Message = message;
++			Type = type;
++		}
+ 	}
++	
++	public enum ErrorType {
++		Syntaxic,
++		Semantic,
++		UserDefined
++	}
+ }
+Index: Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui/SourceEditorView.cs
+===================================================================
+--- Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui/SourceEditorView.cs	(révision 85735)
++++ Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui/SourceEditorView.cs	(copie de travail)
+@@ -55,6 +55,121 @@
+ 		bool showTipScheduled;
+ 		int langTipX, langTipY;
+ 		uint tipTimeoutId;
++		
++		// My adding
++		IParserDatabase db = IdeApp.ProjectOperations.ParserDatabase;
++		
++		TextTag synErrorTag = new TextTag("synError");
++		TextTag semErrorTag = new TextTag("semError");
++		
++		struct ErrInfo
++		{
++			public ErrorInfo Info;
++			public TextMark Mark;
++			
++			public ErrInfo(ErrorInfo info, TextMark mark)
++			{
++				this.Info = info;
++				this.Mark = mark;
++			}
++		}
++		
++		Dictionary<int, ErrInfo> errors = new Dictionary<int,ErrInfo>();
++		
++		void InitAutoCorrectionValues()
++		{
++			synErrorTag.Underline = semErrorTag.Underline = Pango.Underline.Error;
++			buf.TagTable.Add(synErrorTag);
++			buf.TagTable.Add(semErrorTag);
++			synErrorTag.Priority = semErrorTag.Priority = buf.TagTable.Size - 1;
++			
++			db.ParseInformationChanged += delegate (object sender, ParseInformationEventArgs e) {
++				// To prevent some NullReferenceException (possibly when the user switch between editors)
++				if (this.ParentEditor == null || this.ParentEditor.DisplayBinding == null || e == null)
++					return;
++				if (this.ParentEditor.DisplayBinding.ContentName != e.FileName)
++					return;
++				
++				ParseCompilationUnit(e.ParseInformation.MostRecentCompilationUnit);
++			};
++			buf.DeleteRange += OnDeleteRange;
++			buf.InsertText += OnInsertText;
++		}
++		
++		void ParseCompilationUnit(ICompilationUnitBase cu)
++		{
++			// No new errors
++			if (!cu.ErrorsDuringCompile)
++				return;
++			
++			Application.Invoke(delegate {
++				// We replace the error tags at the highest priority
++				synErrorTag.Priority = semErrorTag.Priority = buf.TagTable.Size - 1;
++				// Else we underline the error
++				foreach (ErrorInfo info in cu.ErrorInformation)
++					UnderLineError(info);
++			});
++		}
++		
++		void UnderLineError(ErrorInfo info)
++		{
++			if (errors.ContainsKey(info.Line))
++				return;
++			
++			TextIter startIter = buf.GetIterAtLine(info.Line);
++			while (startIter.Char == "\t" || startIter.Char == " ")
++				startIter.ForwardChar();
++			
++			TextIter endIter = buf.GetIterAtLine(info.Line);
++			endIter.ForwardToLineEnd();
++			
++			TextMark temp = buf.CreateMark("error" + info.Line.ToString(), startIter, true);
++			errors[info.Line] = new ErrInfo(info, temp);
++			
++			UnderlineErrorAt(ref startIter, ref endIter, info.Type);
++		}
++		
++		void UnderlineErrorAt(ref TextIter start, ref TextIter end, ErrorType type)
++		{
++			/*string errorType = (type == ErrorType.Syntaxic) ? "synError" : "semError";*/
++			// For the moment there is no difference for the presentation bewteen synError and semError
++			buf.ApplyTag("synError", start, end);
++			Runtime.LoggingService.Info("UnderlineErrorAt applied at line : " + start.Line.ToString());
++		}
++		
++		void ResetUnderlineChangement(TextMark mark)
++		{
++			if (errors.Count > 0) {
++				Application.Invoke(delegate {
++					/*TextIter startIter = buf.GetIterAtMark(mark);
++					TextIter endIter = buf.GetIterAtMark(mark);
++					endIter.ForwardToLineEnd();*/
++					buf.RemoveTag("synError", buf.StartIter, buf.EndIter);
++					//buf.RemoveTag("semError", buf.StartIter, buf.EndIter);
++				});
++				errors.Clear();
++			}
++		}
++		
++		void OnDeleteRange(object sender, DeleteRangeArgs e)
++		{
++			ResetUnderlineChangement(null);
++		}
++		
++		void OnInsertText(object sender, InsertTextArgs e)
++		{
++			ResetUnderlineChangement(null);
++		}
++		
++		string GetErrorInformationAt(TextIter iter)
++		{
++			ErrInfo info;
++			if (errors.TryGetValue(iter.Line, out info))
++				return "<b> Parser Error : </b>" + info.Info.Message;
++			else
++				return null;
++		}
++		// end
+ 
+ 		public bool EnableCodeCompletion {
+ 			get { return codeCompleteEnabled; }
+@@ -106,6 +221,8 @@
+ 			buf.Changed += new EventHandler (BufferChanged);
+ 			LoadEditActions ();
+ 			this.Events = this.Events | EventMask.PointerMotionMask | EventMask.LeaveNotifyMask | EventMask.ExposureMask;
++			
++			InitAutoCorrectionValues();
+ 		}
+ 		
+ 		public new void Dispose ()
+@@ -183,7 +300,8 @@
+ 				if (pctx == null)
+ 					return false;
+ 
+-				languageItemWindow = new LanguageItemWindow (tipItem, pctx, GetAmbience ());
++				languageItemWindow = new LanguageItemWindow (tipItem, pctx, GetAmbience (), 
++				                                             GetErrorInformationAt(ti));
+ 				
+ 				int ox, oy;
+ 				this.GetWindow (TextWindowType.Text).GetOrigin (out ox, out oy);
+Index: Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui/LanguageItemWindow.cs
+===================================================================
+--- Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui/LanguageItemWindow.cs	(révision 85735)
++++ Extras/MonoDevelop.SourceEditor/MonoDevelop.SourceEditor.Gui/LanguageItemWindow.cs	(copie de travail)
+@@ -18,39 +18,69 @@
+ 	{
+ 		static ConversionFlags WindowConversionFlags = ConversionFlags.StandardConversionFlags | ConversionFlags.IncludePangoMarkup;
+ 		
+-		public LanguageItemWindow (ILanguageItem item, IParserContext ctx, Ambience ambience) : base (WindowType.Popup)
++		static string paramStr = GettextCatalog.GetString ("Parameter");
++		static string localStr = GettextCatalog.GetString ("Local variable");
++		static string fieldStr = GettextCatalog.GetString ("Field");
++		static string propertyStr = GettextCatalog.GetString ("Property");
++		
++		public LanguageItemWindow (ILanguageItem item, IParserContext ctx, Ambience ambience,
++		                           string errorInformations) : base (WindowType.Popup)
+ 		{
+ 			Name = "gtk-tooltips";
+ 			
+-			string s;
++			/*if (paramStr == null) paramStr = GettextCatalog.GetString ("Parameter");
++			if (localStr == null) localStr = GettextCatalog.GetString ("Local variable");
++			if (fieldStr == null) fieldStr = GettextCatalog.GetString ("Field");*/
+ 			
++			// Approximate value for usual case
++			StringBuilder s = new StringBuilder(150);
++			
+ 			if (item is IParameter) {
+-				s = "<small><i>" + GettextCatalog.GetString ("Parameter") + "</i></small>\n";
+-				s += ambience.Convert((IParameter)item, WindowConversionFlags);
++				s.Append("<small><i>");
++				s.Append(paramStr);
++				s.Append("</i></small>\n");
++				s.Append(ambience.Convert((IParameter)item, WindowConversionFlags));
+ 			}
+ 			else if (item is LocalVariable) {
+-				s = "<small><i>" + GettextCatalog.GetString ("Local variable") + "</i></small>\n";
+-				s += ambience.Convert((LocalVariable)item, WindowConversionFlags);
++				s.Append("<small><i>");
++				s.Append(localStr);
++				s.Append("</i></small>\n");
++				s.Append(ambience.Convert((LocalVariable)item, WindowConversionFlags));
+ 			}
+ 			else if (item is IField) {				
+-				s = "<small><i>" + GettextCatalog.GetString ("Field") + "</i></small>\n";
+-				s += ambience.Convert((IField)item, WindowConversionFlags);
++				s.Append("<small><i>");
++				s.Append(fieldStr);
++				s.Append("</i></small>\n");
++				s.Append(ambience.Convert((IField)item, WindowConversionFlags));
+ 			}
+ 			else if (item is IProperty) {				
+-				s = "<small><i>" + GettextCatalog.GetString ("Property") + "</i></small>\n";
+-				s += ambience.Convert((IProperty)item, WindowConversionFlags);
++				s.Append("<small><i>");
++				s.Append(propertyStr);
++				s.Append("</i></small>\n");
++				s.Append(ambience.Convert((IProperty)item, WindowConversionFlags));
+ 			}
+-			else if (item is Namespace)
+-				s = "namespace " + "<b>" + item.Name + "</b>";
+-			else
+-				s = ambience.Convert(item, WindowConversionFlags);
++			else if (item is Namespace) {
++				s.Append("namespace <b>");
++				s.Append(item.Name);
++				s.Append("</b>");
++			} else
++				s.Append(ambience.Convert(item, WindowConversionFlags));
+ 
+ 			string doc = GetDocumentation (item.Documentation).Trim ('\n');
+-			if (doc.Length > 0)
+-				s += "\n<small>" + doc + "</small>";
++			if (doc.Length > 0) {
++				s.Append("\n<small>");
++				s.Append(doc);
++				s.Append("</small>");
++			}
+ 			
++			if (!string.IsNullOrEmpty(errorInformations)) {
++				s.Append("\n\n<small>");
++				s.Append(errorInformations);
++				s.Append("</small>");
++			}
++			
+ 			Label lab = new Label ();
+-			lab.Markup = s;
++			lab.Markup = s.ToString();
+ 			lab.Xalign = 0;
+ 			lab.Xpad = 3;
+ 			lab.Ypad = 3;
+@@ -69,7 +99,7 @@
+ 		{
+ 			System.IO.StringReader reader = new System.IO.StringReader("<docroot>" + doc + "</docroot>");
+ 			XmlTextReader xml   = new XmlTextReader(reader);
+-			StringBuilder ret   = new StringBuilder();
++			StringBuilder ret   = new StringBuilder(70);
+ 			
+ 			try {
+ 				xml.Read();
+Index: Extras/CSharpBinding/Parser/Parser.cs
+===================================================================
+--- Extras/CSharpBinding/Parser/Parser.cs	(révision 85735)
++++ Extras/CSharpBinding/Parser/Parser.cs	(copie de travail)
+@@ -8,6 +8,7 @@
+ using System.IO;
+ using System.Drawing;
+ using System.Collections;
++using System.Collections.Generic;
+ using MonoDevelop.Core;
+ using MonoDevelop.Projects.Parser;
+ using MonoDevelop.Projects;
+@@ -86,15 +87,23 @@
+ 		
+ 		ICompilationUnit Parse (ICSharpCode.NRefactory.IParser p, string fileName)
+ 		{
+-        	p.Lexer.SpecialCommentTags = lexerTags;
+-            p.Parse ();
++			p.Lexer.SpecialCommentTags = lexerTags;
++			
++			List<ErrorInfo> errors = new List<ErrorInfo>();
++			p.Errors.Error += delegate (int line, int col, string message) {
++				errors.Add(new ErrorInfo(line, col, message, ErrorType.Syntaxic));
++			};
++			
++			p.Parse ();
+             
+-            CSharpVisitor visitor = new CSharpVisitor();
++			CSharpVisitor visitor = new CSharpVisitor();
+ 			visitor.VisitCompilationUnit (p.CompilationUnit, null);
+ 			visitor.Cu.ErrorsDuringCompile = p.Errors.Count > 0;
+ 			visitor.Cu.Tag = p.CompilationUnit;
+-			// FIXME: track api changes
+-			//visitor.Cu.ErrorInformation = p.Errors.ErrorInformation;
++			visitor.Cu.ErrorInformation = errors.ToArray();
++			
++			System.Diagnostics.Debug.Assert(p.Errors.Count == errors.Count);
++			
+ 			RetrieveRegions (visitor.Cu, p.Lexer.SpecialTracker);
+ 			foreach (IClass c in visitor.Cu.Classes)
+ 				c.Region.FileName = fileName;

@@ -1,0 +1,206 @@
+Index: MonoDevelop.Ide/Services.cs
+===================================================================
+--- MonoDevelop.Ide/Services.cs	(revision 76004)
++++ MonoDevelop.Ide/Services.cs	(working copy)
+@@ -25,6 +25,7 @@
+ 		static IParserService parserService;
+ 		static DispatchService dispatchService;
+ 		static IProjectService projectService;
++		static IProfilerService profilerService;
+ 	
+ 		public static IStatusBarService StatusBar {
+ 			get {
+@@ -113,6 +114,14 @@
+ 				return projectService;
+ 			}
+ 		}
++		
++		public static IProfilerService ProfilerService {
++			get {
++				if (profilerService == null)
++					profilerService = (IProfilerService) ServiceManager.GetService (typeof(IProfilerService));
++				return profilerService;
++			}
++		}
+ 	}
+ }
+ 
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 76004)
++++ ChangeLog	(working copy)
+@@ -1,5 +1,20 @@
+ 2007-04-20  Ben Motmans  <ben.motmans@gmail.com>
+ 
++	* MonoDevelop.Ide/Services.cs:
++	Added property for IProfilerService
++	* MonoDevelop.Ide.addin.xml:
++	Added a new workbench context for profiling
++	* MonoDevelop.Ide.Gui/Document.cs:
++	Profile method to run a single file in a profiled environment
++	* MonoDevelop.Ide.Gui/ProjectOperations.cs:
++	Profile method: Start a new Async ExecutionContext for a Combine
++	ProfileFile method: create a temp single-file project and execute Profile
++	* MonoDevelop.Ide.Gui/IWorkbench.cs: Profile context
++	* MonoDevelop.Ide.Gui/ProgressMonitors.cs:
++	Added a null check so we don't get a NullReferenceException
++
++2007-04-20  Ben Motmans  <ben.motmans@gmail.com>
++
+ 	* MonoDevelop.Ide.Gui.Pads/ErrorListPad.cs:
+ 	Include a "show error reference" item in the popup menu
+ 	* MonoDevelop.Ide.Tasks/Task.cs: store the ErrorNumber
+Index: MonoDevelop.Ide.addin.xml
+===================================================================
+--- MonoDevelop.Ide.addin.xml	(revision 76004)
++++ MonoDevelop.Ide.addin.xml	(working copy)
+@@ -730,6 +730,14 @@
+ 			<ContextPad id = "MonoDevelop.Ide.Gui.Pads.ErrorListPad"/>
+ 			<ContextPad id = "MonoDevelop.Ide.Gui.Pads.TaskListPad" defaultVisible = "False"/>
+ 		</WorkbenchContext>
++		<WorkbenchContext id = "Profile">
++			<ContextPad id = "MonoDevelop.Ide.Gui.Pads.ProjectPad"/>
++			<ContextPad id = "MonoDevelop.Ide.Gui.Pads.ClassPad" defaultVisible = "False"/>
++			<ContextPad id = "MonoDevelop.Ide.Gui.Pads.FileScout" defaultVisible = "False"/>
++			<ContextPad id = "MonoDevelop.Ide.Gui.Pads.HelpTree" defaultVisible = "False"/>
++			<ContextPad id = "MonoDevelop.Ide.Gui.Pads.ErrorListPad"/>
++			<ContextPad id = "MonoDevelop.Ide.Gui.Pads.TaskListPad" defaultVisible = "False"/>
++		</WorkbenchContext>
+ 	</Extension>
+ 	
+ 	<Extension path = "/SharpDevelop/Dialogs/OptionsDialog" extension-nodes="DialogPanel" description="Dialog panels for global MonoDevelop options.">
+Index: Makefile.am
+===================================================================
+--- Makefile.am	(revision 76004)
++++ Makefile.am	(working copy)
+@@ -70,8 +70,8 @@
+ 	MonoDevelop.Ide.ExternalTools/ExternalTool.cs \
+ 	MonoDevelop.Ide.ExternalTools/ToolLoader.cs \
+ 	MonoDevelop.Ide.Gui.BrowserDisplayBinding/BrowserDisplayBinding.cs \
++	MonoDevelop.Ide.Gui.BrowserDisplayBinding/HtmlViewPane.cs \
+ 	MonoDevelop.Ide.Gui.BrowserDisplayBinding/HTMLInterfaces.cs \
+-	MonoDevelop.Ide.Gui.BrowserDisplayBinding/HtmlViewPane.cs \
+ 	MonoDevelop.Ide.Gui.Content/IBookmarkBuffer.cs \
+ 	MonoDevelop.Ide.Gui.Content/IClipboardHandler.cs \
+ 	MonoDevelop.Ide.Gui.Content/ICodeStyleOperations.cs \
+Index: MonoDevelop.Ide.Gui/Document.cs
+===================================================================
+--- MonoDevelop.Ide.Gui/Document.cs	(revision 76004)
++++ MonoDevelop.Ide.Gui/Document.cs	(working copy)
+@@ -34,6 +34,7 @@
+ using Gtk;
+ 
+ using MonoDevelop.Core;
++using MonoDevelop.Core.Execution;
+ using MonoDevelop.Components;
+ using MonoDevelop.Projects;
+ using MonoDevelop.Projects.Text;
+@@ -267,6 +268,11 @@
+ 			return IdeApp.ProjectOperations.DebugFile (Window.ViewContent.ContentName);
+ 		}
+ 		
++		public virtual IAsyncOperation Profile (IProfiler profiler)
++		{
++			return IdeApp.ProjectOperations.ProfileFile (Window.ViewContent.ContentName, profiler);
++		}
++		
+ 		public void Close ()
+ 		{
+ 			Window.CloseWindow (false, true, 0);
+Index: MonoDevelop.Ide.Gui/ProjectOperations.cs
+===================================================================
+--- MonoDevelop.Ide.Gui/ProjectOperations.cs	(revision 76004)
++++ MonoDevelop.Ide.Gui/ProjectOperations.cs	(working copy)
+@@ -963,6 +963,59 @@
+ 			public void Run (object sender, EventArgs e) { Monitor.Dispose (); }
+ 		}
+ 		
++		public IAsyncOperation Profile (CombineEntry entry, IProfiler profiler)
++		{
++			if (currentRunOperation != null && !currentRunOperation.IsCompleted)
++				return currentRunOperation;
++			
++			if (profiler == null) {
++				Services.MessageService.ShowError(GettextCatalog.GetString ("Invalid profiler."));
++				return NullAsyncOperation.Failure;
++			}
++			
++			guiHelper.SetWorkbenchContext (WorkbenchContext.Profile);
++
++			IProgressMonitor monitor = new MessageDialogProgressMonitor ();
++			ExecutionContext context = new ExecutionContext (profiler.GetExecutionHandlerFactory (), IdeApp.Workbench.ProgressMonitors);
++
++			Services.DispatchService.ThreadDispatch (new StatefulMessageHandler (ProfileCombineEntryAsync), new object[] {entry, monitor, context});
++			currentRunOperation = monitor.AsyncOperation;
++			
++			return currentRunOperation;
++		}
++		
++		public IAsyncOperation ProfileFile (string file, IProfiler profiler)
++		{
++			Project tempProject = projectService.CreateSingleFileProject (file);
++			if (tempProject != null) {
++				IAsyncOperation aop = Profile (tempProject, profiler);
++				ProjectOperationHandler h = new ProjectOperationHandler ();
++				h.Project = tempProject;
++				aop.Completed += new OperationHandler (h.Run);
++				return aop;
++			} else {
++				Services.MessageService.ShowError(GettextCatalog.GetString ("No runnable executable found."));
++				return NullAsyncOperation.Failure;
++			}
++		}
++		
++		void ProfileCombineEntryAsync (object ob)
++		{
++			object[] data = (object[]) ob;
++			CombineEntry entry = (CombineEntry) data[0];
++			IProgressMonitor monitor = (IProgressMonitor) data[1];
++			ExecutionContext context = (ExecutionContext) data[2];
++			OnBeforeStartProject ();
++			try {
++				entry.Execute (monitor, context);
++			} catch (Exception ex) {
++				monitor.ReportError (GettextCatalog.GetString ("Execution failed."), ex);
++			} finally {
++				monitor.Dispose ();
++			}
++			guiHelper.SetWorkbenchContext (WorkbenchContext.Edit);
++		}
++		
+ 		class ProjectOperationHandler {
+ 			public Project Project;
+ 			public void Run (IAsyncOperation op) { Project.Dispose (); }
+Index: MonoDevelop.Ide.Gui/IWorkbench.cs
+===================================================================
+--- MonoDevelop.Ide.Gui/IWorkbench.cs	(revision 76004)
++++ MonoDevelop.Ide.Gui/IWorkbench.cs	(working copy)
+@@ -39,6 +39,10 @@
+ 			get { return GetContext ("Debug"); }
+ 		}
+ 		
++		public static WorkbenchContext Profile {
++			get { return GetContext ("Profile"); }
++		}
++		
+ 		public string Id {
+ 			get { return id; }
+ 		}
+Index: MonoDevelop.Ide.Gui/ProgressMonitors.cs
+===================================================================
+--- MonoDevelop.Ide.Gui/ProgressMonitors.cs	(revision 76004)
++++ MonoDevelop.Ide.Gui/ProgressMonitors.cs	(working copy)
+@@ -101,9 +101,13 @@
+ 				icon = MonoDevelop.Core.Gui.Stock.OutputIcon;
+ 
+ 			if (allowMonitorReuse) {
++		
+ 				lock (outputMonitors) {
+ 					// Look for an available pad
+ 					for (int n=0; n<outputMonitors.Count; n++) {
++						object obj = outputMonitors [n];
++						if (obj == null)
++							continue; //FIXME: for some reason, this can be null when in Profiling mode
+ 						Pad mpad = (Pad) outputMonitors [n];
+ 						if (mpad.Title == title) {
+ 							pad = mpad;

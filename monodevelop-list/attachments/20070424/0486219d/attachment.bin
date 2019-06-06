@@ -1,0 +1,565 @@
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/BaseRefactorer.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/BaseRefactorer.cs	(revisión: 76173)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/BaseRefactorer.cs	(copia de trabajo)
+@@ -82,6 +82,13 @@
+ 		{
+ 			IEditableTextFile buffer = ctx.GetFile (cls.Region.FileName);
+ 			
++			return this.AddMember (ctx, cls, member, buffer);
++		}
++		
++        //Overload that takes the buffer where to replace the member. Usefull for
++        //changing code in opened editors.
++		public virtual IMember AddMember (RefactorerContext ctx, IClass cls, CodeTypeMember member, IEditableTextFile buffer)
++		{
+ 			int pos = GetNewMemberPosition (buffer, cls, member);
+ 			
+ 			string code = GenerateCodeFromMember (member);
+@@ -109,7 +116,15 @@
+ 		public virtual IMember ReplaceMember (RefactorerContext ctx, IClass cls, IMember oldMember, CodeTypeMember memberInfo)
+ 		{
+ 			IEditableTextFile buffer = ctx.GetFile (cls.Region.FileName);
+-			IRegion reg = GetMemberBounds (oldMember);
++			this.ReplaceMember (ctx, cls, oldMember, memberInfo, buffer);
++			return FindGeneratedMember (ctx, buffer, cls, memberInfo);
++		}
++		
++        //Overload that takes the buffer where to replace the member. Usefull for
++        //changing code in opened editors.
++		public virtual void ReplaceMember (RefactorerContext ctx, IClass cls, IMember oldMember, CodeTypeMember memberInfo, IEditableTextFile buffer)
++		{
++		    IRegion reg = GetMemberBounds (oldMember);
+ 			int sp = buffer.GetPositionFromLineColumn (reg.BeginLine, reg.BeginColumn);
+ 			int ep = buffer.GetPositionFromLineColumn (reg.EndLine, reg.EndColumn);
+ 			buffer.DeleteText (sp, ep - sp);
+@@ -119,9 +134,6 @@
+ 			code = Indent (code, indent, false);
+ 			
+ 			buffer.InsertText (sp, code);
+-			
+-			return FindGeneratedMember (ctx, buffer, cls, memberInfo);
+-				
+ 		}
+ 		
+ 		public virtual IMember RenameMember (RefactorerContext ctx, IClass cls, IMember member, string newName)
+@@ -129,6 +141,16 @@
+ 			IEditableTextFile file = ctx.GetFile (cls.Region.FileName);
+ 			if (file == null)
+ 				return null;
++			
++			CodeTypeMember memberInfo = this.RenameMember (ctx, cls, member, newName, file);
++			return FindGeneratedMember (ctx, file, cls, memberInfo);
++		}
++		
++		//Renames a member in a file and returns the CodeTypeMember used to rename
++		public CodeTypeMember RenameMember (RefactorerContext ctx, IClass cls, IMember member, string newName, IEditableTextFile file)
++		{
++			if (file == null)
++				return null;
+ 
+ 			int pos = GetMemberNamePosition (file, member);
+ 			if (pos == -1)
+@@ -154,7 +176,7 @@
+ 				return null;
+ 			
+ 			memberInfo.Name = newName;
+-			return FindGeneratedMember (ctx, file, cls, memberInfo);
++			return memberInfo;
+ 		}
+ 		
+ 		public virtual MemberReferenceCollection FindMemberReferences (RefactorerContext ctx, string fileName, IClass cls, IMember member)
+@@ -170,7 +192,6 @@
+ 			else
+ 				return null;
+ 		}
+-		
+ 
+ 		/// Method overridables ////////////////////////////
+ 		
+@@ -406,8 +427,7 @@
+ 				pos = GetNextLine (buffer, pos);
+ 				buffer.InsertText (pos, ind);
+ 				return pos + ind.Length;
+-			}
+-			else {
++			} else {
+ 				IMethod m = cls.Methods [cls.Methods.Count - 1];
+ 				
+ 				int pos;
+@@ -427,7 +447,10 @@
+ 		
+ 		protected virtual int GetNewPropertyPosition (IEditableTextFile buffer, IClass cls)
+ 		{
+-			if (cls.Properties.Count == 0) {
++			//Check that the BodyRegion is not null to avoid a NullException. This happens
++			//in EncapsulateFields command when generating the new property in the class.
++			if (cls.Properties.Count == 0 ||
++                cls.Properties [cls.Properties.Count - 1].BodyRegion==null) {
+ 				int pos = GetNewEventPosition (buffer, cls);
+ 				int line, col;
+ 				buffer.GetLineColumnFromPosition (pos, out line, out col);
+Index: Core/src/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/CodeRefactorer.cs
+===================================================================
+--- Core/src/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/CodeRefactorer.cs	(revisión: 76173)
++++ Core/src/MonoDevelop.Projects/MonoDevelop.Projects.CodeGeneration/CodeRefactorer.cs	(copia de trabajo)
+@@ -29,6 +29,7 @@
+ using System;
+ using System.CodeDom;
+ using System.Collections;
++using System.Collections.Generic;
+ using MonoDevelop.Core;
+ using MonoDevelop.Projects.Text;
+ using MonoDevelop.Projects.Parser;
+@@ -88,13 +89,20 @@
+ 			return refs;
+ 		}
+ 		
+-		public IMember AddMember (IClass cls, CodeTypeMember member)
+-		{
++	    public IMember AddMember (IClass cls, CodeTypeMember member)
++	    {
+ 			RefactorerContext gctx = GetGeneratorContext (cls);
+ 			IRefactorer gen = GetGeneratorForClass (cls);
+ 			IMember m = gen.AddMember (gctx, cls, member);
+ 			gctx.Save ();
+-			return m;
++			return m;	    
++	    }
++		
++		public IMember AddMember (IClass cls, CodeTypeMember member, IEditableTextFile txtFile)
++		{
++			RefactorerContext gctx = GetGeneratorContext (cls);
++			IRefactorer gen = GetGeneratorForClass (cls);
++			return ((BaseRefactorer)gen).AddMember (gctx, cls, member, txtFile);
+ 		}
+ 		
+ 		public void RemoveMember (IClass cls, IMember member)
+@@ -118,6 +126,23 @@
+ 			return m;
+ 		}
+ 		
++		public void RenameMember (IProgressMonitor monitor, IClass cls, IMember member, string newName, RefactoryScope scope, bool omitClass, IEditableTextFile file)
++		{
++			MemberReferenceCollection refs = new MemberReferenceCollection ();
++			Refactor (monitor, cls, scope, new RefactorDelegate (new RefactorFindMemberReferences (cls, member, refs).Refactor));
++			//FIXME:If the file where the reference is found is opened the editor buffer should be
++			//changed.
++			refs.RenameAll (newName);
++			
++			if(omitClass)
++			{
++				RefactorerContext gctx = GetGeneratorContext (cls);
++				IRefactorer gen = GetGeneratorForClass (cls);
++				((BaseRefactorer)gen).RenameMember (gctx, cls, member, newName, file);
++				gctx.Save ();
++			}
++		}
++		
+ 		public MemberReferenceCollection FindMemberReferences (IProgressMonitor monitor, IClass cls, IMember member, RefactoryScope scope)
+ 		{
+ 			MemberReferenceCollection refs = new MemberReferenceCollection ();
+@@ -134,6 +159,17 @@
+ 			return m;
+ 		}
+ 		
++        // Overload of ReplaceMember that takes the buffer where de member is
++        // to replace it there.
++		public void ReplaceMember(IClass cls, IMember oldMember, CodeTypeMember member, IEditableTextFile buffer)
++		{
++            RefactorerContext gctx = GetGeneratorContext (cls);
++			IRefactorer gen = GetGeneratorForClass (cls);
++            //Unbox to access the overload that lets us specify the buffer to change
++			((BaseRefactorer)gen).ReplaceMember (gctx, cls, oldMember, member, buffer);
++			gctx.Save ();
++		}
++		
+ 		public IClass[] FindDerivedClasses (IClass baseClass)
+ 		{
+ 			ArrayList list = new ArrayList ();
+@@ -156,6 +192,32 @@
+ 			return (IClass[]) list.ToArray (typeof(IClass));
+ 		}
+ 		
++        // Encapsulates the access to the field with a property. The property is generated to have
++        // a fresh name not used in the class being refactorized.
++		public IMember EncapsulateField (IField field, IEditableTextFile textFile)
++		{
++		    RefactorCodeGeneratorHelper generator = new RefactorCodeGeneratorHelper (field.DeclaringType);
++            
++		    //We need to create the code member for the field to update the declaration
++		    //only if it's public
++		    if (field.IsPublic) {
++    		    CodeMemberField cmField = generator.GetField (field);
++				
++				//MSDN says this is the way to modify attributes
++				//http://msdn2.microsoft.com/en-us/library/system.codedom.aspx
++				cmField.Attributes = (cmField.Attributes & ~MemberAttributes.AccessMask) | 
++						MemberAttributes.Private;
++				
++    		    //Set private and replace
++    		    cmField.Attributes |= MemberAttributes.Private;
++    		    this.ReplaceMember(field.DeclaringType, (IMember)field, cmField, textFile);
++		    }
++			
++		    //Generate the property
++		    CodeMemberProperty prop = generator.GetProperty (field, true);
++		    return this.AddMember (field.DeclaringType, prop, textFile);
++		}
++		
+ 		bool IsSubclass (IParserContext ctx, IClass baseClass, IClass subclass)
+ 		{
+ 			foreach (IReturnType clsName in subclass.BaseTypes)
+@@ -253,6 +315,257 @@
+ 		{
+ 			return Services.Languages.GetRefactorerForFile (cls.Region.FileName);
+ 		}
++    }
++	
++	//Helper class that does the creation of CodeDom objects and other stuff needed
++	class RefactorCodeGeneratorHelper
++	{
++	    private IClass cls;
++	    
++	    public RefactorCodeGeneratorHelper (IClass cls)
++	    {
++	       this.cls = cls;
++	    }
++	    
++		// Creates an array of code comments
++	    public CodeCommentStatement[] GetDocumentationCodeComment (string summary, string remarks, Dictionary<string, string> parameters)
++	    {
++	        List<CodeCommentStatement> result = new List<CodeCommentStatement> ();
++	        CodeCommentStatement comment;
++	        
++	        if (summary!=null){
++	            comment = new CodeCommentStatement ("<summary>", true);
++	            result.Add (comment);
++	            comment = new CodeCommentStatement (summary, true);
++	            result.Add (comment);
++	            comment = new CodeCommentStatement ("</summary>", true);
++	            result.Add (comment);
++	        }
++	        
++	        if (parameters!=null && parameters.Count > 0)
++	        {
++	            foreach (string key in parameters.Keys)
++	            {
++	                comment = new CodeCommentStatement ("<param name=\""+key+"\">"+parameters[key]+"</param>", true);
++	                result.Add (comment);
++	            }
++	        }
++	        
++	        if (remarks!=null) {
++	            comment = new CodeCommentStatement ("<remarks>", true);
++	            result.Add (comment);
++	            comment = new CodeCommentStatement (remarks, true);
++	            result.Add (comment);
++	            comment = new CodeCommentStatement ("</remarks>", true);
++	            result.Add (comment);	            
++	        }
++	        
++	        return result.ToArray ();
++	    }
++	    
++		//Gets a field member (CodeDom) from an IField instance
++	    public CodeMemberField GetField (IField field)
++	    {
++	        Console.Out.WriteLine ("GetField "+field.Name);
++	        //Create the code field with type and name
++	        CodeMemberField cmField = new CodeMemberField (
++	                                           new CodeTypeReference(field.ReturnType.Name),
++	                                           field.Name);
++	        //Attributes                                   
++	        cmField.Attributes = GetAttributes ((IMember)field);
++	        //Documentation
++	        string[] documentation = field.Documentation.Split (new char[]{'\n','\r'}, StringSplitOptions.RemoveEmptyEntries);
++	        foreach (string docLine in documentation) {
++	            cmField.Comments.Add( new CodeCommentStatement (docLine, true));
++	        }
++	        cmField.CustomAttributes = GetCustomAttributes ((IMember)field);
++			
++	        return cmField;
++	    }
++	    
++		//Gets a property from a field. 
++	    public CodeMemberProperty GetProperty (IField field, bool isPublic)
++	    {
++	        Console.Out.WriteLine ("GetProperty "+field.Name);
++	        if (field.DeclaringType != cls)
++	            throw new ArgumentException ("The field must be part of the declaring type "+
++	                                         cls.FullyQualifiedName);
++	    
++	        CodeMemberProperty property = new CodeMemberProperty();
++	        
++	        property.Name = BuildEncapNameForField (field.Name);
++	        
++			//To set something with public visibility we have to set it as public 
++			//and also final or it will be "public virtual" instead of "public"
++			//The same applies to the protected modifier
++	        if (isPublic)
++	            property.Attributes = MemberAttributes.Public | MemberAttributes.Final;
++	        else 
++	            property.Attributes = MemberAttributes.Family | MemberAttributes.Final;
++	    
++	        property.HasGet = true;
++	        property.HasSet = true;
++	        property.Type = new CodeTypeReference (field.ReturnType.Name);	        
++			//Generate get and set body instructions
++            CodeAssignStatement assign = new CodeAssignStatement();
++            CodeFieldReferenceExpression fieldRef  = 
++                new CodeFieldReferenceExpression (new CodeThisReferenceExpression(), field.Name);
++            assign.Left = fieldRef;
++            assign.Right = new CodePropertySetValueReferenceExpression ();
++
++            property.SetStatements.Add (assign);
++
++            property.GetStatements.Add(new CodeMethodReturnStatement (fieldRef));
++	        
++			//Create and add default comments
++	        CodeCommentStatement[] comments = 
++	            GetDocumentationCodeComment ("Get/Set the value for "+property.Name+" property",
++	                                         "Generated automatically by a command.", 
++	                                         null);
++	                              
++	        for (int i=0 ; i<comments.Length ; i++){
++	            property.Comments.Add (comments[i]);
++	        }
++            
++            return property;
++	    }  
++	    
++		//Get the collection of custom attributes from an IMember instance
++	    public CodeAttributeDeclarationCollection GetCustomAttributes(IMember member)
++	    {
++	        CodeAttributeDeclarationCollection decs = 
++	           new CodeAttributeDeclarationCollection ();
++	           
++	        CodeAttributeDeclaration cAttrDec;
++	        
++	        foreach ( IAttributeSection secAttr in member.Attributes){
++	            foreach ( IAttribute attr in secAttr.Attributes){
++	                cAttrDec = new CodeAttributeDeclaration(attr.Name);
++	                
++	                foreach ( NamedAttributeArgument nAttrArg in attr.NamedArguments){
++	                    cAttrDec.Arguments.Add (new CodeAttributeArgument(nAttrArg.Name, nAttrArg.Expression));
++	                }
++	                
++	                foreach ( CodeExpression expr in attr.PositionalArguments){
++	                    cAttrDec.Arguments.Add (new CodeAttributeArgument(expr));
++	                }
++	                
++	                decs.Add ( cAttrDec);
++	            }
++	        }
++	        
++	        return decs;
++	    }
++	    
++		//Get attributes
++	    public MemberAttributes GetAttributes (IMember member)
++	    {
++	        MemberAttributes attrs;
++	        
++	        //First accesibility
++	        if (member.IsPublic && !member.IsVirtual) {
++	           attrs = MemberAttributes.Public | MemberAttributes.Final;
++	        } else if (member.IsPublic) {
++	           attrs = MemberAttributes.Public;
++	        } else if (member.IsPrivate) {
++	           attrs = MemberAttributes.Private;
++	        } else if (member.IsProtected) {
++	           attrs = MemberAttributes.Family;
++	        } else if (member.IsProtectedAndInternal) {
++	           attrs = MemberAttributes.FamilyAndAssembly;
++	        } else if (member.IsProtectedOrInternal) {
++	           attrs = MemberAttributes.FamilyOrAssembly;
++	        } else
++	           attrs = MemberAttributes.FamilyAndAssembly;
++	        
++	        
++	        //Second scope and others
++	        if (member.IsAbstract) {
++	           attrs |= MemberAttributes.Abstract;
++	        } else if (member.IsNew && member.IsStatic) {
++	           attrs |= MemberAttributes.New | MemberAttributes.Static;
++	        } else if (member.IsNew) {
++	           attrs |= MemberAttributes.New;
++	        } else if (member.IsOverride) {
++	           attrs |= MemberAttributes.Override;
++	        } else if (member.IsStatic) {
++	           attrs |= MemberAttributes.Static;
++	        } else if (member.IsFinal) {
++	           attrs |= MemberAttributes.Final;
++	        }
++
++	        return attrs;
++	    }
++	    
++		//Gets a fresh name. This excludes the name of the enclosing type and
++		//puts the first letter in upper case.
++        private string BuildEncapNameForField (string name)
++        {
++            string propName = null;
++
++            int num = 1;
++            //i'm going to follow ms way for this
++            //The name will be the name of the field with the first char converted
++            //to uppercase and if it is already uppercase i will add a number to the
++            //end to make them different. 
++            if (name.Length>1) {
++                propName = Char.ToUpper (name[0])+name.Substring (1);
++            } else {
++                propName = Char.ToUpper (name[0]).ToString();
++            }
++            
++            if ( !ExistsMemberWithName (propName)) {
++                return propName;
++            }
++
++            while (ExistsMemberWithName (propName+num))
++            { 
++                num++; 
++            }
++            
++            return propName+num;
++        }
++                
++		//Search a member with the given name
++        public bool ExistsMemberWithName (string name)
++        {
++            //Can't be the name of the declaring type
++            if (name == cls.Name)
++                return true;
++                
++            //Check fields
++            foreach (IField f in cls.Fields) {
++                if ( f.Name == name )
++                    return true;
++            }
++            //Check methods
++            foreach (IMethod m in cls.Methods) {
++                if ( m.Name == name)
++                    return true;
++            }
++            //Check properties
++            foreach (IProperty p in cls.Properties) {
++                if ( p.Name == name)
++                    return true;
++            }
++            
++            return false;
++        }
++		
++        public void PrintAttributes (MemberAttributes attr)
++        {
++            string str = String.Empty;
++			
++			Array values = Enum.GetValues (typeof(MemberAttributes));
++			
++			foreach (MemberAttributes value in values)
++			{
++				if ((attr & value) == value)
++					str+=value+" ";
++			}
++			
++			Console.Out.WriteLine ("Attributes: "+str);
++        }
+ 	}
+ 	
+ 	class RefactorFindClassReferences
+Index: Core/src/MonoDevelop.Ide/MonoDevelop.Ide.Commands/RefactoryCommands.cs
+===================================================================
+--- Core/src/MonoDevelop.Ide/MonoDevelop.Ide.Commands/RefactoryCommands.cs	(revisión: 76173)
++++ Core/src/MonoDevelop.Ide/MonoDevelop.Ide.Commands/RefactoryCommands.cs	(copia de trabajo)
+@@ -28,6 +28,8 @@
+ 
+ 
+ using System;
++using System.IO;
++using System.CodeDom;
+ using System.Threading;
+ 
+ using MonoDevelop.Core;
+@@ -37,6 +39,7 @@
+ using MonoDevelop.Projects.Parser;
+ using MonoDevelop.Ide.Gui.Content;
+ using MonoDevelop.Ide.Gui.Search;
++using MonoDevelop.Projects;
+ using MonoDevelop.Projects.CodeGeneration;
+ 
+ namespace MonoDevelop.Ide.Commands
+@@ -175,6 +178,8 @@
+ 				ciset.CommandInfos.Add (GettextCatalog.GetString ("_Find references"), new RefactoryOperation (refactorer.FindReferences));
+ 			} else if (item is IField) {
+ 				txt = GettextCatalog.GetString ("Field {0} : {1}", item.Name, ((IField)item).ReturnType.Name);
++                //Add the menu entry to encapsulate this field
++				ciset.CommandInfos.Add(GettextCatalog.GetString ("Encapsulate field {0}", item.Name), new RefactoryOperation (refactorer.EncapsulateField));
+ 				AddRefactoryMenuForClass (ctx, ciset, ((IField)item).ReturnType.FullyQualifiedName);
+ 			} else if (item is IProperty) {
+ 				txt = GettextCatalog.GetString ("Property {0} : {1}", item.Name, ((IProperty)item).ReturnType.Name);
+@@ -194,7 +199,7 @@
+ 				txt = GettextCatalog.GetString ("Variable {0}", item.Name);
+ 			} else
+ 				return null;
+-			
++            
+ 			if (item is IMember) {
+ 				IClass cls = ((IMember)item).DeclaringType;
+ 				if (cls != null) {
+@@ -202,8 +207,8 @@
+ 					if (ci != null)
+ 						ciset.CommandInfos.Add (ci, null);
+ 				}
+-			} 
+-
++			}
++            
+ 			ciset.Text = txt;
+ 			return ciset;
+ 		}
+@@ -303,6 +314,44 @@
+ 				}
+ 			}
+ 		}
++        
++        // Encapsulates the selected field with a property. If the field is public or protected
++        // the references to it have to be changed to point to the newly generated property outside
++        // the refactorized class.
++        public void EncapsulateField ()
++        {
++            IField field = (IField)item;
++            if (field==null) return;
++
++            string fileName = IdeApp.Workbench.ActiveDocument.FileName;
++            //We need this to change the editing buffer instead of the file directly in disk
++            IEditableTextFile txtFile = 
++                (IEditableTextFile) IdeApp.Workbench.ActiveDocument.GetContent<IEditableTextFile> ();
++			monitor = IdeApp.Workbench.ProgressMonitors.GetSearchProgressMonitor (true);
++            IMember property = IdeApp.ProjectOperations.CodeRefactorer.EncapsulateField (field, txtFile);
++			Thread t = new Thread (new ParameterizedThreadStart (EncapsulateFieldThread));
++			t.IsBackground = true;
++			t.Start (property); 
++        }
++        
++        void EncapsulateFieldThread (object newProperty)
++        {
++            using ( monitor){
++				IField field = (IField) item;
++				if (field == null || newProperty == null) return;
++				IMember prop = (IMember)newProperty;
++                
++                //TODO: Display dialog to notify the user about what is going to be done?                                                                
++
++                //TODO: If the user answered yes find all the references that need to be
++                //replaced.
++			    
++				//TODO: Rename all the references found. If they are in files that are being
++                //edited the change must be done in these buffers instead of disk.
++                //Should the user have the option to keep open all the files that are going
++                //to be changed?
++            }
++        }
+ 		
+ 		void ImplementInterface (bool explicitly)
+ 		{

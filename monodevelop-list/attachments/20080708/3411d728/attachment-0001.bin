@@ -1,0 +1,263 @@
+Index: Makefile.am
+===================================================================
+--- Makefile.am	(revision 107474)
++++ Makefile.am	(working copy)
+@@ -20,6 +20,7 @@
+ 	MonoDevelop.VersionControl/CommitCommand.cs \
+ 	MonoDevelop.VersionControl/CommitDialogExtension.cs \
+ 	MonoDevelop.VersionControl/CommitEventHandler.cs \
++	MonoDevelop.VersionControl/EditCommand.cs \
+ 	MonoDevelop.VersionControl/FileUpdateEventHandler.cs \
+ 	MonoDevelop.VersionControl/Publish.cs \
+ 	MonoDevelop.VersionControl/Repository.cs \
+Index: MonoDevelop.VersionControl.mdp
+===================================================================
+--- MonoDevelop.VersionControl.mdp	(revision 107474)
++++ MonoDevelop.VersionControl.mdp	(working copy)
+@@ -53,6 +53,7 @@
+     <File name="MonoDevelop.VersionControl/CommitCommand.cs" subtype="Code" buildaction="Compile" />
+     <File name="MonoDevelop.VersionControl/CommitDialogExtension.cs" subtype="Code" buildaction="Compile" />
+     <File name="MonoDevelop.VersionControl/CommitEventHandler.cs" subtype="Code" buildaction="Compile" />
++	<File name="MonoDevelop.VersionControl/EditCommand.cs" subtype="Code" buildaction="Compile" />
+     <File name="MonoDevelop.VersionControl/Publish.cs" subtype="Code" buildaction="Compile" />
+     <File name="MonoDevelop.VersionControl/Repository.cs" subtype="Code" buildaction="Compile" />
+     <File name="MonoDevelop.VersionControl/RevertCommand.cs" subtype="Code" buildaction="Compile" />
+@@ -106,4 +107,4 @@
+     <AsmRefVar Sync="True" Name="REFS" Prefix="-r:" />
+     <ProjectRefVar Sync="True" Name="REFS" Prefix="-r:" />
+   </MonoDevelop.Autotools.MakefileInfo>
+-</Project>
+\ No newline at end of file
++</Project>
+Index: MonoDevelop.VersionControl/ChangeSet.cs
+===================================================================
+--- MonoDevelop.VersionControl/ChangeSet.cs	(revision 107474)
++++ MonoDevelop.VersionControl/ChangeSet.cs	(working copy)
+@@ -201,6 +201,10 @@
+ 			get { return versionInfo.LocalPath; }
+ 		}
+ 		
++		public string RepositoryPath {
++			get { return versionInfo.RepositoryPath; }
++		}
++		
+ 		public VersionStatus Status {
+ 			get { return versionInfo.Status; }
+ 		}
+Index: MonoDevelop.VersionControl/Commands.cs
+===================================================================
+--- MonoDevelop.VersionControl/Commands.cs	(revision 107474)
++++ MonoDevelop.VersionControl/Commands.cs	(working copy)
+@@ -14,6 +14,7 @@
+     	Checkout,
+     	Repository,
+     	Commit,
+-    	Revert
++    	Revert,
++    	Edit
+ 	}
+ }
+Index: MonoDevelop.VersionControl/EditCommand.cs
+===================================================================
+--- MonoDevelop.VersionControl/EditCommand.cs	(revision 0)
++++ MonoDevelop.VersionControl/EditCommand.cs	(revision 0)
+@@ -0,0 +1,81 @@
++/* EditCommand.cs -- handle "open for edit" commands.
++   Copyright (C) 2008 Pacific Biosciences, Inc.
++
++Permission is hereby granted, free of charge, to any person obtaining
++a copy of this software and associated documentation files (the
++"Software"), to deal in the Software without restriction, including
++without limitation the rights to use, copy, modify, merge, publish,
++distribute, sublicense, and/or sell copies of the Software, and to
++permit persons to whom the Software is furnished to do so, subject to
++the following conditions:
++
++The above copyright notice and this permission notice shall be
++included in all copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
++
++
++using System;
++using System.Collections;
++using System.IO;
++
++using Gtk;
++
++using MonoDevelop.Projects;
++using MonoDevelop.Ide.Gui.Pads;
++using MonoDevelop.Projects.Parser;
++using MonoDevelop.Core;
++using MonoDevelop.Components.Commands;
++using MonoDevelop.Core.Gui;
++using MonoDevelop.Components;
++
++namespace MonoDevelop.VersionControl
++{
++	internal class EditCommand
++	{
++		public static bool Edit(Repository vc, string path, bool test)
++		{
++			if (vc.EditCommandRequired && vc.CanEdit (path))
++			{
++				if (!test)
++					new EditWorker(vc, path).Start();
++				return true;
++			}
++			return false;
++		}
++
++		public static bool CanEdit(Repository vc, string path)
++		{
++			return vc.CanEdit(path);
++		}
++
++		private class EditWorker : Task
++		{
++			Repository vc;
++			string path;
++						
++			public EditWorker (Repository vc, string path) 
++			{
++				this.vc = vc;
++				this.path = path;
++			}
++			
++			protected override string GetDescription()
++			{
++				return GettextCatalog.GetString ("Opening {0} for edit...", path);
++			}
++			
++			protected override void Run ()
++			{
++				vc.EditFile (path, GetProgressMonitor ());
++				VersionControlService.NotifyFileStatusChanged (vc, path, Directory.Exists (path));
++			}
++		}
++	}
++}
+\ No newline at end of file
+Index: MonoDevelop.VersionControl/Repository.cs
+===================================================================
+--- MonoDevelop.VersionControl/Repository.cs	(revision 107474)
++++ MonoDevelop.VersionControl/Repository.cs	(working copy)
+@@ -180,6 +180,13 @@
+ 		{
+ 			return false;
+ 		}
++
++		// VC systems that have an "open for edit" policy should
++		// override this to return something meaningful.
++		public virtual bool CanEdit (string localPath)
++		{
++			return true;
++		}
+ 		
+ 		// Returns a path to the last version of the file updated from the repository
+ 		public abstract string GetPathToBaseText (string localFile);
+@@ -309,6 +316,28 @@
+ 		
+ 		public abstract string GetTextAtRevision (string repositoryPath, Revision revision);
+ 		
++		/// <value>
++		/// True if this repository requires files to be opened for editing
++		/// before modifications can be made. <see cref="EditFile"/>
++		/// </value>
++		public virtual bool EditCommandRequired {
++			get { return false; }
++		}
++		
++		/// <summary>
++		/// Opens a file for editing, on VC systems that require this.
++		/// </summary>
++		/// <param name="localPath">
++		/// The local file to open for editing.
++		/// </param>
++		/// <returns>
++		/// True if the file was successfully opened.
++		/// </returns>
++		public virtual bool EditFile(string localPath, IProgressMonitor monitor)
++		{
++			return true;
++		}
++		
+ 		static protected DiffInfo[] GenerateUnifiedDiffInfo (string diffFile, string basePath, string[] localPaths)
+ 		{
+ 			ArrayList list = new ArrayList ();
+Index: MonoDevelop.VersionControl/VersionControlNodeExtension.cs
+===================================================================
+--- MonoDevelop.VersionControl/VersionControlNodeExtension.cs	(revision 107474)
++++ MonoDevelop.VersionControl/VersionControlNodeExtension.cs	(working copy)
+@@ -268,6 +268,16 @@
+ 		protected void UpdateRevert(CommandInfo item) {
+ 			TestCommand(Commands.Revert, item);
+ 		}
++
++		[CommandHandler (Commands.Edit)]
++		protected void OnEdit() {
++			RunCommand(Commands.Edit, false);
++		}
++
++		[CommandUpdateHandler (Commands.Edit)]
++		protected void UpdateEdit(CommandInfo item) {
++			TestCommand(Commands.Edit, item);
++		}
+ 			
+ 		private void TestCommand(Commands cmd, CommandInfo item) {
+ 			TestResult res = RunCommand(cmd, true);
+@@ -350,6 +360,9 @@
+ 						if (isDir)
+ 							res = PublishCommand.Publish (pentry, path, test);
+ 						break;
++					case Commands.Edit:
++						res = EditCommand.Edit (repo, path, test);
++						break;
+ 				}
+ 			}
+ 			catch (Exception ex) {
+Index: VersionControl.addin.xml
+===================================================================
+--- VersionControl.addin.xml	(revision 107474)
++++ VersionControl.addin.xml	(working copy)
+@@ -100,6 +100,10 @@
+ 			_label = "C_heckout..."
+ 			icon = "vc-update"
+ 			description = "Checkout a project from repository."/>
++		<Command id = "MonoDevelop.VersionControl.Commands.Edit"
++			_label = "Open for _Edit"
++			icon = "vc-update"
++			description = "Open a file for editing."/>
+ 		</Category>
+ 	</Extension>
+ 	
+@@ -110,6 +114,7 @@
+ 
+ 	<Extension path = "/MonoDevelop/Ide/ContextMenu/ProjectPad/ProjectFile">
+ 		<ItemSet id = "VersionControl" _label = "_Version Control" insertafter = "IncludeSeparator">
++			<CommandItem id = "MonoDevelop.VersionControl.Commands.Edit"/>
+ 			<CommandItem id = "MonoDevelop.VersionControl.Commands.Add"/>
+ 			<CommandItem id = "MonoDevelop.VersionControl.Commands.Remove"/>
+ 			<CommandItem id = "MonoDevelop.VersionControl.Commands.Revert"/>
+@@ -122,6 +127,7 @@
+ 	</Extension>
+ 	<Extension path = "/MonoDevelop/Ide/ContextMenu/ProjectPad/SystemFile">
+ 		<ItemSet id = "VersionControl" _label = "_Version Control" insertafter = "IncludeToProjectSeparator">
++			<CommandItem id = "MonoDevelop.VersionControl.Commands.Edit"/>
+ 			<CommandItem id = "MonoDevelop.VersionControl.Commands.Add"/>
+ 			<CommandItem id = "MonoDevelop.VersionControl.Commands.Remove"/>
+ 			<CommandItem id = "MonoDevelop.VersionControl.Commands.Revert"/>
+@@ -134,6 +140,7 @@
+ 	</Extension>
+ 	<Extension path = "/MonoDevelop/Ide/ContextMenu/ProjectPad/Folder">
+ 		<ItemSet id = "VersionControl" _label = "_Version Control" insertafter = "AddSeparator">
++			<CommandItem id = "MonoDevelop.VersionControl.Commands.Edit"/>
+ 			<CommandItem id = "MonoDevelop.VersionControl.Commands.Add"/>
+ 			<CommandItem id = "MonoDevelop.VersionControl.Commands.Remove"/>
+ 			<CommandItem id = "MonoDevelop.VersionControl.Commands.Revert"/>

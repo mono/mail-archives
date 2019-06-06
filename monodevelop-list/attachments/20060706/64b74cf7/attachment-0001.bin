@@ -1,0 +1,484 @@
+Index: Core/src/MonoDevelop.Ide/MonoDevelop.Ide.Gui.Pads.ClassPad/ClassNodeBuilder.cs
+===================================================================
+--- Core/src/MonoDevelop.Ide/MonoDevelop.Ide.Gui.Pads.ClassPad/ClassNodeBuilder.cs	(revisión: 62314)
++++ Core/src/MonoDevelop.Ide/MonoDevelop.Ide.Gui.Pads.ClassPad/ClassNodeBuilder.cs	(copia de trabajo)
+@@ -28,6 +28,7 @@
+ 
+ using System;
+ using System.Collections;
++using System.Text;
+ 
+ using MonoDevelop.Projects;
+ using MonoDevelop.Core;
+@@ -49,15 +50,34 @@
+ 
+ 		public override string GetNodeName (ITreeNavigator thisNode, object dataObject)
+ 		{
+-			return ((ClassData)dataObject).Class.Name;
++			return GetNameWithGenericParameters(((ClassData)dataObject).Class);
+ 		}
+ 		
+ 		public override void BuildNode (ITreeBuilder treeBuilder, object dataObject, ref string label, ref Gdk.Pixbuf icon, ref Gdk.Pixbuf closedIcon)
+ 		{
+ 			ClassData classData = dataObject as ClassData;
+-			label = classData.Class.Name;
++			label = GetNameWithGenericParameters(classData.Class);
+ 			icon = Context.GetIcon (Services.Icons.GetIcon (classData.Class));
+ 		}
++		
++		private string GetNameWithGenericParameters (IClass c)
++		{
++			if (c.GenericParameters != null && c.GenericParameters.Count > 0)
++			{
++				System.Console.WriteLine ("hey");
++				StringBuilder builder = new StringBuilder (c.Name);
++				builder.Append("&lt;");
++				for (int i = 0; i < c.GenericParameters.Count; i++)
++				{
++					builder.Append(c.GenericParameters[i].Name);
++					if (i + 1 < c.GenericParameters.Count) builder.Append(", ");
++				}
++				builder.Append("&gt;");
++				return builder.ToString();
++			}
++			else
++				return c.Name;
++		}
+ 
+ 		public override void BuildChildNodes (ITreeBuilder builder, object dataObject)
+ 		{
+Index: Extras/NemerleBinding/Parser/Parser.cs
+===================================================================
+--- Extras/NemerleBinding/Parser/Parser.cs	(revisión: 62314)
++++ Extras/NemerleBinding/Parser/Parser.cs	(copia de trabajo)
+@@ -163,7 +163,7 @@
+                     break;
+                 }
+             }
+-            ResolveResult res = real_resolve (parserContext, caretLine, caretColumn, fileName, fileContent);
++            ResolveResult res = real_resolve (parserContext, caretLine, caretColumn, fileName, fileContent, true);
+             return res.Members;
+         }
+ 
+@@ -174,10 +174,10 @@
+ 
+         public ResolveResult Resolve (IParserContext parserContext, string expression, int caretLineNumber, int caretColumn, string fileName, string fileContent)
+         {
+-            return real_resolve (parserContext, caretLineNumber, caretColumn, fileName, fileContent);
++            return real_resolve (parserContext, caretLineNumber, caretColumn, fileName, fileContent, false);
+         }
+         
+-        public ResolveResult real_resolve (IParserContext parserContext, int caretLineNumber, int caretColumn, string fileName, string fileContent)
++        public ResolveResult real_resolve (IParserContext parserContext, int caretLineNumber, int caretColumn, string fileName, string fileContent, bool completeLocals)
+         {
+             try
+             {
+@@ -299,7 +299,7 @@
+                         NCC.CompletionResult infox = engine.RunCompletionEngine ((NCC.MethodBuilder)the_method.Member,
+                             method_start + method_end, method_start.Length);
+                         
+-                        return GetResults (infox, comp, false);                        
++                        return GetResults (infox, comp, completeLocals);                        
+                     }
+                 }
+             }
+@@ -318,6 +318,7 @@
+             
+             bool complete_types = false;
+             NCC.OverloadPossibility head = results.Overloads.Head;
++            
+             if (head.Member.Name == ".ctor" || head.Member.Name == ".cctor" || head.Member is NCC.TypeInfo)
+                 complete_types = true;
+             
+@@ -368,8 +369,14 @@
+                 LanguageItemCollection lang = new LanguageItemCollection ();
+                 foreach (NCC.OverloadPossibility ov in results.Overloads)
+                 {
+-                    if (ov is NCC.LocalValueCompletionPossibility && !completeLocals)
+-                        continue;
++                    if (ov is NCC.LocalValueCompletionPossibility)
++                    {
++                        if (completeLocals)
++                            lang.Add (new Local (new Class ("LOCALS", cu),
++                                (NCC.LocalValueCompletionPossibility)ov));
++                        else
++                            continue;
++                    }
+                     
+                     // Do not add property getters and setters, not events adders and removers,
+                     // nor overloaded operators, nor enum value__, not Nemerle internal methods
+@@ -451,11 +458,17 @@
+             for (int i = startLine - 1; i < endLine; i++)
+             {
+                 if (i == (startLine - 1) && i == (endLine - 1))
++                {
+                     sb.Append (lines[i].Substring (startColumn - 1, endColumn - startColumn));
++                    break;
++                }
+                 else if (i == (startLine - 1))
+                     sb.Append (lines[i].Substring (startColumn - 1) + "\n");
+-                else if (i == (endLine - 1))
++                else if (i == (endLine - 1) || i >= lines.Length)
++                {
+                     sb.Append (lines[i].Substring (0, endColumn - 1));
++                    break;
++                }
+                 else
+                     sb.Append (lines[i] + "\n");
+             }
+Index: Extras/NemerleBinding/Parser/SharpDevelopTree/Method.cs
+===================================================================
+--- Extras/NemerleBinding/Parser/SharpDevelopTree/Method.cs	(revisión: 62314)
++++ Extras/NemerleBinding/Parser/SharpDevelopTree/Method.cs	(copia de trabajo)
+@@ -255,6 +255,15 @@
+             modifiers = mod;
+             this.FullyQualifiedName = tinfo.Name;
+             
++            if (tinfo.GetHeader().typarms.Length > 0)
++            {
++                this.genericParameters = new GenericParameterList ();
++                foreach (NCC.StaticTyVar typarm in tinfo.GetHeader().typarms)
++                {
++                    genericParameters.Add (Class.GetGenericParameter (typarm));
++                }
++            }
++            
+             if (tinfo.Name == "op_Addition") this.FullyQualifiedName = "@+";
+             else if (tinfo.Name == "op_Subtraction") this.FullyQualifiedName = "@-";
+             else if (tinfo.Name == "op_Multiply") this.FullyQualifiedName = "@*";
+Index: Extras/NemerleBinding/Parser/SharpDevelopTree/ReturnType.cs
+===================================================================
+--- Extras/NemerleBinding/Parser/SharpDevelopTree/ReturnType.cs	(revisión: 62314)
++++ Extras/NemerleBinding/Parser/SharpDevelopTree/ReturnType.cs	(copia de trabajo)
+@@ -2,7 +2,7 @@
+ 
+ using MonoDevelop.Projects.Parser;
+ using Nemerle.Completion;
+-using Nemerle.Compiler;
++using NCC = Nemerle.Compiler;
+ 
+ namespace NemerleBinding.Parser.SharpDevelopTree
+ {
+@@ -31,67 +31,104 @@
+ 			base.FullyQualifiedName = fullyQualifiedName;
+ 		}
+ 
+-        public ReturnType(MType type)
++        public ReturnType(NCC.MType type)
+         {
+-            base.FullyQualifiedName = Engine.GetNameFromType (type);
++            base.arrayDimensions = new int[0];
++            base.pointerNestingLevel = 0;
++            
++            if (type is NCC.MType.Class)
++            {
++                NCC.MType.Class t = (NCC.MType.Class)type;
++                base.FullyQualifiedName = t.tycon.FrameworkTypeName
++                        .Replace ("`1", "")
++                        .Replace ("`2", "")
++                        .Replace ("`3", "")
++                        .Replace ("`4", "");
++                        
++                if (t.args.Length > 0)
++                {
++                    base.genericArguments = new ReturnTypeList ();
++                    foreach (NCC.TyVar tyvar in t.args)
++                    {
++                        base.genericArguments.Add (new ReturnType (tyvar.Fix ()));
++                    }
++                }
++            }
++            else if (type is NCC.MType.TyVarRef)
++            {
++                base.FullyQualifiedName = ((NCC.MType.TyVarRef)type).tyvar.Name;
++            }
++            else if (type is NCC.MType.Fun)
++            {
++                // Use the plain type until Ambience works correctly
++                base.FullyQualifiedName = Engine.GetNameFromType (type);
++            }
++            else if (type is NCC.MType.Tuple)
++            {
++                // Use the plain type until Ambience works correctly
++                base.FullyQualifiedName = Engine.GetNameFromType (type);
++            }
++            else if (type is NCC.MType.Array)
++            {
++                NCC.MType.Array a = (NCC.MType.Array)type;
++                ReturnType rtx = new ReturnType (a.t.Fix ());
++                this.FullyQualifiedName = rtx.FullyQualifiedName;
++                this.arrayDimensions = new int[rtx.ArrayDimensions.Length + 1];
++                this.arrayDimensions[0] = a.rank;
++                for (int i = 0; i < rtx.ArrayDimensions.Length; i++)
++                    this.arrayDimensions[i+1] = rtx.ArrayDimensions[i];
++            }
++            else if (type is NCC.MType.Void)
++            {
++                base.FullyQualifiedName = "System.Void";
++            }
++            else if (type is NCC.MType.Ref)
++            {
++                ReturnType rtx = new ReturnType (((NCC.MType.Ref)type).t.Fix ());
++                this.FullyQualifiedName = rtx.FullyQualifiedName;
++                this.arrayDimensions = rtx.ArrayDimensions;
++            }
++            else if (type is NCC.MType.Out)
++            {
++                ReturnType rtx = new ReturnType (((NCC.MType.Out)type).t.Fix ());
++                this.FullyQualifiedName = rtx.FullyQualifiedName;
++                this.arrayDimensions = rtx.ArrayDimensions;
++            }
+         }
+         
+         public ReturnType(System.Type type)
+         {
+-            base.FullyQualifiedName = type_name (type);
+-        }
+-        
+-        public string type_name (System.Type type)
+-        {
+             try
+             {
+-                string namex;
+                 if (type.IsGenericParameter)
+                 {
+-                    namex = type.Name;
++                    base.FullyQualifiedName = type.Name;
+                 }
+                 else
+                 {
+-                    namex = type.FullName.Replace ("System.Byte", "byte")
+-                        .Replace ("System.SByte", "sbyte")  
+-                        .Replace ("System.Int16", "short")
+-                        .Replace ("System.UInt16", "ushort")
+-                        .Replace ("System.Int32", "int")
+-                        .Replace ("System.UInt32", "uint")
+-                        .Replace ("System.Int64", "long")
+-                        .Replace ("System.UInt64", "ulong")
+-                        .Replace ("System.Single", "float")
+-                        .Replace ("System.Double", "double")
+-                        .Replace ("System.Decimal", "decimal")
+-                        .Replace ("System.String", "string")
+-                        .Replace ("System.Object", "object")
+-                        .Replace ("System.Boolean", "bool")
+-                        .Replace ("System.Char", "char")
+-                        .Replace ("Nemerle.Core.list", "list")
+-                        .Replace ("System.Void", "void")
++                    base.FullyQualifiedName = type.FullName
+                         .Replace ("`1", "")
+                         .Replace ("`2", "")
+                         .Replace ("`3", "")
+                         .Replace ("`4", "");
+-                    if (type.GetGenericArguments().Length > 0)
++                }
++                if (type.IsArray)
++                    base.arrayDimensions = new int[] { 1 };
++                    
++                if (type.GetGenericArguments().Length > 0)
++                {
++                    base.genericArguments = new ReturnTypeList ();
++                    foreach (System.Type gt in type.GetGenericArguments())
+                     {
+-                        namex += "[";
+-                        foreach (System.Type gt in type.GetGenericArguments())
+-                        {
+-                            namex += type_name (gt) + ", ";
+-                        }
+-                        namex = namex.TrimEnd (' ', ',') + "]";
++                        base.genericArguments.Add (new ReturnType (gt));
+                     }
+                 }
+-                if (type.IsArray)
+-                    namex = "array[" + namex + "]";
+-                return namex;
+             }
+             catch (System.Exception ex)
+             {
+                 System.Console.WriteLine (ex.Message);
+                 System.Console.WriteLine (ex.StackTrace);
+-                return "??";
++                base.FullyQualifiedName = "??";
+             }
+         }
+ 		
+Index: Extras/NemerleBinding/Parser/SharpDevelopTree/Class.cs
+===================================================================
+--- Extras/NemerleBinding/Parser/SharpDevelopTree/Class.cs	(revisión: 62314)
++++ Extras/NemerleBinding/Parser/SharpDevelopTree/Class.cs	(copia de trabajo)
+@@ -172,6 +172,15 @@
+                 
+             modifiers = mod;
+             
++            if (tinfo.Typarms.Length > 0)
++            {
++                this.genericParamters = new GenericParameterList ();
++                foreach (NCC.StaticTyVar typarm in tinfo.Typarms)
++                {
++                    genericParamters.Add (GetGenericParameter (typarm));
++                }
++            }
++            
+             if (addMembers || tinfo.IsDelegate)
+             {
+                 foreach (NCC.IMember member in tinfo.GetMembers ())
+@@ -217,7 +226,12 @@
+             
+             foreach (NCC.MType.Class mt in tinfo.GetDirectSuperTypes ())
+             {
+-                baseTypes.Add (new ReturnType(mt));
++                if (mt.tycon.FrameworkTypeName != "System.Object" &&
++                    mt.tycon.FrameworkTypeName != "System.ValueType" &&
++                    mt.tycon.FrameworkTypeName != "System.Enum" &&
++                    mt.tycon.FrameworkTypeName != "System.Delegate" &&
++                    mt.tycon.FrameworkTypeName != "System.MulticastDelegate")
++                    baseTypes.Add (new ReturnType(mt));
+             }
+             
+             LoadXml ();
+@@ -245,6 +259,27 @@
+             return rd;
+         }
+         
++        internal static GenericParameter GetGenericParameter (NCC.StaticTyVar tyvar)
++        {
++            ReturnTypeList constraints = new ReturnTypeList ();
++            foreach (NCC.MType constraint in tyvar.Constraints)
++                constraints.Add (new ReturnType (constraint));
++
++            SpecialConstraintType special = (SpecialConstraintType)0;
++            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.ReferenceTypeConstraint) != 0)
++                special |= SpecialConstraintType.Class;
++            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0)
++                special |= SpecialConstraintType.Struct;
++            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.DefaultConstructorConstraint) != 0)
++                special |= SpecialConstraintType.New;
++            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.Contravariant) != 0)
++                special |= SpecialConstraintType.Contravariant;
++            if ((tyvar.SpecialConstraints & SR.GenericParameterAttributes.Covariant) != 0)
++                special |= SpecialConstraintType.Covariant;
++                
++            return new GenericParameter (tyvar.Name, constraints, special);
++        }
++        
+         public override ICompilationUnit CompilationUnit
+         {
+             get { return cu; }
+Index: Extras/NemerleBinding/Parser/SharpDevelopTree/Local.cs
+===================================================================
+--- Extras/NemerleBinding/Parser/SharpDevelopTree/Local.cs	(revisión: 0)
++++ Extras/NemerleBinding/Parser/SharpDevelopTree/Local.cs	(revisión: 0)
+@@ -0,0 +1,35 @@
++// created on 04.08.2003 at 18:06
++
++using MonoDevelop.Projects.Parser;
++using Nemerle.Completion;
++using SR = System.Reflection;
++using NCC = Nemerle.Compiler;
++
++using System.Xml;
++
++namespace NemerleBinding.Parser.SharpDevelopTree
++{
++	public class Local : AbstractField
++	{
++		public void AddModifier(ModifierEnum m)
++		{
++			modifiers = modifiers | m;
++		}
++		
++		public Local (Class declaringType, NCC.LocalValueCompletionPossibility tinfo)
++		{
++		    this.declaringType = declaringType;
++		
++		    ModifierEnum mod = ModifierEnum.Public;
++            
++            if (!tinfo.Value.IsMutable)
++                mod |= ModifierEnum.Readonly;
++                
++			modifiers = mod;
++			
++			this.FullyQualifiedName = tinfo.Value.Name;
++			returnType = new ReturnType (tinfo.Value.Type.Fix ());
++			this.region = Class.GetRegion ();
++	   }
++	}
++}
+Index: Extras/NemerleBinding/Makefile.am
+===================================================================
+--- Extras/NemerleBinding/Makefile.am	(revisión: 62314)
++++ Extras/NemerleBinding/Makefile.am	(copia de trabajo)
+@@ -30,6 +30,7 @@
+ Parser/SharpDevelopTree/CompilationUnit.cs \
+ Parser/SharpDevelopTree/Property.cs \
+ Parser/SharpDevelopTree/Field.cs \
++Parser/SharpDevelopTree/Local.cs \
+ Parser/SharpDevelopTree/ReturnType.cs \
+ Parser/SharpDevelopTree/Modifier.cs \
+ Parser/Parser.cs \
+Index: Extras/CSharpBinding/CSharpAmbience.cs
+===================================================================
+--- Extras/CSharpBinding/CSharpAmbience.cs	(revisión: 62314)
++++ Extras/CSharpBinding/CSharpAmbience.cs	(copia de trabajo)
+@@ -154,6 +154,17 @@
+ 				AppendPangoHtmlTag (builder, c.FullyQualifiedName, "b");
+ 			else
+ 				AppendPangoHtmlTag (builder, c.Name, "b");
++				
++			if (c.GenericParameters != null && c.GenericParameters.Count > 0)
++			{
++				builder.Append("&lt;");
++				for (int i = 0; i < c.GenericParameters.Count; i++)
++				{
++					builder.Append(c.GenericParameters[i].Name);
++					if (i + 1 < c.GenericParameters.Count) builder.Append(", ");
++				}
++				builder.Append("&gt;");
++			}
+ 			
+ 			
+ 			if (c.ClassType == ClassType.Delegate) {
+@@ -178,7 +189,7 @@
+ 				if (c.BaseTypes.Count > 0) {
+ 					builder.Append(" : ");
+ 					for (int i = 0; i < c.BaseTypes.Count; ++i) {
+-						builder.Append(c.BaseTypes[i].FullyQualifiedName);
++						builder.Append(Convert(c.BaseTypes[i]));
+ 						if (i + 1 < c.BaseTypes.Count) {
+ 							builder.Append(", ");
+ 						}
+@@ -368,6 +379,17 @@
+ 					AppendPangoHtmlTag (builder, m.Name, "b");
+ 			}
+ 			
++			if (m.GenericParameters != null && m.GenericParameters.Count > 0)
++			{
++				builder.Append("&lt;");
++				for (int i = 0; i < m.GenericParameters.Count; i++)
++				{
++					builder.Append(m.GenericParameters[i].Name);
++					if (i + 1 < m.GenericParameters.Count) builder.Append(", ");
++				}
++				builder.Append("&gt;");
++			}
++			
+ 			builder.Append(" (");
+ 			if (IncludeHTMLMarkup) builder.Append("<br>");
+ 			
+@@ -431,6 +453,17 @@
+ 				}
+ 			}
+ 			
++			if (returnType.GenericArguments != null && returnType.GenericArguments.Count > 0)
++			{
++				builder.Append("&lt;");
++				for (int i = 0; i < returnType.GenericArguments.Count; i++)
++				{
++					builder.Append(Convert(returnType.GenericArguments[i]));
++					if (i + 1 < returnType.GenericArguments.Count) builder.Append(", ");
++				}
++				builder.Append("&gt;");
++			}
++			
+ 			if (linkSet) {
+ 				builder.Append("</a>");
+ 			}

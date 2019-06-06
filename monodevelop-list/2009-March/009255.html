@@ -1,0 +1,301 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [MonoDevelop] BooBinding patch bug 324223
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:monodevelop-list%40lists.ximian.com?Subject=%5BMonoDevelop%5D%20BooBinding%20patch%20bug%20324223&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009254.html">
+   <LINK REL="Next"  HREF="009257.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[MonoDevelop] BooBinding patch bug 324223</H1>
+    <B>Manuel de la Pena</B> 
+    <A HREF="mailto:monodevelop-list%40lists.ximian.com?Subject=%5BMonoDevelop%5D%20BooBinding%20patch%20bug%20324223&In-Reply-To="
+       TITLE="[MonoDevelop] BooBinding patch bug 324223">mandel at themacaque.com
+       </A><BR>
+    <I>Tue Mar 17 13:40:05 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009254.html">[MonoDevelop] debugging mono develop
+</A></li>
+        <LI>Next message: <A HREF="009257.html">[MonoDevelop] BooBinding patch bug 324223
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9255">[ date ]</a>
+              <a href="thread.html#9255">[ thread ]</a>
+              <a href="subject.html#9255">[ subject ]</a>
+              <a href="author.html#9255">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello there,
+
+Here is the patch I have been working on to shell the Boo compilation
+allowing to recompile without having problems because the compilation
+loaded assemblies to the AppDomain
+(<A HREF="https://bugzilla.novell.com/show_bug.cgi?id=324223">https://bugzilla.novell.com/show_bug.cgi?id=324223</A>)
+
+I hope it helps.
+
+Kr,
+
+manuel =&gt; mandel
+
+PS: Thanks to Tak and mhutch at IRC... I must have been a pain in the
+ass, in my defense is my  first monodevelop patch :P
+-------------- next part --------------
+Index: BooBindingCompilerServices.boo
+===================================================================
+--- BooBindingCompilerServices.boo	(revision 129338)
++++ BooBindingCompilerServices.boo	(working copy)
+@@ -20,19 +20,15 @@
+ namespace BooBinding
+ 
+ import System
+-import System.Diagnostics
+ import System.IO
+ import System.CodeDom.Compiler
+ import System.Text
+-import System.Reflection
++import System.Text.RegularExpressions
+ 
+-import MonoDevelop.Core.Gui.Components
+ import MonoDevelop.Core
++import MonoDevelop.Core.ProgressMonitoring
+ import MonoDevelop.Projects
+ 
+-import Boo.Lang.Compiler
+-import Boo.Lang.Compiler.Resources
+-
+ [extension] #FIXME: workaround BOO-1167
+ def GetAllReferences (this as ProjectItemCollection) as ProjectReference*:
+ 	for item in this:
+@@ -45,6 +41,14 @@
+ 
+ 
+ public class BooBindingCompilerServices:
++
++	#region Private variables
++	
++	#we use a static string builder to be able to read the ouput from the compiler process
++	private static _output as StringBuilder = StringBuilder()
++	
++	#endregion
++	
+ 	public def CanCompile (fileName as string):
+ 		return Path.GetExtension(fileName).ToUpper() == &quot;.BOO&quot;
+ 	
+@@ -52,77 +56,111 @@
+ 		compilerparameters = cast(BooCompilerParameters, configuration.CompilationParameters)
+ 		if compilerparameters is null:
+ 			compilerparameters = BooCompilerParameters()
++		#we get the compiler target to be used
++		compilerTarget as string = &quot;exe&quot;
+ 		
+-		// FIXME: Use outdir 'configuration.OutputDirectory'
+-		compiler = Boo.Lang.Compiler.BooCompiler()
+-		compiler.Parameters.Pipeline = Pipelines.CompileToFile()
+-
+-		compiler.Parameters.Debug = configuration.DebugMode
+-		compiler.Parameters.OutputAssembly = configuration.CompiledOutputName
+-		compiler.Parameters.Ducky = compilerparameters.Ducky
+-
+-		# Make sure we don't load the generated assembly at all
+-		compiler.Parameters.GenerateInMemory = false
+-
++		if configuration.CompileTarget == CompileTarget.Exe:
++			compilerTarget = &quot;exe&quot;
++		elif configuration.CompileTarget == CompileTarget.Library:
++			compilerTarget = &quot;library&quot;
++		elif configuration.CompileTarget == CompileTarget.WinExe:
++			compilerTarget = &quot;winexe&quot;
++			
++		parameters as StringBuilder = StringBuilder(
++			&quot;-o:${configuration.CompiledOutputName} -t:${compilerTarget}&quot;)
++		
++		#we decide if we want to use ducks
++		if 	compilerparameters.Ducky:
++			parameters.Append(&quot; -ducky &quot;)
++			
++		#we decide if we are going to define the debug var
++		if configuration.DebugMode:
++			parameters.Append(&quot; -define:DEBUG &quot;)
++			
++		#we add the different references
+ 		for lib as ProjectReference in projectItems.GetAllReferences ():
+ 			for fileName as string in lib.GetReferencedFileNames (configuration.Id):
+-				compiler.Parameters.References.Add(Assembly.LoadFile(fileName))
+-
++				parameters.Append(&quot; -reference:${fileName} &quot;)
++				
+ 		for finfo as ProjectFile in projectItems.GetAllFiles ():
+ 			if finfo.Subtype != Subtype.Directory:
+ 				if finfo.BuildAction == BuildAction.Compile:
+-					compiler.Parameters.Input.Add(Boo.Lang.Compiler.IO.FileInput(finfo.Name))
++					parameters.Append(&quot; ${finfo.FilePath} &quot;)
+ 				elif finfo.BuildAction == BuildAction.EmbeddedResource:
+-					compiler.Parameters.Resources.Add (EmbeddedFileResource (finfo.Name))
++					parameters.Append(&quot;  -resource:${finfo.FilePath}&quot;)
+ 
++		tf = TempFileCollection ()
++		compilationOutput = DoCompilation (monitor, parameters.ToString(), configuration.OutputDirectory )
++		monitor.Log.WriteLine(GettextCatalog.GetString(&quot;Parsing output&quot;))
++		return ParseOutput (tf, compilationOutput)
+ 		
+-		if configuration.CompileTarget == CompileTarget.Exe:
+-			compiler.Parameters.OutputType = CompilerOutputType.ConsoleApplication
+-		elif configuration.CompileTarget == CompileTarget.Library:
+-			compiler.Parameters.OutputType = CompilerOutputType.Library
+-		elif configuration.CompileTarget == CompileTarget.WinExe:
+-			compiler.Parameters.OutputType = CompilerOutputType.WindowsApplication
+ 
+-		tf = TempFileCollection ()
+-		context = DoCompilation (monitor, compiler)
+-		cr = ParseOutput (tf, context)
+-		return cr
+-
+-	private def DoCompilation (monitor as IProgressMonitor, compiler as Boo.Lang.Compiler.BooCompiler):
++	private def DoCompilation (monitor as IProgressMonitor, parameters as string, outpurDir as string):
+ 		try:
+-			monitor.BeginTask (null, 2)
+-			monitor.Log.WriteLine (&quot;Compiling Boo source code ...&quot;)
+-			context = compiler.Run()
+-			monitor.Step (1)
+-			return context
++			
++			swError = StringWriter ()
++			chainedError as LogTextWriter = LogTextWriter()
++			chainedError.ChainWriter(monitor.Log)
++			chainedError.ChainWriter(swError);
++			
++			operationMonitor = AggregatedOperationMonitor(monitor)
++			monitor.Log.WriteLine(GettextCatalog.GetString(&quot;Starting Boo compilation&quot;))
++			monitor.Log.WriteLine(GettextCatalog.GetString(&quot;booc ${parameters}&quot;))
++			
++			#we need to redirect the error output to the stdout to make sure we can use it correctly
++			System.Console.SetError(swError)
++			
++			#we create a new process that will be used to execute the command line of the compiler
++			wrapper =  MonoDevelop.Core.Runtime.ProcessService.StartProcess(&quot;booc&quot;,parameters ,
++				Path.GetDirectoryName(outpurDir),monitor.Log, chainedError, null)
++			
++			#we take care of cancelation
++			operationMonitor.AddOperation(wrapper);
++			wrapper.WaitForOutput();
++			exitCode = wrapper.ExitCode
++			
++			if monitor.IsCancelRequested:
++				monitor.Log.WriteLine (GettextCatalog.GetString (&quot;Build cancelled&quot;))
++				monitor.ReportError (GettextCatalog.GetString (&quot;Build cancelled&quot;), null)
++				if exitCode == 0:
++					exitCode = -1
++					
++			error = swError.ToString()
++			return error
+ 		ensure:
++			#we get rid of this guys
++			wrapper.Dispose()
++			swError.Close()
++			chainedError.Close ()
++			operationMonitor.Dispose ()
+ 			monitor.EndTask()
+ 		
+-	def ParseOutput (tf as TempFileCollection , context as CompilerContext) as BuildResult:
++	def ParseOutput (tf as TempFileCollection , errors as string):
+ 		cr = CompilerResults (tf)
++		# we read the errors line by line to get them in the monodevelop list
++		reader = StringReader(errors);
++		nextError as string
+ 		
+-		for err as Boo.Lang.Compiler.CompilerError in context.Errors:
+-			cerror = System.CodeDom.Compiler.CompilerError ()
+-			cerror.ErrorText = err.Code + &quot;: &quot; + err.Message
+-
+-			if err.LexicalInfo is not null:
+-				SetErrorLexicalInfo (cerror, err.LexicalInfo)
+-
+-			cr.Errors.Add(cerror)
+-
+-		for warning as CompilerWarning in context.Warnings:
+-			cerror = System.CodeDom.Compiler.CompilerError ()
+-			cerror.ErrorText = warning.Code + &quot;: &quot; + warning.Message
+-
+-			if warning.LexicalInfo is not null:
+-				SetErrorLexicalInfo (cerror, warning.LexicalInfo)
+-
+-			cerror.IsWarning = true
+-			cr.Errors.Add(cerror)
+-
++		while (nextError = reader.ReadLine()) != null:
++			error = ParseErrorLine(nextError)
++			if not error is null:
++				cr.Errors.Insert(0,error)
++			
++		reader.Close ();
+ 		return BuildResult (cr, null)
+ 	
+-	def SetErrorLexicalInfo (error as System.CodeDom.Compiler.CompilerError, lexicalInfo as Boo.Lang.Compiler.Ast.LexicalInfo):
+-		error.FileName = lexicalInfo.FileName 
+-		error.Column = lexicalInfo.Column
+-		error.Line = lexicalInfo.Line
++	private def ParseErrorLine(errorLine as string) as System.CodeDom.Compiler.CompilerError:
++		error = System.CodeDom.Compiler.CompilerError()
++		#errors are of the form &quot;file(row, column):ErrorNum:Type:message&quot;
++		data = @/(?&lt;file&gt;.*\.boo)\s*\((?&lt;row&gt;\d+),\s?(?&lt;column&gt;\d+)\):\s*(?&lt;message&gt;.*)/.Matches(errorLine)
++		if data.Count &gt; 0:
++			error.ErrorText = data[0].Groups[&quot;message&quot;].Value
++			error.FileName = data[0].Groups[&quot;file&quot;].Value
++			error.Line = int.Parse(data[0].Groups[&quot;row&quot;].Value)
++			error.Column = int.Parse(data[0].Groups[&quot;column&quot;].Value)
++			if error.ErrorText.Contains(&quot;WARNING&quot;):
++				error.IsWarning = true
++			return error
++		else:
++			return null
++	
+\ No newline at end of file
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009254.html">[MonoDevelop] debugging mono develop
+</A></li>
+	<LI>Next message: <A HREF="009257.html">[MonoDevelop] BooBinding patch bug 324223
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9255">[ date ]</a>
+              <a href="thread.html#9255">[ thread ]</a>
+              <a href="subject.html#9255">[ subject ]</a>
+              <a href="author.html#9255">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/monodevelop-list">More information about the Monodevelop-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,694 @@
+Index: MonoDevelop.WebReferences/WebReferenceItem.cs
+===================================================================
+--- MonoDevelop.WebReferences/WebReferenceItem.cs	(revisión: 117678)
++++ MonoDevelop.WebReferences/WebReferenceItem.cs	(copia de trabajo)
+@@ -44,12 +44,19 @@
+ 			get { return proxyFile; }
+ 			set { proxyFile = value; }
+ 		}
++
++		public string ConfigKey
++		{
++			get { return configKey; }
++			set { configKey = value; }
++		}
+ 		#endregion
+ 		
+ 		#region Member Variables
+ 		private string name;
+ 		private ProjectFile proxyFile;
+ 		private ProjectFile mapFile;
++		private string configKey;
+ 		#endregion
+ 		
+ 		/// <summary>Initializes a new instance of the WebReferenceItem class.</summary>
+@@ -63,7 +70,7 @@
+ 		/// <param name="name">A string containing the name for the web reference.</param>
+ 		/// <param name="proxyFile">A ProjectFile containing the proxy file.</param>
+ 		/// <param name="mapFile">A ProjectFile containing the map file.</param>
+-		public WebReferenceItem(string name, ProjectFile proxyFile, ProjectFile mapFile)
++		public WebReferenceItem(string name, ProjectFile proxyFile, ProjectFile mapFile, string configKey)
+ 		{
+ 			this.name = name;
+ 			this.proxyFile = proxyFile;
+@@ -98,7 +105,8 @@
+ 			// Re-generate the proxy and map files
+ 			string basePath = new FileInfo(MapFile.FilePath).Directory.FullName;
+ 			CodeGenerator codeGen = new CodeGenerator(ProxyFile.Project, (DiscoveryClientProtocol)protocol);
+-			codeGen.CreateProxyFile(basePath, MapFile.Project.Name + "." + Name, "Reference");
++			Console.WriteLine ("Acá: {0}", this.configKey);
++			codeGen.CreateProxyFile(basePath, MapFile.Project.Name + "." + Name, "Reference", this.configKey);
+ 			protocol.WriteAll(basePath, "Reference.map");
+ 			protocol.Dispose();
+ 		}
+Index: MonoDevelop.WebReferences/CodeGenerator.cs
+===================================================================
+--- MonoDevelop.WebReferences/CodeGenerator.cs	(revisión: 117678)
++++ MonoDevelop.WebReferences/CodeGenerator.cs	(copia de trabajo)
+@@ -2,9 +2,12 @@
+ using System.CodeDom;
+ using System.CodeDom.Compiler;
+ using System.IO;
++using System.Xml;
+ using System.Web.Services.Discovery;
+ using System.Web.Services.Description;
+ using MonoDevelop.Projects;
++using MonoDevelop.Projects.Text;
++using MonoDevelop.Ide.Gui;
+ 
+ namespace MonoDevelop.WebReferences
+ {
+@@ -103,12 +106,112 @@
+ 			this.project = project;
+ 			this.protocol = protocol;
+ 		}
++
++		public void AddUrlToConfiguration (Project configProject, string configKeyName, string url)
++		{
++			XmlDocument doc = new XmlDocument();
++
++			string file = Path.Combine (configProject.BaseDirectory, "app.config");
++
++			ProjectFile appConfigFile;
++			FileStream configStream;
++
++			// Already exist app.config file
++			if (configProject.IsFileInProject (file)) {
++				TextFile configfile = new TextFile (file);
++				doc.LoadXml (configfile.Text);
++
++				XmlNode configurationNode = null;
++				XmlNode appSettingsNode = null;
++				XmlNode configKeyNode = null;
++				
++				// Search if Configuration Key Exists.
++				foreach (XmlNode node in doc.ChildNodes) {
++					if (node.Name == "configuration") {
++						configurationNode = node;
++						foreach (XmlNode appSetnode in node.ChildNodes) {
++							if (appSetnode.Name == "appSettings") {
++								appSettingsNode = appSetnode;
++								foreach (XmlNode configNode in appSetnode.ChildNodes) {
++									if (configNode.Name == "add")
++										if (configNode.Attributes ["key"].Value == configKeyName)
++											configKeyNode = configNode;
++								}
++							}
++						}
++					}
++				}
++
++				// If configKeyNode is set, key already exists, then overwrite it with the Url
++				if (configKeyNode != null) {
++					configKeyNode.Attributes ["value"].Value = url;
++				} else {
++					// If configuration key doesn't exists create it
++					if (configurationNode == null) {
++						configurationNode = doc.CreateNode (XmlNodeType.Element, "configuration", string.Empty);
++						doc.AppendChild (configurationNode);
++					}
++					// If appSettings key doesn't exists create it
++					if (appSettingsNode == null) {
++						appSettingsNode = doc.CreateNode (XmlNodeType.Element, "appSettings", string.Empty);
++						configurationNode.AppendChild (appSettingsNode);
++					}
++
++					// Create the config key (add) with 2 attributes: Key, Value
++					configKeyNode = doc.CreateNode (XmlNodeType.Element, "add", string.Empty);
++
++					XmlAttribute keyAttr = doc.CreateAttribute ("key");
++					keyAttr.Value = configKeyName;
++					configKeyNode.Attributes.Append (keyAttr);
++					
++					XmlAttribute valAttr = doc.CreateAttribute ("value");
++					valAttr.Value = url;
++					configKeyNode.Attributes.Append (valAttr);
++					appSettingsNode.AppendChild (configKeyNode);
++				}
++				using (StringWriter writer = new StringWriter ()) {
++					doc.Save (writer);
++					configfile.Text = writer.ToString ();
++				}
++				configfile.Save ();
++			} else {
++				configStream = File.Create (file);
++
++				// Default xml for app.config
++				doc.LoadXml ("<?xml version=\"1.0\" encoding=\"utf-8\" ?><configuration><appSettings></appSettings></configuration>");
++
++				// Node for the service setting
++				XmlNode node = doc.CreateNode (XmlNodeType.Element, "add", String.Empty);
++
++				// key Attribute (name of the services)
++				XmlAttribute keyAttr = doc.CreateAttribute ("key");
++				keyAttr.Value = configKeyName;
++				node.Attributes.Append (keyAttr);
++				
++				// Value Attribute (url)
++				XmlAttribute valAttr = doc.CreateAttribute ("value");
++				valAttr.Value = url;
++				node.Attributes.Append (valAttr);
++				doc.ChildNodes [1].ChildNodes[0].AppendChild (node);
++				doc.Save (configStream);
++				configStream.Close ();
++				configStream.Dispose ();
++
++				appConfigFile = new ProjectFile (file);
++				appConfigFile.CopyToOutputDirectory = FileCopyMode.Always;
++				appConfigFile.BuildAction = BuildAction.None;
++				appConfigFile.Subtype = Subtype.Code;
++				
++				configProject.Files.Add(appConfigFile);
++				IdeApp.ProjectOperations.Save (configProject);
++			}
++		}
+ 		
+ 		/// <summary>Generate the proxy file for the web service.</summary>
+ 		/// <param name="basePath">A string containing the base path for the proxy file.</param>
+ 		/// <param name="proxyNamespace">A string containing the namespace for the proxy class.</param>
+ 		/// <param name="referenceName">A string containing the file name for the proxy file.</param>
+-		public string CreateProxyFile(string basePath, string proxyNamespace, string referenceName)
++		public string CreateProxyFile(string basePath, string proxyNamespace, string referenceName, string configKey)
+ 		{
+ 			// Setup the proxy namespacec and compile unit
+ 			ICodeGenerator codeGen = Provider.CreateGenerator();
+@@ -120,7 +223,7 @@
+ 			// Setup the importer and import the service description into the code unit
+ 			ServiceDescriptionImporter importer = Library.ReadServiceDescriptionImporter(protocol);
+ 			ServiceDescriptionImportWarnings warnings = importer.Import(codeNamespace, codeUnit);
+-
++			
+ 			// Add the new Constructor with Url as a paremeter
+ 			// Search for the class which inherit SoapHttpClientProtocol (Which is the Service Class)
+ 			foreach (CodeTypeDeclaration declarationType in codeUnit.Namespaces[0].Types) 
+@@ -136,6 +239,37 @@
+ 						                                                                                             "Url"),
+ 						                                                        new CodeVariableReferenceExpression ("url")));
+ 							declarationType.Members.Add (urlConstructor);
++							// Add constructor to use Configuration Key
++							if (configKey.Length > 0) {
++								// System.Configuration.ConfigurationManager.AppSettings ["MyKey"]
++								CodeConstructor urlConfigConstructor = new CodeConstructor ();
++								urlConfigConstructor.Attributes = MemberAttributes.Public;
++								urlConfigConstructor.Parameters.Add (new CodeParameterDeclarationExpression ("System.Boolean", "useConfig"));
++								
++								CodeConditionStatement initCondition = new CodeConditionStatement ();
++								initCondition.Condition = new CodeBinaryOperatorExpression (
++							                                                            new CodeVariableReferenceExpression ("useConfig"),
++							                                                            CodeBinaryOperatorType.IdentityEquality,
++							                                                            new CodePrimitiveExpression (true));
++							                                                            
++								// initCondition.TrueStatements.Add (new CodeSnippetStatement(string.Concat ("this.Url = System.Configuration.ConfigurationManager.AppSettings [\"", configKey , "\"];")));
++							
++								
++								initCondition.TrueStatements.Add (
++							                                  
++							                                  new CodeAssignStatement (
++							                                                        new CodePropertyReferenceExpression (new CodeThisReferenceExpression(), 
++							                                                                                             "Url"),
++							                                                        new CodeIndexerExpression (new CodePropertyReferenceExpression (new CodeVariableReferenceExpression ("System.Configuration.ConfigurationManager"), "AppSettings"), 
++							                                                                                   new CodePrimitiveExpression (configKey))));
++							
++							// new CodePropertyReferenceExpression ("System.Configuration.ConfigurationManager.AppSettings");
++							// new CodeMemberField ("System.Configuration.ConfigurationManager", "AppSettings")
++								declarationType.Comments.Add (new CodeCommentStatement (string.Concat("ConfigurationKey=", configKey)));
++								urlConfigConstructor.Statements.Add (initCondition);
++								declarationType.Members.Add (urlConfigConstructor);
++							
++							}
+ 						}
+ 			
+ 			// Generate the code and save the file
+Index: MonoDevelop.WebReferences/WebReferenceItemCollection.cs
+===================================================================
+--- MonoDevelop.WebReferences/WebReferenceItemCollection.cs	(revisión: 117678)
++++ MonoDevelop.WebReferences/WebReferenceItemCollection.cs	(copia de trabajo)
+@@ -2,6 +2,7 @@
+ using System.Collections.Specialized; 
+ using System.IO;
+ using MonoDevelop.Projects;
++using System.CodeDom;
+ 
+ namespace MonoDevelop.WebReferences
+ {
+@@ -49,7 +50,7 @@
+ 					WebReferenceItem item;
+ 					FileInfo fileInfo = new FileInfo(file.FilePath); 
+ 					string refName = fileInfo.Directory.Name;
+-					
++					string configKey = "";
+ 					// Add the item if it does not exist, otherwise get the current item
+ 					if (Contains(refName))
+ 						item = this[refName];
+@@ -59,11 +60,53 @@
+ 						this.Add(item);
+ 					}
+ 					
++					MonoDevelop.Projects.Text.TextFile configFile = MonoDevelop.Projects.Text.TextFile.ReadFile (file.FilePath);
++					// Check if it have a ConfigurationKey (This text is in a comment, i check it to not parse all the file with the CodeDom
++					if (configFile.Text.IndexOf ("ConfigurationKey=") > -1)
++					{
++						// Provider
++						System.CodeDom.Compiler.CodeDomProvider provider = ((DotNetProject)project).LanguageBinding.GetCodeDomProvider ();
++						
++						// Read it with a TextReader beacause Parse need one.
++						using (TextReader reader = System.IO.File.OpenText (file.FilePath)) {
++							// Parse the file
++							CodeCompileUnit codeUnit = provider.Parse (reader);
++							// Search in all the namespaces/objects
++							foreach (CodeNamespace ns in codeUnit.Namespaces)
++							{
++								foreach(CodeTypeDeclaration td in ns.Types)
++								{
++									// Find a WebService Proxy.
++									if (td.BaseTypes [0].BaseType.IndexOf ("SoapHttpClientProtocol") > -1) {
++										foreach (CodeTypeMember ctm in td.Members)
++											// Search in the Class Contructor if it has a parameter named useConfig
++											if (ctm.Name.IndexOf (".ctor") > -1) {
++												CodeConstructor constructor = (CodeConstructor)ctm;
++												if (constructor.Parameters.Count > 0) {
++													if (constructor.Parameters [0].Name == "useConfig") {
++														CodeStatementCollection st = ((CodeConditionStatement)constructor.Statements [0]).TrueStatements;
++														CodeIndexerExpression cidx = (CodeIndexerExpression)((CodeAssignStatement)st[0]).Right;
++														// Set the configKey var with the actual value.
++														configKey = ((CodePrimitiveExpression)cidx.Indices[0]).Value.ToString ();
++														
++												}
++											}
++										}
++										break;
++									}
++								}
++							}
++							reader.Close();
++						}
++						item.ConfigKey = configKey;
++					}
++					
+ 					// Add the current project file to the web reference item
+ 					if (fileInfo.Extension == ".map")
+ 						item.MapFile = file;
+ 					else
+ 						item.ProxyFile = file;
++					
+ 				}
+ 			}
+ 		}
+Index: MonoDevelop.WebReferences.Commands/WebReferenceCommandHandler.cs
+===================================================================
+--- MonoDevelop.WebReferences.Commands/WebReferenceCommandHandler.cs	(revisión: 117678)
++++ MonoDevelop.WebReferences.Commands/WebReferenceCommandHandler.cs	(copia de trabajo)
+@@ -37,14 +37,12 @@
+ 				else
+ 					return;
+ 			}
+-			
++
+ 			WebReferenceDialog dialog = new WebReferenceDialog(Library.GetWebReferencePath(project));
+ 			dialog.NamespacePrefix = project.Name;
+-			
+-			int response = dialog.Run();
+-			dialog.Destroy();
+-			if (response == (int)Gtk.ResponseType.Ok)
+-			{
++			int response;
++			response = dialog.Run ();
++			if (response == (int)Gtk.ResponseType.Ok) {
+ 				try
+ 				{
+ 					CodeGenerator gen = new CodeGenerator(project, dialog.SelectedService);
+@@ -60,19 +58,27 @@
+ 					mapFile.BuildAction = BuildAction.None;
+ 					mapFile.Subtype = Subtype.Code;
+ 					project.Files.Add(mapFile);
+-			
++
++					// Generate Configuration File
++					if (dialog.UseConfiguration) {
++						Project configProject = dialog.ConfigurationProject;
++						string configKey = dialog.ConfigurationKey;
++						gen.AddUrlToConfiguration (configProject, configKey, dialog.ServiceUrl);
++					}
++
+ 					// Generate the proxy class
+-					string proxySpec = gen.CreateProxyFile(basePath, dialog.Namespace + "." + dialog.ReferenceName, "Reference");
++					string proxySpec = gen.CreateProxyFile(basePath, dialog.Namespace + "." + dialog.ReferenceName, "Reference", dialog.ConfigurationKey);
+ 					ProjectFile proxyFile = new ProjectFile(proxySpec);
+ 					proxyFile.BuildAction = BuildAction.Compile;
+ 					proxyFile.Subtype = Subtype.Code;
+ 					project.Files.Add(proxyFile);
+-					
++				
+ 					// Add references to the project if they do not exist
+ 					string[] references = { 
+ 						"System, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089",
+ 						"System.Web.Services, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a",
+-						"System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
++						"System.Xml, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089",
++						"System.Configuration, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a"
+ 					};
+ 					ProjectReference gacRef;
+ 					
+@@ -89,6 +95,7 @@
+ 					MessageService.ShowException (exception);
+ 				}
+ 			}
++			dialog.Destroy();
+ 		}
+ 		
+ 		/// <summary>Execute the command for updating a web reference in a project.</summary>
+@@ -118,26 +125,32 @@
+ 		[CommandHandler (MonoDevelop.WebReferences.WebReferenceCommands.Delete)]
+ 		public void Delete()
+ 		{
+-			WebReferenceItem item = (WebReferenceItem) CurrentNode.DataItem;
+-			Project project = item.ProxyFile.Project;
+-			item.Delete();
+-			IdeApp.ProjectOperations.Save(project);
+-			IdeApp.Workbench.StatusBar.ShowMessage("Deleted Web Reference " + item.Name);
++			if (MessageService.Confirm("¿Are you sure you want to delete Web Reference?", MonoDevelop.Core.Gui.AlertButton.Ok))
++			{
++				WebReferenceItem item = (WebReferenceItem) CurrentNode.DataItem;
++				Project project = item.ProxyFile.Project;
++				item.Delete();
++				IdeApp.ProjectOperations.Save(project);
++				IdeApp.Workbench.StatusBar.ShowMessage("Deleted Web Reference " + item.Name);
++			}
+ 		}
+ 		
+ 		/// <summary>Execute the command for removing all web references from a project.</summary>
+ 		[CommandHandler (MonoDevelop.WebReferences.WebReferenceCommands.DeleteAll)]
+ 		public void DeleteAll()
+ 		{
+-			Project project = ((WebReferenceFolder) CurrentNode.DataItem).Project;
+-			WebReferenceItemCollection items = new WebReferenceItemCollection (project);
+-			for (int index = 0; index < items.AllKeys.Length; index ++)
++			if (MessageService.Confirm("¿Are you sure you want to delete ALL of the Web References?", MonoDevelop.Core.Gui.AlertButton.Ok))
+ 			{
+-				items[items.AllKeys[index]].Delete();
+-				IdeApp.Workbench.StatusBar.ShowMessage("Deleted Web Reference " + items.AllKeys[index]);
++				Project project = ((WebReferenceFolder) CurrentNode.DataItem).Project;
++				WebReferenceItemCollection items = new WebReferenceItemCollection (project);
++				for (int index = 0; index < items.AllKeys.Length; index ++)
++				{
++					items[items.AllKeys[index]].Delete();
++					IdeApp.Workbench.StatusBar.ShowMessage("Deleted Web Reference " + items.AllKeys[index]);
++				}
++				IdeApp.ProjectOperations.Save(project);
++				IdeApp.Workbench.StatusBar.ShowMessage("Deleted all Web References");
+ 			}
+-			IdeApp.ProjectOperations.Save(project);
+-			IdeApp.Workbench.StatusBar.ShowMessage("Deleted all Web References");
+ 		}
+ 	}	
+ }
+Index: MonoDevelop.WebReferences.Dialogs/WebReferenceDialog.cs
+===================================================================
+--- MonoDevelop.WebReferences.Dialogs/WebReferenceDialog.cs	(revisión: 117678)
++++ MonoDevelop.WebReferences.Dialogs/WebReferenceDialog.cs	(copia de trabajo)
+@@ -15,6 +15,8 @@
+ using MonoDevelop.Core.Gui.WebBrowser;
+ using MonoDevelop.Ide.Gui;
+ using MonoDevelop.WebReferences;
++using MonoDevelop.Projects;
++using MonoDevelop.Projects.Text;
+ using Gtk;
+ 
+ namespace MonoDevelop.WebReferences.Dialogs
+@@ -25,10 +27,17 @@
+ 		#region Widgets
+ 		protected Widget browserWidget = null;
+ 		protected IWebBrowser browser = null;
++		// TODO: Add this widgets with stetic (Right now stetic doesn't regenerate files if add with it)
++		protected Expander advancedExpander;
++		protected Table advancedTable;
++		protected CheckButton useConfigCheck;
++		protected Label appKeyLabel;
++		protected Label appProjectLabel;
++		protected ComboBoxEntry appKeyComboBoxEntry;
++		protected ComboBox appProjectComboBox;
+ 		#endregion
+ 		
+ 		Label docLabel;
+-		
+ 		#region Properties
+ 		/// <summary>Gets or Sets whether the current location of the browser is a valid web service or not.</summary>
+ 		/// <value>True if the current location of the browser is a Web Service, otherwise false.</value>
+@@ -42,6 +51,7 @@
+ 				{
+ 					this.tbxReferenceName.Text = "";
+ 				}
++				
+ 				btnOK.Sensitive = value;
+ 				tbxReferenceName.Sensitive = value;
+ 			}
+@@ -119,6 +129,39 @@
+ 		{
+ 			get { return System.IO.Path.Combine(BasePath, ReferenceName); }
+ 		}
++
++		/// <summary>Gets when to save URL in configuration File.</summary>
++		/// <value>A bool value containing when to save in configuration File.</value>
++		public bool UseConfiguration
++		{
++			get { return useConfigCheck.Active; }
++		}
++
++		public Project ConfigurationProject
++		{
++			get {
++				if (useConfigCheck.Active) {
++					TreeIter iter;
++					if (appProjectComboBox.GetActiveIter(out iter))
++						return (Project)projectStore.GetValue(iter, 1);
++					else
++						return null;
++				} else
++					return null;
++			}
++		}
++
++		public string ConfigurationKey
++		{
++			get {
++				if (useConfigCheck.Active) {
++					return appKeyComboBoxEntry.ActiveText;
++				} else
++					return string.Empty;
++			}
++		}
++
++		
+ 		#endregion
+ 		
+ 		#region Member Variables
+@@ -127,13 +170,79 @@
+ 		private string namespacePrefix = "";
+ 		private DiscoveryClientProtocol selectedService;
+ 		private string basePath = "";
++		ListStore projectStore = new ListStore (typeof (String), typeof (Project));
++		ListStore keyStore = new ListStore (typeof(string));
+ 		protected Gtk.Alignment frmBrowserAlign;
++		bool isServiceLoaded = false;
+ 		#endregion
+-		
++
+ 		/// <summary>Initializes a new instance of the AddWebReferenceDialog widget.</summary>
+ 		public WebReferenceDialog(string basePath)
+ 		{
+ 			Build();
++
++			// Create advanced Expander for App.Config Setting
++			advancedExpander = new Expander ("Advanced");
++			advancedTable = new Table (3, 2, false);
++			useConfigCheck = new CheckButton ("Use app.config to store Web Services Url");
++			useConfigCheck.Toggled += useConfigCheck_Toggled;
++			advancedTable.Attach (useConfigCheck, 0, 2, 0, 1);
++			
++			appProjectLabel = new Label ("Project");
++			appProjectLabel.Xalign = 0F;
++			
++			appKeyLabel = new Label ("Configuration Key");
++			appKeyLabel.Xalign = 0F;
++			
++			appKeyComboBoxEntry = ComboBoxEntry.NewText ();
++			appKeyComboBoxEntry.Sensitive = false;
++			appKeyComboBoxEntry.Model = keyStore;
++			appKeyComboBoxEntry.Changed += appKeyComboBoxEntry_Changed;
++			appProjectComboBox = new ComboBox ();
++			appProjectComboBox.Sensitive = false;
++			appProjectComboBox.Changed += appProjectComboBox_Changed;
++			CellRendererText projectNameCellRenderer = new CellRendererText ();
++			appProjectComboBox.PackStart(projectNameCellRenderer, true);
++			appProjectComboBox.AddAttribute (projectNameCellRenderer, "text", 0);
++			appProjectComboBox.Model = projectStore;
++			
++			advancedTable.Attach (appProjectComboBox, 1, 2, 1, 2);
++			Table.TableChild tc = ((Table.TableChild)advancedTable[appProjectLabel]);
++			tc.XOptions = (AttachOptions)4;
++			tc.YOptions = (AttachOptions)4;
++
++			advancedTable.Attach (appKeyComboBoxEntry, 1, 2, 2, 3);
++			tc = ((Table.TableChild)advancedTable[appKeyComboBoxEntry]);
++			tc.XOptions = (AttachOptions)4;
++			tc.YOptions = (AttachOptions)4;
++
++			advancedTable.Attach (appProjectLabel, 0, 1, 1, 2);
++			tc = ((Table.TableChild)advancedTable[appProjectLabel]);
++			tc.XOptions = (AttachOptions)4;
++			tc.YOptions = (AttachOptions)4;
++			tc.XPadding = 2;
++
++			advancedTable.Attach (appKeyLabel, 0, 1, 2, 3);
++			tc = ((Table.TableChild)advancedTable[appKeyLabel]);
++			tc.XOptions = (AttachOptions)4;
++			tc.YOptions = (AttachOptions)4;
++			tc.XPadding = 2;
++			
++			vbxContainer.PackEnd (advancedExpander, false, true, 0);
++			advancedExpander.Add (advancedTable);
++			
++			advancedExpander.ShowAll ();
++
++			// Fill the projects Combo
++			System.Collections.ObjectModel.ReadOnlyCollection<Solution> solutions = IdeApp.ProjectOperations.CurrentSelectedSolution.GetAllSolutions ();
++			foreach (Solution s in solutions) {
++				System.Collections.ObjectModel.ReadOnlyCollection<Project> projects = s.GetAllProjects ();;
++				foreach (Project p in projects) {
++					projectStore.AppendValues (p.Name, p);
++				}
++				
++			}
++			// appProjectComboBox.Model = projectStore;
+ 			this.basePath = basePath;
+ 			this.IsWebService = false;
+ 			
+@@ -172,6 +281,103 @@
+ 			frmBrowser.Show();
+ 			this.ShowAll();
+ 		}
++
++		void appKeyComboBoxEntry_Changed(object sender, EventArgs e)
++		{
++			if (appKeyComboBoxEntry.Entry.Text.Trim ().Length > 0) {
++				if(isServiceLoaded)
++					this.btnOK.Sensitive = true;
++				else
++					this.btnOK.Sensitive = false;
++			} else
++				this.btnOK.Sensitive = false;
++
++		}
++
++		/// <summary>
++		/// Execute the event changed of the Project ComboBox and Fill the AppKey ComboBoxEntry
++		/// </summary>
++		/// <param name="sender">
++		/// A <see cref="System.Object"/>
++		/// </param>
++		/// <param name="e">
++		/// A <see cref="EventArgs"/>
++		/// </param>
++		void appProjectComboBox_Changed(object sender, EventArgs e)
++		{
++			keyStore.Clear ();
++			appKeyComboBoxEntry.Entry.Text = "";
++			
++			// Search App Config Values;
++			TreeIter iter;
++			if (appProjectComboBox.GetActiveIter (out iter)) {
++				Project p = (Project)projectStore.GetValue (iter, 1);
++				// Navigate through project files
++				foreach (ProjectFile f in p.Files)
++					if (f.Name.IndexOf (".config") > 0) {
++						TextFile configFile = TextFile.ReadFile (f.FilePath);
++						XmlDocument doc = new XmlDocument ();
++						doc.LoadXml (configFile.Text);
++						
++						// TODO: Make this with LinQ2Xml
++						// Navigate through Parent Nodes to search Configuration
++						foreach (XmlNode node in doc.ChildNodes) 
++							if (node.Name == "configuration") 
++								// Navigate through configuration's node to search appSettings
++								foreach (XmlNode nodeInsideConfig in node.ChildNodes) 
++									if (nodeInsideConfig.Name == "appSettings") 
++										// Values to display in Combo
++										foreach (XmlNode nodeInsideAppConfig in nodeInsideConfig.ChildNodes) 
++											if (nodeInsideAppConfig.Name == "add")
++												keyStore.AppendValues (nodeInsideAppConfig.Attributes ["key"].Value);
++				}
++			}
++		}
++
++		/// <summary>
++		/// Execute the event when Check Toggled Change
++		/// </summary>
++		/// <param name="sender">
++		/// A <see cref="System.Object"/>
++		/// </param>
++		/// <param name="e">
++		/// A <see cref="EventArgs"/>
++		/// </param>
++		void useConfigCheck_Toggled(object sender, EventArgs e)
++		{
++			if (useConfigCheck.Active) {
++				if (appKeyComboBoxEntry.Entry.Text.Trim ().Length > 0 && isServiceLoaded)
++					this.btnOK.Sensitive = true;
++				else
++					this.btnOK.Sensitive = false;
++				appKeyComboBoxEntry.Sensitive = true;
++				appProjectComboBox.Sensitive = true;
++			} else {
++				if (isServiceLoaded)
++					this.btnOK.Sensitive = true;
++				else
++					this.btnOK.Sensitive = false;
++				appKeyComboBoxEntry.Sensitive = false;
++				appProjectComboBox.Sensitive = false;
++			}
++		}
++
++		/// <summary>
++		/// Return if the dialog is valid.
++		/// </summary>
++		/// <returns>
++		/// A <see cref="System.Boolean"/>
++		/// </returns>
++		public bool IsValid ()
++		{
++			if (!useConfigCheck.Active)
++				return true;
++			else
++				if (appKeyComboBoxEntry.Entry.Text.Trim ().Length == 0) 
++					return false;
++			 	else
++					return true;
++		}
+ 		
+ 		/// <summary>Execute the event when any of the buttons on the action panel has been clicked</summary>
+ 		/// <param name="sender">An object that contains the sender data.</param>
+@@ -333,6 +539,7 @@
+ 				this.selectedService = null;
+ 			}
+ 			else {
++				isServiceLoaded = true;
+ 				// Set the Default Namespace and Reference
+ 				this.tbxNamespace.Text = this.DefaultNamespace;
+ 				this.tbxReferenceName.Text = this.DefaultReferenceName;
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revisión: 117678)
++++ ChangeLog	(copia de trabajo)
+@@ -1,3 +1,12 @@
++2008-11-02 Luciano N. Callero <lnc19@hotmail.com>
++	* MonoDevelop.WebReferences/WebReferenceItem.cs,
++	  MonoDevelop.WebReferences/CodeGenerator.cs
++	  MonoDevelop.WebReferences/WebReferenceItemCollection.cs
++	  MonoDevelop.WebReferences.Commands/WebReferenceCommandHandler.cs
++	  MonoDevelop.WebReferences.Dialogs/WebReferenceDialog.cs
++	Add the posibility to store Url of the WebService in app.Config.
++   	Ask confirmation before delete a WebService.
++
+ 2008-10-22 Luciano N. Callero <lnc19@hotmail.com>
+ 
+ 	* MonoDevelop.WebReferences/CodeGenerator.cs: Add a new Constructor

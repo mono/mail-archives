@@ -1,0 +1,169 @@
+Index: MonoDevelop.Projects/SolutionItem.cs
+===================================================================
+--- MonoDevelop.Projects/SolutionItem.cs	(revision 150092)
++++ MonoDevelop.Projects/SolutionItem.cs	(working copy)
+@@ -55,8 +55,11 @@
+ 		
+ 		PropertyBag userProperties;
+ 		
++		bool visible;
++		
+ 		public SolutionItem()
+ 		{
++			this.visible = true;
+ 			ProjectExtensionUtil.LoadControl (this);
+ 		}
+ 		
+@@ -455,6 +458,11 @@
+ 		{
+ 			return false;
+ 		}
++
++		public bool Visible {
++			get { return visible; }
++			set { visible = value; }
++		}
+ 		
+ 		public event SolutionItemRenamedEventHandler NameChanged;
+ 		public event SolutionItemModifiedEventHandler Modified;
+Index: MonoDevelop.Projects.Formats.MSBuild/SlnFileFormat.cs
+===================================================================
+--- MonoDevelop.Projects.Formats.MSBuild/SlnFileFormat.cs	(revision 150092)
++++ MonoDevelop.Projects.Formats.MSBuild/SlnFileFormat.cs	(working copy)
+@@ -212,6 +212,9 @@
+ 			monitor.BeginStepTask (GettextCatalog.GetString ("Saving projects"), folder.Items.Count, 1); 
+ 			foreach (SolutionItem ce in folder.Items)
+ 			{
++				if (!ce.Visible)
++					continue;
++
+ 				string[] l = null;
+ 				if (ce is SolutionEntityItem) {
+ 					SolutionEntityItem item = (SolutionEntityItem) ce;
+Index: MonoDevelop.Projects.Formats.MSBuild/MSBuildProjectService.cs
+===================================================================
+--- MonoDevelop.Projects.Formats.MSBuild/MSBuildProjectService.cs	(revision 150092)
++++ MonoDevelop.Projects.Formats.MSBuild/MSBuildProjectService.cs	(working copy)
+@@ -155,6 +155,11 @@
+ 			}
+ 			return null;
+ 		}
++
++		internal static IEnumerable<DotNetProjectSubtypeNode> GetDotNetProjectSubtypes ()
++		{
++			return GetItemSubtypeNodes ();
++		}
+ 		
+ 		static IEnumerable<ItemTypeNode> GetItemTypeNodes ()
+ 		{
+Index: MonoDevelop.Projects.Formats.MSBuild/MSBuildFileFormat.cs
+===================================================================
+--- MonoDevelop.Projects.Formats.MSBuild/MSBuildFileFormat.cs	(revision 150092)
++++ MonoDevelop.Projects.Formats.MSBuild/MSBuildFileFormat.cs	(working copy)
+@@ -74,7 +74,14 @@
+ 			if (slnFileFormat.CanWriteFile (obj, this))
+ 				return slnFileFormat.GetValidFormatName (obj, fileName, this);
+ 			else {
+-				ItemTypeNode node = MSBuildProjectService.FindHandlerForItem ((SolutionEntityItem)obj);
++				SolutionEntityItem item = (SolutionEntityItem)obj;
++				foreach (string subtypeGuid in MSBuildProjectService.GetItemHandler(item).SubtypeGuids)
++				{
++					DotNetProjectSubtypeNode subtypeNode =  MSBuildProjectService.GetDotNetProjectSubtype (subtypeGuid);
++					if (!string.IsNullOrEmpty (subtypeNode.Extension))
++						return fileName.ChangeExtension ("." + subtypeNode.Extension);
++				}
++				ItemTypeNode node = MSBuildProjectService.FindHandlerForItem (item);
+ 				return fileName.ChangeExtension ("." + node.Extension);
+ 			}
+ 		}
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 150092)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,22 @@
++2010-01-24 Lars Magnusson <lavima@gmail.com>
++	
++	* MonoDevelop.Projects/SolutionItem.cs: Added private field and 
++	  property allowing the item to be invisible within the solution
++	* MonoDevelop.Projects.Formats.MSBuild/SlnFileFormat.cs: Made 
++	  WriteProjects() skip invisible projects
++	* MonoDevelop.Projects.Extensions/DotNetProjectSubtypeNode.cs: 
++	  Added support for custom extensions and added CanHandleFile() 
++	  method.
++	* MonoDevelop.Projects.Extensions/DotNetProjectNode.cs: Added 
++	  CanHandlFile() override that checks the subtypes by forwarding
++	  the call to all the subtypes.
++	* MonoDevelop.Projects.Formats.MSBuild/MSBuildFileFormat.cs:
++	  Changed GetValidFormatName() to check the corresponding 
++	  dotnet project subtype.
++	* MonoDevelop.Projects.Formats.MSBuild/MSBuildProjectService.cs:
++	  Added method for returning all the registered dotnet project
++	  subtypes
++
+ 2010-01-22  Michael Hutchinson  <mhutchinson@novell.com>
+ 
+ 	* MonoDevelop.Projects/HelpService.cs: Oops, include tree
+Index: MonoDevelop.Projects.Extensions/DotNetProjectNode.cs
+===================================================================
+--- MonoDevelop.Projects.Extensions/DotNetProjectNode.cs	(revision 150092)
++++ MonoDevelop.Projects.Extensions/DotNetProjectNode.cs	(working copy)
+@@ -53,6 +53,16 @@
+ 			return handler.Load (monitor, fileName, language, null);
+ 		}
+ 		
++		public override bool CanHandleFile (string fileName, string typeGuid)
++		{
++			foreach (DotNetProjectSubtypeNode subtypeNode in MSBuildProjectService.GetDotNetProjectSubtypes ())
++			{
++				if (subtypeNode.CanHandleFile (fileName, typeGuid))
++					return true;	
++			}
++			return base.CanHandleFile (fileName, typeGuid);
++		}
++
+ 		public IResourceHandler GetResourceHandler ()
+ 		{
+ 			if (!string.IsNullOrEmpty (resourceHandler))
+Index: MonoDevelop.Projects.Extensions/DotNetProjectSubtypeNode.cs
+===================================================================
+--- MonoDevelop.Projects.Extensions/DotNetProjectSubtypeNode.cs	(revision 150092)
++++ MonoDevelop.Projects.Extensions/DotNetProjectSubtypeNode.cs	(working copy)
+@@ -41,6 +41,9 @@
+ 		
+ 		[NodeAttribute]
+ 		string import;
++
++		[NodeAttribute]
++		string extension;
+ 		
+ 		Type itemType;
+ 
+@@ -60,6 +63,12 @@
+ 				return itemType;
+ 			}
+ 		}
++
++		public string Extension {
++			get { 
++				return extension; 
++			}
++		}
+ 		
+ 		public bool SupportsType (string guid)
+ 		{
+@@ -75,6 +84,15 @@
+ 		{
+ 			return Type.IsAssignableFrom (item.GetType ());
+ 		}
++
++		public virtual bool CanHandleFile (string fileName, string typeGuid)
++		{
++			if (typeGuid != null && string.Compare (typeGuid, guid, true) == 0)
++				return true;
++			if (!string.IsNullOrEmpty (extension) && System.IO.Path.GetExtension (fileName) == "." + extension)
++				return true;
++			return false;
++		}
+ 		
+ 		public virtual void InitializeHandler (SolutionEntityItem item)
+ 		{
