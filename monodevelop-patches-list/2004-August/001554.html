@@ -1,0 +1,480 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Monodevelop-patches-list] r1947 - in branches/MonoDevelop-plan-43: . src/Plugins/Node
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:monodevelop-patches-list%40lists.ximian.com?Subject=%5BMonodevelop-patches-list%5D%20r1947%20-%20in%20branches/MonoDevelop-plan-43%3A%20.%20src/Plugins/Node&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001553.html">
+   
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Monodevelop-patches-list] r1947 - in branches/MonoDevelop-plan-43: . src/Plugins/Node</H1>
+    <B>commit-watcher at mono-cvs.ximian.com</B> 
+    <A HREF="mailto:monodevelop-patches-list%40lists.ximian.com?Subject=%5BMonodevelop-patches-list%5D%20r1947%20-%20in%20branches/MonoDevelop-plan-43%3A%20.%20src/Plugins/Node&In-Reply-To="
+       TITLE="[Monodevelop-patches-list] r1947 - in branches/MonoDevelop-plan-43: . src/Plugins/Node">commit-watcher at mono-cvs.ximian.com
+       </A><BR>
+    <I>Tue Aug 17 13:01:35 EDT 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001553.html">[Monodevelop-patches-list] r1946 - in branches/MonoDevelop-plan-43: . src/Plugins/Content src/Plugins/Node src/Plugins/Workbench
+</A></li>
+        
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1554">[ date ]</a>
+              <a href="thread.html#1554">[ thread ]</a>
+              <a href="subject.html#1554">[ subject ]</a>
+              <a href="author.html#1554">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: jzwart
+Date: 2004-08-17 13:01:35 -0400 (Tue, 17 Aug 2004)
+New Revision: 1947
+
+Added:
+   branches/MonoDevelop-plan-43/src/Plugins/Node/BufferMemoryStream.cs
+   branches/MonoDevelop-plan-43/src/Plugins/Node/ReadOnlyException.cs
+Modified:
+   branches/MonoDevelop-plan-43/ChangeLog
+   branches/MonoDevelop-plan-43/src/Plugins/Node/Buffer.cs
+   branches/MonoDevelop-plan-43/src/Plugins/Node/FileNode.cs
+Log:
+2004-08-17  Jeroen Zwartepoorte  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">jeroen at xs4all.nl</A>&gt;
+
+	* src/Plugins/Node/ReadOnlyException: custom IOException used in Buffer.
+	* src/Plugins/Node/BufferMemoryStream.cs: custom MemoryStream which
+	calls Buffer.UpdateBuffer when it's being closed. Used in the Writer
+	property of Buffer.
+	* src/Plugins/Node/FileNode.cs: Cleanup.
+	* src/Plugins/Node/Buffer.cs: major cleanup and implementations added.
+
+
+
+Modified: branches/MonoDevelop-plan-43/ChangeLog
+===================================================================
+--- branches/MonoDevelop-plan-43/ChangeLog	2004-08-16 15:39:04 UTC (rev 1946)
++++ branches/MonoDevelop-plan-43/ChangeLog	2004-08-17 17:01:35 UTC (rev 1947)
+@@ -1,3 +1,12 @@
++2004-08-17  Jeroen Zwartepoorte  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">jeroen at xs4all.nl</A>&gt;
++
++	* src/Plugins/Node/ReadOnlyException: custom IOException used in Buffer.
++	* src/Plugins/Node/BufferMemoryStream.cs: custom MemoryStream which
++	calls Buffer.UpdateBuffer when it's being closed. Used in the Writer
++	property of Buffer.
++	* src/Plugins/Node/FileNode.cs: Cleanup.
++	* src/Plugins/Node/Buffer.cs: major cleanup and implementations added.
++
+ 2004-08-16  Jeroen Zwartepoorte  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">jeroen at xs4all.nl</A>&gt;
+ 
+ 	* src/Plugins/Workbench/workbench.ui: remove quit action from toolbar.
+
+Modified: branches/MonoDevelop-plan-43/src/Plugins/Node/Buffer.cs
+===================================================================
+--- branches/MonoDevelop-plan-43/src/Plugins/Node/Buffer.cs	2004-08-16 15:39:04 UTC (rev 1946)
++++ branches/MonoDevelop-plan-43/src/Plugins/Node/Buffer.cs	2004-08-17 17:01:35 UTC (rev 1947)
+@@ -12,89 +12,228 @@
+ using System;
+ using System.IO;
+ using Gnome.Vfs;
++using log4net;
+ 
+ namespace MonoDevelop.Node {
+-	public delegate void BufferChanged (Buffer buffer);
+-	public delegate void BufferLoaded (Buffer buffer);
+-	public delegate void BufferSaving (Buffer buffer);
++	public delegate void BufferHandler (Buffer buffer);
+ 
+ 	public class Buffer {
+-		private BufferContentCallback callback;
+-		private long lastModified;
+-		private long sourceLastModified;
++		static private readonly ILog log = LogManager.GetLogger (typeof (Buffer));
++		private bool loading = false;
++		private DateTime lastModified;
++		private bool modified = false;
+ 		private Gnome.Vfs.Uri uri;
++		private Gnome.Vfs.FileInfo info = null;
++		private MemoryStream buffer = null;
++		private IAsyncResult asyncResult;
+ 
++		public event BufferHandler BufferChanged;
++		public event BufferHandler BufferLoaded;
++		public event BufferHandler BufferSaving;
++
+ 		internal Buffer (Gnome.Vfs.Uri uri)
+ 		{
+ 			this.uri = uri;
+ 		}
+-		
+-		public BufferContentCallback BufferUpdater {
+-			set {
+-				callback = value;
++
++		//
++		// Indicates whether the buffer is being loaded into memory.
++		//
++		public bool Loading {
++			get {
++				return loading;
+ 			}
+ 		}
+-		
+-		public long LastModified {
++
++		//
++		// Returns a timestamp representing the last time the buffer's
++		// contents were modified.
++		//
++		public DateTime LastModified {
+ 			get {
++				if (buffer == null)
++					LoadBuffer ();
+ 				return lastModified;
+ 			}
+ 		}
+ 		
++		//
++		// Determines if the buffer has been changed since it was last
++		// loaded from or saved to permanent storage.
++		//
+ 		public bool Modified {
+ 			get {
+-				return false;
++				return modified;
+ 			}
+ 			set {
++				if (buffer == null)
++					throw new InvalidOperationException (&quot;Buffer not loaded; access the buffer first&quot;);
++				modified = value;
++				if (modified)
++					lastModified = DateTime.Now;
++				else
++					lastModified = SourceLastModified;
+ 			}
+ 		}
+ 		
+-		public bool ReadOnly {
++		//
++		// Returns the buffer's content in the form of a MemoryStream.
++		//
++		public Stream Reader {
+ 			get {
+-				return true;
++				if (buffer == null)
++					LoadBuffer ();
++				asyncResult.AsyncWaitHandle.WaitOne ();
++				return buffer;
+ 			}
+ 		}
+-		
+-		public int Size {
++
++		//
++		// Reports whether the buffer is currently read only, a state
++		// that is typically kept in sync with the state of the source
++		// of the buffer by the virtual file system.
++		//
++		public bool ReadOnly {
+ 			get {
+-				return 0;
++				if (buffer == null)
++					LoadBuffer ();
++				return (info.Permissions &amp; FilePermissions.AccessWritable) ==
++				       FilePermissions.AccessWritable;
+ 			}
+ 		}
+ 		
+-		public long SourceLastModified {
++		//
++		// A timestamp representing the last time the source of the
++		// buffer's contents had been modified at the time the buffer
++		// was read.
++		//
++		public DateTime SourceLastModified {
+ 			get {
+-				return sourceLastModified;
++				if (buffer == null)
++					LoadBuffer ();
++				return info.Mtime;
+ 			}
+ 		}
+ 		
++		//
++		// Returns the uri that this buffer represents.
++		//
+ 		public string Uri {
+ 			get {
+ 				return uri.ToString ();
+ 			}
+ 		}
+-		
+-		public Stream Reader {
+-			get {
+-				return new VfsStream (uri.ToString (), FileMode.Open);
+-			}
+-		}
+ 
++		//
++		// Creates a Stream to provide write access to the contents of
++		// the buffer.
++		//
+ 		public Stream Writer {
+ 			get {
+-				return new VfsStream (uri.ToString (), FileMode.Truncate);
++				if (ReadOnly)
++					throw new ReadOnlyException (&quot;Buffer is read-only&quot;);
++				return new BufferMemoryStream (this);
+ 			}
+ 		}
+ 		
++		//
++		// The buffer's SourceLastModified property is compared with the
++		// original uri's last modification to ensure that the in-memory
++		// representation is up to date with changes that may have been
++		// made outside the VFS. If the uri has been updated then the
++		// action depends on the buffer's state. If the buffer is not
++		// modified, the buffer is automatically updated via a call to
++		// Revert. Otherwise, interested parties are notified to via the
++		// designated event handlers to give the user a chance to make
++		// the choice. The call to Revert, if made, also updates the
++		// read-only state of the buffer to match the current filesystem
++		// state.
++		//
+ 		public void Check ()
+ 		{
+ 		}
+ 		
++		//
++		// Reads the conents of the buffer's uri source, marks the
++		// buffer unmodified, and sets the buffer's read-only state to
++		// match that of the source uri. Lastly, the buffer's
++		// SourceLastModified property is set to match the timestamp on
++		// the uri. While this description is conceptually accurate, in
++		// practice the actual loading of the buffer's contents is
++		// deferred until the first time the contents are actually
++		// needed.
++		//
+ 		public void Revert ()
+ 		{
+ 		}
+ 		
++		//
++		// Writes the contents of a buffer to its uri and marks the
++		// buffer unmodified. The buffer's SourceLastModified property
++		// is reset to match the uri's new timestamp.
++		//
+ 		public void Save ()
+ 		{
+ 		}
++		
++		//
++		// Update the buffer contents with the specified stream. This
++		// method is called in the Close method of the
++		// BufferMemoryStream.
++		//
++		internal void UpdateBuffer (BufferMemoryStream stream)
++		{
++			buffer = new MemoryStream (stream.GetBuffer ());
++			EmitBufferEvent (BufferChanged);
++		}
++
++		private void EmitBufferEvent (BufferHandler handler)
++		{
++			if (handler != null)
++				handler (this);
++		}
++
++		//
++		// Read the uri and fill the buffer MemoryStream.
++		//
++		private void LoadBuffer ()
++		{
++			loading = true;
++			modified = false;
++
++			// Get all the file options.
++			FileInfoOptions options = FileInfoOptions.GetMimeType |
++						  FileInfoOptions.FollowLinks |
++						  FileInfoOptions.GetAccessRights;
++			info = uri.GetFileInfo (options);
++			lastModified = info.Mtime;
++			
++			// Create a new MemoryStream the size of the file.
++			buffer = new MemoryStream ((int)info.Size);
++			
++			// Create a new async VfsStream and read the data into
++			// the MemoryStream.
++			try {
++				VfsStream stream = new VfsStream (uri.ToString (),
++								  FileMode.Open,
++								  true);
++				asyncResult = stream.BeginRead (buffer.GetBuffer (),
++								0, (int)info.Size,
++								new System.AsyncCallback (BeginReadCompleted),
++								null);
++			} catch (Exception ex) {
++				log.Error (&quot;Error creating VfsStream for uri '&quot; + Uri + &quot;'&quot;, ex);
++			}
++		}
++		
++		private void BeginReadCompleted (IAsyncResult result)
++		{
++			if (!result.IsCompleted) {
++				log.Error (&quot;Stream.BeginRead callback returned, but not completed&quot;);
++			} else {
++				loading = false;
++				EmitBufferEvent (BufferLoaded);
++			}
++		}
+ 	}
+ }
+
+Added: branches/MonoDevelop-plan-43/src/Plugins/Node/BufferMemoryStream.cs
+===================================================================
+--- branches/MonoDevelop-plan-43/src/Plugins/Node/BufferMemoryStream.cs	2004-08-16 15:39:04 UTC (rev 1946)
++++ branches/MonoDevelop-plan-43/src/Plugins/Node/BufferMemoryStream.cs	2004-08-17 17:01:35 UTC (rev 1947)
+@@ -0,0 +1,30 @@
++//
++// BufferMemoryStream.cs: A custom MemoryStream which overwrites the Close
++//                        method so it can use the MemoryStream in the Buffer
++//                        instance provided in the constructor.
++//
++// Author:
++//   Jeroen Zwartepoorte &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">jeroen at xs4all.nl</A>&gt;
++//
++// (C) Copyright Jeroen Zwartepoorte 2004
++//
++
++using System;
++using System.IO;
++
++namespace MonoDevelop.Node {
++	internal class BufferMemoryStream : MemoryStream {
++		private Buffer buffer;
++	
++		public BufferMemoryStream (Buffer buffer) : base ()
++		{
++			this.buffer = buffer;
++		}
++		
++		public override void Close ()
++		{
++			buffer.UpdateBuffer (this);
++			base.Close ();
++		}
++	}
++}
+
+Modified: branches/MonoDevelop-plan-43/src/Plugins/Node/FileNode.cs
+===================================================================
+--- branches/MonoDevelop-plan-43/src/Plugins/Node/FileNode.cs	2004-08-16 15:39:04 UTC (rev 1946)
++++ branches/MonoDevelop-plan-43/src/Plugins/Node/FileNode.cs	2004-08-17 17:01:35 UTC (rev 1947)
+@@ -16,6 +16,8 @@
+ using log4net;
+ 
+ namespace MonoDevelop.Node {
++	public delegate void FileNodeHandler (FileNode node);
++
+ 	public class FileNode : Node {
+ 		static private readonly ILog log = LogManager.GetLogger (typeof (FileNode));
+ 		static private Hashtable fileNodeTypes = new Hashtable ();
+@@ -26,6 +28,8 @@
+ 		private Gnome.Vfs.FileInfo info;
+ 		private Buffer buffer = null;
+ 
++		public event FileNodeHandler FileUpdated;
++
+ 		public FileNode (Project project, Node parent, string uri)
+ 		{
+ 			this.project = project;
+@@ -126,6 +130,12 @@
+ 			}
+ 		}
+ 		
++		public override bool Modified {
++			get {
++				return buffer != null ? buffer.Modified : false;
++			}
++		}
++		
+ 		public override Node Parent {
+ 			get {
+ 				return parent;
+@@ -134,12 +144,6 @@
+ 			}
+ 		}
+ 		
+-		public override bool Modified {
+-			get {
+-				return false;
+-			}
+-		}
+-		
+ 		public override bool Persistent {
+ 			get {
+ 				return false;
+@@ -152,14 +156,6 @@
+ 			}
+ 		}
+ 		
+-		protected Gnome.Vfs.FileInfo FileInfo {
+-			get {
+-				if (info == null)
+-					info = new Gnome.Vfs.FileInfo (uri);
+-				return info;
+-			}
+-		}
+-		
+ 		public override void Delete ()
+ 		{
+ 		}
+
+Added: branches/MonoDevelop-plan-43/src/Plugins/Node/ReadOnlyException.cs
+===================================================================
+--- branches/MonoDevelop-plan-43/src/Plugins/Node/ReadOnlyException.cs	2004-08-16 15:39:04 UTC (rev 1946)
++++ branches/MonoDevelop-plan-43/src/Plugins/Node/ReadOnlyException.cs	2004-08-17 17:01:35 UTC (rev 1947)
+@@ -0,0 +1,18 @@
++//
++// ReadOnlyException.cs: An exception derived from IOException which is thrown
++//                       when a user attempts to access the Writer property on
++//                       a Buffer of which the underlying uri is read-only.
++//
++// Author:
++//   Jeroen Zwartepoorte &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">jeroen at xs4all.nl</A>&gt;
++//
++// (C) Copyright Jeroen Zwartepoorte 2004
++//
++
++using System.IO;
++
++namespace MonoDevelop.Node {
++	public class ReadOnlyException : IOException {
++		public ReadOnlyException (string msg) : base (msg) {}
++	}
++}
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001553.html">[Monodevelop-patches-list] r1946 - in branches/MonoDevelop-plan-43: . src/Plugins/Content src/Plugins/Node src/Plugins/Workbench
+</A></li>
+	
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1554">[ date ]</a>
+              <a href="thread.html#1554">[ thread ]</a>
+              <a href="subject.html#1554">[ subject ]</a>
+              <a href="author.html#1554">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">More information about the Monodevelop-patches-list
+mailing list</a><br>
+</body></html>

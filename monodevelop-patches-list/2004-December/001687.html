@@ -1,0 +1,261 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Monodevelop-patches-list] r2083 - in trunk/MonoDevelop/Core/src/Main/Base: . Services/DispatchService Services/ParserService
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:monodevelop-patches-list%40lists.ximian.com?Subject=%5BMonodevelop-patches-list%5D%20r2083%20-%20in%20trunk/MonoDevelop/Core/src/Main/Base%3A%20.%20Services/DispatchService%20Services/ParserService&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001686.html">
+   <LINK REL="Next"  HREF="001688.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Monodevelop-patches-list] r2083 - in trunk/MonoDevelop/Core/src/Main/Base: . Services/DispatchService Services/ParserService</H1>
+    <B>commit-watcher at mono-cvs.ximian.com</B> 
+    <A HREF="mailto:monodevelop-patches-list%40lists.ximian.com?Subject=%5BMonodevelop-patches-list%5D%20r2083%20-%20in%20trunk/MonoDevelop/Core/src/Main/Base%3A%20.%20Services/DispatchService%20Services/ParserService&In-Reply-To="
+       TITLE="[Monodevelop-patches-list] r2083 - in trunk/MonoDevelop/Core/src/Main/Base: . Services/DispatchService Services/ParserService">commit-watcher at mono-cvs.ximian.com
+       </A><BR>
+    <I>Wed Dec 15 20:08:09 EST 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001686.html">[Monodevelop-patches-list] r2082 - in trunk/MonoDevelop/Core/src/Main/Base: . Commands
+</A></li>
+        <LI>Next message: <A HREF="001688.html">[Monodevelop-patches-list] r2084 - in trunk/MonoDevelop/Core/src/Main/Base: . Services/DispatchService
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1687">[ date ]</a>
+              <a href="thread.html#1687">[ thread ]</a>
+              <a href="subject.html#1687">[ subject ]</a>
+              <a href="author.html#1687">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Author: lluis
+Date: 2004-12-15 20:08:09 -0500 (Wed, 15 Dec 2004)
+New Revision: 2083
+
+Modified:
+   trunk/MonoDevelop/Core/src/Main/Base/ChangeLog
+   trunk/MonoDevelop/Core/src/Main/Base/Services/DispatchService/DispatchService.cs
+   trunk/MonoDevelop/Core/src/Main/Base/Services/ParserService/DefaultParserService.cs
+Log:
+2004-12-16  Lluis Sanchez Gual &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">lluis at novell.com</A>&gt;
+
+	* Services/DispatchService/DispatchService.cs: added a locks for accessing
+	the message queue. In synchronous calls, don't use gui dispatch if the
+	calling thread is already the gui thread.
+	* Services/ParserService/DefaultParserService.cs: Removed unneeded lock
+	that was causing deadlocks.
+
+
+
+Modified: trunk/MonoDevelop/Core/src/Main/Base/ChangeLog
+===================================================================
+--- trunk/MonoDevelop/Core/src/Main/Base/ChangeLog	2004-12-16 00:01:45 UTC (rev 2082)
++++ trunk/MonoDevelop/Core/src/Main/Base/ChangeLog	2004-12-16 01:08:09 UTC (rev 2083)
+@@ -1,3 +1,11 @@
++2004-12-16  Lluis Sanchez Gual &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">lluis at novell.com</A>&gt;
++
++	* Services/DispatchService/DispatchService.cs: added a locks for accessing
++	the message queue. In synchronous calls, don't use gui dispatch if the
++	calling thread is already the gui thread.
++	* Services/ParserService/DefaultParserService.cs: Removed unneeded lock
++	that was causing deadlocks.
++
+ 2004-12-15  Sander Rijken  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">sr+ximianbugs at d-90.nl</A>&gt;
+ 
+ 	* Commands/CustomStringTagProvider.cs: Patch to have COMBINEDIR return
+
+Modified: trunk/MonoDevelop/Core/src/Main/Base/Services/DispatchService/DispatchService.cs
+===================================================================
+--- trunk/MonoDevelop/Core/src/Main/Base/Services/DispatchService/DispatchService.cs	2004-12-16 00:01:45 UTC (rev 2082)
++++ trunk/MonoDevelop/Core/src/Main/Base/Services/DispatchService/DispatchService.cs	2004-12-16 01:08:09 UTC (rev 2083)
+@@ -38,22 +38,24 @@
+ 
+ 		public void GuiDispatch (MessageHandler cb)
+ 		{
+-			arrGuiQueue.Add (new GenericMessageContainer (cb, false));
+-			UpdateIdle ();
++			QueueMessage (new GenericMessageContainer (cb, false));
+ 		}
+ 
+ 		public void GuiDispatch (StatefulMessageHandler cb, object state)
+ 		{
+-			arrGuiQueue.Add (new StatefulMessageContainer (cb, state, false));
+-			UpdateIdle ();
++			QueueMessage (new StatefulMessageContainer (cb, state, false));
+ 		}
+ 
+ 		public void GuiSyncDispatch (MessageHandler cb)
+ 		{
++			if (IsGuiThread) {
++				cb ();
++				return;
++			}
++
+ 			GenericMessageContainer mc = new GenericMessageContainer (cb, true);
+ 			lock (mc) {
+-				arrGuiQueue.Add (mc);
+-				UpdateIdle ();
++				QueueMessage (mc);
+ 				Monitor.Wait (mc);
+ 			}
+ 			if (mc.Exception != null)
+@@ -62,28 +64,35 @@
+ 		
+ 		public void GuiSyncDispatch (StatefulMessageHandler cb, object state)
+ 		{
++			if (IsGuiThread) {
++				cb (state);
++				return;
++			}
++
+ 			StatefulMessageContainer mc = new StatefulMessageContainer (cb, state, true);
+ 			lock (mc) {
+-				arrGuiQueue.Add (mc);
+-				UpdateIdle ();
++				QueueMessage (mc);
+ 				Monitor.Wait (mc);
+ 			}
+ 			if (mc.Exception != null)
+ 				throw new Exception (errormsg, mc.Exception);
+ 		}
+ 
+-		void UpdateIdle ()
++		void QueueMessage (object msg)
+ 		{
+-			if (iIdle == 0) {
+-				iIdle = GLib.Idle.Add (handler);
+-				/* This code is required because for some
+-				 * reason the idle handler is run once
+-				 * before being set, so you get a idle
+-				 * handler that isnt running, but our code
+-				 * thinks that it is.
+-				 */
+-				if (arrGuiQueue.Count == 0 &amp;&amp; iIdle != 0)
+-					iIdle = 0;
++			lock (arrGuiQueue) {
++				arrGuiQueue.Add (msg);
++				if (iIdle == 0) {
++					iIdle = GLib.Idle.Add (handler);
++					/* This code is required because for some
++					 * reason the idle handler is run once
++					 * before being set, so you get a idle
++					 * handler that isnt running, but our code
++					 * thinks that it is.
++					 */
++					if (arrGuiQueue.Count == 0 &amp;&amp; iIdle != 0)
++						iIdle = 0;
++				}
+ 			}
+ 		}
+ 		
+@@ -116,12 +125,13 @@
+ 
+ 		private bool guiDispatcher ()
+ 		{
+-			if (arrGuiQueue.Count == 0) {
+-				iIdle = 0;
+-				return false;
+-			}
+-			GenericMessageContainer msg = null;
++			GenericMessageContainer msg;
++			
+ 			lock (arrGuiQueue) {
++				if (arrGuiQueue.Count == 0) {
++					iIdle = 0;
++					return false;
++				}
+ 				msg = (GenericMessageContainer)arrGuiQueue[0];
+ 				arrGuiQueue.RemoveAt (0);
+ 			}
+@@ -132,11 +142,13 @@
+ 				else if (msg.Exception != null)
+ 					HandlerError (msg);
+ 			}
+-			
+-			if (arrGuiQueue.Count == 0) {
+-				iIdle = 0;
+-				return false;
++			lock (arrGuiQueue) {
++				if (arrGuiQueue.Count == 0) {
++					iIdle = 0;
++					return false;
++				}
+ 			}
++
+ 			return true;
+ 		}
+ 
+
+Modified: trunk/MonoDevelop/Core/src/Main/Base/Services/ParserService/DefaultParserService.cs
+===================================================================
+--- trunk/MonoDevelop/Core/src/Main/Base/Services/ParserService/DefaultParserService.cs	2004-12-16 00:01:45 UTC (rev 2082)
++++ trunk/MonoDevelop/Core/src/Main/Base/Services/ParserService/DefaultParserService.cs	2004-12-16 01:08:09 UTC (rev 2083)
+@@ -653,25 +653,23 @@
+ 					
+ 				IParseInformation parseInformation = null;
+ 				bool updated = false;
+-				lock (parsings) {
+-				
+-					if (lastUpdateSize[fileName] == null || (int)lastUpdateSize[fileName] != text.GetHashCode()) {
+-						parseInformation = DoParseFile(fileName, text);
+-						if (parseInformation == null) return;
+-						
+-						if (viewContent.Project != null) {
+-							ProjectCodeCompletionDatabase db = GetProjectDatabase (viewContent.Project);
+-							ClassUpdateInformation res = db.UpdateFromParseInfo (parseInformation, fileName);
+-							if (res != null) NotifyParseInfoChange (fileName, res);
+-						}
+-						else {
+-							SimpleCodeCompletionDatabase db = GetSingleFileDatabase (fileName);
+-							db.UpdateFromParseInfo (parseInformation);
+-						}
+-
+-						lastUpdateSize[fileName] = text.GetHashCode();
+-						updated = true;
++			
++				if (lastUpdateSize[fileName] == null || (int)lastUpdateSize[fileName] != text.GetHashCode()) {
++					parseInformation = DoParseFile(fileName, text);
++					if (parseInformation == null) return;
++					
++					if (viewContent.Project != null) {
++						ProjectCodeCompletionDatabase db = GetProjectDatabase (viewContent.Project);
++						ClassUpdateInformation res = db.UpdateFromParseInfo (parseInformation, fileName);
++						if (res != null) NotifyParseInfoChange (fileName, res);
+ 					}
++					else {
++						SimpleCodeCompletionDatabase db = GetSingleFileDatabase (fileName);
++						db.UpdateFromParseInfo (parseInformation);
++					}
++
++					lastUpdateSize[fileName] = text.GetHashCode();
++					updated = true;
+ 				}
+ 				if (updated &amp;&amp; parseInformation != null &amp;&amp; editable is IParseInformationListener) {
+ 					((IParseInformationListener)editable).ParseInformationUpdated(parseInformation);
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001686.html">[Monodevelop-patches-list] r2082 - in trunk/MonoDevelop/Core/src/Main/Base: . Commands
+</A></li>
+	<LI>Next message: <A HREF="001688.html">[Monodevelop-patches-list] r2084 - in trunk/MonoDevelop/Core/src/Main/Base: . Services/DispatchService
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1687">[ date ]</a>
+              <a href="thread.html#1687">[ thread ]</a>
+              <a href="subject.html#1687">[ subject ]</a>
+              <a href="author.html#1687">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/monodevelop-patches-list">More information about the Monodevelop-patches-list
+mailing list</a><br>
+</body></html>
