@@ -1,0 +1,158 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [mono-android] Changing Folder/File permissions in MfA
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:monodroid%40lists.ximian.com?Subject=Re%3A%20%5Bmono-android%5D%20Changing%20Folder/File%20permissions%20in%20MfA&In-Reply-To=%3C8DCED36E-2D01-446C-9AFB-0085F878B139%40xamarin.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012700.html">
+   <LINK REL="Next"  HREF="012702.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[mono-android] Changing Folder/File permissions in MfA</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:monodroid%40lists.ximian.com?Subject=Re%3A%20%5Bmono-android%5D%20Changing%20Folder/File%20permissions%20in%20MfA&In-Reply-To=%3C8DCED36E-2D01-446C-9AFB-0085F878B139%40xamarin.com%3E"
+       TITLE="[mono-android] Changing Folder/File permissions in MfA">jonp at xamarin.com
+       </A><BR>
+    <I>Wed Oct 24 02:35:56 UTC 2012</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012700.html">[mono-android] Changing Folder/File permissions in MfA
+</A></li>
+        <LI>Next message: <A HREF="012702.html">[mono-android] Changing Folder/File permissions in MfA
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12701">[ date ]</a>
+              <a href="thread.html#12701">[ thread ]</a>
+              <a href="subject.html#12701">[ subject ]</a>
+              <a href="author.html#12701">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Oct 22, 2012, at 4:47 PM, was &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodroid">skylogdev at btconnect.com</A>&gt; wrote:
+&gt;<i> As I'm not familiar with unix permissions, is there a way of changing the permissions for the App.AppName folder?
+</I>
+Yes: with the chmod(2) system call [0, 1]. (Insert rant about how C# actually allows you to do things like this, while it's not easy in Java w/o using JNI).
+
+&gt;<i> I looked at using permission: MODE_WORLD_READABLE and MODE_WORLD_WRITEABLE, but these aren't available in the MfA 4.2.6 Required Permissions list.
+</I>
+1. They're not permissions, they're integer constants for use with e.g. Context.OpenFileOutput().
+2. MODE_WORLD_READABLE is mapped to the Android.Content.FileCreationMode.WorldReadable enum value [2].
+
+&gt;<i> I'm also not sure they would fix the problem anyway.
+</I>
+Using FileCerationMode.WorldReadable would workaround the problem: Context.OpenFileOutput() allows you to specify the FileCreationMode, which sets the Unix mode for that specific file (at creation time, iirc):
+
+	using (var o = new StreamWriter(OpenFileOutput(&quot;foo.txt&quot;, FileCreationMode.WorldReadable)))
+		o.WriteLine (&quot;Hello, world!&quot;); 
+
+The file created in that fashion will be in a directory that by default can't be listed:
+
+	$ adb shell ls -l /data/data/Scratch.PublicFiles/files
+	opendir failed, Permission denied 
+
+However, if you know the name of the file you can read it:
+
+	$ adb shell cat /data/data/Scratch.PublicFiles/files/foo.txt
+	Hello, world!
+
+This may in fact be suitable for your purposes, and has an added &quot;security&quot; benefit (obfuscation) that the names of the files aren't determined easily.
+
+There is another interesting Context method that takes a FileCreationMode: Context.GetDir(string, FileCreationMode) [3]. This will create a new directory, but what's interesting is two things:
+
+1. The directory it creates isn't a child of Context.FilesDir:
+
+	var d = GetDir (&quot;foo&quot;, FileCreationMode.WorldReadable | FileCreationMode.WorldWriteable);
+	Console.WriteLine (&quot;Created: {0}&quot;, d.AbsolutePath);
+	// Created: /data/data/Scratch.PublicFiles/app_foo
+
+Notice that the directory name gets an &quot;app_&quot; prefix.
+
+2. The only way (that I've found) to create a file with a specific set of permissions is Context.OpenFileOutput(), and Context.OpenFileOutput() doesn't allow you to specify sub-directories. Consequently the only way to use the above &quot;app_foo&quot; directory is via normal System.IO methods, which creates files with the default process umask, which is no good here:
+
+	// C# code
+	var bar = Path.Combine (d.AbsolutePath, &quot;bar.txt&quot;);
+	using (var o = File.AppendText (bar))
+		o.WriteLine (&quot;managed foo/bar.txt contents&quot;);
+
+	# verification...
+	$ adb shell ls -l /data/data/Scratch.PublicFiles/app_foo
+	-rw------- u0_a62   u0_a62         58 2012-10-23 21:50 bar.txt
+
+We can't do anything with that file; the &quot;other&quot; permissions are &quot;---&quot;, aka &quot;nothing&quot;.
+
+This makes Context.GetDir() + create-file rather worthless unless you subsequently change the file's permissions:
+
+		int p666 = LinuxUtils.Syscall.S_IRUSR | LinuxUtils.Syscall.S_IWUSR | \
+			LinuxUtils.Syscall.S_IRGRP | LinuxUtils.Syscall.S_IWGRP | \
+			LinuxUtils.Syscall.S_IROTH | LinuxUtils.Syscall.S_IWOTH;
+		LinuxUtils.Syscall.chmod (bar, p666);
+
+Given that the above is (1) ugly, and (2) requires a bit of support code ([0]), the easiest path is to accept the inability to use `ls`, use Context.OpenFileOutput(), and just &quot;know&quot; which files you can read or write.
+
+ - Jon
+
+[0] 
+	namespace LinuxUtils {
+		using System.Runtime.InteropServices;
+
+		static class Syscall {
+
+			public const int S_IRWXU = 0x1C0; // 00700
+			public const int S_IRUSR = 0x100; // 00400
+			public const int S_IWUSR = 0x080; // 00200
+			public const int S_IXUSR = 0x040; // 00100
+
+			public const int S_IRWXG = 0x038; // 00070
+			public const int S_IRGRP = 0x020; // 00040
+			public const int S_IWGRP = 0x010; // 00020
+			public const int S_IXGRP = 0x008; // 00010
+
+			public const int S_IRWXO = 0x007; // 00007
+			public const int S_IROTH = 0x004; // 00004
+			public const int S_IWOTH = 0x002; // 00002
+			public const int S_IXOTH = 0x001; // 00001
+
+			[DllImport (&quot;c&quot;)]
+			public static extern int chmod (string path, int mode);
+		}
+	}
+
+[1] This will change the permissions of /data/data/@PACKAGE_NAME@/files so that it's world readable and world writable, using [0]:
+
+	LinuxUtils.Syscall.chmod (FilesDir.AbsolutePath, LinuxUtils.Syscall.S_IRWXU | LinuxUtils.Syscall.S_IRWXG | LinuxUtils.Syscall.S_IRWXO); 
+
+[2] <A HREF="http://androidapi.xamarin.com/?link=T:Android.Content.FileCreationMode">http://androidapi.xamarin.com/?link=T:Android.Content.FileCreationMode</A>
+
+[3] <A HREF="http://androidapi.xamarin.com/monodoc.ashx?link=M%3aAndroid.Content.Context.GetDir(System.String%2cAndroid.Content.FileCreationMode">http://androidapi.xamarin.com/monodoc.ashx?link=M%3aAndroid.Content.Context.GetDir(System.String%2cAndroid.Content.FileCreationMode</A>)
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012700.html">[mono-android] Changing Folder/File permissions in MfA
+</A></li>
+	<LI>Next message: <A HREF="012702.html">[mono-android] Changing Folder/File permissions in MfA
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12701">[ date ]</a>
+              <a href="thread.html#12701">[ thread ]</a>
+              <a href="subject.html#12701">[ subject ]</a>
+              <a href="author.html#12701">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/monodroid">More information about the Monodroid
+mailing list</a><br>
+</body></html>

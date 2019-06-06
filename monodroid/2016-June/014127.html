@@ -1,0 +1,156 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [mono-android] JavaFinalize and .NET Finalizers
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:monodroid%40lists.ximian.com?Subject=Re%3A%20%5Bmono-android%5D%20JavaFinalize%20and%20.NET%20Finalizers&In-Reply-To=%3C68B69FCC-9C6C-4A82-9B9B-BD4E9E6F6A34%40vt.edu%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014126.html">
+   <LINK REL="Next"  HREF="014128.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[mono-android] JavaFinalize and .NET Finalizers</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:monodroid%40lists.ximian.com?Subject=Re%3A%20%5Bmono-android%5D%20JavaFinalize%20and%20.NET%20Finalizers&In-Reply-To=%3C68B69FCC-9C6C-4A82-9B9B-BD4E9E6F6A34%40vt.edu%3E"
+       TITLE="[mono-android] JavaFinalize and .NET Finalizers">jonpryor at vt.edu
+       </A><BR>
+    <I>Tue Jun 21 02:51:58 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014126.html">[mono-android] JavaFinalize and .NET Finalizers
+</A></li>
+        <LI>Next message: <A HREF="014128.html">[mono-android] JavaFinalize and .NET Finalizers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14127">[ date ]</a>
+              <a href="thread.html#14127">[ thread ]</a>
+              <a href="subject.html#14127">[ subject ]</a>
+              <a href="author.html#14127">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Jun 17, 2016, at 9:50 AM, Jeremy A. Kolb - ARA/NED &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/monodroid">jkolb at ara.com</A>&gt; wrote:
+&gt;<i> I'm investigating <A HREF="https://github.com/MvvmCross/MvvmCross/issues/1343">https://github.com/MvvmCross/MvvmCross/issues/1343</A> for a possible memory leak related to our version of the RecyclerView widget MvxRecyclerView and have run against an interesting issue.
+</I>&gt;<i> 
+</I>&gt;<i> When swapping out the itemsource in the adapter the RecyclerView instantiates ViewHolders but never seems to kill them no matter how many times I force a GC.  If I add a &quot;~MvxRecyclerViewHolder()&quot;  method to MvxRecyclerViewHolder I never get in there.  However I do hit the JavaFinalize method and now I am completely confused.
+</I>&gt;<i> 
+</I>&gt;<i> Why would I hit the JavaFinalizer and not the .NET one?  There is never an explicit Dispose on the MvxRecyclerView so I can't see why the Java -&gt; .NET connection would be severed.
+</I>&gt;<i> 
+</I>&gt;<i> The only instance I've found where Xamarin uses JavaFinalize is at <A HREF="https://github.com/xamarin/Xamarin.Forms/blob/master/Xamarin.Forms.Platform.Android/Renderers/GenericAnimatorListener.cs#L35">https://github.com/xamarin/Xamarin.Forms/blob/master/Xamarin.Forms.Platform.Android/Renderers/GenericAnimatorListener.cs#L35</A> which doesn't explain much.
+</I>&gt;<i> 
+</I>&gt;<i> Am I seeing a bug in Xamarin?  In MvvmCross's RecyclerView?  Or more likely: am I just confused about the interaction of two garbage collectors.
+</I>
+The interaction is deep voodoo. :-)
+
+As usual with these things, enable GREF logging:
+
+	<A HREF="https://developer.xamarin.com/guides/android/troubleshooting/troubleshooting/#Global_Reference_Messages">https://developer.xamarin.com/guides/android/troubleshooting/troubleshooting/#Global_Reference_Messages</A>
+	<A HREF="https://developer.xamarin.com/releases/android/xamarin.android_5/xamarin.android_5.1/#GREF_Logging_Changes">https://developer.xamarin.com/releases/android/xamarin.android_5/xamarin.android_5.1/#GREF_Logging_Changes</A>
+
+	$ adb shell setprop debug.mono.log gref,gc
+
+The relevant GC bridge code is `take_global_ref_jni()`, `take_weak_global_ref_jni()`, and `gc_cross_references()`:
+
+	<A HREF="https://github.com/xamarin/xamarin-android/blob/c3811e8/src/monodroid/jni/monodroid-glue.c#L1140-L1202">https://github.com/xamarin/xamarin-android/blob/c3811e8/src/monodroid/jni/monodroid-glue.c#L1140-L1202</A>
+	<A HREF="https://github.com/xamarin/xamarin-android/blob/c3811e8/src/monodroid/jni/monodroid-glue.c#L1483-L1522">https://github.com/xamarin/xamarin-android/blob/c3811e8/src/monodroid/jni/monodroid-glue.c#L1483-L1522</A>
+
+This is run as part of Mono&#8217;s GC bridge code&#8230;which I&#8217;m kinda flaky on. The *general* idea is as follows:
+
+1. Mono&#8217;s GC looks for finalizable objects.
+2. When a finalizable instance has no more managed references, it&#8217;s placed into some finalizer queue
+3. *Before* the finalizer queue is emptied, the GC bridge is queried to determine if the instance is *actually* finalizable.
+3.a. If the instance can be finalized, it will be during the next GC.
+3.b. If the instance can&#8217;t be finalized, it will be kept alive.
+
+The GC bridge, in this context, is `gc_cross_references()`, which is given a set of Java.Lang.Object instances, and:
+
+1. Toggles all the GREFs to Weak GREFs&#8230;for the *entire object graph* the instance refers to. (Plus some mirroring of the object graph in Java-land&#8230;)
+2. Kicks off a Java-side GC.
+3. Checks to see if anything was collected. If it was collected, Mono&#8217;s GC is told that the instance can be finalized. Otherwise, the instance is kept alive.
+4. For all alive instances, toggle the Weak GREFs to GREFs.
+
+Note: mid-term plan is to unify that code with the ~equivalent code here:
+
+	<A HREF="https://github.com/xamarin/java.interop/blob/master/src/java-interop/java-interop-gc-bridge-mono.c">https://github.com/xamarin/java.interop/blob/master/src/java-interop/java-interop-gc-bridge-mono.c</A>
+
+That project keeps getting punted as more important work pops up&#8230;
+
+Very important question: what Android version do you see this on? There are two Weak reference implementations, one that uses &#8220;proper&#8221; JNI Weak Global References, and one which uses java.lang.WeakReference (because API-8 was the first to support JNI Weak Global references, and then Android 4.4 + ART broke them&#8230;). The  WeakReference implementation doesn&#8217;t get as much testing, so&#8230;it&#8217;s possibly suspect unless you can discount it.
+
+Returning to the original description&#8230;
+`Java.Lang.Object.Handle` is a JNI Global Reference, which *should* keep the instance alive. Period. Thus, it shouldn&#8217;t be possible for `Object.JavaFinalize()` to be invoked while `Object.Handle` is not IntPtr.Zero.
+
+I can think of *one* way it would happen, but `GenericAnimatorListener` doesn&#8217;t trigger it: if the class had a `T(IntPtr, JniHandleOwnership)` constructor, *and* the instance were `Dispose()`d, then I can see `JavaFinalize()` being invoked:
+
+	class Silly : Java.Lang.Object {
+		public Silly () {}
+		public Silly (IntPtr h, JniHandleOwnership t) : base (h, t) {}
+		protected override void JavaFinalize () {
+		}
+	}
+	// &#8230;
+	using (var s = new Silly ()) {
+	}
+
+Once `s.Dispose()` is invoked, nothing will keep the Java-side peer alive, so later `Object.finalize()` may eventually be invoked by the Java GC, but since there is no longer a registered peer for the JNI instance, we&#8217;ll invoke the `Silly(IntPtr, JniHandleOwnership)` constructor to *create a new* peer, and invoke `Silly.JavaFinalize()` on the newly created peer, *not* the original instance:
+
+	// above `using` block + subsequent behavior is as if&#8230;
+	new Silly ().Dispose();
+	// time passes...
+	new Silly (value, JniHandleOwnership.DoNotTransfer).JavaFinalize();
+
+That&#8217;s clearly not the case in GenericAnimatorListener &#8212; it doesn&#8217;t have the right constructor.
+
+That *may* be the case in MvxRecyclerViewHolder, as it *does* have the activation constructor:
+
+	<A HREF="https://github.com/MvvmCross/MvvmCross-AndroidSupport/blob/e88c556/MvvmCross.Droid.Support.V7.RecyclerView/MvxRecyclerViewHolder.cs#L107-L109">https://github.com/MvvmCross/MvvmCross-AndroidSupport/blob/e88c556/MvvmCross.Droid.Support.V7.RecyclerView/MvxRecyclerViewHolder.cs#L107-L109</A>
+
+
+        public MvxRecyclerViewHolder(IntPtr handle, JniHandleOwnership transfer)
+            : base(handle, transfer)
+        {}
+
+I would thus suggest you look into *why* `MvxRecyclerViewHolder ` has an Activation constructor. I strongly suggest *avoiding* activation constructors unless absolutely necessary:
+
+	<A HREF="https://developer.xamarin.com/guides/android/under_the_hood/architecture/#Java_Activation">https://developer.xamarin.com/guides/android/under_the_hood/architecture/#Java_Activation</A>
+
+The Activation constructor has a tendency to &#8220;hide&#8221; or &#8220;change&#8221; the behavior of actual buggy behavior, so the fact that `MvxRecyclerViewHolder` provides an activation constructor without overriding any virtual methods (other than Dispose()) does not fill me with confidence.
+
+If this is happening, you&#8217;d see the `MvxRecyclerViewHolder._bindingContext` is null &#8212; along with all over members! You could check for that within your `JavaFinalize()` override, and see if the instance has &#8220;meaningful&#8221; data compared to what the instance had after construction.
+
+Additionally, to track *managed* instance lifetimes, I suggest copious use of RuntimeHelpers.GetHashCode(object):
+
+	<A HREF="https://msdn.microsoft.com/en-us/library/11tbk3h9(v=vs.110">https://msdn.microsoft.com/en-us/library/11tbk3h9(v=vs.110</A>).aspx
+
+ - Jon
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014126.html">[mono-android] JavaFinalize and .NET Finalizers
+</A></li>
+	<LI>Next message: <A HREF="014128.html">[mono-android] JavaFinalize and .NET Finalizers
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14127">[ date ]</a>
+              <a href="thread.html#14127">[ thread ]</a>
+              <a href="subject.html#14127">[ subject ]</a>
+              <a href="author.html#14127">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/monodroid">More information about the Monodroid
+mailing list</a><br>
+</body></html>

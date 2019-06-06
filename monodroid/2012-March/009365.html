@@ -1,0 +1,157 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [mono-android] JniEnv problem
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:monodroid%40lists.ximian.com?Subject=Re%3A%20%5Bmono-android%5D%20JniEnv%20problem&In-Reply-To=%3CFA4A41D1-7273-42B8-8CED-159D708F1738%40xamarin.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009363.html">
+   <LINK REL="Next"  HREF="009366.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[mono-android] JniEnv problem</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:monodroid%40lists.ximian.com?Subject=Re%3A%20%5Bmono-android%5D%20JniEnv%20problem&In-Reply-To=%3CFA4A41D1-7273-42B8-8CED-159D708F1738%40xamarin.com%3E"
+       TITLE="[mono-android] JniEnv problem">jonp at xamarin.com
+       </A><BR>
+    <I>Tue Mar 20 15:07:20 UTC 2012</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009363.html">[mono-android] JniEnv problem
+</A></li>
+        <LI>Next message: <A HREF="009366.html">[mono-android] JniEnv problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9365">[ date ]</a>
+              <a href="thread.html#9365">[ thread ]</a>
+              <a href="subject.html#9365">[ subject ]</a>
+              <a href="author.html#9365">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Mar 20, 2012, at 10:10 AM, H&#228;nke, Maik wrote:
+
+I suspect that the problem is that your native method wants `int lIdentifier`:
+
+&gt;<i> public static native int Msg_UpdateOptions(int lIdentifier, boolean bEnabled, boolean bQueue, String functionName, int convention, Object callBackObj);
+</I>&gt;<i>  
+</I>&gt;<i> I import the method with this code:
+</I>&gt;<i> public static int Msg_UpdateOptions(uint lIdentifier, bool bEnabled, bool bQueue, String functionName, int convention, Java.Lang.Object callBackObj)
+</I>
+Yet you declared the parameter as `uint`. Java doesn't support uint, so when you construct a JValue around it:
+
+&gt;<i>              new JValue(lIdentifier),
+</I>
+it will probably be invoking the JValue(long) constructor, not the JValue(int) constructor. The result, presumably, is that you're passing a long when an int is expected, and screwing up the stack.
+
+I would suggest that you instead do:
+
+	using (var _functionName = new Java.Lang.String(functionName))
+		return JNIEnv.CallStaticIntMethod(mAlkClass, methodId, new JValue[] {
+				new JValue((int) lIdentifier),	// cast uint to int, so we don't implicitly convert uint to long
+				new JValue(bEnabled),
+				new JValue(bQueue),
+				new JValue(_functionName),
+				new JValue(convention),
+				new JValue(callBackObj)
+		});
+
+The `using` is so that we don't retain a gref for the string longer than necessary.
+
+&gt;<i> In the Java sample the method is used in this way:
+</I>&gt;<i> Msg_UpdateOptions(AlkMsg.MSG_ID_TurnInstructions, true, false, &quot;OnTurnInstructionReceived&quot;, 0, this );
+</I>&gt;<i>  
+</I>&gt;<i> Where &#8218;this&#8216; is an activity and OnTurnInstructionReceived is a method of the actvity.
+</I>
+This will be problematic, as what your Java library will have access to is the generated Android Callable Wrapper, which will not have a declaration for OnTurnInstructionReceived(). The result is that the method lookup will fail, presumably resulting in an exception at runtime.
+
+The forthcoming (alpha!) 4.1 release will provide an [Export] custom attribute to support this scenario. In the meantime, you're probably looking at a painful world of declaring a Java-side interface and hand-writing a C# binding to that Java interface. For an example, see:
+
+	<A HREF="https://github.com/xamarin/monodroid-samples/blob/master/SanityTests/Adder.java">https://github.com/xamarin/monodroid-samples/blob/master/SanityTests/Adder.java</A>
+	<A HREF="https://github.com/xamarin/monodroid-samples/blob/master/SanityTests/ManagedAdder.cs">https://github.com/xamarin/monodroid-samples/blob/master/SanityTests/ManagedAdder.cs</A>
+
+For example, you'd need to add a TurnInstructionReceived.java file to your project, setting its build action to AndroidJavaSource:
+
+	package demo;
+
+	public interface TurnInstructionReceived {
+		void OnTurnInstructionReceived(int buffer, int len);
+	}
+
+Then add a &quot;fleshed out&quot; version of a C# binding for the above Java interface:
+
+	// see <A HREF="https://github.com/xamarin/monodroid-samples/blob/master/SanityTests/ManagedAdder.cs#L82">https://github.com/xamarin/monodroid-samples/blob/master/SanityTests/ManagedAdder.cs#L82</A>
+	[Register(&quot;demo/TurnInstructionReceived&quot;, DoNotGenerateAcw=true)]
+	interface ITurnInstructionReceived : Android.Runtime.IJavaObject {
+		// Note: TODO_AQN is the AssemblyQualifiedName of the assembly containing this type.
+		[Register (&quot;OnTurnInstructionReceived&quot;, &quot;(II)V&quot;, &quot;GetOnTurnInstructionReceivedHandler: ITurnInstructionReceivedInvoker, TODO_AQN&quot;)]
+		void OnTurnInstructionReceived(int buffer, int len);
+	}
+
+	class ITurnInstructionReceivedInvoker : Java.Lang.Object, ITurnInstructionReceived {
+		// ...lots of stuff omitted...
+		static Delegate cb_OnTurnInstructionReceived;
+		static Delegate GetOnTurnInstructionReceivedHandler ()
+		{
+			if (cb_OnTurnInstructionReceived == null)
+				cb_OnTurnInstructionReceived = JNINativeWrapper.CreateDelegate((Action&lt;IntPtr, IntPtr, int, int&gt;) n_OnTurnInstructionReceived);
+			return cb_OnTurnInstructionReceived;
+		}
+
+		static void n_OnTurnInstructionReceived(IntPtr jnienv, IntPtr lrefThis, int buffer, int len)
+		{
+			ITurnInstructionReceived __this = Java.Lang.Object.GetObject&lt;ITurnInstructionReceived &gt;(lrefThis, JniHandleOwnership.DoNotTransfer);
+			__this.OnTurnInstructionReceived(buffer, len);
+		}
+	}
+
+With the above two files, you could then modify your activity to implement ITurnInstructionReceived, allowing Msg_UpdateOptions() to invoke the OnTurnInstructionReceived() method.
+
+ - Jon
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009363.html">[mono-android] JniEnv problem
+</A></li>
+	<LI>Next message: <A HREF="009366.html">[mono-android] JniEnv problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9365">[ date ]</a>
+              <a href="thread.html#9365">[ thread ]</a>
+              <a href="subject.html#9365">[ subject ]</a>
+              <a href="author.html#9365">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/monodroid">More information about the Monodroid
+mailing list</a><br>
+</body></html>
