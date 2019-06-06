@@ -1,0 +1,163 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 472732] mod-mono spawns many process and fails to respond when using AutoRestartMode
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20472732%5D%20mod-mono%20spawns%20many%20process%20and%20fails%20to%0A%20respond%20when%20using%20AutoRestartMode&In-Reply-To=bug-472732-28286%40https.bugzilla.novell.com/">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="085852.html">
+   <LINK REL="Next"  HREF="085888.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 472732] mod-mono spawns many process and fails to respond when using AutoRestartMode</H1>
+    <B>bugzilla_noreply at novell.com</B> 
+    <A HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20472732%5D%20mod-mono%20spawns%20many%20process%20and%20fails%20to%0A%20respond%20when%20using%20AutoRestartMode&In-Reply-To=bug-472732-28286%40https.bugzilla.novell.com/"
+       TITLE="[Mono-bugs] [Bug 472732] mod-mono spawns many process and fails to respond when using AutoRestartMode">bugzilla_noreply at novell.com
+       </A><BR>
+    <I>Wed Feb 11 09:32:37 EST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="085852.html">[Mono-bugs] [Bug 472732] mod-mono spawns many process and fails to respond when using AutoRestartMode
+</A></li>
+        <LI>Next message: <A HREF="085888.html">[Mono-bugs] [Bug 472732] mod-mono spawns many process and fails to respond when using AutoRestartMode
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#85881">[ date ]</a>
+              <a href="thread.html#85881">[ thread ]</a>
+              <a href="subject.html#85881">[ subject ]</a>
+              <a href="author.html#85881">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE><A HREF="https://bugzilla.novell.com/show_bug.cgi?id=472732">https://bugzilla.novell.com/show_bug.cgi?id=472732</A>
+
+User <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mhabersack at novell.com</A> added comment
+<A HREF="https://bugzilla.novell.com/show_bug.cgi?id=472732#c14">https://bugzilla.novell.com/show_bug.cgi?id=472732#c14</A>
+
+
+Marek Habersack &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mhabersack at novell.com</A>&gt; changed:
+
+           What    |Removed                     |Added
+----------------------------------------------------------------------------
+           Priority|P1 - Urgent                 |P3 - Medium
+
+
+
+
+--- Comment #14 from Marek Habersack &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mhabersack at novell.com</A>&gt;  2009-02-11 07:32:36 MST ---
+Thanks for the test case, I will look at it next week. In the meantime, let me
+provide more in-depth analysis of what, in my opinion, is going on.
+
+You need to understand the way apache2+mod_mono+backend work regarding the
+requests and restarts. Apache MPM uses either a process (prefork) or a
+process+threads (worker) model. Each instance of the apache daemon, with either
+MPM, loads its own copy of mod_mono and is handed connections by the main
+apache process listening on the configured ports. When a request gets to
+mod_mono, it checks whether the appropriate backend(s) are running and, if not,
+starts them and then sends them the request. The request is sent synchronously
+and the backend answer is received in the same fashion - during that time this
+particular instance of httpd process (in the prefork MPM) or thread inside a
+process (the worker MPM) is not able to service any other requests. If mod_mono
+notices that a restart criterion (like time elapsed or requests server) is met,
+it restarts the backend (by killing it and starting at the next request) in the
+_synchronous_ way again - that is, it can happen only after the backend has
+finished processing the previous request and the httpd instance needs to wait
+for the shutdown request to finish. Depending on your application, either of
+those can take a long time and if the backend locks up or blocks for some
+reason, it can be a very long time. At the same time each of the spawned
+backends consumes an unknown (you can check that by looking at the
+/proc/BACKENDPID/fd directory) number of file descriptors - and the descriptors
+are consumed on behalf of the httpd worker/prefork instance which spawned the
+backend. Now, if you restart your backend every 100 requests, then each time it
+happens you might have an unknown number of backend waiting to finish, which
+means apache needs to spawn new processes/threads and those, in turn, need to
+spawn new backends - all of them under the same process which spawned the
+backends waiting to finish. Even if you have a limit of 32k file descriptors,
+this is a limit per entire group of processes led by a specific httpd instance,
+it's not a per-process limit for your backend. There's also the question of
+whether your _soft_ limit was raised along with the _hard_ limit (soft limits
+are those which the application itself can adjust within the boundaries set by
+the hard limits) - if not, then raising the hard limit serves no purpose.
+After this description it should be clear that the situation you're facing is
+not a bug in mod_mono (although mod_mono could handle this more robustly - and
+I'm working on it atm) but rather a configuration isue arising from a
+miscalculation of the resource limits - the error message you're seing (the one
+regarding process handles) demonstrates that.
+You mentioned that your application survived 4 days without problems after you
+increased the fd limit, that confirms my analysis above should be correct. I
+would suggest doing the following:
+
+- discovering what is the peak fd usage of your application
+- raising that times 100 (or to the limit of your operating system's maximum
+value minus, say, 1000 file descriptors for administrative usage) and making
+that the hard+soft limit of apache.
+- not restarting the application every 100 requests, but increasing that value
+to 1000 - it should really be enough even with big memory usage.
+- if the above restart limit is not possible, disable it altogether and restart
+apache from a cronjob at some time during the week's most peaceful period.
+- if you have long-running requests, increase the number of concurrent requests
+served by mod_mono (or disable the limit)
+
+You might want to graph the memory usage and requests served to get a picture
+of your application pattern is and tune the above settings accordingly.
+
+As for the compacting GC - it is not a panacea of all the memory problems. The
+current GC is well capable of freeing up memory given that it has enough time
+to do it. To give it the time needed, allocate more resources to apache and
+throw a bigger number of concurrent mono instances. Also, you might want to
+consider using a newer mono (even the 2.4 prerelease) - we've observed better
+memory usage in that version for ASP.NET application. Another possibility to
+improve GC performance is to enable the parallel marker code, for that you
+would have to recompile mono configuring it with the --with-parallel-mark flag
+passed to the configure script.
+
+hope that helps
+
+-- 
+Configure bugmail: <A HREF="https://bugzilla.novell.com/userprefs.cgi?tab=email">https://bugzilla.novell.com/userprefs.cgi?tab=email</A>
+------- You are receiving this mail because: -------
+You are the QA contact for the bug.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="085852.html">[Mono-bugs] [Bug 472732] mod-mono spawns many process and fails to respond when using AutoRestartMode
+</A></li>
+	<LI>Next message: <A HREF="085888.html">[Mono-bugs] [Bug 472732] mod-mono spawns many process and fails to respond when using AutoRestartMode
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#85881">[ date ]</a>
+              <a href="thread.html#85881">[ thread ]</a>
+              <a href="subject.html#85881">[ subject ]</a>
+              <a href="author.html#85881">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-bugs">More information about the mono-bugs
+mailing list</a><br>
+</body></html>

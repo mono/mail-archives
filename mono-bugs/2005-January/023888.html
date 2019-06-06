@@ -1,0 +1,280 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 71062][Wis] Changed - ABC removal not performed for substitution boxes
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:bugzilla-daemon%40bugzilla.ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="023887.html">
+   <LINK REL="Next"  HREF="023889.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 71062][Wis] Changed - ABC removal not performed for substitution boxes
+   </H1>
+    <B>bugzilla-daemon@bugzilla.ximian.com
+    </B> 
+    <A HREF="mailto:bugzilla-daemon%40bugzilla.ximian.com"
+       TITLE="[Mono-bugs] [Bug 71062][Wis] Changed - ABC removal not performed for substitution boxes">bugzilla-daemon@bugzilla.ximian.com
+       </A><BR>
+    <I>Fri,  7 Jan 2005 05:12:16 -0500 (EST)</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="023887.html">[Mono-bugs] [Bug 66564][Nor] Changed - DateTime Conversion error if MS SQL DB uses &quot;British English&quot;
+</A></li>
+        <LI> Next message: <A HREF="023889.html">[Mono-bugs] [Bug 71084][Wis] New - AppDomain unload locks up with MarshalByRefObject
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23888">[ date ]</a>
+              <a href="thread.html#23888">[ thread ]</a>
+              <a href="subject.html#23888">[ subject ]</a>
+              <a href="author.html#23888">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Please do not reply to this email- if you want to comment on the bug, go to the
+URL shown below and enter your comments there.
+
+Changed by <A HREF="mailto:massi@ximian.com.">massi@ximian.com.</A>
+
+<A HREF="http://bugzilla.ximian.com/show_bug.cgi?id=71062">http://bugzilla.ximian.com/show_bug.cgi?id=71062</A>
+
+--- shadow/71062	2005-01-06 16:34:20.000000000 -0500
++++ shadow/71062.tmp.4045	2005-01-07 05:12:16.000000000 -0500
+@@ -1,12 +1,12 @@
+ Bug#: 71062
+ Product: Mono: Runtime
+ Version: 1.1
+ OS: All
+ OS Details: 
+-Status: NEW   
++Status: ASSIGNED   
+ Resolution: 
+ Severity: Unknown
+ Priority: Wishlist
+ Component: JIT
+ AssignedTo: <A HREF="mailto:massi@ximian.com">massi@ximian.com</A>                            
+ ReportedBy: <A HREF="mailto:sebastien@ximian.com">sebastien@ximian.com</A>               
+@@ -258,6 +258,203 @@
+ ***** it seems strange (to me) that the range should be influenced by
+ the constant 136629984 *******
+ 
+ ------- Additional Comments From <A HREF="mailto:bmaurer@users.sf.net">bmaurer@users.sf.net</A>  2005-01-06 16:34 -------
+ I had a patch that removed all abc on x [(byte) blob] where x is a
+ readonly array. I will post it when I find it.
++
++------- Additional Comments From <A HREF="mailto:massi@ximian.com">massi@ximian.com</A>  2005-01-07 05:12 -------
++
++&gt; ***** it seems strange (to me) that the range should be influenced
++&gt; by the constant 136629984 *******
++
++Oh my...
++This was unexpected!
++
++The ABC removal code is not &quot;type checked&quot;, in the sense that it does
++not check the types of local variables (or arguments, they are just
++like locals for me).
++Simply, if a &quot;new xxx [yyy]&quot; is assigned to a local, it is assumed to
++be an array of size &quot;yyy&quot;, but internally this is handled like assigning
++&quot;yyy&quot; to the *array*, like if it were an integer.
++Then, other integer variables and constants can be seen in the code, and
++in the end some relation between them and &quot;yyy&quot; can be found or deduced,
++and this is one way in which bound checks can be removed.
++The other way is if there's some conditional branch where the array
++length is part of the condition: this also gives some &quot;clue&quot; on the array
++size in all BBs dominated by the condition, and these clues, if they
++match with the array indexes, can be used to remove checks.
++Also in this case the whole array is handled internally like an integer
++whose value is the array size.
++
++The logic is that in ABC removal we are not interested in the array
++contents, only in the array length, and we must build a graph of relations
++between those lengths and the indexes used to access the arrays.
++If the graph is connected, and the relations are the ones we need, the
++ABC is removed, but in the process it seemed just easier to me to handle
++array just by their sizes, as it is those sizes that we put in the graph.
++
++The problem here is twofold: correctness and effectiveness.
++
++I put correctness first (even if this bug was on effectiveness).
++Those constants that are assigned to the local array are placeholders for
++the pointer to the actual array (which in this case is a static variable).
++The problem is, this confuses the ABC removal code, which thinks that the
++variable is an integer and that constant is its value (remember, the code
++does not check types, it assumes assignments are correct, after all the
++CIL should have been be checked before!).
++Later on, the *same* variable is handled like an array (which it is), and
++an element is accessed using one index.
++The code finds in the graph that a constant value has been assigned to
++the array, and it believes that's the array length, and tries to relate
++the index to the constant :-(
++
++I'm pretty sure you see the potential for an exploit here ;-)
++Just to play with it, I inserted this code (with no real meaning):
++
++------------------------------------------------------------------
++		// anyway it gets me (a little) further
++		
++		int k = sbox [12]; // access sbox with constant index
++
++		byte val = (byte)a;
++		int result = sbox [val] + k; // so that k is not dead
++------------------------------------------------------------------
++
++The bound check for 'sbox [12]' is removed, and will be as long as
++the constant used as index is less than the placeholder for the
++pointer to the static variable.
++Being wicker, I could have done a loop with an index from 0 to the
++array length (which is huge), and write all the array contents, which
++is a large part of the program address space!
++Of course this bug must be fixed, and to do this I must handle all
++variables according to their actual types.
++This way the &quot;placeholder assignment&quot; will be refused (in the sense
++of ignored), and the behavior will be the expected one.
++
++Which is not to remove *any* check in your example :-(
++And this brings us back to the bug you actually submitted, which is on the
++effectiveness of ABC removal (all the above is on the correctness of the
++produced code).
++
++
++The problem is that ABC removal simply does not look at type definitions
++at all. In theory, it *could* see that sbox comes from a static variable
++which is readonly, and check the array size statically... well, the local
++variable sbox would not be needed then, It would simply be that the ABC
++removal would be able to handle readonly static variables.
++
++In the beginning I did not think this was important for two reasons:
++- Their handling is useful if (and only if) they are readonly.
++  Otherwise they could be assigned at any time, so they cannot be tracked
++  by SSA (they could even be assigned by a different thread!).
++- Since without proper synchronization they are not thread safe, I didn't
++  think they were really important (synchronizing on a global array would
++  cost more than bound checks anyway IMHO).
++  Of course this doesn't apply if also the array *contents* were read
++  only, which seems to be the case here :-)
++
++
++Going on, this would not be enough to remove the checks.
++It would give the ABC removal code knowledge of the array length, but what
++about the indexes?
++Your SubByte_Int32 does not work because bitwise operations are ignored,
++in the sense that their result is assumed to be unknown (only simple
++arithmetical operations are handled).
++But SubByte_Byte is not more lucky: since ABC removal doesn't look at type
++definitions it just doesn't know that the value of 'val' is limited :-(
++
++All the above can be handled.
++
++When I'll make ABC removal &quot;type safe&quot;, I'll have code that checks all the
++types of local variable definitions. At that point it should be fairly
++easy
++to &quot;inject&quot; in the relation graph &quot;clipping ranges&quot; ('val' in your
++code would
++be from 0 to 255).
++And I could handle bitwise operations on *unsigned* values (or,
++better, with
++unsigned results), assuming that 'x &amp; constant &lt;= constant' and the
++reverse
++for '|'. Doing this for signed values is too risky (if you touch the sign
++bit the relations are reversed, it is hard to predict *statically*
++what will
++be the result of those operations), but this would be enough for your
++needs.
++
++Now I'll try to list the things to do in order of importance:
++
++[1] Make ABC removal look at actual variable types for correctness.
++[2] Use [1] to insert &quot;clipping ranges&quot; in the evaluation graph.
++[3] Still using [1], detect unsigned values, and enable handling of
++    bitwise operations between variables and constants.
++[4] Probably still using [1], detect when an array comes from a static
++    field, and if the field is readonly use the array length (since this
++    method is using the field, it *must* have been initialized, so we can
++    simply take the length of the array object for which the constant is
++    a placeholder).
++
++By the way, point [4] seems not compatible with AOT (at least not if we
++use the array object as I said above).
++The problem is that static fields are initialized by code (.cctor), so in
++principle at AOT compile time one cannot know the array length, even if in
++a case like yours looking at the source code it is obvious that the length
++is fixed.
++The problem is that in principle the .cctor can do what it wants, even
++give
++the array a length which depends from the moonphase.
++Calling monodis on your test program reveals that only an examination of
++the .cctor can give the definitive answer, but I doubt we want ABC removal
++to go that far ;-)
++
++
++About difficulty:
++Coding [2] and [3] is really easy.
++Coding [1] should also be fairly easy.
++About [4] I'm not sure (and in any case too hard with AOT).
++
++I put [4] last in order of importance because there are chances for the
++checks to be removed also without that point.
++I see that your SubByte_Int32 and SubByte_Byte are used in loops, and I
++guess they would be good candidates for inlining.
++When copyprop will work properly with SSA, inlining will be effective,
++and then if you code it like this:
++
++if (sbox.Length == 256) {
++	for (...) ...
++} else {
++	// Throw something, this should not be reached anyway
++}
++
++then the ABC removal code in the 'for' will know the length of sbox.
++At that point, even just [3] or [2] would be enough to have the checks
++removed... I know it's a workaround, but it would be easy (*and* it would
++also work with AOT).
++
++In the end, I'm going to implement [1], [2] and [3] as soon as I have
++some time, but I'd like so see some comment on the real usefullness of
++doing [4].
++
++
++&gt; I had a patch that removed all abc on x [(byte) blob] where x is a
++&gt; readonly array. I will post it when I find it.
++
++Yes, but... is it *safe*? (in the sense of &quot;correct&quot;)
++
++I suppose 'blob' is an int here, and the rationale is &quot;hey, '(byte) blob'&quot;
++is gonna be small, and in any case we're gonna just read from 'x', so
++let's
++skip the check&quot;.
++
++But what if the size of 'x' were smaller than '(byte) blob'?
++I guess your patch will just read a random value instead of throwing the
++required exception but I might have got it wrong.
++
++If your patch checked the actual array length, it would be very nice (but
++at that point I would not see the need for the cast to 'byte', since you
++know the real length you can just compare to that).
++But again, maybe I misunderstood it, maybe your patch checks the real
++length, and if it is &lt;= 256 *and* the index is a '(byte)' removes the
++check.
++This would be really useful, and a base on which [4] could be implemented
++very easily (again, AOT excluded).
++
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="023887.html">[Mono-bugs] [Bug 66564][Nor] Changed - DateTime Conversion error if MS SQL DB uses &quot;British English&quot;
+</A></li>
+	<LI> Next message: <A HREF="023889.html">[Mono-bugs] [Bug 71084][Wis] New - AppDomain unload locks up with MarshalByRefObject
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23888">[ date ]</a>
+              <a href="thread.html#23888">[ thread ]</a>
+              <a href="subject.html#23888">[ subject ]</a>
+              <a href="author.html#23888">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

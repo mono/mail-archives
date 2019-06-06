@@ -1,0 +1,272 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 449300] New: [PATCH] Exceptions in	Novell.Directory.Ldap
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20449300%5D%20New%3A%20%5BPATCH%5D%20Exceptions%20in%0A%09Novell.Directory.Ldap&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="082731.html">
+   <LINK REL="Next"  HREF="082733.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 449300] New: [PATCH] Exceptions in	Novell.Directory.Ldap</H1>
+    <B>bugzilla_noreply at novell.com</B> 
+    <A HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20449300%5D%20New%3A%20%5BPATCH%5D%20Exceptions%20in%0A%09Novell.Directory.Ldap&In-Reply-To="
+       TITLE="[Mono-bugs] [Bug 449300] New: [PATCH] Exceptions in	Novell.Directory.Ldap">bugzilla_noreply at novell.com
+       </A><BR>
+    <I>Wed Nov 26 10:00:52 EST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="082731.html">[Mono-bugs] [Bug 433952] Error VBNC99999: No non-narrowing (except object) for Thread. Sleep(double)
+</A></li>
+        <LI>Next message: <A HREF="082733.html">[Mono-bugs] [Bug 449312] New: Mono DataGridView no work as expected! Return NULL DataBoundItem. In Mono
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#82732">[ date ]</a>
+              <a href="thread.html#82732">[ thread ]</a>
+              <a href="subject.html#82732">[ subject ]</a>
+              <a href="author.html#82732">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE><A HREF="https://bugzilla.novell.com/show_bug.cgi?id=449300">https://bugzilla.novell.com/show_bug.cgi?id=449300</A>
+
+
+           Summary: [PATCH] Exceptions in Novell.Directory.Ldap
+           Product: Mono: Class Libraries
+           Version: SVN
+          Platform: i386
+        OS/Version: Linux
+            Status: NEW
+          Keywords: patch
+          Severity: Normal
+          Priority: P5 - None
+         Component: System
+        AssignedTo: <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mono-bugs at lists.ximian.com</A>
+        ReportedBy: <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">jlarimer at gmail.com</A>
+         QAContact: <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mono-bugs at lists.ximian.com</A>
+          Found By: ---
+
+
+Created an attachment (id=255825)
+ --&gt; (<A HREF="https://bugzilla.novell.com/attachment.cgi?id=255825">https://bugzilla.novell.com/attachment.cgi?id=255825</A>)
+proposed patch
+
+Description of Problem:
+-----------------------
+
+The Novell.DirectoryServices.Ldap.Connection class has multiple race conditions
+that can cause unhandled exceptions.
+
+There are three big issues I ran into:
+
+1.
+
+  // Just before closing the sockets, abort the reader thread
+  if ((reader != null) &amp;&amp; (reason != &quot;reader: thread stopping&quot;))
+    reader.Abort();
+
+  It's possible for reader to be null by the time reader.Abort() is
+called,leading to a NullReferenceException.
+
+2. The other issue is that when Abort() is called on the reader thread, there's
+no guarantee the thread will be aborted immediately, so it's possible for
+shutdown() to close the socket while the reader thread is still trying to read,
+which causes an ObjectDisposedException.
+
+If the code is compiled to run under a JVM (TARGET_JVM), the Abort() doesn't
+happen and the reader thread catches the ObjectDisposedException. For now, I
+think the non-JVM library should work the same way.
+
+3. If there's a SocketException during connect(), freeWriteSemaphore() can get
+called twice and will exception the 2nd time. This is because
+freeWriteSemaphore() is called in the catch{} blocks and also in the finally{}
+block.
+
+Really, all of Connection.cs should be rewritten to use asynchronous I/O
+instead of relying on a reader thread and the semaphore implementation, but the
+attached patch fixes most of the issues that I ran into with this class.
+
+
+Steps to reproduce the problem:
+-------------------------------
+
+Here's some test code. I ran it against a working Active Directory server,
+fiddling with the various values (THREAD_COUNT, THREAD_WAIT) to get different
+results. Some of the exceptions I've seen are below in Actual Results.
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.DirectoryServices;
+using System.Threading;
+
+namespace LdapTest {
+    class Program {
+
+        static readonly int THREAD_SLEEP = 1000;
+        static readonly int THREAD_COUNT = 50;
+
+        static readonly string SERVER = &quot;<A HREF="LDAP://192.168.234.39&quot;;">LDAP://192.168.234.39&quot;;</A>
+        static readonly string USERNAME = &quot;Administrator&quot;;
+        static readonly string PASSWORD = &quot;password123&quot;;
+
+        static void Main(string[] args) {
+            for(int i=0; i&lt;THREAD_COUNT; i++) {
+                ThreadStart ts = new ThreadStart(TheThread);
+                Thread t = new Thread(ts);
+                t.Start();
+            }
+        }
+
+        static void TheThread() {
+            while(true) {
+                string path = SERVER;
+
+                DirectoryEntry de = null;
+                DirectorySearcher ds = null;
+                try {
+                    de = new DirectoryEntry(path, USERNAME, PASSWORD,
+AuthenticationTypes.Secure);
+                    ds = new DirectorySearcher(de);
+                    ds.SearchScope = SearchScope.Base;
+                    ds.PropertiesToLoad.Add(&quot;defaultNamingContext&quot;);
+                    using (SearchResultCollection src = ds.FindAll()) {
+                        foreach (SearchResult sr in src) {
+                            ResultPropertyValueCollection rpvc =
+sr.Properties[&quot;defaultNamingContext&quot;];
+                            if (rpvc != null) rpvc[0].ToString();
+                        }
+                    }
+                } finally {
+                    if (ds != null)
+                        ds.Dispose();
+                    if (de != null) {
+                        de.Close();
+                        de.Dispose();
+                    }
+                }
+
+                Thread.Sleep(THREAD_SLEEP);
+            }
+        }
+    }
+}
+
+
+Actual Results:
+---------------
+
+Unhandled Exception: System.NullReferenceException: Object reference not set to
+an instance of an object
+  at Novell.Directory.Ldap.Connection.shutdown (System.String reason, Int32
+semaphoreId, Novell.Directory.Ldap.InterThreadException notifyUser) [0x0011d]
+in /home/jlarimer/mono-dev/m
+cs/class/Novell.Directory.Ldap/Novell.Directory.Ldap/Connection.cs:1148
+  at Novell.Directory.Ldap.Connection.destroyClone (Boolean apiCall) [0x0006d]
+in
+/home/jlarimer/mono-dev/mcs/class/Novell.Directory.Ldap/Novell.Directory.Ldap/Connection.cs:918
+  at Novell.Directory.Ldap.LdapConnection.Disconnect
+(Novell.Directory.Ldap.LdapConstraints cons, Boolean how) [0x00000] in
+/home/jlarimer/mono-dev/mcs/class/Novell.Directory.Ldap/No
+vell.Directory.Ldap/LdapConnection.cs:2116
+  at Novell.Directory.Ldap.LdapConnection.Disconnect () [0x00000] in
+/home/jlarimer/mono-dev/mcs/class/Novell.Directory.Ldap/Novell.Directory.Ldap/AssemblyInfo.cs:1
+  at System.DirectoryServices.DirectorySearcher.Dispose (Boolean disposing)
+[0x00021] in
+/home/jlarimer/mono-dev/mcs/class/System.DirectoryServices/System.DirectoryServices/Directory
+Searcher.cs:712
+  at System.ComponentModel.Component.Dispose () [0x00000] in
+/home/jlarimer/mono-dev/mcs/class/System/System.ComponentModel/Component.cs:115
+  at (wrapper remoting-invoke-with-check)
+System.ComponentModel.Component:Dispose ()
+  at ldaptest.Program.TheThread () [0x00000]
+
+Unhandled Exception: System.SystemException: Connection.freeWriteSemaphore(-2):
+semaphore not owned by any thread
+  at Novell.Directory.Ldap.Connection.freeWriteSemaphore (Int32 msgId)
+[0x00000]
+  at Novell.Directory.Ldap.Connection.connect (System.String host, Int32 port,
+Int32 semaphoreId) [0x00000]
+  at Novell.Directory.Ldap.Connection.connect (System.String host, Int32 port)
+[0x00000]
+  at Novell.Directory.Ldap.LdapConnection.Connect (System.String host, Int32
+port) [0x00000]
+  at System.DirectoryServices.DirectorySearcher.InitBlock () [0x00000]
+  at System.DirectoryServices.DirectorySearcher.DoSearch () [0x00000]
+  at System.DirectoryServices.DirectorySearcher.get_SrchColl () [0x00000]
+  at System.DirectoryServices.DirectorySearcher.FindAll () [0x00000]
+  at (wrapper remoting-invoke-with-check)
+System.DirectoryServices.DirectorySearcher:FindAll ()
+  at ldaptest.Program.TheThread () [0x00000]
+
+Unhandled Exception: System.ObjectDisposedException: The object was used after
+being
+disposed.
+  at System.Net.Sockets.NetworkStream.CheckDisposed () [0x00000]
+  at System.Net.Sockets.NetworkStream.Read (System.Byte[] buffer, Int32 offset,
+Int32
+size) [0x00000]
+  at System.IO.Stream.ReadByte () [0x00000]
+  at Novell.Directory.Ldap.Asn1.Asn1Identifier..ctor (System.IO.Stream
+in_Renamed)
+[0x00000]
+  at Novell.Directory.Ldap.Connection+ReaderThread.Run () [0x00000]
+Expected Results:
+
+None of the above exceptions should happen.
+
+How often does this happen? 
+
+The issues are mostly race conditions, so they happen randomly depending on the
+hardware, platform, etc.
+
+Additional Information:
+-----------------------
+
+See attached patch.
+
+
+-- 
+Configure bugmail: <A HREF="https://bugzilla.novell.com/userprefs.cgi?tab=email">https://bugzilla.novell.com/userprefs.cgi?tab=email</A>
+------- You are receiving this mail because: -------
+You are the QA contact for the bug.
+You are the assignee for the bug.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="082731.html">[Mono-bugs] [Bug 433952] Error VBNC99999: No non-narrowing (except object) for Thread. Sleep(double)
+</A></li>
+	<LI>Next message: <A HREF="082733.html">[Mono-bugs] [Bug 449312] New: Mono DataGridView no work as expected! Return NULL DataBoundItem. In Mono
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#82732">[ date ]</a>
+              <a href="thread.html#82732">[ thread ]</a>
+              <a href="subject.html#82732">[ subject ]</a>
+              <a href="author.html#82732">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-bugs">More information about the mono-bugs
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,340 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 319930] Interface re-implementations lost in	inheritance
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20319930%5D%20Interface%20re-implementations%20lost%20in%0A%09inheritance&In-Reply-To=bug-319930-28286%40https.bugzilla.novell.com/">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="067627.html">
+   <LINK REL="Next"  HREF="067591.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 319930] Interface re-implementations lost in	inheritance</H1>
+    <B>bugzilla_noreply at novell.com</B> 
+    <A HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20319930%5D%20Interface%20re-implementations%20lost%20in%0A%09inheritance&In-Reply-To=bug-319930-28286%40https.bugzilla.novell.com/"
+       TITLE="[Mono-bugs] [Bug 319930] Interface re-implementations lost in	inheritance">bugzilla_noreply at novell.com
+       </A><BR>
+    <I>Wed Jan  9 06:38:43 EST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="067627.html">[Mono-bugs] [Bug 352586] [PATCH] Certain sequences of ModuleDefinition. Import can cause NRE
+</A></li>
+        <LI>Next message: <A HREF="067591.html">[Mono-bugs] [Bug 319930] Interface re-implementations lost in	inheritance
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#67508">[ date ]</a>
+              <a href="thread.html#67508">[ thread ]</a>
+              <a href="subject.html#67508">[ subject ]</a>
+              <a href="author.html#67508">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE><A HREF="https://bugzilla.novell.com/show_bug.cgi?id=319930">https://bugzilla.novell.com/show_bug.cgi?id=319930</A>
+
+User <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">massi at ximian.com</A> added comment
+<A HREF="https://bugzilla.novell.com/show_bug.cgi?id=319930#c1">https://bugzilla.novell.com/show_bug.cgi?id=319930#c1</A>
+
+
+
+
+
+--- Comment #1 from Massimiliano Mantione &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">massi at ximian.com</A>&gt;  2008-01-09 04:38:42 MST ---
+The test &quot;bug-77127.exe&quot; is failing again since r92011.
+
+Strictly speaking, the bug is not the same, it is a new one triggred by the C#
+compiler change and luckily discovered by the same test.
+But since it is related to &quot;vtable inheritance&quot;, it can be handled here...
+
+Tracking the problem down, we see that the compiler change uses different names
+for property methods in the interface and in the class that implements it.
+The correct override is then specified in the &quot;.override&quot; section.
+
+In the test, Mono handles it correctly in the B class.
+However, when building the C vtable, the &quot;.override&quot; data is not visible
+anymore, and since the IA interface ends up in a different interface offset,
+its vtable section must be rebuilt. This rebuild does not reuse the correct
+method from the B vtable, so the wrong one is taken.
+
+IMHO, the obvious fix is to &quot;inherit&quot; all the interface vtable sections
+(copying them from the parent vtable to the new interface offset in the current
+vtable) before attempting to rebuild them: the rebuild should just add
+overrides.
+This would be the only way to get the correct method, because the &quot;.override&quot;
+data for class B is simply not visible anymore in the code when we build the
+vtable for class C.
+
+In doing so, I begun fighting a bit with the current code.
+My main issue is that the vtable building loop iterations are &quot;guarded&quot; by &quot;if
+(vtable [io + l]) continue;&quot; statements, and it definitely does not play well
+with the case when the method slots are pre-initialized.
+
+The current code has a very convoluted algorithm, like this:
+
+[1] Find the max vtable size, and init interface offsets.
+[2] Copy over (inherit) the parent vtable.
+[3] Foreach method in the &quot;.override&quot; section, if it is an
+    interface method put it in the right slot *and* in
+    the override hash table (only for the current class).
+[4] Foreach class &quot;k&quot;, starting from the current towards its
+    superclasses:
+    [4.1] Foreach interface &quot;ic&quot; implemented by &quot;k&quot; (even if
+          implemented indirectly, but *not* through class
+          inheritance, only through interface inheritance):
+          [4.1.1] If &quot;k&quot; is still the starting class:
+                  - Foreach method &quot;im&quot; in &quot;ic&quot;:
+                    - Foreach method &quot;cm&quot; in &quot;k&quot;:
+                      If the method names and signatures match,
+                      initialize the right slot.
+                  Else, if &quot;ic&quot; is outside of the &quot;k&quot; vtable,
+                  continue loop [4.1].
+          [4.1.2] Foreach method &quot;im&quot; in &quot;ic&quot;:
+                  [4.1.2.1] If its slot is full, continue [4.1.2].
+                  [4.1.2.2] Foreach class &quot;k1&quot; from &quot;k&quot; through
+                            all its superclasses:
+                            - Foreach method &quot;cm&quot; in &quot;k1&quot;:
+                              If the fully qualified names and
+                              signatures of &quot;im&quot; and &quot;cm&quot; match,
+                              initialize the slot.
+          [4.1.3] Foreach method &quot;im&quot; in &quot;ic&quot;:
+                  [4.1.3.1] If its slot is full, continue [4.1.3].
+                  [4.1.3.2] Foreach class &quot;k1&quot; like in [4.1.2.2]:
+                            - Foreach method &quot;cm&quot; in &quot;k1&quot;:
+                              If the names-signatures  of &quot;im&quot; and
+                              &quot;cm&quot; match, initialize the slot.
+          [4.1.4] If class is not abstract,
+                  foreach method &quot;im&quot; in &quot;ic&quot;:
+                  [4.1.4.1] If its slot is empty,
+                            foreach class &quot;parent&quot; from &quot;class&quot;
+                            through all its superclasses:
+                            [4.1.4.1.1] If its corresponding slot
+                                        is full, copy it here.
+                            [4.1.4.1.2] IMHO, reading the code, a
+                                        break statement (from loop
+                                        [4.1.4.1]) is missing!
+                            After loop [4.1.4.1], if the slot is
+                            still empty, raise the loading error.
+          [4.1.5] Foreach method &quot;im&quot; in &quot;ic&quot;:
+                  If it's slot is -1, fix it (nobody knows why
+                  this is needed, or even why it can happen).
+[5] Foreach method &quot;cm&quot; in the current class:
+    - If it in not &quot;newslot&quot;, find its slot to override.
+    - Else, give it a new slot.
+[6] A loop like [3], but for non-interface methods.
+[7] Apply the override hash table to the vtable.
+[8] Put the vtable in place (or, if it's identical, use the parent).
+
+The bad part, IMO, is section [4].
+Perhaps it has been written in such a convoluted way because we did not have an
+array like &quot;MonoClass.interfaces_packed&quot;, which collects all the implemented
+intefaces.
+The checks at [4.1.2.1] and [4.1.3.1] are the ones that cause me problems, but
+I think that the whole logic should be rewritten like this:
+
+[2] In section [2], besides copying the parent vtable, foreach
+    interface &quot;ic&quot; implemented by &quot;parent&quot;, if it has an interface
+    offset larger than &quot;parent-&gt;vtable_size&quot;, copy its vtable
+    section at the correct interface offset inside the current
+    vtable (this &quot;inherits&quot; the vtable section).
+[3] ...
+[4] Foreach interface &quot;ic&quot; implemented by the current class:
+    [4.1] Foreach method &quot;im&quot; in &quot;ic&quot;:
+          [4.1.1] Foreach method &quot;cm&quot; in the current class:
+                  - If &quot;cm&quot; is a suitable override for &quot;im&quot;
+                    (by signature, fully qualified name, name
+                    or &quot;.override&quot; section), use it (potentially
+                    overwriting the slot written at [2]).
+          [4.1.2] If the class is not abstract, check that the
+                  &quot;im&quot; slot is full (it must, because of [2]),
+                  otherwise  raise the loading error.
+
+The simplicity comes mostly from the fact that in [2] and [4] we would loop on
+&quot;MonoClass.interfaces_packed&quot;, which the previous code could not do.
+And this rewrite, beside making the code much more maintainable, would fix the
+bug.
+
+However, this is a tricky and risky change, even if we've got plenty of
+regression tests to check it...
+
+Comments?
+Am I missing something?
+
+
+-- 
+Configure bugmail: <A HREF="https://bugzilla.novell.com/userprefs.cgi?tab=email">https://bugzilla.novell.com/userprefs.cgi?tab=email</A>
+------- You are receiving this mail because: -------
+You are the QA contact for the bug.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="067627.html">[Mono-bugs] [Bug 352586] [PATCH] Certain sequences of ModuleDefinition. Import can cause NRE
+</A></li>
+	<LI>Next message: <A HREF="067591.html">[Mono-bugs] [Bug 319930] Interface re-implementations lost in	inheritance
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#67508">[ date ]</a>
+              <a href="thread.html#67508">[ thread ]</a>
+              <a href="subject.html#67508">[ subject ]</a>
+              <a href="author.html#67508">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-bugs">More information about the mono-bugs
+mailing list</a><br>
+</body></html>

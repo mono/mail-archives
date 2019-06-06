@@ -1,0 +1,205 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 648193] xsp2 stops responding if application files are touched more than once (while busy)
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20648193%5D%20xsp2%20stops%20responding%20if%20application%20files%0A%20are%20touched%20more%20than%20once%20%28while%20busy%29&In-Reply-To=bug-648193-28286%40http.bugzilla.novell.com/">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="105209.html">
+   <LINK REL="Next"  HREF="105268.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 648193] xsp2 stops responding if application files are touched more than once (while busy)</H1>
+    <B>bugzilla_noreply at novell.com</B> 
+    <A HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20648193%5D%20xsp2%20stops%20responding%20if%20application%20files%0A%20are%20touched%20more%20than%20once%20%28while%20busy%29&In-Reply-To=bug-648193-28286%40http.bugzilla.novell.com/"
+       TITLE="[Mono-bugs] [Bug 648193] xsp2 stops responding if application files are touched more than once (while busy)">bugzilla_noreply at novell.com
+       </A><BR>
+    <I>Thu Oct 21 07:02:45 EDT 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="105209.html">[Mono-bugs] [Bug 648193] xsp2 stops responding if application files are touched more than once (while busy)
+</A></li>
+        <LI>Next message: <A HREF="105268.html">[Mono-bugs] [Bug 648193] xsp2 stops responding if application files are touched more than once (while busy)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#105224">[ date ]</a>
+              <a href="thread.html#105224">[ thread ]</a>
+              <a href="subject.html#105224">[ subject ]</a>
+              <a href="author.html#105224">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+<A HREF="https://bugzilla.novell.com/show_bug.cgi?id=648193">https://bugzilla.novell.com/show_bug.cgi?id=648193</A>
+
+<A HREF="https://bugzilla.novell.com/show_bug.cgi?id=648193#c3">https://bugzilla.novell.com/show_bug.cgi?id=648193#c3</A>
+
+
+Marek Habersack &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mhabersack at novell.com</A>&gt; changed:
+
+           What    |Removed                     |Added
+----------------------------------------------------------------------------
+           Severity|Major                       |Normal
+
+--- Comment #3 from Marek Habersack &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mhabersack at novell.com</A>&gt; 2010-10-21 13:02:44 CEST ---
+Hey Tom,
+
+  So,there are a few things going on here, and some more workarounds for the
+situation. First a word of explanation:
+
+  XSP/mod-mono-server* work in an optimized mode when only one application is
+configured - the optimization consists in creating just one AppDomain to be
+shared by both the server instance (the main xsp/mod-mono-server workhorse) and
+the application. This has the advantage that requests are served faster (no
+need to remote between two AppDomains) but it also has a disadvantage that when
+something bad/unexpected happens in the application, it may take the server
+down with it. It also takes the server down if the AppDomain is shutdown
+because of some regular event like bin/* or /Web.config modification. In both
+cases XSP/mod-mono-server attempt to restart the AppDomain and rebind to the
+listening socket but, from time to time, it may fail. The failure is due to
+some race in AppDomain shutdown or socket teardown/shutdown sequence and
+manifests itself in the socket not being closed properly at times. We are aware
+of the issue and are investigating it. Sometimes it may happen that the socket
+not destroyed correctly is the one XSP/mod-mono-server are listening on and it
+is not possible to rebind to that socket, thus effectively rendering the server
+inoperable. It is also the cause of the hung connections from client to server
+- only in that case it's only that particular client session which times out
+(after 10 minutes on Linux by default) and it does not affect other clients. 
+   The race in socket shutdown sequence may also lead to sockets being closed
+but with some data still in the output buffer (in the native socket, managed by
+the OS, not in Mono) which will keep the socket in CLOSE_WAIT state until it
+times out or is destroyed in some other manner.
+   The ThreadAbortException is also a manifestation of a (yet) unknown race -
+we are also aware of it and looking for solution. System.Web itself uses
+Thread.Abort (which throws the exception) only if user's code calls
+HttpRequest.{Redirect,End} methods or if a request timeout happens, so it's a
+pretty controlled use and it's not the issue here.
+
+   With the above in mind, backup software which touches files all around the
+ASP.NET app is not really a good idea. If an .as?x file is touched, ASP.NET
+runtime will trigger a recompile of that file only, but if anything inside
+bin/* or /Web.config is touched (probably in sequence) then it is possible a
+few AppDomain shutdowns and full recompilation of the entire app will happen -
+it is an unnecessary waste of time and resources.
+
+   You can use the following workarounds until we find the races and fix the
+issues I described above:
+
+ - if you can't change the backup software or modify it so that it doesn't
+touch the files, you can disable file watching by exporting the
+MONO_MANAGED_WATCHER=disabled variable in the application's environment
+ - to remedy the server shutdown issue and the resulting inresponsiveness,
+configure _two_ applications for that server (the other one can be a dummy one
+or can point to the same application, just with a different virtual directory),
+e.g.:
+
+   - XSP: pass --applications &quot;/myrealapp:/path/to/app,/dummy:/path/to/app&quot;
+   - mod_mono: add MonoApplications server_alias_here
+&quot;/myrealapp:/path/to/app,/dummy:/path/to/app&quot;
+
+  The above will have the server work in the multiple AppDomains mode and only
+the application AppDomain will be affected by shutdown/TAEX/etc
+
+-- 
+Configure bugmail: <A HREF="https://bugzilla.novell.com/userprefs.cgi?tab=email">https://bugzilla.novell.com/userprefs.cgi?tab=email</A>
+------- You are receiving this mail because: -------
+You are the QA contact for the bug.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="105209.html">[Mono-bugs] [Bug 648193] xsp2 stops responding if application files are touched more than once (while busy)
+</A></li>
+	<LI>Next message: <A HREF="105268.html">[Mono-bugs] [Bug 648193] xsp2 stops responding if application files are touched more than once (while busy)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#105224">[ date ]</a>
+              <a href="thread.html#105224">[ thread ]</a>
+              <a href="subject.html#105224">[ subject ]</a>
+              <a href="author.html#105224">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-bugs">More information about the mono-bugs
+mailing list</a><br>
+</body></html>

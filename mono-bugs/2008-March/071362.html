@@ -1,0 +1,153 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 375580] New: Buffer overrun plus infinite loop on partial write to serial port - patch included
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20375580%5D%20New%3A%20Buffer%20overrun%20plus%20infinite%20loop%20on%0A%20partial%20write%20to%20serial%20port%20-%20patch%20included&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="071357.html">
+   <LINK REL="Next"  HREF="071363.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 375580] New: Buffer overrun plus infinite loop on partial write to serial port - patch included</H1>
+    <B>bugzilla_noreply at novell.com</B> 
+    <A HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20375580%5D%20New%3A%20Buffer%20overrun%20plus%20infinite%20loop%20on%0A%20partial%20write%20to%20serial%20port%20-%20patch%20included&In-Reply-To="
+       TITLE="[Mono-bugs] [Bug 375580] New: Buffer overrun plus infinite loop on partial write to serial port - patch included">bugzilla_noreply at novell.com
+       </A><BR>
+    <I>Mon Mar 31 15:46:40 EDT 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="071357.html">[Mono-bugs] [Bug 357947] [Performance] Performance problem with	System.Data
+</A></li>
+        <LI>Next message: <A HREF="071363.html">[Mono-bugs] [Bug 375580] Buffer overrun plus infinite loop on partial write to serial port - patch included
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#71362">[ date ]</a>
+              <a href="thread.html#71362">[ thread ]</a>
+              <a href="subject.html#71362">[ subject ]</a>
+              <a href="author.html#71362">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE><A HREF="https://bugzilla.novell.com/show_bug.cgi?id=375580">https://bugzilla.novell.com/show_bug.cgi?id=375580</A>
+
+
+           Summary: Buffer overrun plus infinite loop on partial write to
+                    serial port - patch included
+           Product: Mono: Class Libraries
+           Version: 1.2.6
+          Platform: i386
+        OS/Version: Linux
+            Status: NEW
+          Severity: Normal
+          Priority: P5 - None
+         Component: Mono.POSIX
+        AssignedTo: <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">miguel at novell.com</A>
+        ReportedBy: <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">avillaci at ceibo.fiec.espol.edu.ec</A>
+         QAContact: <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mono-bugs at lists.ximian.com</A>
+          Found By: Customer
+
+
+Created an attachment (id=205123)
+ --&gt; (<A HREF="https://bugzilla.novell.com/attachment.cgi?id=205123">https://bugzilla.novell.com/attachment.cgi?id=205123</A>)
+Fix buffer overrun and endless loop on partial write
+
+This patch fixes two bugs in the write_serial() function in the Mono POSIX
+helper library. 
+
+&gt;<i>From what I understand of the Mono sources, managed code in SerialPortStream
+</I>checks constraints on the data to be sent to the serial port, and then calls
+the following function in the POSIX helper:
+
+int write_serial (int fd, guchar *buffer, int offset, int count, int timeout)
+
+The 'offset' parameter is supposed to contain the byte offset from which the
+data to be written starts (relative to 'buffer'), and 'count' is supposed to
+be the number of bytes to write. 
+
+The first bug is at line 98 of support/serial.c:
+
+&gt;<i> 	n = count - offset;
+</I>
+This subtraction is, IMHO, pointless in this function. Later in the function, 
+'n' is treated like a count of remaining bytes to send, but this subtraction
+treats 'count' as the length of the entire buffer, which is inconsistent with 
+later treatement of the buffer. The subtraction is a noop when offset is 0, but
+breaks when offset &gt; count (for example, sending 20 bytes from offset 40 of a 
+100-byte buffer), which is allowed by the checks in managed code. Since 'n'
+is of type guint32, the subtraction results in a very large unsigned integer,
+which immediately causes a buffer overflow when writing to the serial port.
+
+The second bug is at lie 116 of support/serial.c:
+
+&gt;<i> 		t = write(fd, buffer + offset, count);
+</I>
+In case where write() informs of a partial read (when t &gt; 0 &amp;&amp; t &lt; count), this
+code is incorrect, because 'count' is invariant inside the write() loop. As 
+evidenced at line 127, 'n' is decremented by the amount reported by write(), so
+'n' is intended to hold the amount of remaining bytes to write. In case of a 
+short write, the write is retried with 'count' bytes as before, but with a 
+modified 'offset'. Depending of the values of 'offset' and 'count', this will
+eventually write data past the end of 'buffer' to the serial port. In
+particular, with 'offset' = 0 and 'count' equal to the full length of 'buffer',
+the second write after the first short write WILL read past the end of
+'buffer'. Meanwhile, 'n' keeps being decremented. Since the second read uses
+'count' &gt; 'n', a full write (or a very big short write) will probably cause 't'
+to be greater than 'n'. 
+Unless the writes happen to reduce 'n' exactly to 0, the subtraction eventually 
+wraps around (since guint32 is unsigned) into a very large positive integer, 
+which results in an endless loop of writes of data past the end of buffer, and 
+an eventual program crash.
+
+This patch fixes both issues by removing the subtraction of 'offset' and
+instead
+assigning 'n' to the value of 'count' directly, and by using 'n' instead of 
+'count' as the count of remaining bytes to write, as intended.
+
+This patch applies against mono 1.2.6 .
+
+
+-- 
+Configure bugmail: <A HREF="https://bugzilla.novell.com/userprefs.cgi?tab=email">https://bugzilla.novell.com/userprefs.cgi?tab=email</A>
+------- You are receiving this mail because: -------
+You are the QA contact for the bug.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="071357.html">[Mono-bugs] [Bug 357947] [Performance] Performance problem with	System.Data
+</A></li>
+	<LI>Next message: <A HREF="071363.html">[Mono-bugs] [Bug 375580] Buffer overrun plus infinite loop on partial write to serial port - patch included
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#71362">[ date ]</a>
+              <a href="thread.html#71362">[ thread ]</a>
+              <a href="subject.html#71362">[ subject ]</a>
+              <a href="author.html#71362">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-bugs">More information about the mono-bugs
+mailing list</a><br>
+</body></html>

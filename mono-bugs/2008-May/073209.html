@@ -1,0 +1,228 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 386528] New: Character input with the Carbon backend has endian ( and other) problems
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20386528%5D%20New%3A%20Character%20input%20with%20the%20Carbon%0A%20backend%20has%20endian%20%28%20and%20other%29%20problems&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="073208.html">
+   <LINK REL="Next"  HREF="073267.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 386528] New: Character input with the Carbon backend has endian ( and other) problems</H1>
+    <B>bugzilla_noreply at novell.com</B> 
+    <A HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20386528%5D%20New%3A%20Character%20input%20with%20the%20Carbon%0A%20backend%20has%20endian%20%28%20and%20other%29%20problems&In-Reply-To="
+       TITLE="[Mono-bugs] [Bug 386528] New: Character input with the Carbon backend has endian ( and other) problems">bugzilla_noreply at novell.com
+       </A><BR>
+    <I>Sun May  4 16:43:20 EDT 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="073208.html">[Mono-bugs] [Bug 361906] MyLiveEdu.com fails with javascript error
+</A></li>
+        <LI>Next message: <A HREF="073267.html">[Mono-bugs] [Bug 386528] Character input with the Carbon backend has endian (and other) problems
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#73209">[ date ]</a>
+              <a href="thread.html#73209">[ thread ]</a>
+              <a href="subject.html#73209">[ subject ]</a>
+              <a href="author.html#73209">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE><A HREF="https://bugzilla.novell.com/show_bug.cgi?id=386528">https://bugzilla.novell.com/show_bug.cgi?id=386528</A>
+
+
+           Summary: Character input with the Carbon backend has endian (and
+                    other) problems
+           Product: Mono: Class Libraries
+           Version: 1.9.0
+          Platform: Macintosh
+        OS/Version: Mac OS X 10.4
+            Status: NEW
+          Severity: Major
+          Priority: P5 - None
+         Component: Windows.Forms
+        AssignedTo: <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mono-bugs at lists.ximian.com</A>
+        ReportedBy: <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">jesjones at mindspring.com</A>
+         QAContact: <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">mono-bugs at lists.ximian.com</A>
+          Found By: ---
+
+
+KeyboardHandler::ProcessText has the following problems:
+
+1) kEventParamTextInputSendText returns a Unicode string using the native
+endian. This means bdata[0] may return either the low or high byte of the
+code-point depending on if you are running on an Intel or a PowerPC mac.
+
+2) The key_filter_table is only checked using a single byte from the
+code-point. It should instead check to see if the high byte is zero and then
+use the low byte.
+
+3) wParam is only assigned a byte from the code point instead of the entire
+code point.
+
+Here's a fix for these issues (tested on a PowerPC mac). Note that with these
+fixes stuff like option-p can be used to enter the pi character even on Intel.
+
+internal const uint typeUTF16ExternalRepresentation = 0x75743136; /* 'ut16' 
+big-endian 16 bit unicode with optional byte-order-mark, or little-endian 16
+bit unicode with required byte-order-mark. */
+
+public void ProcessText (IntPtr eventref, ref MSG msg) 
+{
+        // Get the size of the unicode buffer. Note that unlike typeUnicodeText
+typeUTF16ExternalRepresentation
+        // provides enough information to determine the endian of the text we
+get back. TODO: we should really be checking the results of all Carbon calls
+for errors...
+        UInt32 size = 0;
+        GetEventParameter (eventref, kEventParamTextInputSendText,
+typeUTF16ExternalRepresentation, IntPtr.Zero, 0, ref size, IntPtr.Zero);
+
+        // get the actual text buffer
+        IntPtr buffer = Marshal.AllocHGlobal ((int) size);
+        GetEventParameter (eventref, kEventParamTextInputSendText,
+typeUTF16ExternalRepresentation, IntPtr.Zero, size, IntPtr.Zero, buffer);
+
+        byte[] bdata = new byte [size];
+        Marshal.Copy (buffer, bdata, 0, (int) size);
+        Marshal.FreeHGlobal (buffer);
+
+        int cp = GetCodePoint(bdata);
+        int high = cp &gt;&gt; 8;
+        int low = cp &amp; 0xFF;
+
+        if (high != 0 || key_filter_table [low] == 0x00) {        
+                msg.message = Msg.WM_CHAR;
+                msg.wParam = (IntPtr) cp;
+                msg.lParam = IntPtr.Zero;
+                msg.hwnd = XplatUICarbon.FocusWindow;
+        }
+}
+
+private static int GetCodePoint(byte[] data)
+{
+        int index = 0;
+
+        // Check for a byte-order-mark (if the BOM is missing the text
+        // will be big endian).
+        bool bigEndian = true;
+        if (data.Length &gt;= 2)
+        {
+                if (data[0] == 0xFE &amp;&amp; data[1] == 0xFF)
+                {
+                        index = 2;
+                }
+                else if (data[0] == 0xFF &amp;&amp; data[1] == 0xFE)
+                {
+                        bigEndian = false;
+                        index = 2;
+                }
+        }
+
+        // We should now have at least two bytes of data.
+        int cp;
+        int bytes = data.Length - index;
+        if (bytes == 2)
+        {
+                if (bigEndian)
+                        cp = (data[index] &lt;&lt; 8) | data[index + 1];
+                else
+                        cp = (data[index + 1] &lt;&lt; 8) | data[index];
+        }
+        else if (bytes &gt; 2)
+        {    
+                // TODO: This can definitely happen and we should handle it.
+For now
+                // we'll replace whatever the user typed with an ellipsis so
+they know
+                // something bad happened.
+                cp = 0x2027;
+        }
+        else
+        {
+                // This should not happen.
+                throw new Exception(string.Format(&quot;Got {0} bytes of data from
+kEventParamTextInputSendText&quot;, bytes));
+        }
+
+        return cp;
+}
+
+
+-- 
+Configure bugmail: <A HREF="https://bugzilla.novell.com/userprefs.cgi?tab=email">https://bugzilla.novell.com/userprefs.cgi?tab=email</A>
+------- You are receiving this mail because: -------
+You are the QA contact for the bug.
+You are the assignee for the bug.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="073208.html">[Mono-bugs] [Bug 361906] MyLiveEdu.com fails with javascript error
+</A></li>
+	<LI>Next message: <A HREF="073267.html">[Mono-bugs] [Bug 386528] Character input with the Carbon backend has endian (and other) problems
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#73209">[ date ]</a>
+              <a href="thread.html#73209">[ thread ]</a>
+              <a href="subject.html#73209">[ subject ]</a>
+              <a href="author.html#73209">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-bugs">More information about the mono-bugs
+mailing list</a><br>
+</body></html>

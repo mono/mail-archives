@@ -1,0 +1,181 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 541492] TcpListener.AcceptSocket() sometimes throw ThreadAbortedException after listener is stopped
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20541492%5D%20TcpListener.AcceptSocket%28%29%20sometimes%20throw%0A%20ThreadAbortedException%20after%20listener%20is%20stopped&In-Reply-To=bug-541492-28286%40http.bugzilla.novell.com/">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="094583.html">
+   <LINK REL="Next"  HREF="094585.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 541492] TcpListener.AcceptSocket() sometimes throw ThreadAbortedException after listener is stopped</H1>
+    <B>bugzilla_noreply at novell.com</B> 
+    <A HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20541492%5D%20TcpListener.AcceptSocket%28%29%20sometimes%20throw%0A%20ThreadAbortedException%20after%20listener%20is%20stopped&In-Reply-To=bug-541492-28286%40http.bugzilla.novell.com/"
+       TITLE="[Mono-bugs] [Bug 541492] TcpListener.AcceptSocket() sometimes throw ThreadAbortedException after listener is stopped">bugzilla_noreply at novell.com
+       </A><BR>
+    <I>Tue Nov  3 11:21:25 EST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="094583.html">[Mono-bugs] [Bug 541492] TcpListener.AcceptSocket() sometimes throw ThreadAbortedException after listener is stopped
+</A></li>
+        <LI>Next message: <A HREF="094585.html">[Mono-bugs] [Bug 543694] DataObject.GetData and DataObject.GetDataPresent Not Working For Arbitrary Types in Drag Drop
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#94584">[ date ]</a>
+              <a href="thread.html#94584">[ thread ]</a>
+              <a href="subject.html#94584">[ subject ]</a>
+              <a href="author.html#94584">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE><A HREF="http://bugzilla.novell.com/show_bug.cgi?id=541492">http://bugzilla.novell.com/show_bug.cgi?id=541492</A>
+
+User <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">oskar.berggren at gmail.com</A> added comment
+<A HREF="http://bugzilla.novell.com/show_bug.cgi?id=541492#c3">http://bugzilla.novell.com/show_bug.cgi?id=541492#c3</A>
+
+
+
+
+
+--- Comment #3 from Oskar Berggren &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">oskar.berggren at gmail.com</A>&gt;  2009-11-03 09:21:24 MST ---
+The behavior comes from Socket, and should affect everything using a Socket in
+this way (disposing while in Accept()).
+
+Code that exhibits this is part of a bigger project, and doesn't fail all the
+time (but often). From what I can see, any simple multi threaded application
+that uses TcpListener.AcceptSocket() and wishes to stop the listener from a
+different thread may exhibit this behavior. As would any similar app using
+Socket directly.
+
+I described the problem in more detail on the mailing list (2009-09-23), but
+received no reply at the time:
+<A HREF="http://www.mail-archive.com/mono-devel-list@lists.ximian.com/msg22093.html">http://www.mail-archive.com/mono-devel-list@lists.ximian.com/msg22093.html</A>
+
+
+I reproduce the contents of the mail here:
+
+I have a TcpListener and a thread that blocks in AcceptSocket(),
+corresponding to Socket.Accept().
+
+Another thread now calls Stop() on the listener, which causes the
+socket to be disposed. I believe the intention is that the thread
+blocking on Accept() should now get a SocketException with errorcode =
+interrupted. This is based on reading the code, and this does happen
+sometimes. However, sometimes, quite often, I get this
+ThreadAbortException instead:
+
+System.Threading.ThreadAbortException: Thread was being aborted
+ at System.Net.Sockets.SocketException..ctor (Int32 error) [0x00007]
+in
+/home/oskar/mono24/mono-2.4.2.3/mono-2.4.2.3/mcs/class/System/System.Net.Sockets/SocketException.cs:54
+ at System.Net.Sockets.Socket.Accept () [0x000b8] in
+/home/oskar/mono24/mono-2.4.2.3/mono-2.4.2.3/mcs/class/System/System.Net.Sockets/Socket.cs:1434
+ at System.Net.Sockets.TcpListener.AcceptSocket () [0x00016] in
+/home/oskar/mono24/mono-2.4.2.3/mono-2.4.2.3/mcs/class/System/System.Net.Sockets/TcpListener.cs:193
+ at XXXX.TriggerServer.Run_impl () [0x0003b] in MYCODE
+
+BTW, Socket.cs:1434 above seems bogus... There is no call to
+SocketException..ctor on that line. Closest one, and only one in
+Accept(), is on line 1426.
+
+Looking at the code in Socket.Accept() it is built to handle a
+ThreadAbortException by preventing the abort and generating a
+SocketException instead. But this does not seem to work reliably!
+
+Is it possible there is a race condition here? That is: Can
+Close_internal() in fact cause Accept_internal() to return (with an
+error code) before Dispose() calls Abort() on blocking_thread?
+
+
+This is an excerpt from public Socket Accept():
+
+                       blocking_thread = Thread.CurrentThread;
+                       try {
+                               sock = Accept_internal(socket, out error,
+blocking);
+                       } catch (ThreadAbortException) {
+                               if (disposed) {
+#if !NET_2_1
+                                       Thread.ResetAbort ();
+#endif
+                                       error = (int) SocketError.Interrupted;
+                               }
+                       } finally {
+                               blocking_thread = null;
+                       }
+
+                       if (error != 0)
+                               throw new SocketException (error);
+
+
+And this is the Dispose():
+               protected virtual void Dispose (bool explicitDisposing)
+               {
+                       if (disposed)
+                               return;
+
+                       disposed = true;
+                       connected = false;
+                       if ((int) socket != -1) {
+                               int error;
+                               closed = true;
+                               IntPtr x = socket;
+                               socket = (IntPtr) (-1);
+                               Close_internal (x, out error);
+                               if (blocking_thread != null) {
+                                       blocking_thread.Abort ();
+                                       blocking_thread = null;
+                               }
+
+                               if (error != 0)
+                                       throw new SocketException (error);
+                       }
+               }
+
+-- 
+Configure bugmail: <A HREF="http://bugzilla.novell.com/userprefs.cgi?tab=email">http://bugzilla.novell.com/userprefs.cgi?tab=email</A>
+------- You are receiving this mail because: -------
+You are the QA contact for the bug.
+You are the assignee for the bug.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="094583.html">[Mono-bugs] [Bug 541492] TcpListener.AcceptSocket() sometimes throw ThreadAbortedException after listener is stopped
+</A></li>
+	<LI>Next message: <A HREF="094585.html">[Mono-bugs] [Bug 543694] DataObject.GetData and DataObject.GetDataPresent Not Working For Arbitrary Types in Drag Drop
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#94584">[ date ]</a>
+              <a href="thread.html#94584">[ thread ]</a>
+              <a href="subject.html#94584">[ subject ]</a>
+              <a href="author.html#94584">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-bugs">More information about the mono-bugs
+mailing list</a><br>
+</body></html>

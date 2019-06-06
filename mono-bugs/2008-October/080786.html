@@ -1,0 +1,500 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 434289] Assembly.LoadFrom deadlock
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20434289%5D%20Assembly.LoadFrom%20deadlock&In-Reply-To=bug-434289-28286%40https.bugzilla.novell.com/">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="080785.html">
+   <LINK REL="Next"  HREF="080798.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 434289] Assembly.LoadFrom deadlock</H1>
+    <B>bugzilla_noreply at novell.com</B> 
+    <A HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20434289%5D%20Assembly.LoadFrom%20deadlock&In-Reply-To=bug-434289-28286%40https.bugzilla.novell.com/"
+       TITLE="[Mono-bugs] [Bug 434289] Assembly.LoadFrom deadlock">bugzilla_noreply at novell.com
+       </A><BR>
+    <I>Sun Oct 12 18:14:35 EDT 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="080785.html">[Mono-bugs] [Bug 434289] Assembly.LoadFrom deadlock
+</A></li>
+        <LI>Next message: <A HREF="080798.html">[Mono-bugs] [Bug 434289] Assembly.LoadFrom deadlock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#80786">[ date ]</a>
+              <a href="thread.html#80786">[ thread ]</a>
+              <a href="subject.html#80786">[ subject ]</a>
+              <a href="author.html#80786">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE><A HREF="https://bugzilla.novell.com/show_bug.cgi?id=434289">https://bugzilla.novell.com/show_bug.cgi?id=434289</A>
+
+User <A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">meebey at meebey.net</A> added comment
+<A HREF="https://bugzilla.novell.com/show_bug.cgi?id=434289#c9">https://bugzilla.novell.com/show_bug.cgi?id=434289#c9</A>
+
+
+
+
+
+--- Comment #9 from Mirco Bauer &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">meebey at meebey.net</A>&gt;  2008-10-12 16:14:30 MDT ---
+I applied now further patches that seemed related from SVN but are not changing
+the issue for me.
+
+The patch that I am applying against Mono 1.9.1:
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">meebey at redbull</A>:~/data/projects/debian/pkg-mono/mono/mono-1.9.1+dfsg$ cat
+debian/patches/fix_Assembly.LoadFrom_deadlock.dpatch 
+#! /bin/sh /usr/share/dpatch/dpatch-run
+## fix_Assembly.LoadFrom_deadlock_r113458.dpatch by Mirco Bauer
+&lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">meebey at debian.org</A>&gt;
+##
+## All lines beginning with `## DP:' are a description of the patch.
+## DP: Fixes a deadlock in Assembly.LoadFrom(), see:
+## DP: <A HREF="https://bugzilla.novell.com/show_bug.cgi?id=434289">https://bugzilla.novell.com/show_bug.cgi?id=434289</A>
+## DP: <A HREF="https://bugzilla.novell.com/show_bug.cgi?id=323696">https://bugzilla.novell.com/show_bug.cgi?id=323696</A>
+## DP: Backported from upstream SVN revisions:
+## DP: r105036, r105153, r113458 and r115451
+
+@DPATCH@
+diff -urNad mono-1.9.1+dfsg~/mono/metadata/assembly.c
+mono-1.9.1+dfsg/mono/metadata/assembly.c
+--- mono-1.9.1+dfsg~/mono/metadata/assembly.c   2008-10-12 23:37:56.000000000
++0200
++++ mono-1.9.1+dfsg/mono/metadata/assembly.c    2008-10-12 23:59:41.000000000
++0200
+@@ -30,6 +30,7 @@
+ #include &lt;mono/metadata/mono-config.h&gt;
+ #include &lt;mono/utils/mono-digest.h&gt;
+ #include &lt;mono/utils/mono-logger.h&gt;
++#include &lt;mono/utils/mono-membar.h&gt;
+ #include &lt;mono/metadata/reflection.h&gt;
+
+ #ifndef PLATFORM_WIN32
+@@ -372,18 +373,6 @@
+        return TRUE;
+ }
+
+-static MonoAssembly*
+-search_loaded (MonoAssemblyName* aname, gboolean refonly)
+-{
+-       MonoAssembly *ass;
+-
+-       ass = mono_assembly_invoke_search_hook_internal (aname, refonly,
+FALSE);
+-       if (ass)
+-               return ass;
+-
+-       return NULL;
+-}
+-
+ static MonoAssembly *
+ load_in_path (const char *basename, const char** search_path,
+MonoImageOpenStatus *status, MonoBoolean refonly)
+ {
+@@ -1320,8 +1309,14 @@
+        return ass;
+ }
+
++static void
++free_item (gpointer val, gpointer user_data)
++{
++       g_free (val);
++}
++
+ /*
+- * mono_load_friend_assemblies:
++ * mono_assembly_load_friends:
+  * @ass: an assembly
+  *
+  * Load the list of friend assemblies that are allowed to access
+@@ -1336,9 +1331,32 @@
+ mono_assembly_load_friends (MonoAssembly* ass)
+ {
+        int i;
+-       MonoCustomAttrInfo* attrs = mono_custom_attrs_from_assembly (ass);
+-       if (!attrs)
++       MonoCustomAttrInfo* attrs;
++       GSList *list;
++
++       if (ass-&gt;friend_assembly_names_inited)
++               return;
++
++       attrs = mono_custom_attrs_from_assembly (ass);
++       if (!attrs) {
++               mono_assemblies_lock ();
++               ass-&gt;friend_assembly_names_inited = TRUE;
++               mono_assemblies_unlock ();
++               return;
++       }
++
++       mono_assemblies_lock ();
++       if (ass-&gt;friend_assembly_names_inited) {
++               mono_assemblies_unlock ();
+                return;
++       }
++       mono_assemblies_unlock ();
++
++       list = NULL;
++       /* 
++        * We build the list outside the assemblies lock, the worse that can
+happen
++        * is that we'll need to free the allocated list.
++        */
+        for (i = 0; i &lt; attrs-&gt;num_attrs; ++i) {
+                MonoCustomAttrEntry *attr = &amp;attrs-&gt;attrs [i];
+                MonoAssemblyName *aname;
+@@ -1357,12 +1375,26 @@
+                aname = g_new0 (MonoAssemblyName, 1);
+                /*g_print (&quot;friend ass: %s\n&quot;, data);*/
+                if (mono_assembly_name_parse_full (data, aname, TRUE, NULL,
+NULL)) {
+-                       ass-&gt;friend_assembly_names = g_slist_prepend
+(ass-&gt;friend_assembly_names, aname);
++                       list = g_slist_prepend (list, aname);
+                } else {
+                        g_free (aname);
+                }
+        }
+        mono_custom_attrs_free (attrs);
++
++       mono_assemblies_lock ();
++       if (ass-&gt;friend_assembly_names_inited) {
++               mono_assemblies_unlock ();
++               g_slist_foreach (list, free_item, NULL);
++               g_slist_free (list);
++               return;
++       }
++       ass-&gt;friend_assembly_names = list;
++
++       /* Because of the double checked locking pattern above */
++       mono_memory_barrier ();
++       ass-&gt;friend_assembly_names_inited = TRUE;
++       mono_assemblies_unlock ();
+ }
+
+ /**
+@@ -1441,14 +1473,12 @@
+        mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_ASSEMBLY, &quot;Image addref %s %p
+-&gt; %s %p: %d\n&quot;, ass-&gt;aname.name, ass, image-&gt;name, image, image-&gt;ref_count);
+
+        /* 
+-        * Atomically search the loaded list and add ourselves to it if
+necessary.
++        * The load hooks might take locks so we can't call them while holding
+the
++        * assemblies lock.
+         */
+-       mono_assemblies_lock ();
+        if (ass-&gt;aname.name) {
+-               /* avoid loading the same assembly twice for now... */
+-               ass2 = search_loaded (&amp;ass-&gt;aname, refonly);
++               ass2 = mono_assembly_invoke_search_hook_internal (&amp;ass-&gt;aname,
+refonly, FALSE);
+                if (ass2) {
+-                       mono_assemblies_unlock ();
+                        g_free (ass);
+                        g_free (base_dir);
+                        mono_image_close (image);
+@@ -1457,12 +1487,25 @@
+                }
+        }
+
+-       g_assert (image-&gt;assembly == NULL);
++       mono_assemblies_lock ();
++
++       if (image-&gt;assembly) {
++               /* 
++                * This means another thread has already loaded the assembly,
+but not yet
++                * called the load hooks so the search hook can't find the
+assembly.
++                */
++               mono_assemblies_unlock ();
++               ass2 = image-&gt;assembly;
++               g_free (ass);
++               g_free (base_dir);
++               mono_image_close (image);
++               *status = MONO_IMAGE_OK;
++               return ass2;
++       }
++
+        image-&gt;assembly = ass;
+
+        loaded_assemblies = g_list_prepend (loaded_assemblies, ass);
+-       if (mono_defaults.internals_visible_class)
+-               mono_assembly_load_friends (ass);
+        mono_assemblies_unlock ();
+
+        mono_assembly_invoke_load_hook (ass);
+@@ -2301,9 +2344,7 @@
+
+        aname = mono_assembly_remap_version (aname, &amp;maped_aname);
+
+-       mono_assemblies_lock ();
+-       res = search_loaded (aname, refonly);
+-       mono_assemblies_unlock ();
++       res = mono_assembly_invoke_search_hook_internal (aname, refonly,
+FALSE);
+
+        return res;
+ }
+diff -urNad mono-1.9.1+dfsg~/mono/metadata/class.c
+mono-1.9.1+dfsg/mono/metadata/class.c
+--- mono-1.9.1+dfsg~/mono/metadata/class.c      2008-10-12 23:37:56.000000000
++0200
++++ mono-1.9.1+dfsg/mono/metadata/class.c       2008-10-12 23:59:41.000000000
++0200
+@@ -6238,6 +6238,7 @@
+                return TRUE;
+        if (!accessed || !accessing)
+                return FALSE;
++       mono_assembly_load_friends (accessed);
+        for (tmp = accessed-&gt;friend_assembly_names; tmp; tmp = tmp-&gt;next) {
+                MonoAssemblyName *friend = tmp-&gt;data;
+                /* Be conservative with checks */
+diff -urNad mono-1.9.1+dfsg~/mono/metadata/metadata-internals.h
+mono-1.9.1+dfsg/mono/metadata/metadata-internals.h
+--- mono-1.9.1+dfsg~/mono/metadata/metadata-internals.h 2008-10-12
+23:37:56.000000000 +0200
++++ mono-1.9.1+dfsg/mono/metadata/metadata-internals.h  2008-10-12
+23:59:41.000000000 +0200
+@@ -25,7 +25,8 @@
+        MonoAssemblyName aname;
+        MonoDl *aot_module;
+        MonoImage *image;
+-       GSList *friend_assembly_names;
++       GSList *friend_assembly_names; /* Computed by
+mono_assembly_load_friends () */
++       guint8 friend_assembly_names_inited;
+        guint8 in_gac;
+        guint8 dynamic;
+        guint8 corlib_internal;
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">meebey at redbull</A>:~/data/projects/debian/pkg-mono/mono/mono-1.9.1+dfsg$ 
+
+(gdb) t a a bt
+
+Thread 5 (Thread 0xb783fb90 (LWP 28419)):
+#0  0xb7f75424 in __kernel_vsyscall ()
+#1  0xb7e8b8a6 in nanosleep () from /lib/i686/cmov/libpthread.so.0
+#2  0x0811afe8 in collection_thread (unused=0x0) at collection.c:34
+#3  0xb7e844c0 in start_thread () from /lib/i686/cmov/libpthread.so.0
+#4  0xb7ddd61e in clone () from /lib/i686/cmov/libc.so.6
+
+Thread 4 (Thread 0xb72b7b90 (LWP 28420)):
+#0  0xb7f75424 in __kernel_vsyscall ()
+#1  0xb7e88025 in pthread_cond_wait@@GLIBC_2.3.2 () from
+/lib/i686/cmov/libpthread.so.0
+#2  0x08112447 in timedwait_signal_poll_cond (cond=0xb77b11dc,
+mutex=0xb77b11c4, timeout=0x0, alertable=0) at handles.c:1443
+#3  0x081149ec in _wapi_handle_timedwait_signal_handle (handle=0x404,
+timeout=0x0, alertable=0) at handles.c:1523
+#4  0x08114a2c in _wapi_handle_wait_signal_handle (handle=0x404, alertable=0)
+at handles.c:1483
+#5  0x0810a2aa in WaitForSingleObjectEx (handle=0x404, timeout=4294967295,
+alertable=0) at wait.c:200
+#6  0x08172c0a in finalizer_thread (unused=0x0) at gc.c:894
+#7  0x080fa104 in start_wrapper (data=0x9b8a4d8) at threads.c:589
+#8  0x08118bfe in thread_start_routine (args=0xb766db00) at threads.c:282
+#9  0x0812d695 in GC_start_routine (arg=0x26f40) at pthread_support.c:1369
+#10 0xb7e844c0 in start_thread () from /lib/i686/cmov/libpthread.so.0
+#11 0xb7ddd61e in clone () from /lib/i686/cmov/libc.so.6
+
+Thread 3 (Thread 0xb71b2b90 (LWP 28421)):
+#0  0xb7f75424 in __kernel_vsyscall ()
+#1  0xb7e8ac99 in __lll_lock_wait () from /lib/i686/cmov/libpthread.so.0
+#2  0xb7e860d3 in _L_lock_291 () from /lib/i686/cmov/libpthread.so.0
+#3  0xb7e85b36 in pthread_mutex_lock () from /lib/i686/cmov/libpthread.so.0
+#4  0x080f2852 in mono_loader_lock () at loader.c:1801
+#5  0x080beeb3 in mono_metadata_clean_for_image (image=0xb6e86b00) at
+metadata.c:2151
+#6  0x080994df in mono_image_close (image=0xb6e86b00) at image.c:1194
+#7  0x08099d6b in register_image (image=0xb6e86b00) at image.c:988
+#8  0x080eef46 in mono_assembly_open_full (filename=0xb6e77268
+&quot;/usr/lib/mono/gtk-sharp-2.0/gconf-sharp.dll&quot;, status=0xb71b21c0, refonly=0) at
+assembly.c:1276
+#9  0x080fcb1b in ves_icall_System_Reflection_Assembly_LoadFrom (fname=0x45a80,
+refOnly=&lt;value optimized out&gt;) at appdomain.c:1316
+#10 0xb6fa051c in ?? ()
+#11 0x00045a80 in ?? ()
+#12 0x00000000 in ?? ()
+
+Thread 2 (Thread 0xb70adb90 (LWP 28422)):
+#0  0xb7f75424 in __kernel_vsyscall ()
+#1  0xb7e8ac99 in __lll_lock_wait () from /lib/i686/cmov/libpthread.so.0
+#2  0xb7e860d3 in _L_lock_291 () from /lib/i686/cmov/libpthread.so.0
+#3  0xb7e85b36 in pthread_mutex_lock () from /lib/i686/cmov/libpthread.so.0
+#4  0x080efddf in mono_assembly_load_reference (image=0xb6c4a370, index=0) at
+assembly.c:823
+#5  0x080d763e in mono_class_from_typeref (image=0xb6c4a370, type_token=&lt;value
+optimized out&gt;) at class.c:132
+#6  0x080d607c in mono_class_get_full (image=0xb6c4a370, type_token=16777217,
+context=0x80) at class.c:4559
+#7  0x080d6fb5 in mono_class_create_from_typedef (image=0xb6c4a370,
+type_token=33554435) at class.c:3493
+#8  0x080d6059 in mono_class_get_full (image=0xb6c4a370, type_token=33554435,
+context=0x80) at class.c:4556
+#9  0x080d60f0 in mono_class_get (image=0xb6c4a370, type_token=33554435) at
+class.c:4618
+#10 0x08178978 in mono_module_get_types (domain=0x25f00, image=0xb6c4a370,
+exportedOnly=0 '\0') at icall.c:112
+#11 0x0817c63a in ves_icall_System_Reflection_Assembly_GetTypes
+(assembly=0x41d80, exportedOnly=0 '\0') at icall.c:4998
+#12 0xb6fa0604 in ?? ()
+#13 0x00041d80 in ?? ()
+#14 0x00000000 in ?? ()
+
+---Type &lt;return&gt; to continue, or q &lt;return&gt; to quit---
+Thread 1 (Thread 0xb7ccc6d0 (LWP 28418)):
+#0  0xb7f75424 in __kernel_vsyscall ()
+#1  0xb7e8b8a6 in nanosleep () from /lib/i686/cmov/libpthread.so.0
+#2  0x081148ff in _wapi_handle_timedwait_signal_handle (handle=&lt;value optimized
+out&gt;, timeout=0x0, alertable=1) at ../../mono/io-layer/handles-private.h:315
+#3  0x08114a2c in _wapi_handle_wait_signal_handle (handle=0x40a, alertable=1)
+at handles.c:1483
+#4  0x0810a2aa in WaitForSingleObjectEx (handle=0x40a, timeout=4294967295,
+alertable=1) at wait.c:200
+#5  0x080f88fa in ves_icall_System_Threading_Thread_Join_internal
+(this=0x25a50, ms=-1, thread=0x40a) at threads.c:1254
+#6  0xb7847495 in ?? ()
+#7  0x00025a50 in ?? ()
+#8  0xffffffff in ?? ()
+#9  0x0000040a in ?? ()
+#10 0x09b5eaa0 in ?? ()
+#11 0x00025a50 in ?? ()
+#12 0x00025a50 in ?? ()
+#13 0xbfc8f29c in ?? ()
+#14 0x00025960 in ?? ()
+#15 0x00025a50 in ?? ()
+#16 0x00000001 in ?? ()
+#17 0xbfc8f27c in ?? ()
+#18 0xb784746c in ?? ()
+#19 0xbfc8f290 in ?? ()
+#20 0xb7847333 in ?? ()
+#21 0x00025a50 in ?? ()
+#22 0xffffffff in ?? ()
+#23 0x0000040a in ?? ()
+#24 0xbfc8f304 in ?? ()
+#25 0xb78404ac in ?? ()
+#26 0x00025a50 in ?? ()
+#27 0x0004efa8 in ?? ()
+#28 0x00000001 in ?? ()
+#29 0x00000002 in ?? ()
+#30 0x0004efa8 in ?? ()
+#31 0xfffffffe in ?? ()
+#32 0x00000002 in ?? ()
+#33 0x0004efa8 in ?? ()
+#34 0xfffffffe in ?? ()
+#35 0x00000002 in ?? ()
+#36 0x0004efa8 in ?? ()
+#37 0xfffffffe in ?? ()
+#38 0x00000002 in ?? ()
+#39 0x00042d90 in ?? ()
+#40 0x00025960 in ?? ()
+#41 0x00025960 in ?? ()
+#42 0x0004efa8 in ?? ()
+#43 0x01b625e4 in ?? ()
+#44 0x00047ff8 in ?? ()
+#45 0x09b624c4 in ?? ()
+#46 0x09b624a4 in ?? ()
+#47 0xbfc8f298 in ?? ()
+#48 0x09b624a4 in ?? ()
+#49 0x00000000 in ?? ()
+#0  0xb7f75424 in __kernel_vsyscall ()
+(gdb) 
+
+A Mono SVN user running r115551 could not reproduce it (while could reproduce
+with Mono 2.0):
+23:02:55 &lt;icqnumber_&gt; meebey, can not reproduce it any more with  2.1
+(/trunk/mono r115551)
+
+
+-- 
+Configure bugmail: <A HREF="https://bugzilla.novell.com/userprefs.cgi?tab=email">https://bugzilla.novell.com/userprefs.cgi?tab=email</A>
+------- You are receiving this mail because: -------
+You are the QA contact for the bug.
+You are the assignee for the bug.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="080785.html">[Mono-bugs] [Bug 434289] Assembly.LoadFrom deadlock
+</A></li>
+	<LI>Next message: <A HREF="080798.html">[Mono-bugs] [Bug 434289] Assembly.LoadFrom deadlock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#80786">[ date ]</a>
+              <a href="thread.html#80786">[ thread ]</a>
+              <a href="subject.html#80786">[ subject ]</a>
+              <a href="author.html#80786">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-bugs">More information about the mono-bugs
+mailing list</a><br>
+</body></html>

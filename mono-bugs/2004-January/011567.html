@@ -1,0 +1,277 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 53177][Nor] Changed - WaitHandles are not finalizing
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:bugzilla-daemon%40bugzilla.ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="011565.html">
+   <LINK REL="Next"  HREF="011568.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 53177][Nor] Changed - WaitHandles are not finalizing
+   </H1>
+    <B>bugzilla-daemon@bugzilla.ximian.com
+    </B> 
+    <A HREF="mailto:bugzilla-daemon%40bugzilla.ximian.com"
+       TITLE="[Mono-bugs] [Bug 53177][Nor] Changed - WaitHandles are not finalizing">bugzilla-daemon@bugzilla.ximian.com
+       </A><BR>
+    <I>Sat, 24 Jan 2004 03:42:51 -0500 (EST)</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="011565.html">[Mono-bugs] Muscle Relief
+</A></li>
+        <LI> Next message: <A HREF="011568.html">[Mono-bugs] [Bug 53288][Min] New - File locking not implemented FileStream.Lock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11567">[ date ]</a>
+              <a href="thread.html#11567">[ thread ]</a>
+              <a href="subject.html#11567">[ subject ]</a>
+              <a href="author.html#11567">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Please do not reply to this email- if you want to comment on the bug, go to the
+URL shown below and enter your comments there.
+
+Changed by <A HREF="mailto:derek.mcumber@datamtnsol.com.">derek.mcumber@datamtnsol.com.</A>
+
+<A HREF="http://bugzilla.ximian.com/show_bug.cgi?id=53177">http://bugzilla.ximian.com/show_bug.cgi?id=53177</A>
+
+--- shadow/53177	2004-01-23 11:44:37.000000000 -0500
++++ shadow/53177.tmp.4803	2004-01-24 03:42:51.000000000 -0500
+@@ -1,12 +1,12 @@
+ Bug#: 53177
+ Product: Mono/Runtime
+ Version: unspecified
+ OS: unknown
+ OS Details: 
+-Status: REOPENED   
++Status: CLOSED   
+ Resolution: 
+ Severity: Unknown
+ Priority: Normal
+ Component: misc
+ AssignedTo: <A HREF="mailto:mono-bugs@ximian.com">mono-bugs@ximian.com</A>                            
+ ReportedBy: <A HREF="mailto:derek.mcumber@datamtnsol.com">derek.mcumber@datamtnsol.com</A>               
+@@ -251,6 +251,200 @@
+ ------- Additional Comments From <A HREF="mailto:derek.mcumber@datamtnsol.com">derek.mcumber@datamtnsol.com</A>  2004-01-23 11:44 -------
+ I think you need to do:
+ 
+ export GC_PRINT_STATS=true
+ 
+ as well.....
++
++------- Additional Comments From <A HREF="mailto:derek.mcumber@datamtnsol.com">derek.mcumber@datamtnsol.com</A>  2004-01-24 03:42 -------
++It's finished!
++
++There were a few problems in GC6.2 that are probably on all platforms
++that cause detrimental memory leaks.
++
++Most notable:
++
++1.  malloc.c puts every object on the heap 2 to infinite times with my
++gcc compiler with this code in malloc.c:
++
++     h = GC_allochblk(blah);
++     ...
++     while (0 == h &amp;&amp; GC_collect_or_expand(n_blocks, (flags != 0))) {
++	h = GC_allochblk(lw, k, flags);
++     }
++
++use this instead====
++/* Allocate a large block of size lw words.	*/
++/* The block is not cleared.			*/
++/* Flags is 0 or IGNORE_OFF_PAGE.		*/
++ptr_t GC_alloc_large(lw, k, flags)
++word lw;
++int k;
++unsigned flags;
++{
++    struct hblk * h;
++    word n_blocks = OBJ_SZ_TO_BLOCKS(lw);
++    ptr_t result;
++	
++    if (!GC_is_initialized) GC_init_inner();
++    /* Do our share of marking work */
++        if(GC_incremental &amp;&amp; !GC_dont_gc)
++	    GC_collect_a_little_inner((int)n_blocks);
++
++    h = GC_allochblk(lw, k, flags);
++#   ifdef USE_MUNMAP
++	if (0 == h) {
++	    GC_merge_unmapped();
++	    h = GC_allochblk(lw, k, flags);
++	}
++#   endif
++
++    if (0 == h) {
++	/* GC_print_hblkfreelist();
++	GC_printf0(&quot;Previous allochblk returned 0, calling
++collect_or_expand\n&quot;); */	
++    	while (0 == h &amp;&amp; GC_collect_or_expand(n_blocks, (flags != 0))) {
++		h = GC_allochblk(lw, k, flags);
++    	}
++    }
++    if (0 == h) {
++	result = 0;
++    } else {
++	int total_bytes = BYTES_TO_WORDS(n_blocks * HBLKSIZE);
++	if (n_blocks &gt; 1) {
++	    GC_large_allocd_bytes += n_blocks * HBLKSIZE;
++	    if (GC_large_allocd_bytes &gt; GC_max_large_allocd_bytes)
++	        GC_max_large_allocd_bytes = GC_large_allocd_bytes;
++	}
++	result = (ptr_t) (h -&gt; hb_body);
++	GC_words_wasted += total_bytes - lw;
++    }
++    return result;
++}
++============
++
++2.  Algoritm in alloc.c increased heap by 8 meg at minimum and didn't
++allow garbage to collect properly (for continuous programs like xsp.exe)
++    
++use this instead=======
++/*
++ * this explicitly increases the size of the heap.  It is used
++ * internally, but may also be invoked from GC_expand_hp by the user.
++ * The argument is in units of HBLKSIZE.
++ * Tiny values of n are rounded up.
++ * Returns FALSE on failure.
++ */
++GC_bool GC_expand_hp_inner(n)
++word n;
++{
++    word bytes;
++    struct hblk * space;
++    word expansion_slop;	/* Number of bytes by which we expect the */
++    				/* heap to expand soon.			  */
++
++#	ifdef CONDPRINT
++	  if (GC_print_stats) {
++	GC_printf1(
++	    &quot;Inside expand_hp_inner for %ld hblocks\n&quot;,
++	   	  (long)WORDS_TO_BYTES(n));
++	  }
++#       endif
++
++    if (n &lt; MINHINCR) n = MINHINCR;
++
++    bytes = n * HBLKSIZE;
++    /* Make sure bytes is a multiple of GC_page_size */
++      {
++	word mask = GC_page_size - 1;
++	bytes += mask;
++	bytes &amp;= ~mask;
++      }
++    
++    if (GC_max_heapsize != 0 &amp;&amp; GC_heapsize + bytes &gt; GC_max_heapsize) {
++        /* Exceeded self-imposed limit */
++        return(FALSE);
++    }
++    space = GET_MEM(bytes);
++    if( space == 0 ) {
++#	ifdef CONDPRINT
++	  if (GC_print_stats) {
++	    GC_printf1(&quot;Failed to expand heap by %ld bytes\n&quot;,
++		       (unsigned long)bytes);
++	  }
++#       endif
++	return(FALSE);
++    }
++#   ifdef CONDPRINT
++      if (GC_print_stats) {
++	GC_printf2(&quot;Increasing heap size by %lu after %lu allocated bytes\n&quot;,
++	           (unsigned long)bytes,
++	           (unsigned long)WORDS_TO_BYTES(GC_words_allocd));
++# 	ifdef UNDEFINED
++	  GC_printf1(&quot;Root size = %lu\n&quot;, GC_root_size);
++	  GC_print_block_list(); GC_print_hblkfreelist();
++	  GC_printf0(&quot;\n&quot;);
++#	endif
++      }
++#   endif
++    expansion_slop = 8 * WORDS_TO_BYTES(min_words_allocd());
++    if (5 * HBLKSIZE * MAXHINCR &gt; expansion_slop) {
++        expansion_slop = 5 * HBLKSIZE * MAXHINCR;
++    }
++    if (GC_last_heap_addr == 0 &amp;&amp; !((word)space &amp; SIGNB)
++        || GC_last_heap_addr != 0 &amp;&amp; GC_last_heap_addr &lt; (ptr_t)space) {
++        /* Assume the heap is growing up */
++        GC_greatest_plausible_heap_addr =
++            GC_max(GC_greatest_plausible_heap_addr,
++                   (ptr_t)space + bytes + expansion_slop);
++    } else {
++        /* Heap is growing down */
++        GC_least_plausible_heap_addr =
++            GC_min(GC_least_plausible_heap_addr,
++                   (ptr_t)space - expansion_slop);
++    }
++    GC_prev_heap_addr = GC_last_heap_addr;
++    GC_last_heap_addr = (ptr_t)space;
++    GC_add_to_heap(space, bytes);
++    return(TRUE);
++}
++
++3.  make sure all GC_allochblk's are flags == IGNORE_OFF_PAGE in
++    allochblk.c 
++
++use this instead========
++/*
++ * Allocate (and return pointer to) a heap block
++ *   for objects of size sz words, searching the nth free list.
++ *
++ * NOTE: We set obj_map field in header correctly.
++ *       Caller is responsible for building an object freelist in block.
++ *
++ * Unlike older versions of the collectors, the client is responsible
++ * for clearing the block, if necessary.
++ */
++struct hblk *
++GC_allochblk(sz, kind, flags)
++word sz;
++int kind;
++unsigned flags;  /* IGNORE_OFF_PAGE or 0 */
++{
++    word blocks = OBJ_SZ_TO_BLOCKS(sz);
++    int start_list = GC_hblk_fl_from_blocks(blocks);
++    int i;
++    if (flags == IGNORE_OFF_PAGE) {
++	/* GC_printf0(&quot;flags == IGNORE_OFF_PAGE\n&quot;); */	
++    } else {
++	flags = IGNORE_OFF_PAGE;
++    }
++    for (i = start_list; i &lt;= N_HBLK_FLS; ++i) {
++	struct hblk * result = GC_allochblk_nth(sz, kind, flags, i);
++	if (0 != result) {
++	    return result;
++	}
++    }
++    return 0;
++}
++==========
++
++I can build you a diff of my libgc and MONO's to get the little stuff.
++ How and where do you want this?
++  
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="011565.html">[Mono-bugs] Muscle Relief
+</A></li>
+	<LI> Next message: <A HREF="011568.html">[Mono-bugs] [Bug 53288][Min] New - File locking not implemented FileStream.Lock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#11567">[ date ]</a>
+              <a href="thread.html#11567">[ thread ]</a>
+              <a href="subject.html#11567">[ subject ]</a>
+              <a href="author.html#11567">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

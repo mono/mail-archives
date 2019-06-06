@@ -1,0 +1,159 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-bugs] [Bug 325495] arrays don' t appear to be implementing all the generic interfaces in 2.0
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20325495%5D%20arrays%20don%27%20t%20appear%20to%20be%20implementing%0A%20all%20the%20generic%20interfaces%20in%202.0&In-Reply-To=bug-325495-28286%40https.bugzilla.novell.com/">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="063856.html">
+   <LINK REL="Next"  HREF="062268.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-bugs] [Bug 325495] arrays don' t appear to be implementing all the generic interfaces in 2.0</H1>
+    <B>bugzilla_noreply at novell.com</B> 
+    <A HREF="mailto:mono-bugs%40lists.ximian.com?Subject=%5BMono-bugs%5D%20%5BBug%20325495%5D%20arrays%20don%27%20t%20appear%20to%20be%20implementing%0A%20all%20the%20generic%20interfaces%20in%202.0&In-Reply-To=bug-325495-28286%40https.bugzilla.novell.com/"
+       TITLE="[Mono-bugs] [Bug 325495] arrays don' t appear to be implementing all the generic interfaces in 2.0">bugzilla_noreply at novell.com
+       </A><BR>
+    <I>Mon Oct  1 06:00:26 EDT 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="063856.html">[Mono-bugs] [Bug 329718] Forms: ArgEx: &quot;Cannot activate invisible...&quot;, when open color picker twice
+</A></li>
+        <LI>Next message: <A HREF="062268.html">[Mono-bugs] [Bug 327691] initial screen not rendered correctly in	bubblemark
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#62267">[ date ]</a>
+              <a href="thread.html#62267">[ thread ]</a>
+              <a href="subject.html#62267">[ subject ]</a>
+              <a href="author.html#62267">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE><A HREF="https://bugzilla.novell.com/show_bug.cgi?id=325495#c6">https://bugzilla.novell.com/show_bug.cgi?id=325495#c6</A>
+
+
+
+
+
+--- Comment #6 from Paolo Molaro &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-bugs">lupus at novell.com</A>&gt;  2007-10-01 04:00:25 MST ---
+First the good news: with the lazy IMT entry change, memory usage for the IMT
+thunks goes from 191 KB to less than 6 KB, so a big win (monodevelop is
+similar, from 196 KB to 5.2 KB).
+Now the not so good news (but not so bad either). I assume (I don't have a
+windows box at hand to test) that the additional interfaces on arrays are
+completely implicit (they don't appear on arraytype.GetInterfaces()): this
+would explain why gmcs is able to compile the code at all, the checking is not
+done using the runtime (which would have failed anyway).
+That assumption (that needs to be checked) means that we don't really need to
+create all the MonoClass structures representing the interfaces, with the
+associated runtime memory and cpu costs, which as we saw causes the problem to
+be intractable as soon as we go into a few deep array types (current gmcs/mono
+can't compile some programs already). So the solution to this bug is to really
+not create _any_ implicit interface. Here is how the magic would work.
+
+We need to implement the above suggestion of reserving in the array vtables the
+slots for the three interface members and each of the possibly thousands of
+interfaces will map to the 3 offsets, so the vtables will be always small in
+size, not dependent on the number of interfaces. Then we need to consider that
+we may have the specific arrays implement only the interfaces that the user
+actually requested in some way (either as a cast or as an interface method
+call). This reduces the amount of created interfaces from thousands/millions in
+simple programs to the few that are actually needed (and that are already
+otherwise limited by disk space or memory usage): in practice the limiting
+factor won't be the runtime implementation, but the user itself, which is fine.
+
+Now the problem becomes: where do we lazily add the interfaces?
+
+There are basically 3 places: the cast opcodes implementations (we'd do
+something similar to the transparent proxies slow-path: if the cast fails we
+check for an array object and we go into the runtime and setup all the needed
+data structures for the cast to work the next time around). The second place is
+basically mono_object_get_virtual_method(), though in this case we don't
+actually need to change the data structures, just get the offset in the vtable
+manually. The third place is at the interface method invocation: here things
+are a little more complicated, since the method is called without an explicit
+cast and we need to consider two implementations, the IMT way and the old way.
+
+For the IMT case it's pretty simple to jump to a runtime trampoline in the case
+where the interface method to execute is not found in the IMT slots thunks
+(this means a small performance penalty and the requirement that all the IMT
+slots for array vtables are created as colliding slots). The runtime will then
+create a new IMT slot entry that includes the called method and all will be
+well the second time around (there will be no need to go into the runtime).
+There is a small issue here, which is of the same nature as the issue we
+currently have already for the transparent proxies vtables and for the
+interface bitmap in array vtables when this solution is implemented: as each
+new thunk/bitmap/vtable is created we'll use more memory as we currently don't
+have code to free them
+until appdomain unload. We can't use the hazard pointers stuff here because
+they would make the casts too slow, so we need some other way to handle this,
+maybe with some hook inside the GC that would enable us to free the data at GC
+time
+(since the GC can inspect the threads state when they are stopped and determine
+if they are using the vtables, the thunks or the bitmaps). The need to be able
+to free the IMT thunks is shared with the implementation idea about the fast
+invoke for virtual generic methods, see the relevant bug for the idea
+description. There are ways to minimize the memory usage, like doubling the
+sizes on overflow, that can be used until the freeing is actually implemented.
+We need to remember that this excessive memory usage will be limited to arrays
+and only if the users abuses them someway (as opposed to now where we waste
+much more memory beforehand).
+
+In the non-IMT case things are more complicated, since interface methods are
+called by indexing into an array by interface ID and that array is part of the
+MonoVTable memory block. An helper method would likely be needed for the
+implementation and the invocation would be necessarily slow. I think at this
+time it would be much better to port the missing architectures to use IMT
+invocation.
+
+So overall this solution adds a small overhead for the casts and a small memory
+issue (but always user-limited in practice) vs the huge perf and memory usage
+of the current code which doesn't even allow some trivial programs to compile
+and/or execute. Comments welcome before we go ahead and implement all the
+needed support for this.
+
+Before I forget: the array interfaces should be enabled only for vectors, not
+for all the arrays, so this will save some pain as well.
+
+
+-- 
+Configure bugmail: <A HREF="https://bugzilla.novell.com/userprefs.cgi?tab=email">https://bugzilla.novell.com/userprefs.cgi?tab=email</A>
+------- You are receiving this mail because: -------
+You are the QA contact for the bug.
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="063856.html">[Mono-bugs] [Bug 329718] Forms: ArgEx: &quot;Cannot activate invisible...&quot;, when open color picker twice
+</A></li>
+	<LI>Next message: <A HREF="062268.html">[Mono-bugs] [Bug 327691] initial screen not rendered correctly in	bubblemark
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#62267">[ date ]</a>
+              <a href="thread.html#62267">[ thread ]</a>
+              <a href="subject.html#62267">[ subject ]</a>
+              <a href="author.html#62267">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-bugs">More information about the mono-bugs
+mailing list</a><br>
+</body></html>
