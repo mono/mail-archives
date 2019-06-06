@@ -1,0 +1,402 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [MonoTouch] SQLite + Monotouch
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:monotouch%40lists.ximian.com?Subject=%5BMonoTouch%5D%20SQLite%20%2B%20Monotouch&In-Reply-To=C6C81115.5433%25tscott%40lunaversesoftware.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000689.html">
+   <LINK REL="Next"  HREF="000744.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[MonoTouch] SQLite + Monotouch</H1>
+    <B>Frank Krueger</B> 
+    <A HREF="mailto:monotouch%40lists.ximian.com?Subject=%5BMonoTouch%5D%20SQLite%20%2B%20Monotouch&In-Reply-To=C6C81115.5433%25tscott%40lunaversesoftware.com"
+       TITLE="[MonoTouch] SQLite + Monotouch">fak at kruegersystems.com
+       </A><BR>
+    <I>Mon Sep  7 15:52:15 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000689.html">[MonoTouch] SQLite + Monotouch
+</A></li>
+        <LI>Next message: <A HREF="000744.html">[MonoTouch] SQLite + Monotouch
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#743">[ date ]</a>
+              <a href="thread.html#743">[ thread ]</a>
+              <a href="subject.html#743">[ subject ]</a>
+              <a href="author.html#743">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I have a simple wrapper over SQLite that works well for me. You can create
+queries with bound params, and you can perform type-specific selects.
+For example, you can do:
+
+using (var db = new SQLiteClient.SQLiteConnection(&quot;myfile&quot;)) {
+
+    db.Open();
+
+    //
+    // Perform &quot;non-queries&quot;
+    //
+    db.Execute(&quot;DELETE User WHERE Name = ?&quot;, &quot;Miguel&quot;);
+
+    //
+    // Perform strongly typed queries
+    //
+    var users = db.Query&lt;User&gt;(&quot;SELECT Name FROM User WHERE Id &gt; ?&quot;, 1000);
+    foreach (var user in users) {
+        Console.WriteLine(user.Name);
+    }
+}
+
+It's not perfect (no support for DateTime, etc.), but should get you
+started.
+
+
+Here is the code. Consider it released into the public domain. If there's
+interest, I can start a Google code project or something.
+
+
+using System;
+using System.Runtime.InteropServices;
+using System.Collections.Generic;
+
+namespace SQLiteClient
+{
+public class SQLiteException : Exception
+{
+public SQLiteException (string message) : base(message)
+{
+}
+}
+
+public class SQLiteConnection : IDisposable
+{
+private IntPtr _db;
+private bool _open;
+
+public string Database { get; set; }
+
+public SQLiteConnection (string database)
+{
+Database = database;
+}
+
+public void Open ()
+{
+if (SQLite3.Open (Database, out _db) != SQLite3.Result.OK) {
+throw new SQLiteException (&quot;Could not open database file: &quot; + Database);
+}
+_open = true;
+}
+
+public SQLiteCommand CreateCommand (string cmdText, params object[] ps)
+{
+if (!_open) {
+throw new SQLiteException (&quot;Cannot create commands from unopened database&quot;);
+} else {
+var cmd = new SQLiteCommand (_db);
+cmd.CommandText = cmdText;
+foreach (var o in ps) {
+cmd.Bind (o);
+}
+return cmd;
+}
+}
+
+public int Execute (string query, params object[] ps)
+{
+var cmd = CreateCommand (query, ps);
+Console.Error.WriteLine(&quot;Executing &quot; + cmd);
+return cmd.ExecuteNonQuery ();
+}
+
+public IEnumerable&lt;T&gt; Query&lt;T&gt; (string query, params object[] ps) where T :
+new()
+{
+var cmd = CreateCommand (query, ps);
+return cmd.ExecuteQuery&lt;T&gt; ();
+}
+
+public void Dispose ()
+{
+if (_open) {
+SQLite3.Close(_db);
+_db = IntPtr.Zero;
+_open = false;
+}
+}
+}
+
+public class SQLiteCommand
+{
+private IntPtr _db;
+private List&lt;Binding&gt; _bindings;
+
+public string CommandText { get; set; }
+
+internal SQLiteCommand (IntPtr db)
+{
+_db = db;
+_bindings = new List&lt;Binding&gt; ();
+CommandText = &quot;&quot;;
+}
+
+public int ExecuteNonQuery ()
+{
+var stmt = Prepare ();
+
+var r = SQLite3.Step (stmt);
+if (r == SQLite3.Result.Error) {
+string msg = SQLite3.Errmsg (_db);
+SQLite3.Finalize (stmt);
+throw new SQLiteException (msg);
+} else if (r == SQLite3.Result.Done) {
+int rowsAffected = SQLite3.Changes (_db);
+SQLite3.Finalize (stmt);
+return rowsAffected;
+} else {
+SQLite3.Finalize (stmt);
+throw new SQLiteException (&quot;Unknown error&quot;);
+}
+}
+ public IEnumerable&lt;T&gt; ExecuteQuery&lt;T&gt; () where T : new()
+{
+var stmt = Prepare ();
+
+var props = GetProps (typeof(T));
+var cols = new System.Reflection.PropertyInfo[SQLite3.ColumnCount (stmt)];
+for (int i = 0; i &lt; cols.Length; i++) {
+cols[i] = MatchColProp (SQLite3.ColumnName (stmt, i), props);
+}
+
+while (SQLite3.Step (stmt) == SQLite3.Result.Row) {
+var obj = new T ();
+for (int i = 0; i &lt; cols.Length; i++) {
+if (cols[i] == null)
+continue;
+var val = ReadCol (stmt, i, cols[i].PropertyType);
+cols[i].SetValue (obj, val, null);
+}
+yield return obj;
+}
+
+SQLite3.Finalize (stmt);
+}
+
+public void Bind (string name, object val)
+{
+_bindings.Add (new Binding {
+Name = name,
+Value = val
+});
+}
+public void Bind (object val)
+{
+Bind (null, val);
+}
+
+public override string ToString ()
+{
+return CommandText;
+}
+
+IntPtr Prepare ()
+{
+var stmt = SQLite3.Prepare (_db, CommandText);
+BindAll (stmt);
+return stmt;
+}
+
+void BindAll (IntPtr stmt)
+{
+int nextIdx = 1;
+foreach (var b in _bindings) {
+if (b.Name != null) {
+b.Index = SQLite3.BindParameterIndex (stmt, b.Name);
+} else {
+b.Index = nextIdx++;
+}
+}
+foreach (var b in _bindings) {
+if (b.Value == null) {
+SQLite3.BindNull (stmt, b.Index);
+} else {
+if (b.Value is Byte || b.Value is UInt16 || b.Value is SByte || b.Value is
+Int16 || b.Value is Int32) {
+SQLite3.BindInt (stmt, b.Index, Convert.ToInt32 (b.Value));
+} else if (b.Value is UInt32 || b.Value is Int64) {
+SQLite3.BindInt64 (stmt, b.Index, Convert.ToInt64 (b.Value));
+} else if (b.Value is Single || b.Value is Double || b.Value is Decimal) {
+SQLite3.BindDouble (stmt, b.Index, Convert.ToDouble (b.Value));
+} else if (b.Value is String) {
+SQLite3.BindText (stmt, b.Index, b.Value.ToString (), -1, new IntPtr (-1));
+}
+}
+}
+}
+
+class Binding
+{
+public string Name { get; set; }
+public object Value { get; set; }
+public int Index { get; set; }
+}
+
+object ReadCol (IntPtr stmt, int index, Type clrType)
+{
+var type = SQLite3.ColumnType (stmt, index);
+if (type == SQLite3.ColType.Null) {
+return null;
+} else {
+if (clrType == typeof(Byte) || clrType == typeof(UInt16) || clrType ==
+typeof(SByte) || clrType == typeof(Int16) || clrType == typeof(Int32)) {
+return Convert.ChangeType (SQLite3.ColumnInt (stmt, index), clrType);
+} else if (clrType == typeof(UInt32) || clrType == typeof(Int64)) {
+return Convert.ChangeType (SQLite3.ColumnInt64 (stmt, index), clrType);
+} else if (clrType == typeof(Single) || clrType == typeof(Double) || clrType
+== typeof(Decimal)) {
+return Convert.ChangeType (SQLite3.ColumnDouble (stmt, index), clrType);
+} else if (clrType == typeof(String)) {
+return Convert.ChangeType (SQLite3.ColumnText (stmt, index), clrType);
+} else {
+throw new NotSupportedException (&quot;Don't know how to read &quot; + clrType);
+}
+}
+}
+
+static System.Reflection.PropertyInfo[] GetProps (Type t)
+{
+return t.GetProperties ();
+}
+static System.Reflection.PropertyInfo MatchColProp (string colName,
+System.Reflection.PropertyInfo[] props)
+{
+foreach (var p in props) {
+if (p.Name == colName) {
+return p;
+}
+}
+return null;
+}
+}
+
+public static class SQLite3
+{
+public enum Result : int
+{
+OK = 0,
+Error = 1,
+Row = 100,
+Done = 101
+}
+
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_open&quot;)]
+public static extern Result Open (string filename, out IntPtr db);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_close&quot;)]
+public static extern Result Close (IntPtr db);
+
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_changes&quot;)]
+public static extern int Changes (IntPtr db);
+
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_prepare_v2&quot;)]
+public static extern Result Prepare (IntPtr db, string sql, int numBytes,
+out IntPtr stmt, IntPtr pzTail);
+public static IntPtr Prepare (IntPtr db, string query)
+{
+IntPtr stmt;
+if (Prepare (db, query, query.Length, out stmt, IntPtr.Zero) != Result.OK)
+throw new SQLiteException (Errmsg (db));
+return stmt;
+}
+
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_step&quot;)]
+public static extern Result Step (IntPtr stmt);
+
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_finalize&quot;)]
+public static extern Result Finalize (IntPtr stmt);
+
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_errmsg&quot;)]
+public static extern string Errmsg (IntPtr db);
+
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_bind_parameter_index&quot;)]
+public static extern int BindParameterIndex (IntPtr stmt, string name);
+
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_bind_null&quot;)]
+public static extern int BindNull (IntPtr stmt, int index);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_bind_int&quot;)]
+public static extern int BindInt (IntPtr stmt, int index, int val);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_bind_int64&quot;)]
+public static extern int BindInt64 (IntPtr stmt, int index, long val);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_bind_double&quot;)]
+public static extern int BindDouble (IntPtr stmt, int index, double val);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_bind_text&quot;)]
+public static extern int BindText (IntPtr stmt, int index, string val, int
+n, IntPtr free);
+
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_column_count&quot;)]
+public static extern int ColumnCount (IntPtr stmt);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_column_name&quot;)]
+public static extern string ColumnName (IntPtr stmt, int index);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_column_type&quot;)]
+public static extern ColType ColumnType (IntPtr stmt, int index);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_column_int&quot;)]
+public static extern int ColumnInt (IntPtr stmt, int index);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_column_int64&quot;)]
+public static extern long ColumnInt64 (IntPtr stmt, int index);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_column_double&quot;)]
+public static extern double ColumnDouble (IntPtr stmt, int index);
+[DllImport(&quot;sqlite3&quot;, EntryPoint = &quot;sqlite3_column_text&quot;)]
+public static extern string ColumnText (IntPtr stmt, int index);
+
+public enum ColType : int
+{
+Integer = 1,
+Float = 2,
+Text = 3,
+Blob = 4,
+Null = 5
+}
+}
+}
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <A HREF="http://lists.ximian.com/mailman/private/monotouch/attachments/20090907/85ddc84e/attachment-0001.html">http://lists.ximian.com/mailman/private/monotouch/attachments/20090907/85ddc84e/attachment-0001.html</A> 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000689.html">[MonoTouch] SQLite + Monotouch
+</A></li>
+	<LI>Next message: <A HREF="000744.html">[MonoTouch] SQLite + Monotouch
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#743">[ date ]</a>
+              <a href="thread.html#743">[ thread ]</a>
+              <a href="subject.html#743">[ subject ]</a>
+              <a href="author.html#743">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/monotouch">More information about the MonoTouch
+mailing list</a><br>
+</body></html>

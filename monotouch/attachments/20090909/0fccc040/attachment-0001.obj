@@ -1,0 +1,880 @@
+/*
+	Sound.cs
+	 
+	Author:
+	      Christian Beaumont chris@foundation42.org (http://www.foundation42.com)
+	
+	Copyright (c) 2009 Foundation42 LLC
+	
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"), to deal
+	in the Software without restriction, including without limitation the rights
+	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	copies of the Software, and to permit persons to whom the Software is
+	furnished to do so, subject to the following conditions:
+	
+	The above copyright notice and this permission notice shall be included in
+	all copies or substantial portions of the Software.
+	
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+	THE SOFTWARE.
+*/
+
+namespace Foundation42.Applications
+{
+	using System;
+	using System.Runtime.InteropServices;
+	using OpenTK;
+	using OpenTK.Graphics.ES11;
+	
+	/// <summary>
+	/// Low level sprite rendering system 
+	/// </summary>
+    public class SpriteManager : IDisposable, ISpriteLayer
+    {
+        [ Flags ]
+        public enum SpriteFlags : uint
+        {
+            None = 0,
+            Allocated = 1,
+            Visible = 2,
+            All = 0xFFFFFFFF
+        }
+
+        /// <summary>
+        /// Maintains per-sprite attributes.
+        /// Note that texture co-ordinates and colors
+        /// are not held in this structure as they are
+        /// allowed to be set on a per-vertex basis
+        /// </summary>
+        [ StructLayout(LayoutKind.Explicit) ]
+        public struct Sprite
+        {
+            [ FieldOffset(0) ]
+            public float ScaleX;
+
+            [FieldOffset(4)]
+            public float ScaleY;
+
+            [FieldOffset(8)]
+            public float Rotation;
+
+            [FieldOffset(12)]
+            public float X;
+
+            [FieldOffset(16)]
+            public float Y;
+
+            [FieldOffset(20)]
+            public SpriteFlags Flags;
+        }
+
+		private string _Name = string.Empty;
+
+		/// <summary>
+		/// Hands out sprite handles and maintains an
+		/// array of deleted handles that can be recycled
+		/// </summary>
+        public FreeList FreeList = new FreeList();
+		
+		///////////////////////////////////////////////////////////////
+		// sprite information is stored as array of structs
+		// to optimize cache locality for bulk per-sprite updates
+		///////////////////////////////////////////////////////////////
+		
+		/// <summary>
+		/// Storage for per-sprite attributes. 
+		/// </summary>
+        protected UnmanagedBuffer Sprites = new UnmanagedBuffer();
+
+		///////////////////////////////////////////////////////////////
+		// vertex information for the quads stored in structure of arrays
+        // to optimize cache locality for individual element updates
+		///////////////////////////////////////////////////////////////
+		
+		/// <summary>
+		/// Storage for per-vertex position data. 
+		/// </summary>
+        private UnmanagedBuffer VertexPositions = new UnmanagedBuffer();
+		
+		/// <summary>
+		/// Storage for per-vertex texture co-ordinates. 
+		/// </summary>
+        private UnmanagedBuffer VertexTexCoords = new UnmanagedBuffer();
+		
+		/// <summary>
+		/// Storage for per-vertex color information. 
+		/// </summary>
+        private UnmanagedBuffer VertexColors = new UnmanagedBuffer();
+		
+		/// <summary>
+		/// The number of visible quads (a subset of the sprite count) 
+		/// </summary>
+		private int QuadCount;
+		
+		/// <summary>
+		/// Storage for index buffer. 
+		/// </summary>
+        private UnmanagedBuffer Indices = new UnmanagedBuffer();
+		
+		/// <summary>
+		/// Flag to control whether per-sprite rotations are allowed 
+		/// </summary>
+        private bool AllowRotations;
+		
+		/// <summary>
+		/// Set to true to force a rebuild of the index
+		/// buffer at the time of the next draw request 
+		/// </summary>
+		private bool RebuildIndices = true;
+		
+		private bool IsDisposed;
+
+		///////////////////////////////////////////////////////////////
+		// template set of UV coordinates for a newly allocated sprite
+		///////////////////////////////////////////////////////////////
+		
+        private static Vector2 UV0 = new Vector2(0.0f, 0.0f); // Top Left
+        private static Vector2 UV1 = new Vector2(1.0f, 0.0f); // Top Right
+        private static Vector2 UV2 = new Vector2(0.0f, 1.0f); // Bottom Left
+        private static Vector2 UV3 = new Vector2(1.0f, 1.0f); // Bottom Right
+		
+		///////////////////////////////////////////////////////////////
+		// constants used by fast sin/cos
+		///////////////////////////////////////////////////////////////
+
+		private const float Pi = 3.141592654f;
+		private const float MinusPi = -3.141592654f;
+		private const float TwoPi = 6.283185307f;
+		private const float C1 = 1.27323954f;
+		private const float C2 = 0.40528474f;
+
+		public SpriteManager()
+		{
+			this.EnableRotations = true;
+		}
+		
+		~SpriteManager()
+		{
+			this.Free();
+		}
+		
+		public virtual void Reserve(int spriteCount)
+		{
+            this.Sprites.Reserve(spriteCount * 24 /* sizeof(Sprite) */);
+
+            int vertexCount = spriteCount * 4;
+            this.VertexPositions.Reserve(vertexCount * 8 /* sizeof(Vector2) */);
+            this.VertexTexCoords.Reserve(vertexCount * 8 /* sizeof(Vector2) */);
+            this.VertexColors.Reserve(vertexCount * 4 /* sizeof(Color) */);
+
+            int indexCount = spriteCount * 6;
+            this.Indices.Reserve(indexCount * sizeof(ushort));
+		}		
+
+        public virtual unsafe int CreateSprite()
+        {
+			this.RebuildIndices = true;
+			
+            int handle = this.FreeList.Alloc();
+            int count = this.FreeList.Top;
+			
+			this.Reserve(count);
+
+            this.SetScale(handle, 0.0f, 0.0f);
+            this.SetRotation(handle, 0.0f);
+            this.SetTranslation(handle, 0.0f, 0.0f);
+            this.SetVisible(handle, true);
+            this.SetColor(handle, PixelColor.White);
+			this.SetUV(handle, ref SpriteManager.UV0, ref SpriteManager.UV1, ref SpriteManager.UV2, ref SpriteManager.UV3);
+			
+            return handle;
+        }
+		
+		/// <summary>
+		/// Destroys the specified sprite. 
+		/// </summary>
+		/// <param name="spriteHandle">The handle of the sprite to destroy.</param>
+		public unsafe void DestroySprite(int spriteHandle)
+		{
+			this.OnDestroySprite(spriteHandle);
+			
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+			// mark the sprite as unallocated/invisible
+			pSprite->Flags = SpriteFlags.None;
+			
+			// add it to the free list
+			this.FreeList.Free(spriteHandle);
+
+			// mark that the indices need to be rebuilt
+			// at the next call to Draw()
+			this.RebuildIndices = true;
+		}
+		
+		protected virtual void OnDestroySprite(int spriteHandle)
+		{
+		}
+
+		/// <summary>
+		/// Updates the sprite vertex information with or
+		/// without rotation calculations as controlled
+		/// by the state of RotationEnabled
+		/// </summary>
+		public unsafe void UpdateSRT(int spriteHandle)
+		{
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+
+            float sx = pSprite->ScaleX;
+            float sy = pSprite->ScaleY;
+            float tx = pSprite->X;
+            float ty = pSprite->Y;
+
+            // depending on how the sprite system is configured
+			// determines whether or not to use the rotation information
+            if (this.AllowRotations)
+			{
+                float theta = pSprite->Rotation;
+
+                int vertexBase = spriteHandle * 4;
+				
+		        Vector2* pPos = ((Vector2*)this.VertexPositions.Address) + vertexBase;
+				
+#if false
+	            float sinAlpha = (float)Math.Sin(theta);
+	            float cosAlpha = (float)Math.Cos(theta);
+#else
+                ///////////////////////////////////////////////////////////////
+                // Low precision sin/cos (~14x faster)
+				// http://lab.polygonal.de/2007/07/18/fast-and-accurate-sinecosine-approximation/
+                ///////////////////////////////////////////////////////////////
+
+                // wrap input theta to -PI..PI
+                if (theta < MinusPi || theta > Pi)
+				{
+                    float rem = (theta + Pi) % TwoPi;
+                    theta = rem + ((rem < 0) ? Pi : MinusPi);
+				}
+				
+	            float sinAlpha;
+	            float cosAlpha;
+					
+				//compute sine
+                if (theta < 0)
+                    sinAlpha = C1 * theta + C2 * theta * theta;
+				else
+                    sinAlpha = C1 * theta - C2 * theta * theta;
+				
+				// cosine: cos(x) = sin(x + PI/2)
+                theta += 1.57079632f;
+				
+				// wrap if we exceeded the bounds
+                if (theta > Pi)
+                    theta -= TwoPi;
+
+                if (theta < 0)
+                    cosAlpha = C1 * theta + C2 * theta * theta;
+				else
+                    cosAlpha = C1 * theta - C2 * theta * theta;
+				////////////////////////////////////////////
+#endif
+	
+	            //////////////// TOP LEFT VERTEX ////////////////
+	            // scale
+	            float x = -0.5f * sx;
+	            float y = 0.5f * sy;
+	            // rotate
+	            float rotX = x * cosAlpha - y * sinAlpha;
+	            float rotY = x * sinAlpha + y * cosAlpha;
+	            // translate
+	            pPos->X = rotX + tx;
+	            pPos->Y = rotY + ty;
+	
+	            pPos++;
+	
+	            //////////////// TOP RIGHT VERTEX ////////////////
+	            // scale
+	            x = 0.5f * sx;
+	            y = 0.5f * sy;
+	            // rotate
+	            rotX = x * cosAlpha - y * sinAlpha;
+	            rotY = x * sinAlpha + y * cosAlpha;
+	            // translate
+	            pPos->X = rotX + tx;
+	            pPos->Y = rotY + ty;
+	
+	            pPos++;
+	
+	            //////////////// BOTTOM LEFT VERTEX ////////////////
+	            // scale
+	            x = -0.5f * sx;
+	            y = -0.5f * sy;
+	            // rotate
+	            rotX = x * cosAlpha - y * sinAlpha;
+	            rotY = x * sinAlpha + y * cosAlpha;
+	            // translate
+	            pPos->X = rotX + tx;
+	            pPos->Y = rotY + ty;
+	
+	            pPos++;
+	
+	            //////////////// BOTTOM RIGHT VERTEX ////////////////
+	            // scale
+	            x = 0.5f * sx;
+	            y = -0.5f * sy;
+	            // rotate
+	            rotX = x * cosAlpha - y * sinAlpha;
+	            rotY = x * sinAlpha + y * cosAlpha;
+	            // translate
+	            pPos->X = rotX + tx;
+	            pPos->Y = rotY + ty;
+			}
+			else
+			{
+				int vertexBase = spriteHandle * 4;
+				
+		        Vector2* pPos = ((Vector2*)this.VertexPositions.Address) + vertexBase;
+				
+		        //////////////// TOP LEFT VERTEX ////////////////
+		        pPos->X = -0.5f * sx + tx;
+		        pPos->Y =  0.5f * sy + ty;
+				pPos++;
+		
+		        //////////////// TOP RIGHT VERTEX ////////////////
+		        // scale
+		        pPos->X =  0.5f * sx + tx;
+		        pPos->Y =  0.5f * sy + ty;
+				pPos++;
+		
+		        //////////////// BOTTOM LEFT VERTEX ////////////////
+		        pPos->X = -0.5f * sx + tx;
+		        pPos->Y = -0.5f * sy + ty;
+				pPos++;
+		
+		        //////////////// BOTTOM RIGHT VERTEX ////////////////
+		        pPos->X =  0.5f * sx + tx;
+		        pPos->Y = -0.5f * sy + ty;
+			}
+		}
+
+		/// <summary>
+		/// Builds the index buffer for the quads, skipping
+		/// sprites that are marked as not visible 
+		/// </summary>
+        private unsafe void BuildIndices()
+        {
+			// the number of quads actually visible
+			this.QuadCount = 0;
+			
+            int count = this.FreeList.Top;
+            if (count == 0)
+                return;
+
+            Sprite* pSprite = (Sprite*)this.Sprites.Address;
+            ushort* pIndex = (ushort*)this.Indices.Address;
+
+            int vertexBase = 0;
+			
+			for (int i = 0; i < count;
+                i++,
+                pSprite++,
+			    vertexBase += 4)
+            {
+                if ((pSprite->Flags & SpriteFlags.Visible) != SpriteFlags.Visible)
+                    continue;
+
+                // sprite is visible
+                this.QuadCount++;
+
+                // emit indices
+                *(pIndex++) = (ushort)(vertexBase);
+                *(pIndex++) = (ushort)(vertexBase + 1);
+                *(pIndex++) = (ushort)(vertexBase + 2);
+                *(pIndex++) = (ushort)(vertexBase + 1);
+                *(pIndex++) = (ushort)(vertexBase + 2);
+                *(pIndex++) = (ushort)(vertexBase + 3);
+            }
+        }
+		
+		/// <summary>
+		/// Builds the index buffer for the quads, skipping
+		/// sprites that are marked as not visible 
+		/// </summary>
+        public unsafe ushort[] GetIndicesForSpriteSet(int[] spriteHandles)
+        {
+			int handleCount = spriteHandles.Length;
+			if (handleCount == 0)
+				return new ushort[0];
+			
+			int indexCount = handleCount * 6;
+			ushort[] indices = new ushort[indexCount];
+			
+			fixed (ushort* pIndices = indices)
+			{
+				ushort* pIndex = pIndices;
+				
+				int spriteHandle;
+	            int vertexBase;
+				
+				for (int i = 0; i < handleCount; i++)
+	            {
+					spriteHandle = spriteHandles[i];
+					vertexBase = spriteHandle * 4;
+					
+	                // emit indices
+	                *(pIndex++) = (ushort)(vertexBase);
+	                *(pIndex++) = (ushort)(vertexBase + 1);
+	                *(pIndex++) = (ushort)(vertexBase + 2);
+	                *(pIndex++) = (ushort)(vertexBase + 1);
+	                *(pIndex++) = (ushort)(vertexBase + 2);
+	                *(pIndex++) = (ushort)(vertexBase + 3);
+	            }
+			}
+			
+			return indices;
+        }
+
+        /// <summary>
+        /// Gets the scale of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <returns>The scale of the sprite.</returns>
+        public unsafe Vector2 GetScale(int spriteHandle)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+
+			return new Vector2(pSprite->ScaleX, pSprite->ScaleY);
+        }
+
+        /// <summary>
+        /// Gets the scale of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="scale">The scale of the sprite.</param>
+        public unsafe void GetScale(int spriteHandle, out Vector2 scale)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+
+			scale.X = pSprite->ScaleX;
+			scale.Y = pSprite->ScaleY;
+        }
+
+        /// <summary>
+        /// Sets the scale of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="scale">The new scale of the sprite.</param>
+        public unsafe void SetScale(int spriteHandle, Vector2 scale)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+            pSprite->ScaleX = scale.X;
+            pSprite->ScaleY = scale.Y;
+
+            this.UpdateSRT(spriteHandle);
+        }
+
+        /// <summary>
+        /// Sets the scale of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="scale">The new scale of the sprite.</param>
+        public unsafe void SetScale(int spriteHandle, ref Vector2 scale)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+            pSprite->ScaleX = scale.X;
+            pSprite->ScaleY = scale.Y;
+
+            this.UpdateSRT(spriteHandle);
+        }
+
+        /// <summary>
+        /// Sets the scale of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="scaleX">The scale of the x component.</param>
+        /// <param name="scaleY">The scale of the y component.</param>
+        public unsafe void SetScale(int spriteHandle, float scaleX, float scaleY)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+            pSprite->ScaleX = scaleX;
+            pSprite->ScaleY = scaleY;
+
+            this.UpdateSRT(spriteHandle);
+        }
+
+        /// <summary>
+        /// Sets a uniform scale of the sprite in both x and y directions.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="scale">The value to set for both x and y scale components.</param>
+        public unsafe void SetScale(int spriteHandle, float scale)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+            pSprite->ScaleX = scale;
+            pSprite->ScaleY = scale;
+
+            this.UpdateSRT(spriteHandle);
+        }
+		
+        /// <summary>
+        /// Gets the rotation angle of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <returns>The angle (in radians) of the sprite rotation.</returns>
+        public unsafe float GetRotation(int spriteHandle)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+
+			return pSprite->Rotation;
+        }
+
+        /// <summary>
+        /// Sets the rotation angle of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="theta">The angle (in radians) to rotate the sprite.</param>
+        public unsafe void SetRotation(int spriteHandle, float theta)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+            pSprite->Rotation = theta;
+
+            if (this.AllowRotations)
+                this.UpdateSRT(spriteHandle);
+        }
+
+        public unsafe void Rotate(int spriteHandle, float theta)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+            pSprite->Rotation += theta;
+
+            if (this.AllowRotations)
+                this.UpdateSRT(spriteHandle);
+        }
+		
+        /// <summary>
+        /// Gets the translation of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <returns>The translation of the sprite.</returns>
+        public unsafe Vector2 GetTranslation(int spriteHandle)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+            return new Vector2(pSprite->X, pSprite->Y);
+        }
+
+        /// <summary>
+        /// Gets the translation of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="translation">The translation of the sprite.</param>
+        public unsafe void GetTranslation(int spriteHandle, out Vector2 translation)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+			translation.X = pSprite->X;
+			translation.Y = pSprite->Y;
+        }
+
+        /// <summary>
+        /// Sets the translation of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="x">The x co-ordinate of the translation.</param>
+        /// <param name="y">The y co-ordinate of the translation.</param>
+        public unsafe void SetTranslation(int spriteHandle, float x, float y)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+
+			pSprite->X = x;
+			pSprite->Y = y;
+
+            this.UpdateSRT(spriteHandle);
+        }
+
+        /// <summary>
+        /// Sets the scale, rotation and translation of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="scale">The scale of the sprite.</param>
+        /// <param name="rotation">The rotation of the sprite (in radians).</param>
+        /// <param name="translation">The translation of the sprite.</param>
+        public unsafe void SetSRT(int spriteHandle, Vector2 scale, float rotation, Vector2 translation)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+
+            pSprite->ScaleX = scale.X;
+            pSprite->ScaleY = scale.Y;
+
+            pSprite->Rotation = rotation;
+
+            pSprite->X = translation.X;
+            pSprite->Y = translation.Y;
+
+            this.UpdateSRT(spriteHandle);
+        }
+
+        /// <summary>
+        /// Sets the scale, rotation and translation of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="scale">The scale of the sprite.</param>
+        /// <param name="rotation">The rotation of the sprite (in radians).</param>
+        /// <param name="translation">The translation of the sprite.</param>
+        public unsafe void SetSRT(int spriteHandle, ref Vector2 scale, float rotation, ref Vector2 translation)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+
+            pSprite->ScaleX = scale.X;
+            pSprite->ScaleY = scale.Y;
+
+            pSprite->Rotation = rotation;
+
+            pSprite->X = translation.X;
+            pSprite->Y = translation.Y;
+
+            this.UpdateSRT(spriteHandle);
+        }
+
+        /// <summary>
+        /// Gets the color of the sprite (from the first vertex in the sprite quad).
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <returns>The color of the first vertex in the sprite quad.</returns>
+        public unsafe PixelColor GetColor(int spriteHandle)
+        {
+			int vertexBase = spriteHandle * 4;
+			
+			PixelColor* pColor = ((PixelColor*)this.VertexColors.Address) + vertexBase;
+			
+			return *pColor;
+        }
+
+        /// <summary>
+        /// Sets the colors of all corners of the sprite quad to the same color.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="color">The color to use on each vertex.</param>
+        public unsafe void SetColor(int spriteHandle, PixelColor color)
+        {
+			int vertexBase = spriteHandle * 4;
+			
+			PixelColor* pColor = ((PixelColor*)this.VertexColors.Address) + vertexBase;
+
+            *(pColor++) = color;
+            *(pColor++) = color;
+            *(pColor++) = color;
+            *(pColor) = color;
+        }
+
+        /// <summary>
+        /// Sets the color of each corner of the sprite quad.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="topLeft">The color to set on the top left corner of the sprite.</param>
+        /// <param name="topRight">The color to set on the top right corner of the sprite.</param>
+        /// <param name="bottomLeft">The color to set on the bottom left corner of the sprite.</param>
+        /// <param name="bottomRight">The color to set on the bottom right corner of the sprite.</param>
+        public unsafe void SetColors(int spriteHandle, PixelColor topLeft, PixelColor topRight, PixelColor bottomLeft, PixelColor bottomRight)
+        {
+            int vertexBase = spriteHandle * 4;
+			
+            PixelColor* pColor = ((PixelColor*)this.VertexColors.Address) + vertexBase;
+
+            *(pColor++) = topLeft;
+            *(pColor++) = topRight;
+            *(pColor++) = bottomLeft;
+            *(pColor) = bottomRight;
+        }
+
+        /// <summary>
+        /// Sets the texture co-ordinates of the sprite quad.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="topLeft">The texture co-ordinate for the top left corner of the sprite.</param>
+        /// <param name="topRight">The texture co-ordinate for the top right corner of the sprite.</param>
+        /// <param name="bottomLeft">The texture co-ordinate for the bottom left corner of the sprite.</param>
+        /// <param name="bottomRight">The texture co-ordinate for the bottom right corner of the sprite.</param>
+		public unsafe void SetUV(int spriteHandle, ref Vector2 topLeft, ref Vector2 topRight, ref Vector2 bottomLeft, ref Vector2 bottomRight)
+		{
+			int vertexBase = spriteHandle * 4;
+			
+            Vector2* pUV = ((Vector2*)this.VertexTexCoords.Address) + vertexBase;
+			
+            *(pUV++) = topLeft;
+            *(pUV++) = topRight;
+            *(pUV++) = bottomLeft;
+            *(pUV) = bottomRight;
+		}
+
+		public unsafe void SetUV(int spriteHandle, float x0, float y0, float x1, float y1)
+		{
+			int vertexBase = spriteHandle * 4;
+			
+            Vector2* pUV = ((Vector2*)this.VertexTexCoords.Address) + vertexBase;
+			
+            pUV->X = x0;
+            pUV->Y = y0;
+			pUV++;
+            pUV->X = x1;
+            pUV->Y = y0;
+			pUV++;
+            pUV->X = x0;
+            pUV->Y = y1;
+			pUV++;
+            pUV->X = x1;
+            pUV->Y = y1;
+		}
+
+        /// <summary>
+        /// Gets the visibility flag of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <returns>True if the sprite is visible, otherwise false.</returns>
+        public unsafe bool GetVisible(int spriteHandle)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+			bool isVisible = (pSprite->Flags & SpriteFlags.Visible) == SpriteFlags.Visible;
+			
+            return isVisible;
+        }
+
+        /// <summary>
+        /// Sets the visibility flag of the sprite.
+        /// </summary>
+        /// <param name="spriteHandle">The handle of the sprite.</param>
+        /// <param name="isVisible">True to mark the sprite visible, otherwise false.</param>
+        public unsafe void SetVisible(int spriteHandle, bool isVisible)
+        {
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+			// make sure they are not setting visible
+			// to the same value that already is and
+			// bail out in this case to avoid the
+			// expense of rebuilding the indices
+			bool isSpriteVisible = (pSprite->Flags & SpriteFlags.Visible) == SpriteFlags.Visible;
+			if (isSpriteVisible == isVisible)
+				return;
+			
+			if (isVisible)
+ 				pSprite->Flags |= SpriteFlags.Visible;
+			else
+ 				pSprite->Flags = pSprite->Flags & ~SpriteFlags.Visible;
+			
+			this.RebuildIndices = true;
+        }
+
+		/// <summary>
+		/// Enables or disables sprite rotations.
+		/// </summary>
+		public bool EnableRotations
+		{
+			get { return this.AllowRotations; }
+            set { this.AllowRotations = value; }
+		}
+		
+		protected unsafe Sprite* GetSprite(int spriteHandle)
+		{
+            Sprite* pSprite = ((Sprite*)this.Sprites.Address) + spriteHandle;
+			
+			return pSprite;
+		}
+		
+		private void Free()
+		{
+			this.Sprites.Dispose();
+			this.VertexPositions.Dispose();
+			this.VertexTexCoords.Dispose();
+			this.VertexColors.Dispose();
+			this.Indices.Dispose();
+		}
+
+        #region IDisposable Members
+
+        public virtual void Dispose()
+        {
+			if (this.IsDisposed)
+				return;
+			
+			this.IsDisposed = true;
+			
+            this.Free();
+        }
+
+        #endregion
+		
+		#region ISpriteLayer Members
+		
+		public string Name
+		{
+			get { return this._Name; }
+			set { this._Name = value; }
+		}
+		
+		public virtual void Update()
+		{
+		}
+		
+
+		/// <summary>
+		/// Draws the set of visible sprites.
+		/// </summary>
+		public virtual unsafe void Draw()
+		{
+			if (this.RebuildIndices)
+			{
+				this.BuildIndices();
+				this.RebuildIndices = false;
+			}
+			
+			if (this.QuadCount == 0)
+				return;
+				
+            int indexCount = this.QuadCount * 6;
+
+            GL.EnableClientState(All.VertexArray);
+            GL.EnableClientState(All.ColorArray);
+            GL.EnableClientState(All.TextureCoordArray);
+			
+            GL.VertexPointer(2, All.Float, 0, this.VertexPositions.Address);
+            GL.TexCoordPointer(2, All.Float, 0, this.VertexTexCoords.Address);
+            GL.ColorPointer(4, All.UnsignedByte, 0, this.VertexColors.Address);
+			
+            GL.DrawElements(All.Triangles, indexCount, All.UnsignedShort, this.Indices.Address);
+		}
+		
+		#endregion
+		
+		public virtual unsafe void DrawSubset(ushort[] indices)
+		{
+			int indexCount = indices.Length;
+			if (indexCount == 0)
+				return;
+			
+            GL.EnableClientState(All.VertexArray);
+            GL.EnableClientState(All.ColorArray);
+            GL.EnableClientState(All.TextureCoordArray);
+			
+            GL.VertexPointer(2, All.Float, 0, this.VertexPositions.Address);
+            GL.TexCoordPointer(2, All.Float, 0, this.VertexTexCoords.Address);
+            GL.ColorPointer(4, All.UnsignedByte, 0, this.VertexColors.Address);
+
+			fixed (ushort* p = indices)
+			{
+				GL.DrawElements(All.Triangles, indexCount, All.UnsignedShort, (IntPtr)p);
+			}
+		}
+    }
+}
