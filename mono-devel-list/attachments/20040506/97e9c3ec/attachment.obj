@@ -1,0 +1,468 @@
+Index: XSPApplicationHost.cs
+===================================================================
+RCS file: /cvs/public/xsp/server/XSPApplicationHost.cs,v
+retrieving revision 1.25
+diff -u -r1.25 XSPApplicationHost.cs
+--- XSPApplicationHost.cs	16 Apr 2004 11:27:07 -0000	1.25
++++ XSPApplicationHost.cs	6 May 2004 19:00:43 -0000
+@@ -15,6 +15,7 @@
+ using System.Text;
+ using System.Threading;
+ using System.Web;
++using System.Xml;
+ using System.Web.Hosting;
+ using System.Runtime.Remoting.Lifetime;
+ #if MODMONO_SERVER
+@@ -90,7 +91,9 @@
+ 				InitialWorkerRequest ir = new InitialWorkerRequest (ns);
+ 				ir.ReadRequestData ();
+ 				rdata = ir.RequestData;
+-				host = server.GetApplicationForPath (rdata.Path, true);
++				string vhost = null; // TODO - how to get the host
++				int port = 80; // TODO - how to get the port?
++				host = server.GetApplicationForPath (vhost, port, rdata.Path, true);
+ 				if (host == null) {
+ 					byte [] nf = HttpErrors.NotFound (rdata.Path);
+ 					ns.Write (nf, 0, nf.Length);
+@@ -99,7 +102,9 @@
+ 				}
+ #else
+ 				RequestReader rr = new RequestReader (ns);
+-				host = server.GetApplicationForPath (rr.GetUriPath (), false);
++				string vhost = rr.Request.GetRequestHeader("Host");
++				int port = 80; // TODO - how to get the port?
++				host = server.GetApplicationForPath (vhost, port, rr.GetUriPath (), false);
+ 				if (host == null) {
+ 					rr.Decline ();
+ 					return;
+@@ -175,30 +180,67 @@
+ 		}
+ 	}
+ 
++	public class VPathToHost
++	{
++		public readonly string vhost;
++		public readonly int vport;
++		public readonly string vpath;
++		public readonly string realPath;
++
++		public IApplicationHost appHost;
++
++		public VPathToHost(string vhost, int vport, string vpath, string realPath)
++		{
++			this.vhost = vhost;
++			this.vport = vport;
++			this.vpath = vpath;
++			this.realPath = realPath;
++			this.appHost = null;
++		}
++
++		public void ClearHost()
++		{
++			this.appHost = null;
++		}
++
++		public void CreateHost()
++		{
++			string v = vpath;
++			if (v != "/" && v.EndsWith("/"))
++			{
++				v = v.Substring(0, v.Length - 1);
++			}
++			this.appHost = ApplicationHost.CreateApplicationHost(typeof (XSPApplicationHost), v, realPath) as IApplicationHost;
++		}
++	}
++
+ 	public class XSPApplicationServer
+ 	{
+ 		Socket listen_socket;
+ 		bool started;
+ 		bool stop;
++		bool verbose;
++
+ #if !MODMONO_SERVER
+ 		IPEndPoint bindAddress;
+ #endif
+ 		Thread runner;
+- 		Hashtable appToDir;
+- 		Hashtable dirToHost;
++
++		// a sorted list of mappings. This is much faster than hashtable for typical cases.
++		ArrayList vpathToHost = new ArrayList();
++		
+  		object marker = new object ();
+ 
+ #if MODMONO_SERVER
+ 		string filename;
+ #endif
+ 
+-		public XSPApplicationServer (string applications)
++		public XSPApplicationServer()
+ 		{
+ #if MODMONO_SERVER
+ #else
+ 			SetListenAddress (80);
+ #endif
+-			SetApplications (applications);
+ 		}
+ 
+ #if MODMONO_SERVER
+@@ -232,31 +274,121 @@
+ 		}
+ #endif
+ 
+- 		public void SetApplications (string applications)
++		public bool Verbose
++		{
++			get { return verbose; }
++			set { verbose = value; }
++		}
++
++		private void AddApplication(string vhost, int vport, string vpath, string fullPath)
++		{
++			if (verbose) {
++				Console.WriteLine("Registering application:");
++				Console.WriteLine("    Host:          {0}", (vhost != null) ? vhost : "any");
++				Console.WriteLine("    Port:          {0}", (vport != -1) ? vport.ToString() : "any");
++				Console.WriteLine("    Virtual path:  {0}", vpath);
++				Console.WriteLine("    Physical path: {0}", fullPath);
++			}
++
++			vpathToHost.Add(new VPathToHost(vhost, vport, vpath, fullPath));
++		}
++
++ 		public void AddApplicationsFromConfigDirectory(string directoryName)
++ 		{
++			if (verbose) {
++				Console.WriteLine("Adding applications from *.webapp files in directory '{0}'", directoryName);
++			}
++			DirectoryInfo di = new DirectoryInfo(directoryName);
++			foreach (FileInfo fi in di.GetFiles("*.webapp"))
++			{
++				AddApplicationsFromConfigFile(fi.FullName);
++			}
++		}
++
++ 		public void AddApplicationsFromConfigFile(string fileName)
++ 		{
++			if (verbose) {
++				Console.WriteLine("Adding applications from config file '{0}'", fileName);
++			}
++			XmlDocument doc = new XmlDocument();
++			doc.Load(fileName);
++
++			foreach (XmlElement el in doc.SelectNodes("//web-application"))
++			{
++				AddApplicationFromElement(el);
++			}
++		}
++
++		private void AddApplicationFromElement(XmlElement el)
++		{
++			XmlNode n;
++
++			string name = el.SelectSingleNode("name").InnerText;
++			string vpath = el.SelectSingleNode("vpath").InnerText;
++			string path = el.SelectSingleNode("path").InnerText;
++
++			string vhost = null;
++			n = el.SelectSingleNode("vhost");
++			if (n != null)
++				vhost = n.InnerText;
++
++			int vport = -1;
++			n = el.SelectSingleNode("vport");
++			if (n != null)
++				vport = Convert.ToInt32(n.InnerText);
++
++			AddApplication(vhost, vport, vpath, path);
++		}
++
++ 		public void AddApplicationsFromCommandLine(string applications)
+  		{
+  			if (applications == null)
+  				throw new ArgumentNullException ("applications");
+  
+- 			if (appToDir != null)
+- 				throw new InvalidOperationException ("Already called");
+- 
+  			if (applications == "")
+ 				return;
+ 
+- 			appToDir = new Hashtable ();
+- 			dirToHost = new Hashtable ();
++			if (verbose) {
++				Console.WriteLine("Adding applications '{0}'...", applications);
++			}
++
+  			string [] apps = applications.Split (',');
+-			//Console.WriteLine ("applications: {0}", applications);
+- 			foreach (string str in apps) {
+- 				string [] app = str.Split (':');
+- 				if (app.Length != 2)
+- 					throw new ArgumentException ("Should be something like VPath:realpath");
++
++			foreach (string str in apps) {
++				string [] app = str.Split (':');
++
++				Console.WriteLine("str: {0}", str);
++				if (app.Length < 2 || app.Length > 4)
++					throw new ArgumentException ("Should be something like [[hostname:]port:]VPath:realpath");
++
++				int vport;
++				string vhost;
++				string vpath;
++				string realpath;
++				int pos = 0;
++
++				if (app.Length >= 3) {
++					vhost = app[pos++];
++				} else {
++					vhost = null;
++				}
++
++				if (app.Length >= 4) {
++					vport = Convert.ToInt16(app[pos++]);
++				} else {
++					vport = -1;
++				}
++
++				vpath = app[pos++];
++				realpath = app[pos++];
++
++				if (!vpath.EndsWith("/"))
++					vpath += "/";
+  
+- 				string fp = System.IO.Path.GetFullPath (app [1]);
+- 				//Console.WriteLine ("{0} -> {1}", app [0], fp);
+- 				appToDir [app [0]] = fp;
+- 				dirToHost [fp] = marker;
++ 				string fullPath = System.IO.Path.GetFullPath(realpath);
++				AddApplication(vhost, vport, vpath, fullPath);
+  			}
++			// TODO - check for duplicates, sort, optimize, etc.
+  		}
+  
+ 		public bool Start ()
+@@ -264,7 +396,7 @@
+ 			if (started)
+ 				throw new InvalidOperationException ("The server is already started.");
+ 
+- 			if (appToDir == null)
++ 			if (vpathToHost == null)
+  				throw new InvalidOperationException ("SetApplications must be called first");
+ 
+ #if MODMONO_SERVER
+@@ -295,7 +427,11 @@
+ 
+ 			stop = true;	
+ 			listen_socket.Close ();
+-			dirToHost = new Hashtable ();
++			lock (vpathToHost) {
++				foreach (VPathToHost v in vpathToHost) {
++					v.ClearHost();
++				}
++			}
+ 			WebTrace.WriteLine ("Server stopped.");
+ 		}
+ 
+@@ -313,46 +449,52 @@
+ 			started = false;
+ 		}
+ 
+-		public static object CreateApplicationHost (string virtualPath, string baseDirectory)
++		public IApplicationHost GetApplicationForPath (string vhost, int port, string path, bool defaultToRoot)
+ 		{
+-			return ApplicationHost.CreateApplicationHost (typeof (XSPApplicationHost),
+-								      virtualPath,
+-								      baseDirectory);
+-		}
+-
+-		public IApplicationHost GetApplicationForPath (string path, bool defaultToRoot)
+-		{
+-			IApplicationHost bestFit = null;
+-			string [] parts = path.Split ('/');
+-			int count = parts.Length;
+-			while (count > 0) {
+-				string current = String.Join ("/", parts, 0, count);
+-				if (current == "")
+-					current = "/";
+-
+-				//Console.WriteLine ("current: {0} path: {1}", current, path);
+-				string dir = appToDir [current] as string;
+-				if (dir != null) {
+-					lock (dirToHost) {
+-						object o = dirToHost [dir];
+-						if (o == marker) {
+-							o = CreateApplicationHost (current, dir);
+-							dirToHost [dir] = o;
+-						}
+-						bestFit = o as IApplicationHost;
++			VPathToHost bestMatch = null;
++			int bestMatchLength = 0;
++
++			// Console.WriteLine("GetApplicationForPath({0},{1},{2},{3})", vhost, port, path, defaultToRoot);
++			foreach (VPathToHost v in vpathToHost)
++			{
++				if (v.vport != -1) {
++					if (v.vport != port) {
++						// ports don't match - ignore
++						continue;
++					}
++				}
++
++				if (vhost != null && v.vhost != null) {
++					if (0 != String.CompareOrdinal(vhost, v.vhost)) {
++						// vhosts don't match - ignore
++						continue;
+ 					}
+-					break;
+ 				}
+-				
+-				count--;
+-			}
+ 
+-			if (defaultToRoot && bestFit == null) {
+-				if (appToDir.ContainsKey ("/"))
+-					bestFit = dirToHost [appToDir ["/"]] as IApplicationHost;
++				if (path.StartsWith(v.vpath)) {
++					int matchLength = v.vpath.Length;
++					if (matchLength > bestMatchLength) {
++						bestMatchLength = matchLength;
++						bestMatch = v;
++					}
++				}
+ 			}
+ 
+-			return bestFit;
++			if (bestMatch != null) {
++				if (bestMatch.appHost == null) {
++					lock (vpathToHost) {
++						if (bestMatch.appHost == null) {
++							bestMatch.CreateHost();
++						}
++					}
++				}
++				return bestMatch.appHost;
++			} else if (defaultToRoot) {
++				return GetApplicationForPath(vhost, port, "/", false);
++			} else {
++				Console.WriteLine("No application defined for: {0}:{1}{2}", vhost, port, path);
++				throw new InvalidOperationException("No application defined!");
++			}
+ 		}
+ 	}
+ }
+Index: server.cs
+===================================================================
+RCS file: /cvs/public/xsp/server/server.cs,v
+retrieving revision 1.21
+diff -u -r1.21 server.cs
+--- server.cs	16 Apr 2004 11:27:07 -0000	1.21
++++ server.cs	6 May 2004 19:00:43 -0000
+@@ -40,6 +40,7 @@
+ 			Console.WriteLine ("mod-mono-server.exe is a ASP.NET server used from mod_mono_unix.");
+ 			Console.WriteLine ("Usage is:\n");
+ 			Console.WriteLine ("    mod-mono-server.exe [--root rootdir] [--applications APPS] [--filename file]");
++			Console.WriteLine ("            [--appconfigdir DIR] [--appconfigfile FILE]");
+ 			Console.WriteLine ();
+ 			Console.WriteLine ("    --filename file: the unix socket file name.");
+ 			Console.WriteLine ("                    Default value: /tmp/mod_mono_server");
+@@ -49,6 +50,7 @@
+ 			Console.WriteLine ("minimalistic HTTP server\n");
+ 			Console.WriteLine ("Usage is:\n");
+ 			Console.WriteLine ("    xsp.exe [--root rootdir] [--applications APPS]");
++			Console.WriteLine ("            [--appconfigdir DIR] [--appconfigfile FILE]");
+ 			Console.WriteLine ("            [--port N] [--address addr]");
+ 			Console.WriteLine ();
+ 			Console.WriteLine ("    --port N: n is the tcp port to listen on.");
+@@ -65,16 +67,31 @@
+ 			Console.WriteLine ("                    Default value: current directory.");
+ 			Console.WriteLine ("                    AppSettings key name: MonoServerRootDir");
+ 			Console.WriteLine ();
++			Console.WriteLine ("    --appconfigfile FILENAME: adds application definitions from the XML");
++			Console.WriteLine ("                    configuration file. See sample configuration file that");
++			Console.WriteLine ("                    comes with the server.");
++			Console.WriteLine ("                    AppSettings key name: MonoApplicationsConfigFile");
++			Console.WriteLine ();
++			Console.WriteLine ("    --appconfigdir DIR: adds application definitions from all XML files");
++			Console.WriteLine ("                    found in the specified directory DIR. Files must have");
++			Console.WriteLine ("                    '.webapp' extension");
++			Console.WriteLine ("                    AppSettings key name: MonoApplicationsConfigDir");
++			Console.WriteLine ();
+ 			Console.WriteLine ("    --applications APPS: a comma separated list of virtual directory and");
+ 			Console.WriteLine ("                    real directory for all the applications we want to manage");
+ 			Console.WriteLine ("                    with this server. The virtual and real dirs. are separated");
+-			Console.WriteLine ("                    by a colon.");
++			Console.WriteLine ("                    by a colon. Optionally you may specify virtual host name");
++			Console.WriteLine ("                    and a port.");
++			Console.WriteLine ();
+ 			Console.WriteLine ("                    Samples: /:.");
+ 			Console.WriteLine ("                           the virtual / is mapped to the current directory.");
+ 			Console.WriteLine ();
+ 			Console.WriteLine ("                            /blog:../myblog");
+ 			Console.WriteLine ("                           the virtual /blog is mapped to ../myblog");
+ 			Console.WriteLine ();
++			Console.WriteLine ("                            myhost.someprovider.net:/blog:../myblog");
++			Console.WriteLine ("                           the virtual /blog at myhost.someprovider.net is mapped to ../myblog");
++			Console.WriteLine ();
+ 			Console.WriteLine ("                            /:.,/blog:../myblog");
+ 			Console.WriteLine ("                           Two applications like the above ones are handled.");
+ 			Console.WriteLine ("                    Default value: /:.");
+@@ -91,11 +108,12 @@
+ 		public static int Main (string [] args)
+ 		{
+ 			bool nonstop = false;
++			bool verbose = true;
+ 			Trace.Listeners.Add (new TextWriterTraceListener (Console.Out));
+ 			string apps = ConfigurationSettings.AppSettings ["MonoApplications"];
++			string appConfigDir = ConfigurationSettings.AppSettings ["MonoApplicationsConfigDir"];
++			string appConfigFile = ConfigurationSettings.AppSettings ["MonoApplicationsConfigFile"];
+ 			string rootDir = ConfigurationSettings.AppSettings ["MonoServerRootDir"];
+-			if (apps == null)
+-				apps = "/:.";
+ #if MODMONO_SERVER
+ 			string filename = ConfigurationSettings.AppSettings ["UnixSocketFileName"];
+ #else
+@@ -132,6 +150,12 @@
+ 				case "--applications":
+ 					apps = args [++i];
+ 					break;
++				case "--appconfigfile":
++					appConfigFile = args [++i];
++					break;
++				case "--appconfigdir":
++					appConfigDir = args [++i];
++					break;
+ 				case "--nonstop":
+ 					nonstop = true;
+ 					break;
+@@ -141,6 +165,9 @@
+ 				case "--version":
+ 					ShowVersion ();
+ 					return 0;
++				case "--verbose":
++					verbose = true;
++					break;
+ 				default:
+ 					Console.WriteLine ("Unknown argument: {0}", a);
+ 					ShowHelp ();
+@@ -178,7 +205,17 @@
+ 
+ 			rootDir = Directory.GetCurrentDirectory ();
+ 			
+-			XSPApplicationServer server =  new XSPApplicationServer (apps);
++			XSPApplicationServer server =  new XSPApplicationServer ();
++			if (verbose)
++				server.Verbose = true;
++			if (apps != null)
++				server.AddApplicationsFromCommandLine(apps);
++			if (appConfigFile != null)
++				server.AddApplicationsFromConfigFile(appConfigFile);
++			if (appConfigDir != null)
++				server.AddApplicationsFromConfigDirectory(appConfigDir);
++			if (apps == null && appConfigDir == null && appConfigFile == null)
++				server.AddApplicationsFromCommandLine("/:.");
+ #if MODMONO_SERVER
+ 			server.SetListenFile (filename);
+ 			Console.WriteLine ("Listening on: {0}", filename);

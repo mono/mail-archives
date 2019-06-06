@@ -1,0 +1,308 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH] Implement internal Encodings usingunified	code base
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Implement%20internal%20Encodings%20usingunified%0A%09code%20base&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027238.html">
+   <LINK REL="Next"  HREF="027248.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH] Implement internal Encodings usingunified	code base</H1>
+    <B>Korn&#233;l P&#225;l</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Implement%20internal%20Encodings%20usingunified%0A%09code%20base&In-Reply-To="
+       TITLE="[Mono-dev] [PATCH] Implement internal Encodings usingunified	code base">kornelpal at gmail.com
+       </A><BR>
+    <I>Fri Mar 21 07:25:53 EDT 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027238.html">[Mono-dev] [PATCH] Implement internal Encodings using	unified	code base
+</A></li>
+        <LI>Next message: <A HREF="027248.html">[Mono-dev] [PATCH] Implement internal Encodings	usingunified	code base
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27241">[ date ]</a>
+              <a href="thread.html#27241">[ thread ]</a>
+              <a href="subject.html#27241">[ subject ]</a>
+              <a href="author.html#27241">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi,
+
+&gt;<i>From: &quot;Paolo Molaro&quot; &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>&gt;
+</I>&gt;<i>Sure, the existing unsafe methods are perfectly fine, there is no need
+</I>&gt;<i>to add more virtual unsafe methods (this is about 2.0). In 1.1 the
+</I>&gt;<i>unsafe methods would simply become internal.
+</I>
+This is unfortunately unture because we cannot call the public unsafe 
+methods because it would result in the problems described in bug 363713. To 
+fix bug 363713 a private (actually internal) unsafe implementation is 
+required. Also note that by having private implementations code of Encoding 
+and Encoder/Decoder methods can be shared as well by passing state 
+information to these four methods (and passing zero or initial state when 
+called from the stateless Encoding).
+
+&gt;<i>I don't see any need for a different infrastructure to fix that bug,
+</I>&gt;<i>it's simply a bug in our implementation. In 2.0 all the GetByteCount ()
+</I>&gt;<i>overloads must call the unsafe overload to do the work. There is no need
+</I>&gt;<i>for additional virtual methods, because the method is there already.
+</I>&gt;<i>Look at UTF8Encoding for GetByteCount(): it does already mostly the right
+</I>&gt;<i>thing (it calls the internal implementation directly instead of going
+</I>&gt;<i>through the virtual unsafe method, trivially fixable).
+</I>
+To fix bug 363713 we have to take slower code paths (the same that MS.NET
+uses) for some methods that will result in buffer copy operations. This bug
+only affects inherited encodings (but there are a lot of inheritable
+encoding classes). This is why I introduced the IsInternal property;
+instances of internal classes can take faster code paths, while instances of
+inherited classes will take MS compatible (slower) code paths. I decided to
+implement this code path redirection in Encoding.cs and call the four
+internal virtual (in fact internally must-implement) unsafe methods. This
+way the source code of inherited encoding classes will have a clean look
+because only four methods has to be implemented the other ones will only
+call the ...Internal implementations in Encoding.cs that does all the work.
+
+&gt;<i>Let's talk with a concrete example and assume that for
+</I>&gt;<i>UnicodeEncoding.GetByteCount() we need to do something more complicated
+</I>&gt;<i>than count * 2. What is the advantage of doing it in a separate function
+</I>&gt;<i>instead of in the actual method?
+</I>
+Because of fallbacks the actual required byte cound depends on the fallback 
+buffer as well. Also note that UnicodeEncoding in MS.NET 2.0 has support for 
+surrogates and can detect invalid surrogate sequences that means that the 
+fallback buffer will be used to replace invalid input data. If you don't 
+have a single implementation for GetByteCount you will have to duplicate 
+code for strings, char arrays and char pointers as well. So having a single 
+method that implements the actual algorithm makes the code more 
+maintainable. For example have a look at GetBytes methods of ASCIIEncoding: 
+Verifiable ones use fallback buffers the unsafe one doesn't. So it is 
+already out of sync. I believe that there are more of such examples. Having 
+less duplicated/multiplied code helps prevent this.
+
+UnicodeEncoding.GetByteCount will be count * 2 on .NET 1.x but I think it's 
+not worth to use different desing on .NET 1.x to provide a little bit better 
+performance on .NET 1.x than on .NET 2.0. .NET 1.x will work as expected and 
+the code will be cleaner an will remain maintainable with using this 
+infrastructure designed for .NET 2.0 on .NET 1.x as well.
+
+&gt;<i>I don't see where the duplicate code would come from.
+</I>
+Your proposed solution (that would be just as much change in the
+infrastructure) is to use static implementation for these four methods in
+contrast to virtual methods.
+This would need more code in individual encoding classes:
+- Argument checking (can be implemented using static methods in Encoding.cs)
+- IsInternal checks: not much code but can easily go out of sync (some 
+methods require it while others not because the method is overridden in all 
+internal Encoding classes)
+- calling MS compatible slow implementation (could be a static method in 
+Encoding.cs)
+- Array-to-pointer conversions has to be done in each encoding class 
+(because of calling static internal implementations)
+
+Your proposed design avoids the four internal virtual unsafe methods but 
+treads the gain for the above mentioned extra code. Your desing probably has 
+some performance benefits, but there will be a lot of redundant code (in 
+nearly each method of each encoding class). This code will look similar (or 
+the same) in source code but because of calling different static methods in 
+each class the compiled code will be different so the code has to be copied. 
+That means that if someone only modifies a single encoding class (by fixing 
+a bug) the others will go out of sync.
+
+My approved desing uses internal virtual unsafe methods. These methods has 
+to be implemented in all internal encoding (are only used when IsInternal 
+returns true). This lets us call these methods from Encoding.cs and avoid 
+multiplied code. So that individual encoding classes won't go out of sync. 
+Please have a look at the encoding classes with the patch applied to see the 
+result because just looking at the diffgram is less &quot;beautiful&quot;.
+
+&gt;<i>... (it calls the internal implementation directly instead of going
+</I>&gt;<i>through the virtual unsafe method, trivially fixable).
+</I>
+Sure, both designs fix bug 363713 but as a conclusion I believe that my 
+proposed desing will result in code that is much easier to maintain. So I 
+would not trade it for yours unless you have some serious reason(s) not to 
+use it.
+
+&gt;<i>This is all with the assumption that the 363713 bug report suggests that
+</I>&gt;<i>all the overloads are expected to call the unsafe virtual variant for
+</I>&gt;<i>the actual implementation in the end (though it is likely that, for
+</I>&gt;<i>example, GetBytes(char[]) would call GetBytes(char[],int,int), this
+</I>&gt;<i>doesn't change the conclusion).
+</I>&gt;<i>Is this assumption not correct?
+</I>
+Fixing bug 363713 requires infrastructural changes because the current call 
+sequence causes the bug. In a lot of cases (see the test attached to the 
+bug) we cannot call the right public methods for other public methods 
+because MS.NET uses different code paths. For methods expected not to call 
+public methods we either have to have a private implementation that is 
+called by public methods or copy the same implementation to each public 
+method. For method that take slower code paths we have to use a technique 
+like the IsInternal property if we want to provide better performance. I 
+consider these changes being infrastructural because all of the Encodings 
+have to be modified similarly.
+
+&gt;<i>Please make a concrete example of a bug that requires an infrastructure
+</I>&gt;<i>change. 363713 I have already shown that is simply a bug in our
+</I>&gt;<i>implementation and it doesn't require a new infrastructure.
+</I>
+We could of course fix it without infrastructural changes. But MS.NET 2.0 
+has bad desing that results in performance loss (because of buffer copying) 
+for several important methods. I you look at current Encoding.cs you see 
+faster implementations for most of these methods but this causes bug 363713. 
+So if we want to have good performance and fix bug 363713 we have to make 
+infrastructural changes. I also suggest infrastructural changes because if 
+you look at current encoding implementations you will see a lot of 
+duplicated code. For example in ASCII and Latin-1 encodings. Applying the 
+desing pattern you suggest would result in an infrastructural change as well 
+but the implementation would be distributed and copied across source files 
+while mine would be centralized to Encoding.cs.
+
+&gt;&gt;<i> - Also note that I have plans to integrate Encoders/Decoders to this
+</I>&gt;&gt;<i> infrastructure by adding an Encoder/Decoder parameter at the end of the
+</I>&gt;&gt;<i> argument list of these four ...Impl methods that will let us use
+</I>&gt;&gt;<i> Encoder/Decoder as a state store rather than having actual code
+</I>&gt;&gt;<i> implementation.
+</I>&gt;<i>
+</I>&gt;<i>Please describe why we'd need this.
+</I>
+Sharing the same code between Encoding and Encoder/Decoder is good because 
+avoids code duplication. UTF8Encoding for example already does this. So the 
+argument only can be whether we use your suggested desing pattern (static 
+methods in each class) or my design pattern (virtual methods overridden in 
+each class).
+
+&gt;<i>With more unsafe code and unsafe code codepaths the effort required to
+</I>&gt;<i>review the code for security issues increases. It's as simple as that.
+</I>&gt;<i>Then of course is the issue that if we don't really need them, we
+</I>&gt;<i>shouldn't make the code more complex by using them, even if they were
+</I>&gt;<i>non-unsafe.
+</I>&gt;<i>If a valid case is presented where we might need them, we will
+</I>&gt;<i>reconsider.
+</I>
+As I see your solution wouldn't result in less unsafe code paths. The only 
+difference I see is whether to use unsafe virtual methods.
+
+I am open to modifications of my proposed desing but as I see your proposed 
+desing would introduce a lot of code duplication while there still would be 
+unsafe methods and a lot of unsafe code paths, and these code paths would be 
+copied in each encoding that would require to maintain each encoding 
+separatedly. With my desing there would be only four methods with unsafe 
+code per encoding.
+
+Some fact sheets I have created in 2006 about Encoding methods of MS.NET. 
+This is based on the actual implementation of MS.NET (using a test like the 
+one in bug 363713):
+
+Legend:
++: OK - may call other public methods but avoids buffer copy (methods 
+calling public methods use IsInternal redirection in my implementation, 
+others don't call any public methods)
+o: would require override - because of buffer copy (all of these methods use 
+IsInternal redirection in my implementation)
+a: abstract in Encoding - none of them call public methods
+
+.NET 1.1:
+True for all public encodings in mscorlib:
++ int GetByteCount(char[] chars)
+o int GetByteCount(string s)
+a int GetByteCount(char[] chars, int index, int count);
++ byte[] GetBytes(char[] chars)
+o byte[] GetBytes(string s)
++ byte[] GetBytes(char[] chars, int index, int count)
+o int GetBytes(string s, int charIndex, int charCount, byte[] bytes, int 
+byteIndex)
+a int GetBytes(char[] chars, int charIndex, int charCount, byte[] bytes, int 
+byteIndex)
++ int GetCharCount(byte[] bytes)
+a int GetCharCount(byte[] bytes, int index, int count)
++ char[] GetChars(byte[] bytes)
++ char[] GetChars(byte[] bytes, int index, int count)
+a int GetChars(byte[] bytes, int byteIndex, int byteCount, char[] chars, int 
+charIndex)
+a int GetMaxByteCount(int charCount)
+a int GetMaxCharCount(int byteCount)
+o string GetString(byte[] bytes)
+o string GetString(byte[] bytes, int index, int count)
+
+Only true for the named encoding:
+ASCIIEncoding
+o byte[] GetBytes(string s)
+
+UnicodeEncoding
+o string GetString(byte[] bytes)
+o string GetString(byte[] bytes, int index, int count)
+
+UTF7Encoding
+o int GetByteCount(string s)
+o byte[] GetBytes(string s)
+o int GetBytes(string s, int charIndex, int charCount, byte[] bytes, int 
+byteIndex)
+o string GetString(byte[] bytes)
+o string GetString(byte[] bytes, int index, int count)
+
+UTF8Encoding
+o string GetString(byte[] bytes)
+o string GetString(byte[] bytes, int index, int count)
+
+.NET 2.0
+True for all public encodings in mscorlib:
++ int GetByteCount(char[] chars)
+o int GetByteCount(string s)
+o int GetByteCount(char* chars, int count)
+a int GetByteCount(char[] chars, int index, int count);
++ byte[] GetBytes(char[] chars)
+o byte[] GetBytes(string s)
++ byte[] GetBytes(char[] chars, int index, int count)
+o int GetBytes(char* chars, int charCount, byte* bytes, int byteCount)
+o int GetBytes(string s, int charIndex, int charCount, byte[] bytes, int 
+byteIndex)
+a int GetBytes(char[] chars, int charIndex, int charCount, byte[] bytes, int 
+byteIndex)
++ int GetCharCount(byte[] bytes)
+o int GetCharCount(byte* bytes, int count)
+a int GetCharCount(byte[] bytes, int index, int count)
++ char[] GetChars(byte[] bytes)
++ char[] GetChars(byte[] bytes, int index, int count)
+o int GetChars(byte* bytes, int byteCount, char* chars, int charCount)
+a int GetChars(byte[] bytes, int byteIndex, int byteCount, char[] chars, int 
+charIndex)
+a int GetMaxByteCount(int charCount)
+a int GetMaxCharCount(int byteCount)
++ string GetString(byte[] bytes)
+o string GetString(byte[] bytes, int index, int count)
+
+There may be some mistakes in this chart but should be very accurate.
+
+Thanks for your time.
+
+Korn&#233;l 
+
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027238.html">[Mono-dev] [PATCH] Implement internal Encodings using	unified	code base
+</A></li>
+	<LI>Next message: <A HREF="027248.html">[Mono-dev] [PATCH] Implement internal Encodings	usingunified	code base
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27241">[ date ]</a>
+              <a href="thread.html#27241">[ thread ]</a>
+              <a href="subject.html#27241">[ subject ]</a>
+              <a href="author.html#27241">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

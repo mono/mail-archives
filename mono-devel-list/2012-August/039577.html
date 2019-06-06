@@ -1,0 +1,145 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] tuning sgen performance &amp; bug
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=Re%3A%20%5BMono-dev%5D%20tuning%20sgen%20performance%20%26%20bug&In-Reply-To=%3CE06EEC6C-71A4-47BE-A9F3-15C989B9408D%40gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="039576.html">
+   <LINK REL="Next"  HREF="039578.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] tuning sgen performance &amp; bug</H1>
+    <B>Jonathan Shore</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=Re%3A%20%5BMono-dev%5D%20tuning%20sgen%20performance%20%26%20bug&In-Reply-To=%3CE06EEC6C-71A4-47BE-A9F3-15C989B9408D%40gmail.com%3E"
+       TITLE="[Mono-dev] tuning sgen performance &amp; bug">jonathan.shore at gmail.com
+       </A><BR>
+    <I>Fri Aug 31 22:26:41 UTC 2012</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="039576.html">[Mono-dev] tuning sgen performance &amp; bug
+</A></li>
+        <LI>Next message: <A HREF="039578.html">[Mono-dev] runtime assisted object pools
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#39577">[ date ]</a>
+              <a href="thread.html#39577">[ thread ]</a>
+              <a href="subject.html#39577">[ subject ]</a>
+              <a href="author.html#39577">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+With this specific application, (which is single threaded), I have a &quot;volatile&quot; working set of ~2GB .   By volatile I mean that these are not application lifetime objects, rather will be disposed at some point during evaluation.
+
+More specifically, I read 1.6TB of data incrementally into 1600 timeseries (basically an array of event objects).   Each timeseries only holds a window of data (in my case half with 25K items  and half with 5K items).   Once each timeseries has overrun by say 1024 elements, the 1024 oldest elements are shifted off, for GC.
+
+So the pattern is that there are always 2GB of referenced objects, and periodically 1600 x 1024 old objects to be disposed of.    Due to the large sizes, it would seem that these older objects get relegated to the main heap.   This then requires a much more expensive GC (presumably).
+
+If I understood the sgen algorithm correctly, no matter what the size of the nursery (unless was 1.6TB), my working set is going to land in the main heap with my object garbage pattern.    I believe this is because if the nursery fills, any objects that are still referenced, regardless of age, will be moved to the main heap.    Once GC completes, the nursery is empty (maybe except pinned objs)?
+
+My objects become garbage in a FIFO pattern and not something LIFO like.   The garbage &quot;pipeline&quot; is 2GB large, so the nursery fails for this app.
+
+Assuming Boehm is my only choice, If I expand the series window or # of series I quickly run into the maximum heap problem with Boehm.   
+
+Ideas?
+
+
+On Aug 31, 2012, at 5:29 PM, Rodrigo Kumpera wrote:
+
+&gt;<i> There are two situations that make sgen slower than boehm. 
+</I>&gt;<i> 
+</I>&gt;<i> The first is a non-generational workload. If your survivor rate is too high, a generational collector
+</I>&gt;<i> can't compete with single space one like boehm.
+</I>&gt;<i> 
+</I>
+To some extent this is defined by the size of the nursery, no? 
+
+
+&gt;<i> The second one is if you have too much of the old generation pointing to young objects causing minor collections
+</I>&gt;<i> to scan way too much memory to be profitable.
+</I>&gt;<i> 
+</I>&gt;<i> The nursery size should usually be a not so small fraction of the total heap you expect. As a good guess you can use
+</I>&gt;<i> 1/10 - 1/20.
+</I>&gt;<i> 
+</I>&gt;<i> Are you expecting to have a heap of multiple Gigs? Because a 2Gb nursery will need at least 8Gb of major memory.
+</I>&gt;<i> 
+</I>&gt;<i> About your crash. I just noticed a very silly thing, we have never ever tried sgen with huge nurseries because there's a 
+</I>&gt;<i> 128Mb implicit limit due to some internal sizes.
+</I>&gt;<i> 
+</I>&gt;<i> Jonathan, for such huge heaps, sgen will need the parallel collector to compete with boehm on linux, which is a not
+</I>&gt;<i> very mature piece of code both in stability and performance.
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> On Fri, Aug 31, 2012 at 2:03 PM, Jonathan Shore &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">jonathan.shore at gmail.com</A>&gt; wrote:
+</I>&gt;<i> HI,
+</I>&gt;<i> 
+</I>&gt;<i> sgen is now working for me (thanks to a subtle bug fix for thread-local-storage by Zoltan).   However, for one application, sgen is 25% slower than the same with the boehm collector.   I am processing some GBs of timeseries data, though only evaluating a window at a time.   As the window reaches some size, older objects in the timeseries are dereferenced.   The object size is 88bytes, but generate many millions across the course of a run.
+</I>&gt;<i> 
+</I>&gt;<i> I suspect that the nursery is too small, so that the objects I want to collect are now in the main heap.    Towards that end I wanted to extend the nursery, and attempted this:
+</I>&gt;<i> 
+</I>&gt;<i> export MONO_GC_PARAMS=&quot;nursery-size=2g&quot;
+</I>&gt;<i> 
+</I>&gt;<i> This causes mono to crash immediately, with:
+</I>&gt;<i> 
+</I>&gt;<i> 	* Assertion at sgen-gc.c:1206, condition `idx &lt; section-&gt;num_scan_start' not met
+</I>&gt;<i> 	...
+</I>&gt;<i> 
+</I>&gt;<i> (this is on linux with the latest code on master, roughly 2.11.3+)
+</I>&gt;<i> 
+</I>&gt;<i> I took a look at the code, but requires too much context for me to understand the real cause of the issue.   I am guessing that there is some assumption re: the size of the nursery, block size, etc.
+</I>&gt;<i> 
+</I>&gt;<i> Finally, I am interested in trying the &quot;copying collector&quot; as discussed in this blog entry: 
+</I>&gt;<i> 
+</I>&gt;<i> <A HREF="http://schani.wordpress.com/2011/01/10/sgen-the-major-collectors/">http://schani.wordpress.com/2011/01/10/sgen-the-major-collectors/</A>
+</I>&gt;<i> 
+</I>&gt;<i> I'm wondering if will get some performance advantages with this approach, whereas the nursery may be too small for my garbage working set.
+</I>&gt;<i> 
+</I>&gt;<i> Ideas?
+</I>&gt;<i> 
+</I>&gt;<i> Thanks
+</I>&gt;<i> Jonathan
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> _______________________________________________
+</I>&gt;<i> Mono-devel-list mailing list
+</I>&gt;<i> <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">Mono-devel-list at lists.ximian.com</A>
+</I>&gt;<i> <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">http://lists.ximian.com/mailman/listinfo/mono-devel-list</A>
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20120831/f28170fc/attachment-0001.html">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20120831/f28170fc/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="039576.html">[Mono-dev] tuning sgen performance &amp; bug
+</A></li>
+	<LI>Next message: <A HREF="039578.html">[Mono-dev] runtime assisted object pools
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#39577">[ date ]</a>
+              <a href="thread.html#39577">[ thread ]</a>
+              <a href="subject.html#39577">[ subject ]</a>
+              <a href="author.html#39577">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

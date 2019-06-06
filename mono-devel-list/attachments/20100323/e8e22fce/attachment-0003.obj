@@ -1,0 +1,116 @@
+Index: System.ServiceModel.Channels/HttpListenerManager.cs
+===================================================================
+--- System.ServiceModel.Channels/HttpListenerManager.cs	(revision 154044)
++++ System.ServiceModel.Channels/HttpListenerManager.cs	(working copy)
+@@ -331,7 +331,8 @@
+ 		{
+ 			lock (pending) {
+ 				foreach (var pctx in pending) {
+-					if (FilterHttpContext (pctx)) {
++					if (FilterHttpContext (pctx)) {	
++						pending.Remove (pctx);
+ 						callback (pctx);
+ 						return;
+ 					}
+@@ -380,10 +381,8 @@
+ 				}
+ 			}
+ 
+-			lock (registered_channels) {
++			lock (pending) {
+ 				pending.Add (ctx);
+-				// FIXME: this should not be required, but it somehow saves some failures wrt concurrent calls.
+-				Thread.Sleep (100);
+ 				wait_http_ctx.Set ();
+ 			}
+ 		}
+@@ -404,7 +403,8 @@
+ 			if (wsdl_instance.WsdlUrl != null && Uri.Compare (ctx.RequestUrl, wsdl_instance.WsdlUrl, cmpflag, fmtflag, StringComparison.Ordinal) == 0) {
+ 				if (mex_info == null)
+ 					return false; // Do not handle this at normal dispatcher.
+-				if (ctx.QueryString [null] == "wsdl")
++				var query_string = ctx.QueryString [null];
++				if ( (query_string != null) && query_string.Equals("wsdl", StringComparison.OrdinalIgnoreCase))
+ 					return mex_info.SupportsMex; // wsdl dispatcher should handle this.
+ 				if (!wsdl_instance.HelpUrl.Equals (wsdl_instance.WsdlUrl))
+ 					return true; // in case help URL is not equivalent to WSDL URL, it anyways returns WSDL regardless of ?wsdl existence.
+Index: System.ServiceModel.Channels/HttpReplyChannel.cs
+===================================================================
+--- System.ServiceModel.Channels/HttpReplyChannel.cs	(revision 154044)
++++ System.ServiceModel.Channels/HttpReplyChannel.cs	(working copy)
+@@ -174,11 +174,11 @@
+ 			if (wait != null)
+ 				throw new InvalidOperationException ("Another wait operation is in progress");
+ 			try {
+-				wait = new AutoResetEvent (false);
+-				source.ListenerManager.GetHttpContextAsync (timeout, HttpContextAcquired);
+-				if (wait != null) // in case callback is done before WaitOne() here.
+-					return wait.WaitOne (timeout, false);
+-				return waiting.Count > 0;
++					var wait_ = new AutoResetEvent (false);
++					wait = wait_;	// wait can be set to null if HttpContextAcquired runs to completion before we do WaitOne
++					source.ListenerManager.GetHttpContextAsync (timeout, HttpContextAcquired);
++					var result = wait_.WaitOne (timeout, false);
++					return result;
+ 			} catch (HttpListenerException e) {
+ 				// FIXME: does this make sense? I doubt.
+ 				if ((uint) e.ErrorCode == 0x80004005) // invalid handle. Happens during shutdown.
+@@ -196,8 +196,11 @@
+ 			if (wait == null)
+ 				throw new InvalidOperationException ("WaitForRequest operation has not started");
+ 			var sctx = (HttpListenerContextInfo) ctx;
+-			if (State == CommunicationState.Opened && ctx != null)
+-				waiting.Add (sctx.Source);
++			if (State == CommunicationState.Opened && ctx != null) {
++				lock (waiting)
++					waiting.Add (sctx.Source);
++			}
++
+ 			SignalAsyncWait ();
+ 		}
+ 	}
+Index: System.ServiceModel.Channels/ReplyChannelBase.cs
+===================================================================
+--- System.ServiceModel.Channels/ReplyChannelBase.cs	(revision 154044)
++++ System.ServiceModel.Channels/ReplyChannelBase.cs	(working copy)
+@@ -106,6 +106,7 @@
+ 		delegate bool TryReceiveDelegate (TimeSpan timeout, out RequestContext context);
+ 		TryReceiveDelegate try_recv_delegate;
+ 
++		object async_result_lock = new object();
+ 		protected Thread CurrentAsyncThread { get; private set; }
+ 		protected IAsyncResult CurrentAsyncResult { get; private set; }
+ 
+@@ -115,18 +116,26 @@
+ 				throw new InvalidOperationException ("Another async TryReceiveRequest operation is in progress");
+ 			if (try_recv_delegate == null)
+ 				try_recv_delegate = new TryReceiveDelegate (delegate (TimeSpan tout, out RequestContext ctx) {
+-					if (CurrentAsyncResult != null)
+-						CurrentAsyncThread = Thread.CurrentThread;
++					lock ( async_result_lock ) {
++						if (CurrentAsyncResult != null)
++							CurrentAsyncThread = Thread.CurrentThread;
++					}
+ 					try {
+ 						return TryReceiveRequest (tout, out ctx);
+ 					} finally {
+-						CurrentAsyncResult = null;
+-						CurrentAsyncThread = null;
++						lock (async_result_lock) {
++							CurrentAsyncResult = null;
++							CurrentAsyncThread = null;
++						}
+ 					}
+ 					});
+ 			RequestContext dummy;
+-			CurrentAsyncResult = try_recv_delegate.BeginInvoke (timeout, out dummy, callback, state);
+-			return CurrentAsyncResult;
++			IAsyncResult result;
++			lock (async_result_lock) {
++				result = CurrentAsyncResult = try_recv_delegate.BeginInvoke (timeout, out dummy, callback, state);
++			}
++			// Note that at this point CurrentAsyncResult can be null here if delegate has run to completion
++			return result;
+ 		}
+ 
+ 		public virtual bool EndTryReceiveRequest (IAsyncResult result)

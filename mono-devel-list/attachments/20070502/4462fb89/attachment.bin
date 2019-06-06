@@ -1,0 +1,285 @@
+Index: mono/mono/metadata/threads.c
+===================================================================
+--- mono/mono/metadata/threads.c	(revision 76569)
++++ mono/mono/metadata/threads.c	(working copy)
+@@ -289,6 +289,8 @@
+ 
+ 	mono_profiler_thread_start (tid);
+ 
++	mono_thread_set_apartment_state ();
++
+ 	if(thread->start_notify!=NULL) {
+ 		/* Let the thread that called Start() know we're
+ 		 * ready
+@@ -384,6 +386,7 @@
+ 
+ 	thread->handle=thread_handle;
+ 	thread->tid=tid;
++	thread->apartment_state=ThreadApartmentState_Unknown;
+ 
+ 	MONO_OBJECT_SETREF (thread, synch_lock, mono_object_new (domain, mono_defaults.object_class));
+ 						  
+@@ -2921,3 +2924,22 @@
+ {
+ 	return &thread_interruption_requested;
+ }
++
++void mono_thread_set_apartment_state ()
++{
++	MonoThread* thread;
++	thread = mono_thread_current ();
++
++	if (thread->apartment_state == ThreadApartmentState_STA) {
++#ifdef PLATFORM_WIN32
++		CoInitializeEx(NULL, COINIT_APARTMENTTHREADED); 
++#endif
++	}
++	else {
++#ifdef PLATFORM_WIN32
++		CoInitializeEx(NULL, COINIT_MULTITHREADED); 
++#endif
++		/* Set explicitly since state might have been Unknown */
++		thread->apartment_state = ThreadApartmentState_MTA;
++	}
++}
+Index: mono/mono/metadata/object.c
+===================================================================
+--- mono/mono/metadata/object.c	(revision 76569)
++++ mono/mono/metadata/object.c	(working copy)
+@@ -2387,6 +2387,7 @@
+ 	MonoDomain *domain;
+ 	gpointer pa [1];
+ 	int rval;
++	MonoCustomAttrInfo* cinfo;
+ 
+ 	g_assert (args);
+ 
+@@ -2406,6 +2407,22 @@
+ 		g_free (str);
+ 	}
+ 
++	cinfo = mono_custom_attrs_from_method (method);
++	if (cinfo) {
++		static MonoClass *stathread_attribute = NULL;
++		MonoThread* thread = mono_thread_current ();
++		MonoObject* stathread_object;
++		if (!stathread_attribute)
++			stathread_attribute = mono_class_from_name (mono_defaults.corlib, "System", "STAThreadAttribute");
++		mono_custom_attrs_get_attr (cinfo, stathread_attribute);
++		stathread_object = mono_custom_attrs_get_attr (cinfo, stathread_attribute);
++		if (!cinfo->cached)
++			mono_custom_attrs_free (cinfo);
++
++		thread->apartment_state = stathread_object ? ThreadApartmentState_STA : ThreadApartmentState_MTA;
++		mono_thread_set_apartment_state ();
++	}
++
+ 	/* FIXME: check signature of method */
+ 	if (mono_method_signature (method)->ret->type == MONO_TYPE_I4) {
+ 		MonoObject *res;
+Index: mono/mono/metadata/object-internals.h
+===================================================================
+--- mono/mono/metadata/object-internals.h	(revision 76569)
++++ mono/mono/metadata/object-internals.h	(working copy)
+@@ -274,7 +274,7 @@
+ 	MonoBoolean thread_dump_requested;
+ 	gpointer end_stack; /* This is only used when running in the debugger. */
+ 	MonoBoolean thread_interrupt_requested;
+-	gpointer unused4;
++	guint32	apartment_state;
+ 	gpointer unused5;
+ 	gpointer unused6;
+ 	gpointer unused7;
+Index: mono/mono/metadata/threads-types.h
+===================================================================
+--- mono/mono/metadata/threads-types.h	(revision 76569)
++++ mono/mono/metadata/threads-types.h	(working copy)
+@@ -29,8 +29,15 @@
+ 	ThreadState_Suspended = 0x00000040,
+ 	ThreadState_AbortRequested = 0x00000080,
+ 	ThreadState_Aborted = 0x00000100
+-} MonoThreadState;
++} MonoThreadState; 
+ 
++/* This is a copy of System.Threading.ApartmentState */
++typedef enum {
++	ThreadApartmentState_STA = 0x00000000,
++	ThreadApartmentState_MTA = 0x00000001,
++	ThreadApartmentState_Unknown = 0x00000002
++} MonoThreadApartmentState;
++
+ #define SPECIAL_STATIC_NONE 0
+ #define SPECIAL_STATIC_THREAD 1
+ #define SPECIAL_STATIC_CONTEXT 2
+@@ -122,4 +129,6 @@
+ void mono_thread_free_local_slot_values (int slot, MonoBoolean thread_local) MONO_INTERNAL;
+ extern void mono_thread_current_check_pending_interrupt (void) MONO_INTERNAL;
+ 
++extern void mono_thread_set_apartment_state () MONO_INTERNAL;
++
+ #endif /* _MONO_METADATA_THREADS_TYPES_H_ */
+Index: mcs/class/corlib/System.Threading/Thread.cs
+===================================================================
+--- mcs/class/corlib/System.Threading/Thread.cs	(revision 76569)
++++ mcs/class/corlib/System.Threading/Thread.cs	(working copy)
+@@ -95,14 +95,14 @@
+ 		private IntPtr serialized_ui_culture_info;
+ 		private int serialized_ui_culture_info_len;
+ 		private ExecutionContext _ec;
++		private bool thread_dump_requested;
++		private IntPtr end_stack;
++		private bool thread_interrupt_requested;
++		private ApartmentState apartment_state = ApartmentState.Unknown;
+ 		/* 
+ 		 * These fields are used to avoid having to increment corlib versions
+ 		 * when a new field is added to the unmanaged MonoThread structure.
+ 		 */
+-		private IntPtr unused1;
+-		private IntPtr unused2;
+-		private IntPtr unused3;
+-		private IntPtr unused4;
+ 		private IntPtr unused5;
+ 		private IntPtr unused6;
+ 		private IntPtr unused7;
+@@ -305,11 +305,22 @@
+ #endif
+ 		public ApartmentState ApartmentState {
+ 			get {
+-				return(ApartmentState.Unknown);
++				return apartment_state;
+ 			}
+-			
+-			set {
+-				// FIXME: Implement setter.
++
++			set	{
++#if NET_2_0
++				TrySetApartmentState (value);
++#else
++				if (ThreadState != ThreadState.Unstarted)
++					throw new ThreadStateException ("Thread was in an invalid state for the operation being executed.");
++
++				if (value != ApartmentState.STA && value != ApartmentState.MTA)
++					throw new ArgumentException ("value is not a valid apartment state.");
++
++				if (apartment_state == ApartmentState.Unknown)
++					apartment_state = value;
++#endif
+ 			}
+ 		}
+ 
+@@ -870,40 +881,29 @@
+ 		{
+ 			throw new NotImplementedException ();
+ 		}
+-
+-		//
+-		// We disable warning 618, because we are accessing the
+-		// empty property ApartmentState which produces an Obsolete
+-		// message, but since its an empty routine needed for 1.x
+-		// we use it.
+-		//
+-		// Maybe we should later turn these into internal methods for 1.x
+-		// instead and have the property call these.
+ 		
+-		
+ 		public ApartmentState GetApartmentState ()
+ 		{
+-			return this.ApartmentState;
++			return apartment_state;
+ 		}
+ 
+ 		public void SetApartmentState (ApartmentState state)
+ 		{
+-			this.ApartmentState = state;
++			if (!TrySetApartmentState (state))
++				throw new InvalidOperationException ("Failed to set the specified COM apartment state.");
+ 		}
+ 
+-		[MonoTODO]
+-		public bool TrySetApartmentState (ApartmentState state)
++		public bool TrySetApartmentState (ApartmentState state) 
+ 		{
+-			try {
+-				this.ApartmentState = state;
+-				return true;
+-			}
+-			catch (ArgumentException) {
+-				throw;
+-			}
+-			catch {
++			if (ThreadState != ThreadState.Unstarted)
++				throw new ThreadStateException ("Thread was in an invalid state for the operation being executed.");
++
++			if (apartment_state != ApartmentState.Unknown)
+ 				return false;
+-			}
++
++			apartment_state = state;
++
++			return true;
+ 		}
+ 		
+ 		[ComVisible (false)]
+Index: mcs/class/corlib/Test/System.Threading/ThreadTest.cs
+===================================================================
+--- mcs/class/corlib/Test/System.Threading/ThreadTest.cs	(revision 76569)
++++ mcs/class/corlib/Test/System.Threading/ThreadTest.cs	(working copy)
+@@ -643,6 +643,57 @@
+ 			}
+ 		}
+ 	}
++
++
++	[TestFixture]
++	public class ThreadApartmentTest : Assertion
++	{
++		void Start ()
++		{
++		}
++
++		[Test]
++		public void TestApartmentState ()
++		{
++			Thread t1 = new Thread (Start);
++			Thread t2 = new Thread (Start);
++			Thread t3 = new Thread (Start);
++
++			Assert ("Thread1 Default", t1.ApartmentState == ApartmentState.Unknown);
++			Assert ("Thread2 Default", t2.ApartmentState == ApartmentState.Unknown);
++			Assert ("Thread3 Default", t3.ApartmentState == ApartmentState.Unknown);
++
++			t1.ApartmentState = ApartmentState.STA;
++			Assert ("Thread1 Set Once", t1.ApartmentState == ApartmentState.STA);
++			t1.ApartmentState = ApartmentState.MTA;
++			Assert ("Thread1 Set Twice", t1.ApartmentState == ApartmentState.STA);
++
++			t2.ApartmentState = ApartmentState.MTA;
++			Assert ("Thread2 Set Once", t2.ApartmentState == ApartmentState.MTA);
++			t2.ApartmentState = ApartmentState.STA;
++			Assert ("Thread2 Set Twice", t2.ApartmentState == ApartmentState.MTA);
++
++			bool exception_occured = false;
++			try {
++				t3.ApartmentState = ApartmentState.Unknown;
++			}
++			catch (Exception) {
++				exception_occured = true;
++			}
++			Assert ("Thread3 Set Invalid", t3.ApartmentState == ApartmentState.Unknown);
++			Assert ("Thread3 Set Invalid Exception Occured", exception_occured);
++
++			t1.Start ();
++			exception_occured = false;
++			try {
++				t1.ApartmentState = ApartmentState.STA;
++			}
++			catch (Exception) {
++				exception_occured = true;
++			}
++			Assert ("Thread1 Started Invalid Exception Occured", exception_occured);
++		}
++	}
+ 	
+ 	public class TestUtil
+ 	{

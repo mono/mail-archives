@@ -1,0 +1,535 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] signal.c cross-thread access
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20signal.c%20cross-thread%20access&In-Reply-To=E961123C01E7E94AA29163941172913E075024EB%40mail1.dundee.realtimeworlds.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030512.html">
+   <LINK REL="Next"  HREF="030513.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] signal.c cross-thread access</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20signal.c%20cross-thread%20access&In-Reply-To=E961123C01E7E94AA29163941172913E075024EB%40mail1.dundee.realtimeworlds.com"
+       TITLE="[Mono-dev] signal.c cross-thread access">jonpryor at vt.edu
+       </A><BR>
+    <I>Fri Jan 23 00:35:33 EST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030512.html">[Mono-dev] signal.c cross-thread access
+</A></li>
+        <LI>Next message: <A HREF="030513.html">[Mono-dev] Process background problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30606">[ date ]</a>
+              <a href="thread.html#30606">[ thread ]</a>
+              <a href="subject.html#30606">[ subject ]</a>
+              <a href="author.html#30606">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Sorry for the delay in review...
+
+The short version: I don't like it.
+
+The biggest reason is complexity -- the changes are huge, I'm not sure I
+fully understand all the changes, and what's currently here looks like
+it has several race conditions.  (Or I'm imagining things -- it's a huge
+patch.)
+
+The next reason is overhead -- it requires a pipe for every signal
+registered, instead of for every signal being waited upon.  I'm not
+actually sure which is preferable -- it's likely a tradeoff between how
+many signals you're likely to have registered at once vs. how many
+you'll be waiting on at once -- but having lots of pipes hanging around
+doesn't seem like a splendid idea.
+
+But given how Mono_Unix_UnixSignal_WaitAny() works, I'm not sure this
+change can be easily avoided while removing the mutex from WaitAny().
+
+Then there's this:
+
+<A HREF="http://www.bluebytesoftware.com/blog/2009/01/09/SomePerformanceImplicationsOfCASOperations.aspx">http://www.bluebytesoftware.com/blog/2009/01/09/SomePerformanceImplicationsOfCASOperations.aspx</A>
+
+(Summary: CAS falls down, perf-wise, for heavily contested variables.)
+
+Given how CAS works -- memory barriers plus &quot;locking&quot; the memory bus --
+if you try to use Signals a lot performance is going to suck, badly.
+
+The whole reason I used CAS originally was because I had to -- locks
+can't be used within signal context (they're not signal safe).  I
+wouldn't think it would be a problem, either, as signals aren't
+(usually) invoked that often.
+
+But now you're adding CAS for registration, de-registration, and
+waiting.  Oof.
+
+So, with an eye toward fixing your actual problem, what's wrong with
+leaving install and uninstall largely unchanged (keep the mutex, etc.),
+have install allocate a pipe (as you did), and remove the mutex
+acquisition from Mono_Unix_UnixSignal_WaitAny()?
+
+On an unrelated note, what license would you be contributing these
+changes under?  MIT/X11 would be easiest for us to deal with.
+
+Thanks,
+ - Jon
+
+On Fri, 2009-01-16 at 14:27 +0000, <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">tim.jenks at realtimeworlds.com</A> wrote:
+&gt;<i> Index: signal.c
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- signal.c    (revision 123183)
+</I>&gt;<i> +++ signal.c    (working copy)
+</I>&gt;<i> @@ -101,17 +103,21 @@
+</I>&gt;<i>  #ifdef WAPI_ATOMIC_ASM
+</I>&gt;<i>         #define mph_int_get(p)     InterlockedExchangeAdd ((p), 0)
+</I>&gt;<i>         #define mph_int_inc(p)     InterlockedIncrement ((p))
+</I>&gt;<i> -       #define mph_int_set(p,o,n) InterlockedExchange ((p), (n))
+</I>&gt;<i> +       #define mph_int_dec(p)     InterlockedDecrement ((p))
+</I>&gt;<i> +       #define mph_int_set(p,n) do { InterlockedExchange ((p), (n)); } while (0)
+</I>&gt;<i> +       #define mph_int_cas(p,o,n) InterlockedCompareExchange ((p), (n), (o)) == (o)
+</I>&gt;<i>  #elif GLIB_CHECK_VERSION(2,4,0)
+</I>&gt;<i>         #define mph_int_get(p) g_atomic_int_get ((p))
+</I>&gt;<i> -       #define mph_int_inc(p) do {g_atomic_int_inc ((p));} while (0)
+</I>&gt;<i> -       #define mph_int_set(p,o,n) do {                                 \
+</I>&gt;<i> -               while (!g_atomic_int_compare_and_exchange ((p), (o), (n))) {} \
+</I>&gt;<i> -       } while (0)
+</I>&gt;<i> +       #define mph_int_inc(p) g_atomic_int_inc ((p))
+</I>&gt;<i> +       #define mph_int_dec(p) g_atomic_int_dec ((p))
+</I>&gt;<i> +       #define mph_int_set(p,n) g_atomic_set ((p), (n))
+</I>&gt;<i> +       #define mph_int_cas(p,o,n) g_atomic_int_compare_and_exchange ((p), (o), (n))
+</I>&gt;<i>  #else
+</I>&gt;<i>         #define mph_int_get(p) (*(p))
+</I>&gt;<i> -       #define mph_int_inc(p) do { (*(p))++; } while (0)
+</I>&gt;<i> -       #define mph_int_set(p,o,n) do { *(p) = n; } while (0)
+</I>&gt;<i> +       #define mph_int_inc(p) ++(*(p))
+</I>&gt;<i> +       #define mph_int_dec(p) --(*(p))
+</I>&gt;<i> +       #define mph_int_set(p,n) do { *(p) = n; } while (0)
+</I>&gt;<i> +       #define mph_int_cas(p,o,n) do { *(p) = n; return true; }
+</I>&gt;<i>  #endif
+</I>
+These changes are FAIL.
+
+The major problem is that you're trying to replace mph_int_set with
+g_atomic_set(), which (1) doesn't exist (you actually want
+g_atomic_int_set()), and (2) was introduced in GLib 2.10.
+
+Notice that we're checking for GLib 2.4, which predates GLib 2.10 by a
+fair bit.  Furthermore, we're checking for 2.4 because (when this code
+was written) we were supporting platforms that only had GLib 2.4.
+
+Perhaps we should just change mph_int_set() to mph_int_cas()
+everywhere...
+ 
+&gt;<i>  int
+</I>&gt;<i> @@ -122,90 +128,106 @@
+</I>&gt;<i>         return errno == 0 ? 0 : -1;
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i> -#define NUM_SIGNALS 64
+</I>&gt;<i> -static signal_info signals[NUM_SIGNALS];
+</I>&gt;<i> +#define STATE_UNASSIGNED 0
+</I>&gt;<i> +#define STATE_INITIALISING 1
+</I>&gt;<i> +#define STATE_ASSIGNED 2
+</I>&gt;<i> +#define STATE_SIGNALLING 3
+</I>&gt;<i> +#define STATE_WAITING_DISPOSE 4
+</I>&gt;<i> +#define STATE_DISPOSING 5
+</I>&gt;<i>  
+</I>&gt;<i> +#if defined(NSIG)
+</I>&gt;<i> +#define SUPPORTED_SIGNALS NSIG
+</I>&gt;<i> +#elif defined(_NSIG)
+</I>&gt;<i> +#define SUPPORTED_SIGNALS _NSIG
+</I>&gt;<i> +#elif defined(__NSIG)
+</I>&gt;<i> +#define SUPPORTED_SIGNALS __NSIG
+</I>&gt;<i> +#else
+</I>&gt;<i> +#define SUPPORTED_SIGNALS 32
+</I>&gt;<i> +#endif
+</I>&gt;<i> +
+</I>&gt;<i> +#define NUM_UNIXSIGNAL_INSTANCES 8
+</I>&gt;<i> +static signal_info signals[SUPPORTED_SIGNALS][NUM_UNIXSIGNAL_INSTANCES];
+</I>&gt;<i> +
+</I>&gt;<i>  static void
+</I>&gt;<i>  default_handler (int signum)
+</I>&gt;<i>  {
+</I>&gt;<i> -       int i;
+</I>&gt;<i> -       for (i = 0; i &lt; NUM_SIGNALS; ++i) {
+</I>&gt;<i> -               int fd;
+</I>&gt;<i> -               signal_info* h = &amp;signals [i];
+</I>&gt;<i> -               if (mph_int_get (&amp;h-&gt;signum) != signum)
+</I>&gt;<i> +       int i, fd, state;
+</I>&gt;<i> +       for (i = 0; i &lt; NUM_UNIXSIGNAL_INSTANCES; ++i) {
+</I>&gt;<i> +               signal_info* h = &amp;signals [signum] [i];
+</I>&gt;<i> +               state = mph_int_get (&amp;h-&gt;have_handler);
+</I>
+Since have_handler is no longer a simple boolean value, we should rename
+it to state.
+
+&gt;<i> +               /* only allow signal if we're ready to rx one */
+</I>&gt;<i> +               if (state != STATE_ASSIGNED &amp;&amp; state != STATE_SIGNALLING)
+</I>&gt;<i>                         continue;
+</I>&gt;<i> +               /* wait until any other signal handler for this handle has completed */
+</I>&gt;<i> +               while (!mph_int_cas (&amp;h-&gt;have_handler, STATE_ASSIGNED, STATE_SIGNALLING)) { }
+</I>
+mph_int_set() would seem to be more explicit here anyway...
+
+&gt;<i>                 mph_int_inc (&amp;h-&gt;count);
+</I>&gt;<i> -               fd = mph_int_get (&amp;h-&gt;write_fd);
+</I>&gt;<i> +               fd = h-&gt;write_fd;
+</I>
+Why this change?
+
+&gt;<i>                 if (fd &gt; 0) {
+</I>&gt;<i>                         char c = signum;
+</I>&gt;<i>                         write (fd, &amp;c, 1);
+</I>&gt;<i>                 }
+</I>&gt;<i> +               mph_int_set (&amp;h-&gt;have_handler, STATE_ASSIGNED);
+</I>&gt;<i>         }
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i> -static pthread_mutex_t signals_mutex = PTHREAD_MUTEX_INITIALIZER;
+</I>&gt;<i> -
+</I>&gt;<i>  void*
+</I>&gt;<i>  Mono_Unix_UnixSignal_install (int sig)
+</I>&gt;<i>  {
+</I>&gt;<i> -       int i, mr;
+</I>&gt;<i> +       int i;
+</I>&gt;<i>         signal_info* h = NULL; 
+</I>&gt;<i>         int have_handler = 0;
+</I>&gt;<i>         void* handler = NULL;
+</I>
+You MUST check that `sig' is &gt;= 0 and &lt; NSIG prior to here, otherwise
+you tempt the array overflow gods (and introduce a security
+vulnerability) in the later count_handlers() call and the signals[]
+array indexing.
+ 
+&gt;<i> -       mr = pthread_mutex_lock (&amp;signals_mutex);
+</I>&gt;<i> -       if (mr != 0) {
+</I>&gt;<i> -               errno = mr;
+</I>&gt;<i> -               return NULL;
+</I>&gt;<i> -       }
+</I>&gt;<i> -
+</I>&gt;<i>  #if defined (SIGRTMIN) &amp;&amp; defined (SIGRTMAX)
+</I>&gt;<i>         /*The runtime uses some rt signals for itself so it's important to not override them.*/
+</I>&gt;<i>         if (sig &gt;= SIGRTMIN &amp;&amp; sig &lt;= SIGRTMAX &amp;&amp; count_handlers (sig) == 0) {
+</I>&gt;<i>                 struct sigaction sinfo;
+</I>&gt;<i>                 sigaction (sig, NULL, &amp;sinfo);
+</I>&gt;<i>                 if (sinfo.sa_handler != SIG_DFL || (void*)sinfo.sa_sigaction != (void*)SIG_DFL) {
+</I>&gt;<i> -                       pthread_mutex_unlock (&amp;signals_mutex);
+</I>&gt;<i>                         errno = EADDRINUSE;
+</I>&gt;<i>                         return NULL;
+</I>&gt;<i>                 }
+</I>&gt;<i>         }
+</I>&gt;<i>  #endif /*defined (SIGRTMIN) &amp;&amp; defined (SIGRTMAX)*/
+</I>&gt;<i>  
+</I>&gt;<i> -       for (i = 0; i &lt; NUM_SIGNALS; ++i) {
+</I>&gt;<i> -               if (h == NULL &amp;&amp; signals [i].signum == 0) {
+</I>&gt;<i> -                       h = &amp;signals [i];
+</I>&gt;<i> +       for (i = 0; i &lt; NUM_UNIXSIGNAL_INSTANCES; ++i) {
+</I>&gt;<i> +               h = &amp;signals [sig] [i];
+</I>&gt;<i> +               if (mph_int_get (&amp;h-&gt;have_handler) == STATE_UNASSIGNED) {
+</I>&gt;<i> +                       if (!mph_int_cas (&amp;h-&gt;have_handler, STATE_UNASSIGNED, STATE_INITIALISING))
+</I>&gt;<i> +                               continue;
+</I>&gt;<i>                         h-&gt;handler = signal (sig, default_handler);
+</I>&gt;<i>                         if (h-&gt;handler == SIG_ERR) {
+</I>&gt;<i>                                 h-&gt;handler = NULL;
+</I>&gt;<i>                                 h = NULL;
+</I>&gt;<i> +                               mph_int_set (&amp;h-&gt;have_handler, STATE_UNASSIGNED);
+</I>&gt;<i>                                 break;
+</I>&gt;<i>                         }
+</I>&gt;<i>                         else {
+</I>&gt;<i> -                               h-&gt;have_handler = 1;
+</I>&gt;<i> +                               handler = h-&gt;handler;
+</I>&gt;<i> +                               have_handler = 1;
+</I>&gt;<i>                         }
+</I>&gt;<i>                 }
+</I>&gt;<i> -               if (!have_handler &amp;&amp; signals [i].signum == sig &amp;&amp;
+</I>&gt;<i> -                               signals [i].handler != default_handler) {
+</I>&gt;<i> -                       have_handler = 1;
+</I>&gt;<i> -                       handler = signals [i].handler;
+</I>&gt;<i> -               }
+</I>&gt;<i>                 if (h &amp;&amp; have_handler)
+</I>&gt;<i>                         break;
+</I>&gt;<i>         }
+</I>&gt;<i>  
+</I>&gt;<i> +       /* initialise and setup pipes for wait-on-multiple */
+</I>&gt;<i>         if (h &amp;&amp; have_handler) {
+</I>&gt;<i> -               h-&gt;have_handler = 1;
+</I>&gt;<i> -               h-&gt;handler      = handler;
+</I>&gt;<i> -       }
+</I>&gt;<i> +               int filedes[2];
+</I>&gt;<i>  
+</I>&gt;<i> -       if (h) {
+</I>&gt;<i> -               mph_int_set (&amp;h-&gt;count, h-&gt;count, 0);
+</I>&gt;<i> -               mph_int_set (&amp;h-&gt;signum, h-&gt;signum, sig);
+</I>&gt;<i> +               if (pipe (filedes) != 0) {
+</I>&gt;<i> +                       errno = EIO;
+</I>
+Shouldn't h-&gt;have_handler be set to STATE_UNASSIGNED as well?  Otherwise
+it's left in STATE_INITIALIZING.
+
+For that matter, you'd likely ALSO need to reset the original signal
+handler.
+
+&gt;<i> +                       return NULL;
+</I>&gt;<i> +               }
+</I>&gt;<i> +
+</I>&gt;<i> +               h-&gt;read_fd = filedes [0];
+</I>&gt;<i> +               h-&gt;write_fd = filedes [1];
+</I>&gt;<i> +               h-&gt;count = 0;
+</I>&gt;<i> +               h-&gt;signum = sig;
+</I>&gt;<i> +               h-&gt;wait_counter = 0;
+</I>&gt;<i> +               mph_int_set (&amp;h-&gt;have_handler, STATE_ASSIGNED);
+</I>&gt;<i>         }
+</I>&gt;<i>  
+</I>&gt;<i> -       pthread_mutex_unlock (&amp;signals_mutex);
+</I>&gt;<i> -
+</I>&gt;<i>         return h;
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i> @@ -214,86 +236,96 @@
+</I>&gt;<i>  {
+</I>&gt;<i>         int i;
+</I>&gt;<i>         int count = 0;
+</I>&gt;<i> -       for (i = 0; i &lt; NUM_SIGNALS; ++i) {
+</I>&gt;<i> -               if (signals [i].signum == signum)
+</I>&gt;<i> +       for (i = 0; i &lt; NUM_UNIXSIGNAL_INSTANCES; ++i) {
+</I>&gt;<i> +               if (mph_int_get (&amp;signals [signum] [i].have_handler) &gt; STATE_UNASSIGNED)
+</I>&gt;<i>                         ++count;
+</I>&gt;<i>         }
+</I>&gt;<i>         return count;
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i> +static void
+</I>&gt;<i> +teardown_signalinfo (signal_info* h)
+</I>&gt;<i> +{
+</I>&gt;<i> +       while (mph_int_get (&amp;h-&gt;wait_counter) &gt; 0) {} /* block until there are no pending waits on this handle */
+</I>
+...and then another thread bumps the wait counter.  I can't help but
+think this looks like a race condition...
+
+&gt;<i> +       mph_int_set (&amp;h-&gt;have_handler, STATE_DISPOSING);
+</I>&gt;<i> +       /* tear down pipes */
+</I>&gt;<i> +       if (h-&gt;read_fd != 0)
+</I>&gt;<i> +               close (h-&gt;read_fd);
+</I>&gt;<i> +       if (h-&gt;write_fd != 0)
+</I>&gt;<i> +               close (h-&gt;write_fd);
+</I>&gt;<i> +       h-&gt;read_fd = 0;
+</I>&gt;<i> +       h-&gt;write_fd = 0;
+</I>&gt;<i> +
+</I>&gt;<i> +       /* last UnixSignal -- we can unregister */
+</I>&gt;<i> +       if (h-&gt;have_handler &amp;&amp; count_handlers (h-&gt;signum) == 1) {
+</I>&gt;<i> +               signal (h-&gt;signum, h-&gt;handler);
+</I>&gt;<i> +               h-&gt;handler      = NULL;
+</I>&gt;<i> +       }
+</I>&gt;<i> +       h-&gt;signum = 0;
+</I>
+This likely isn't even needed, since signals are directly indexed under
+your strategy.
+
+&gt;<i> +       mph_int_set (&amp;h-&gt;have_handler, STATE_UNASSIGNED);
+</I>&gt;<i> +}
+</I>&gt;<i> +
+</I>&gt;<i>  int
+</I>&gt;<i>  Mono_Unix_UnixSignal_uninstall (void* info)
+</I>&gt;<i>  {
+</I>&gt;<i>         signal_info* h;
+</I>&gt;<i> -       int mr, r = -1;
+</I>&gt;<i> +       int waiting,fd,i = 0;
+</I>&gt;<i>  
+</I>&gt;<i> -       mr = pthread_mutex_lock (&amp;signals_mutex);
+</I>&gt;<i> -       if (mr != 0) {
+</I>&gt;<i> -               errno = mr;
+</I>&gt;<i> -               return -1;
+</I>&gt;<i> -       }
+</I>&gt;<i> -
+</I>&gt;<i>         h = info;
+</I>&gt;<i>  
+</I>&gt;<i> -       if (h == NULL || h &lt; signals || h &gt; &amp;signals [NUM_SIGNALS])
+</I>&gt;<i> +       if (h == NULL || h &lt; &amp;signals [0] [0] || h &gt; &amp;signals [SUPPORTED_SIGNALS] [NUM_UNIXSIGNAL_INSTANCES]) {
+</I>&gt;<i>                 errno = EINVAL;
+</I>&gt;<i> +               return 0;
+</I>&gt;<i> +       }
+</I>&gt;<i>         else {
+</I>&gt;<i> -               /* last UnixSignal -- we can unregister */
+</I>&gt;<i> -               if (h-&gt;have_handler &amp;&amp; count_handlers (h-&gt;signum) == 1) {
+</I>&gt;<i> -                       mph_sighandler_t p = signal (h-&gt;signum, h-&gt;handler);
+</I>&gt;<i> -                       if (p != SIG_ERR)
+</I>&gt;<i> -                               r = 0;
+</I>&gt;<i> -                       h-&gt;handler      = NULL;
+</I>&gt;<i> -                       h-&gt;have_handler = 0;
+</I>&gt;<i> +               /* wait until we are not being signalled, then move to disposed */
+</I>&gt;<i> +               while (!mph_int_cas (&amp;h-&gt;have_handler, STATE_ASSIGNED, STATE_WAITING_DISPOSE)) { }
+</I>
+Again, I can't help but feel this looks like a potential race...
+
+&gt;<i> +               /* send something to the pipe before closing to unblock any waiting threads */
+</I>&gt;<i> +               waiting = mph_int_get(&amp;h-&gt;wait_counter);
+</I>&gt;<i> +               if (waiting &gt; 0) {
+</I>&gt;<i> +                       fd = h-&gt;write_fd;
+</I>&gt;<i> +                       if (fd &gt; 0) {
+</I>&gt;<i> +                               char c = h-&gt;signum;
+</I>&gt;<i> +                               for (i=0;i&lt;waiting;++i)
+</I>&gt;<i> +                               {
+</I>&gt;<i> +                                       write (fd, &amp;c, 1);
+</I>&gt;<i> +                               }
+</I>&gt;<i> +                       }
+</I>&gt;<i>                 }
+</I>&gt;<i> -               h-&gt;signum = 0;
+</I>&gt;<i> +               else { /* if no threads are waiting, teardown now */
+</I>&gt;<i> +                       teardown_signalinfo(h);
+</I>&gt;<i> +               }
+</I>&gt;<i> +
+</I>&gt;<i>         }
+</I>&gt;<i>  
+</I>&gt;<i> -       pthread_mutex_unlock (&amp;signals_mutex);
+</I>&gt;<i> -
+</I>&gt;<i> -       return r;
+</I>&gt;<i> +       return 0;
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i>  static int
+</I>&gt;<i>  setup_pipes (signal_info** signals, int count, fd_set *read_fds, int *max_fd)
+</I>&gt;<i>  {
+</I>&gt;<i> -       int i, r;
+</I>&gt;<i> +       int i, state;
+</I>&gt;<i>         for (i = 0; i &lt; count; ++i) {
+</I>&gt;<i>                 signal_info* h;
+</I>&gt;<i> -               int filedes[2];
+</I>&gt;<i> -
+</I>&gt;<i> -               if ((r = pipe (filedes)) != 0) {
+</I>&gt;<i> -                       break;
+</I>&gt;<i> +               h = signals [i];
+</I>&gt;<i> +               mph_int_inc (&amp;h-&gt;wait_counter); /* increment wait counter */
+</I>&gt;<i> +               state = mph_int_get (&amp;h-&gt;have_handler);
+</I>&gt;<i> +               if ((state == STATE_ASSIGNED) || (state == STATE_SIGNALLING))
+</I>&gt;<i> +               {
+</I>
+Braces go on end of previous line.
+
+&gt;<i> +                       if (h-&gt;read_fd &gt; *max_fd)
+</I>&gt;<i> +                               *max_fd = h-&gt;read_fd;
+</I>&gt;<i> +                       FD_SET (h-&gt;read_fd, read_fds);
+</I>&gt;<i>                 }
+</I>&gt;<i> -               h = signals [i];
+</I>&gt;<i> -               h-&gt;read_fd  = filedes [0];
+</I>&gt;<i> -               h-&gt;write_fd = filedes [1];
+</I>&gt;<i> -               if (h-&gt;read_fd &gt; *max_fd)
+</I>&gt;<i> -                       *max_fd = h-&gt;read_fd;
+</I>&gt;<i> -               FD_SET (h-&gt;read_fd, read_fds);
+</I>&gt;<i>         }
+</I>&gt;<i> -       return r;
+</I>&gt;<i> +       return 0;
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i> -static void
+</I>&gt;<i> -teardown_pipes (signal_info** signals, int count)
+</I>&gt;<i> -{
+</I>&gt;<i> -       int i;
+</I>&gt;<i> -       for (i = 0; i &lt; count; ++i) {
+</I>&gt;<i> -               signal_info* h = signals [i];
+</I>&gt;<i> -               if (h-&gt;read_fd != 0)
+</I>&gt;<i> -                       close (h-&gt;read_fd);
+</I>&gt;<i> -               if (h-&gt;write_fd != 0)
+</I>&gt;<i> -                       close (h-&gt;write_fd);
+</I>&gt;<i> -               h-&gt;read_fd  = 0;
+</I>&gt;<i> -               h-&gt;write_fd = 0;
+</I>&gt;<i> -       }
+</I>&gt;<i> -}
+</I>&gt;<i> -
+</I>&gt;<i>  static int
+</I>&gt;<i>  wait_for_any (signal_info** signals, int count, int max_fd, fd_set* read_fds, int timeout)
+</I>&gt;<i>  {
+</I>&gt;<i> -       int r, idx;
+</I>&gt;<i> +       int r, i, idx;
+</I>&gt;<i>         do {
+</I>&gt;<i>                 struct timeval tv;
+</I>&gt;<i>                 struct timeval *ptv = NULL;
+</I>&gt;<i> @@ -310,18 +342,18 @@
+</I>&gt;<i>         if (r == 0)
+</I>&gt;<i>                 idx = timeout;
+</I>&gt;<i>         else if (r &gt; 0) {
+</I>&gt;<i> -               int i;
+</I>&gt;<i>                 for (i = 0; i &lt; count; ++i) {
+</I>&gt;<i>                         signal_info* h = signals [i];
+</I>&gt;<i>                         if (FD_ISSET (h-&gt;read_fd, read_fds)) {
+</I>&gt;<i>                                 char c;
+</I>&gt;<i>                                 read (h-&gt;read_fd, &amp;c, 1); /* ignore any error */
+</I>&gt;<i> -                               if (idx == -1)
+</I>&gt;<i> +                               if (idx == -1) {
+</I>&gt;<i>                                         idx = i;
+</I>&gt;<i> +                                       break;
+</I>&gt;<i> +                               }
+</I>&gt;<i>                         }
+</I>&gt;<i>                 }
+</I>&gt;<i>         }
+</I>&gt;<i> -
+</I>&gt;<i>         return idx;
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i> @@ -334,27 +366,28 @@
+</I>&gt;<i>  Mono_Unix_UnixSignal_WaitAny (void** _signals, int count, int timeout /* milliseconds */)
+</I>&gt;<i>  {
+</I>&gt;<i>         fd_set read_fds;
+</I>&gt;<i> -       int mr, r;
+</I>&gt;<i> +       int r = 0;
+</I>&gt;<i>         int max_fd = 0;
+</I>&gt;<i> +       int i = 0;
+</I>&gt;<i>  
+</I>&gt;<i>         signal_info** signals = (signal_info**) _signals;
+</I>&gt;<i>  
+</I>&gt;<i> -       mr = pthread_mutex_lock (&amp;signals_mutex);
+</I>&gt;<i> -       if (mr != 0) {
+</I>&gt;<i> -               errno = mr;
+</I>&gt;<i> -               return -1;
+</I>&gt;<i> -       }
+</I>&gt;<i> -
+</I>&gt;<i>         FD_ZERO (&amp;read_fds);
+</I>&gt;<i>  
+</I>&gt;<i>         r = setup_pipes (signals, count, &amp;read_fds, &amp;max_fd);
+</I>&gt;<i>         if (r == 0) {
+</I>&gt;<i>                 r = wait_for_any (signals, count, max_fd, &amp;read_fds, timeout);
+</I>&gt;<i>         }
+</I>&gt;<i> -       teardown_pipes (signals, count);
+</I>&gt;<i>  
+</I>&gt;<i> -       pthread_mutex_unlock (&amp;signals_mutex);
+</I>&gt;<i> -
+</I>&gt;<i> +       /* decrement wait counter */
+</I>&gt;<i> +       for (i = 0; i &lt; count; ++i) {
+</I>&gt;<i> +               signal_info* h;
+</I>&gt;<i> +               h = signals [i];
+</I>&gt;<i> +               mph_int_dec (&amp;h-&gt;wait_counter); /* decrement wait counter */
+</I>&gt;<i> +               /* if this handle has been disposed during this wait, tear it down */
+</I>&gt;<i> +               if (mph_int_get (&amp;h-&gt;have_handler) == STATE_WAITING_DISPOSE)
+</I>&gt;<i> +                       teardown_signalinfo (h);
+</I>&gt;<i> +       }
+</I>&gt;<i>         return r;
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030512.html">[Mono-dev] signal.c cross-thread access
+</A></li>
+	<LI>Next message: <A HREF="030513.html">[Mono-dev] Process background problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30606">[ date ]</a>
+              <a href="thread.html#30606">[ thread ]</a>
+              <a href="subject.html#30606">[ subject ]</a>
+              <a href="author.html#30606">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

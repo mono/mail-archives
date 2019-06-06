@@ -1,0 +1,854 @@
+Index: mono/mini/ChangeLog
+===================================================================
+--- mono/mini/ChangeLog	(revision 105580)
++++ mono/mini/ChangeLog	(working copy)
+@@ -1,3 +1,19 @@
++2008-06-10  Bill Holmes  <billholmes54@gmail.com>
++
++	* mini-amd64.c:add_valuetype: Adding Winx64 code to fill the ArgInfo
++	  for the ArgValuetypeAddrInIReg case.
++	* mini-amd64.c:mono_arch_allocate_vars:  Adding a case for ArgValuetypeAddrInIReg
++	  to avoid asserts.  Code needs to be added here.
++
++	* mini-amd64.c: mono_arch_call_opcode:  Adding Winx64 code for an ArgInfo of type
++	  ArgValuetypeAddrInIReg.  The code emitted will copy the argument to a local 
++	  variable and pass the local variable by reference to the called method.
++	  
++	* mini-amd64.c: mono_arch_emit_prolog:  Adjust the stack for calls to
++	  mono_jit_thread_attach and mono_get_lmf_addr for Winx64.
++
++	Contributed under MIT/X11 license.
++
+ 2008-06-10  Rodrigo Kumpera  <rkumpera@novell.com>
+ 
+ 	* debug-mini.c (mono_debug_free_method_jit_info): Moved to metadata/mono-debug.c.
+Index: mono/mini/mini-amd64.c
+===================================================================
+--- mono/mini/mini-amd64.c	(revision 105580)
++++ mono/mini/mini-amd64.c	(working copy)
+@@ -215,7 +215,8 @@
+ 	ArgInDoubleSSEReg,
+ 	ArgOnStack,
+ 	ArgValuetypeInReg,
+-	ArgNone /* only in pair_storage */
++	ArgNone, /* only in pair_storage */
++	ArgValuetypeAddrInIReg
+ } ArgStorage;
+ 
+ typedef struct {
+@@ -402,8 +403,11 @@
+ 		size = mono_type_native_stack_size (&klass->byval_arg, NULL);
+ 	else 
+ 		size = mini_type_stack_size (gsctx, &klass->byval_arg, NULL);
+-
++#ifndef PLATFORM_WIN32
+ 	if (!sig->pinvoke || (size == 0) || (size > 16)) {
++#else
++	if (!sig->pinvoke) {
++#endif
+ 		/* Allways pass in memory */
+ 		ainfo->offset = *stack_size;
+ 		*stack_size += ALIGN_TO (size, 8);
+@@ -442,9 +446,26 @@
+ 	case 1: case 2: case 4: case 8:
+ 		break;
+ 	default:
+-		ainfo->offset = *stack_size;
+-		*stack_size += ALIGN_TO (info->native_size, 16);
+-		ainfo->storage = ArgOnStack;
++		if (is_return) {
++			ainfo->storage = ArgOnStack;
++			ainfo->offset = *stack_size;
++			*stack_size += ALIGN_TO (info->native_size, 8);
++		}
++		else {
++			ainfo->storage = ArgValuetypeAddrInIReg;
++
++			if (*gr < PARAM_REGS) {
++				ainfo->pair_storage [0] = ArgInIReg;
++				ainfo->pair_regs [0] = param_regs [*gr];
++				(*gr) ++;
++			} 
++			else {
++				ainfo->pair_storage [0] = ArgOnStack;
++				ainfo->offset = *stack_size;
++				*stack_size += 8;
++			}
++		}
++
+ 		return;
+ 	}
+ #endif
+@@ -1167,6 +1188,8 @@
+ 				break;
+ 			case ArgValuetypeInReg:
+ 				break;
++			case ArgValuetypeAddrInIReg:
++				break;  /*FIXME: Not sure what to do for this case yet on Winx64*/
+ 			default:
+ 				NOT_IMPLEMENTED;
+ 			}
+@@ -1421,6 +1444,42 @@
+ 						MONO_INST_LIST_ADD (&arg->node, &call->out_args);
+ 					}
+ 				}
++				else if (ainfo->storage == ArgValuetypeAddrInIReg){
++
++					/* Add a temp variable to the method*/
++					MonoInst *load;
++					MonoInst *vtaddr = mono_compile_create_var (cfg, &in->klass->byval_arg, OP_LOCAL);
++					
++					MONO_INST_NEW (cfg, load, OP_LDADDR);
++					load->ssa_op = MONO_SSA_LOAD;
++					load->inst_left = vtaddr;
++					
++					if (ainfo->pair_storage [0] == ArgInIReg) {
++						/* Inserted after the copy.  Load the address of the temp to the argument regster.*/
++						arg->opcode = OP_OUTARG_REG;
++						arg->inst_left = load;
++						arg->inst_call = call;
++						arg->backend.reg3 =  ainfo->pair_regs [0];
++					} 
++					else {
++						/* Inserted after the copy.  Load the address of the temp on the stack.*/
++						arg->opcode = OP_OUTARG_VT;
++						arg->inst_left = load;
++						arg->type = STACK_PTR;
++						arg->klass = mono_defaults.int_class;
++						arg->backend.is_pinvoke = sig->pinvoke;
++						arg->inst_imm = size;
++					}
++
++					/*Copy the argument to the temp variable.*/
++					MONO_INST_NEW (cfg, load, OP_MEMCPY);
++					load->backend.memcpy_args = mono_mempool_alloc0 (cfg->mempool, sizeof (MonoMemcpyArgs));
++					load->backend.memcpy_args->size = mono_class_value_size (in->klass, &align);
++					load->backend.memcpy_args->align = align;
++					load->inst_left = (cfg)->varinfo [vtaddr->inst_c0];;
++					load->inst_right = in->inst_i0;
++					MONO_INST_LIST_ADD (&load->node, &call->out_args);
++				}
+ 				else {
+ 					arg->opcode = OP_OUTARG_VT;
+ 					arg->klass = in->klass;
+@@ -4188,7 +4247,7 @@
+ 			x86_branch8 (code, X86_CC_NE, 0, 0);
+ 			amd64_patch (no_domain_branch, code);
+ 			code = emit_call (cfg, code, MONO_PATCH_INFO_INTERNAL_METHOD, 
+-					  (gpointer)"mono_jit_thread_attach", FALSE);
++					  (gpointer)"mono_jit_thread_attach", TRUE);
+ 			amd64_patch (buf, code);
+ 		} else {
+ 			g_assert (!cfg->compile_aot);
+@@ -4197,7 +4256,7 @@
+ 			else
+ 				amd64_mov_reg_imm_size (code, AMD64_ARG_REG1, domain, 8);
+ 			code = emit_call (cfg, code, MONO_PATCH_INFO_INTERNAL_METHOD,
+-					  (gpointer)"mono_jit_thread_attach", FALSE);
++					  (gpointer)"mono_jit_thread_attach", TRUE);
+ 		}
+ 	}
+ 
+@@ -4234,7 +4293,7 @@
+ 				 */
+ 				args_clobbered = TRUE;
+ 				code = emit_call (cfg, code, MONO_PATCH_INFO_INTERNAL_METHOD, 
+-								  (gpointer)"mono_get_lmf_addr", FALSE);		
++								  (gpointer)"mono_get_lmf_addr", TRUE);		
+ 			}
+ 
+ 			/* Save lmf_addr */
+Index: mono/tests/ChangeLog
+===================================================================
+--- mono/tests/ChangeLog	(revision 105580)
++++ mono/tests/ChangeLog	(working copy)
+@@ -1,3 +1,10 @@
++2008-06-10  Bill Holmes  <billholmes54@gmail.com>
++	* libtest.c, winx64structs.cs :
++	  Adding marshaling tests for structs.  These tests
++	  represent the different cases to consider on Winx64.
++
++	Contributed under MIT/X11 license.
++
+ 2008-06-10  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* Makefile.am: Delete some tests for the disabled set which seem to work now.
+Index: mono/tests/libtest.c
+===================================================================
+--- mono/tests/libtest.c	(revision 105580)
++++ mono/tests/libtest.c	(working copy)
+@@ -3308,27 +3308,27 @@
+ 	return 0;
+ }
+ 
+-struct winx64_struct1
++typedef struct 
+ {
+ 	char a;
+-};
++} winx64_struct1;
+ 
+ LIBTEST_API int STDCALL  
+-test_Winx64_struct1_in (struct winx64_struct1 var)
++test_Winx64_struct1_in (winx64_struct1 var)
+ {
+ 	if (var.a != 123)
+ 		return 1;
+ 	return 0;
+ }
+ 
+-struct winx64_struct2
++typedef struct
+ {
+ 	char a;
+ 	char b;
+-};
++} winx64_struct2;
+ 
+ LIBTEST_API int STDCALL  
+-test_Winx64_struct2_in (struct winx64_struct2 var)
++test_Winx64_struct2_in (winx64_struct2 var)
+ {
+ 	if (var.a != 4)
+ 		return 1;
+@@ -3338,15 +3338,15 @@
+ }
+ 
+ 
+-struct winx64_struct3
++typedef struct
+ {
+ 	char a;
+ 	char b;
+ 	short c;
+-};
++} winx64_struct3;
+ 
+ LIBTEST_API int STDCALL  
+-test_Winx64_struct3_in (struct winx64_struct3 var)
++test_Winx64_struct3_in (winx64_struct3 var)
+ {
+ 	if (var.a != 4)
+ 		return 1;
+@@ -3357,16 +3357,16 @@
+ 	return 0;
+ }
+ 
+-struct winx64_struct4
++typedef struct
+ {
+ 	char a;
+ 	char b;
+ 	short c;
+ 	unsigned int d;
+-};
++} winx64_struct4;
+ 
+ LIBTEST_API int STDCALL  
+-test_Winx64_struct4_in (struct winx64_struct4 var)
++test_Winx64_struct4_in (winx64_struct4 var)
+ {
+ 	if (var.a != 4)
+ 		return 1;
+@@ -3379,15 +3379,15 @@
+ 	return 0;
+ }
+ 
+-struct winx64_struct5
++typedef struct
+ {
+ 	char a;
+ 	char b;
+ 	char c;
+-};
++} winx64_struct5;
+ 
+ LIBTEST_API int STDCALL  
+-test_Winx64_struct5_in (struct winx64_struct5 var)
++test_Winx64_struct5_in (winx64_struct5 var)
+ {
+ 	if (var.a != 4)
+ 		return 1;
+@@ -3398,12 +3398,31 @@
+ 	return 0;
+ }
+ 
++typedef struct
++{
++	winx64_struct1 a;
++	short b;
++	char c;
++} winx64_struct6;
++
+ LIBTEST_API int STDCALL  
+-test_Winx64_structs_in1 (struct winx64_struct1 var1,
+-			 struct winx64_struct2 var2,
+-			 struct winx64_struct3 var3,
+-			 struct winx64_struct4 var4)
++test_Winx64_struct6_in (winx64_struct6 var)
+ {
++	if (var.a.a != 4)
++		return 1;
++	if (var.b != 5)
++		return 2;
++	if (var.c != 6)
++		return 3;
++	return 0;
++}
++
++LIBTEST_API int STDCALL  
++test_Winx64_structs_in1 (winx64_struct1 var1,
++			 winx64_struct2 var2,
++			 winx64_struct3 var3,
++			 winx64_struct4 var4)
++{
+ 	if (var1.a != 123)
+ 		return 1;
+ 	
+@@ -3431,11 +3450,11 @@
+ }
+ 
+ LIBTEST_API int STDCALL  
+-test_Winx64_structs_in2 (struct winx64_struct1 var1,
+-			 struct winx64_struct1 var2,
+-			 struct winx64_struct1 var3,
+-			 struct winx64_struct1 var4,
+-			 struct winx64_struct1 var5)
++test_Winx64_structs_in2 (winx64_struct1 var1,
++			 winx64_struct1 var2,
++			 winx64_struct1 var3,
++			 winx64_struct1 var4,
++			 winx64_struct1 var5)
+ {
+ 	if (var1.a != 1)
+ 		return 1;
+@@ -3451,37 +3470,78 @@
+ 	return 0;
+ }
+ 
+-LIBTEST_API struct winx64_struct1 STDCALL  
++LIBTEST_API int STDCALL  
++test_Winx64_structs_in3 (winx64_struct1 var1,
++			 winx64_struct5 var2,
++			 winx64_struct1 var3,
++			 winx64_struct5 var4,
++			 winx64_struct1 var5,
++			 winx64_struct5 var6)
++{
++	if (var1.a != 1)
++		return 1;
++	
++	if (var2.a != 2)
++		return 2;
++	if (var2.b != 3)
++		return 2;
++	if (var2.c != 4)
++		return 4;
++	
++	if (var3.a != 5)
++		return 5;
++	
++	if (var4.a != 6)
++		return 6;
++	if (var4.b != 7)
++		return 7;
++	if (var4.c != 8)
++		return 8;
++	
++	if (var5.a != 9)
++		return 9;
++
++	if (var6.a != 10)
++		return 10;
++	if (var6.b != 11)
++		return 11;
++	if (var6.c != 12)
++		return 12;
++	
++	return 0;
++}
++
++LIBTEST_API winx64_struct1 STDCALL  
+ test_Winx64_struct1_ret ()
+ {
+-	struct winx64_struct1 ret;
++	winx64_struct1 ret;
+ 	ret.a = 123;
+ 	return ret;
+ }
+ 
+-LIBTEST_API struct winx64_struct2 STDCALL  
++LIBTEST_API winx64_struct2 STDCALL  
+ test_Winx64_struct2_ret ()
+ {
+-	struct winx64_struct2 ret;
++	winx64_struct2 ret;
+ 	ret.a = 4;
+ 	ret.b = 5;
+ 	return ret;
+ }
+ 
+-LIBTEST_API struct winx64_struct3 STDCALL  
++LIBTEST_API winx64_struct3 STDCALL  
+ test_Winx64_struct3_ret ()
+ {
+-	struct winx64_struct3 ret;
++	winx64_struct3 ret;
+ 	ret.a = 4;
+ 	ret.b = 5;
+ 	ret.c = 0x1234;
+ 	return ret;
+ }
+ 
+-LIBTEST_API struct winx64_struct4 STDCALL  
++LIBTEST_API winx64_struct4 STDCALL  
+ test_Winx64_struct4_ret ()
+ {
+-	struct winx64_struct4 ret;
++	winx64_struct4 ret;
+ 	ret.a = 4;
+ 	ret.b = 5;
+ 	ret.c = 0x1234;
+@@ -3489,14 +3549,24 @@
+ 	return ret;
+ }
+ 
+-struct winx64_floatStruct
++LIBTEST_API winx64_struct5 STDCALL  
++test_Winx64_struct5_ret ()
+ {
++	winx64_struct5 ret;
++	ret.a = 4;
++	ret.b = 5;
++	ret.c = 6;
++	return ret;
++}
++
++typedef struct
++{
+ 	float a;
+ 	float b;
+-};
++} winx64_floatStruct;
+ 
+ LIBTEST_API int STDCALL  
+-test_Winx64_floatStruct (struct winx64_floatStruct a)
++test_Winx64_floatStruct (winx64_floatStruct a)
+ {
+ 	if (a.a > 5.6 || a.a < 5.4)
+ 		return 1;
+@@ -3507,13 +3577,13 @@
+ 	return 0;
+ }
+ 
+-struct winx64_doubleStruct
++typedef struct
+ {
+ 	double a;
+-};
++} winx64_doubleStruct;
+ 
+ LIBTEST_API int STDCALL  
+-test_Winx64_doubleStruct (struct winx64_doubleStruct a)
++test_Winx64_doubleStruct (winx64_doubleStruct a)
+ {
+ 	if (a.a > 5.6 || a.a < 5.4)
+ 		return 1;
+@@ -3521,3 +3591,13 @@
+ 	return 0;
+ }
+ 
++typedef int (STDCALL *managed_struct1_delegate) (winx64_struct1 a);
++
++LIBTEST_API int STDCALL 
++test_managed_Winx64_struct1_in(managed_struct1_delegate func)
++{
++	winx64_struct1 val;
++	val.a = 5;
++	return func (val);
++}
++
+Index: mono/tests/winx64structs.cs
+===================================================================
+--- mono/tests/winx64structs.cs	(revision 105580)
++++ mono/tests/winx64structs.cs	(working copy)
+@@ -4,12 +4,22 @@
+ [StructLayout (LayoutKind.Sequential)]
+ struct winx64_struct1
+ {
++	public winx64_struct1 (byte ia)
++	{
++		a = ia;
++	}
+ 	public byte a;
+ }
+ 
+ [StructLayout (LayoutKind.Sequential)]
+ struct winx64_struct2
+ {
++	public winx64_struct2 (byte ia, byte ib)
++	{
++		a = ia;
++		b = ib;
++	}
++	
+ 	public byte a;
+ 	public byte b;
+ }
+@@ -17,6 +27,13 @@
+ [StructLayout (LayoutKind.Sequential)]
+ struct winx64_struct3
+ {
++	public winx64_struct3 (byte ia, byte ib, short ic)
++	{
++		a = ia;
++		b = ib;
++		c = ic;
++	}
++	
+ 	public byte a;
+ 	public byte b;
+ 	public short c;
+@@ -25,6 +42,14 @@
+ [StructLayout (LayoutKind.Sequential)]
+ struct winx64_struct4
+ {
++	public winx64_struct4 (byte ia, byte ib, short ic, uint id)
++	{
++		a = ia;
++		b = ib;
++		c = ic;
++		d = id;
++	}
++	
+ 	public byte a;
+ 	public byte b;
+ 	public short c;
+@@ -34,14 +59,42 @@
+ [StructLayout (LayoutKind.Sequential)]
+ struct winx64_struct5
+ {
++	public winx64_struct5 (byte ia, byte ib, byte ic)
++	{
++		a = ia;
++		b = ib;
++		c = ic;
++	}
++	
+ 	public byte a;
+ 	public byte b;
+ 	public byte c;
+ }
+ 
+ [StructLayout (LayoutKind.Sequential)]
++struct winx64_struct6
++{
++	public winx64_struct6 (winx64_struct1 ia, short ib, byte ic)
++	{
++		a = ia;
++		b = ib;
++		c = ic;
++	}
++	
++	public winx64_struct1 a;
++	public short b;
++	public byte c;
++}
++
++[StructLayout (LayoutKind.Sequential)]
+ struct winx64_floatStruct
+ {
++	public winx64_floatStruct (float ia, float ib)
++	{
++		a = ia;
++		b = ib;
++	}
++	
+ 	public float a;
+ 	public float b;
+ }
+@@ -49,6 +102,11 @@
+ [StructLayout (LayoutKind.Sequential)]
+ struct winx64_doubleStruct
+ {
++	public winx64_doubleStruct (double ia)
++	{
++		a = ia;
++	}
++	
+ 	public double a;
+ }
+ 
+@@ -70,6 +128,9 @@
+ 	static extern int test_Winx64_struct5_in ([MarshalAs (UnmanagedType.Struct)] winx64_struct5 var);
+ 
+ 	[DllImport ("libtest")]
++	static extern int test_Winx64_struct6_in ([MarshalAs (UnmanagedType.Struct)] winx64_struct6 var);
++
++	[DllImport ("libtest")]
+ 	static extern int test_Winx64_structs_in1 ([MarshalAs (UnmanagedType.Struct)] winx64_struct1 var1,
+ 						   [MarshalAs (UnmanagedType.Struct)] winx64_struct2 var2,
+ 						   [MarshalAs (UnmanagedType.Struct)] winx64_struct3 var3,
+@@ -80,9 +141,17 @@
+ 						   [MarshalAs (UnmanagedType.Struct)] winx64_struct1 var2,
+ 						   [MarshalAs (UnmanagedType.Struct)] winx64_struct1 var3,
+ 					           [MarshalAs (UnmanagedType.Struct)] winx64_struct1 var4,
+-						   [MarshalAs (UnmanagedType.Struct)] winx64_struct1 var6);
++						   [MarshalAs (UnmanagedType.Struct)] winx64_struct1 var5);
+ 
+ 	[DllImport ("libtest")]
++	static extern int test_Winx64_structs_in3 ([MarshalAs (UnmanagedType.Struct)] winx64_struct1 var1,
++						   [MarshalAs (UnmanagedType.Struct)] winx64_struct5 var2,
++						   [MarshalAs (UnmanagedType.Struct)] winx64_struct1 var3,
++						   [MarshalAs (UnmanagedType.Struct)] winx64_struct5 var4,
++						   [MarshalAs (UnmanagedType.Struct)] winx64_struct1 var5,
++						   [MarshalAs (UnmanagedType.Struct)] winx64_struct5 var6);
++
++	[DllImport ("libtest")]
+ 	[return:MarshalAs (UnmanagedType.Struct)]
+ 	static extern winx64_struct1 test_Winx64_struct1_ret ();
+ 
+@@ -99,11 +168,20 @@
+ 	static extern winx64_struct4 test_Winx64_struct4_ret ();
+ 
+ 	[DllImport ("libtest")]
++	[return: MarshalAs (UnmanagedType.Struct)]
++	static extern winx64_struct5 test_Winx64_struct5_ret ();
++
++	[DllImport ("libtest")]
+ 	static extern int test_Winx64_floatStruct ([MarshalAs (UnmanagedType.Struct)] winx64_floatStruct var);
+ 
+ 	[DllImport ("libtest")]
+ 	static extern int test_Winx64_doubleStruct ([MarshalAs (UnmanagedType.Struct)] winx64_doubleStruct var);
+ 
++	public delegate int managed_struct1_delegate ([MarshalAs (UnmanagedType.Struct)] winx64_struct1 var);
++
++	[DllImport ("libtest")]
++	static extern int test_managed_Winx64_struct1_in (managed_struct1_delegate func);
++
+ 	private static bool enableBroken = false;
+ 	
+ 	static int Main (string[] args)
+@@ -116,20 +194,28 @@
+ 				testCode, haveError = true);
+ 
+ 		if ((testCode = Test_In_Args_Value_On_Stack_ADDR_In_RCX ()) != 0)
+-		        Console.WriteLine ("Test_In_Args_Value_On_Stack_ADDR_In_RCX Failed with code {0}",
+-		                testCode, haveError = true);
++			Console.WriteLine ("Test_In_Args_Value_On_Stack_ADDR_In_RCX Failed with code {0}",
++				testCode, haveError = true);
+ 
+ 		if ((testCode = Test_In_Args_Values_In_Multiple_Registers ()) != 0)
+ 			Console.WriteLine ("Test_In_Args_Values_In_Multiple_Registers Failed with code {0}",
+ 				testCode, haveError = true);
+ 
++		if ((testCode = Test_In_Args_Values_In_Registers_with_Stack_and_On_Stack ()) != 0)
++			Console.WriteLine ("Test_In_Args_Values_In_Registers_with_Stack_and_On_Stack Failed with code {0}",
++				testCode, haveError = true);
++
+ 		if ((testCode = Test_Ret_In_RAX ()) != 0)
+ 			Console.WriteLine ("Test_Ret_In_RAX Failed with code {0}",
+ 				testCode, haveError = true);
+ 
+-		if ((testCode = Test_In_Args_Values_In_Registers_and_Stack ()) != 0)
+-			Console.WriteLine ("Test_In_Args_Values_In_Registers_and_Stack Failed with code {0}",
++		if ((testCode = Test_Ret_In_Address ()) != 0)
++			Console.WriteLine ("Test_Ret_In_Address Failed with code {0}",
+ 				testCode, haveError = true);
++
++		if ((testCode = Test_In_Args_Value_In_RCX_Managed ()) != 0)
++			Console.WriteLine ("Test_In_Args_Value_In_RCX_Managed Failed with code {0}",
++				testCode, haveError = true);
+ 		
+ 		if (haveError)
+ 			return 1;
+@@ -141,45 +227,32 @@
+ 	{
+ 		int retCode;
+ 
+-		winx64_struct1 t_winx64_struct1 = new winx64_struct1 ();
+-		t_winx64_struct1.a = 123;
++		winx64_struct1 t_winx64_struct1 = new winx64_struct1 (123);
+ 
+ 		if ((retCode = test_Winx64_struct1_in (t_winx64_struct1)) != 0)
+ 			return 100 + retCode;
+ 
+-		winx64_struct2 t_winx64_struct2 = new winx64_struct2 ();
+-		t_winx64_struct2.a = 4;
+-		t_winx64_struct2.b = 5;
++		winx64_struct2 t_winx64_struct2 = new winx64_struct2 (4, 5);
+ 
+ 		if ((retCode = test_Winx64_struct2_in (t_winx64_struct2)) != 0)
+ 			return 200 + retCode;
+ 
+-		winx64_struct3 t_winx64_struct3 = new winx64_struct3 ();
+-		t_winx64_struct3.a = 4;
+-		t_winx64_struct3.b = 5;
+-		t_winx64_struct3.c = 0x1234;
++		winx64_struct3 t_winx64_struct3 = new winx64_struct3 (4, 5, 0x1234);
+ 
+ 		if ((retCode = test_Winx64_struct3_in (t_winx64_struct3)) != 0)
+ 			return 300 + retCode;
+ 
+-		winx64_struct4 t_winx64_struct4 = new winx64_struct4 ();
+-		t_winx64_struct4.a = 4;
+-		t_winx64_struct4.b = 5;
+-		t_winx64_struct4.c = 0x1234;
+-		t_winx64_struct4.d = 0x87654321;
++		winx64_struct4 t_winx64_struct4 = new winx64_struct4 (4, 5, 0x1234, 0x87654321);
+ 
+ 		if ((retCode = test_Winx64_struct4_in (t_winx64_struct4)) != 0)
+ 			return 400 + retCode;
+ 
+-		winx64_floatStruct t_winx64_floatStruct = new winx64_floatStruct ();
+-		t_winx64_floatStruct.a = 5.5F;
+-		t_winx64_floatStruct.b = 9.5F;
++		winx64_floatStruct t_winx64_floatStruct = new winx64_floatStruct (5.5F, 9.5F);
+ 
+ 		if ((retCode = test_Winx64_floatStruct (t_winx64_floatStruct)) != 0)
+ 			return 500 + retCode;
+ 
+-		winx64_doubleStruct t_winx64_doubleStruct = new winx64_doubleStruct ();
+-		t_winx64_doubleStruct.a = 5.5F;
++		winx64_doubleStruct t_winx64_doubleStruct = new winx64_doubleStruct (5.5F);
+ 
+ 		if ((retCode = test_Winx64_doubleStruct (t_winx64_doubleStruct)) != 0)
+ 			return 600 + retCode;
+@@ -191,24 +264,11 @@
+ 	{
+ 		int retCode; 
+ 		
+-		winx64_struct1 t_winx64_struct1 = new winx64_struct1 ();
+-		t_winx64_struct1.a = 123;
+-
+-		winx64_struct2 t_winx64_struct2 = new winx64_struct2 ();
+-		t_winx64_struct2.a = 4;
+-		t_winx64_struct2.b = 5;
+-
+-		winx64_struct3 t_winx64_struct3 = new winx64_struct3 ();
+-		t_winx64_struct3.a = 4;
+-		t_winx64_struct3.b = 5;
+-		t_winx64_struct3.c = 0x1234;
+-
+-		winx64_struct4 t_winx64_struct4 = new winx64_struct4 ();
+-		t_winx64_struct4.a = 4;
+-		t_winx64_struct4.b = 5;
+-		t_winx64_struct4.c = 0x1234;
+-		t_winx64_struct4.d = 0x87654321;
+-
++		winx64_struct1 t_winx64_struct1 = new winx64_struct1 (123);
++		winx64_struct2 t_winx64_struct2 = new winx64_struct2 (4, 5);
++		winx64_struct3 t_winx64_struct3 = new winx64_struct3 (4, 5, 0x1234);
++		winx64_struct4 t_winx64_struct4 = new winx64_struct4 (4, 5, 0x1234, 0x87654321);
++		
+ 		if ((retCode = test_Winx64_structs_in1 (t_winx64_struct1, t_winx64_struct2,
+ 							t_winx64_struct3, t_winx64_struct4)) != 0)
+ 			return 100 + retCode;
+@@ -250,20 +310,28 @@
+ 		return 0;
+ 	}
+ 
++	static int Test_Ret_In_Address ()
++	{
++		winx64_struct5 t_winx64_struct5 = test_Winx64_struct5_ret ();
++		if (t_winx64_struct5.a != 4)
++			return 101;
++		if (t_winx64_struct5.b != 5)
++			return 102;
++		if (t_winx64_struct5.c != 6)
++			return 103;
++
++		return 0;
++	}
++
+ 	static int Test_In_Args_Values_In_Registers_and_Stack ()
+ 	{
+ 		int retCode;
+ 
+-		winx64_struct1 var1 = new winx64_struct1 ();
+-		var1.a = 1;
+-		winx64_struct1 var2 = new winx64_struct1 ();
+-		var2.a = 2;
+-		winx64_struct1 var3 = new winx64_struct1 ();
+-		var3.a = 3;
+-		winx64_struct1 var4 = new winx64_struct1 ();
+-		var4.a = 4;
+-		winx64_struct1 var5 = new winx64_struct1 ();
+-		var5.a = 5;
++		winx64_struct1 var1 = new winx64_struct1 (1);
++		winx64_struct1 var2 = new winx64_struct1 (2);
++		winx64_struct1 var3 = new winx64_struct1 (3);
++		winx64_struct1 var4 = new winx64_struct1 (4);
++		winx64_struct1 var5 = new winx64_struct1 (5);
+ 
+ 		if ((retCode = test_Winx64_structs_in2 (var1, var2, var3, var4, var5)) != 0)
+ 			return 100 + retCode;
+@@ -271,20 +339,60 @@
+ 		return 0;
+ 	}
+ 
++	static int Test_In_Args_Values_In_Registers_with_Stack_and_On_Stack ()
++	{
++		int retCode;
++
++		winx64_struct1 var1 = new winx64_struct1 (1);
++		winx64_struct5 var2 = new winx64_struct5 (2, 3, 4);
++		winx64_struct1 var3 = new winx64_struct1 (5);
++		winx64_struct5 var4 = new winx64_struct5 (6, 7, 8);
++		winx64_struct1 var5 = new winx64_struct1 (9);
++		winx64_struct5 var6 = new winx64_struct5 (10, 11, 12);
++
++		if ((retCode = test_Winx64_structs_in3 (var1, var2, var3, var4, var5, var6)) != 0)
++			return 100 + retCode;
++
++		return 0;
++	}
++
+ 	static int Test_In_Args_Value_On_Stack_ADDR_In_RCX ()
+ 	{
+ 		int retCode;
+ 
+-		if (enableBroken) {
+-			winx64_struct5 t_winx64_struct5 = new winx64_struct5 ();
+-			t_winx64_struct5.a = 4;
+-			t_winx64_struct5.b = 5;
+-			t_winx64_struct5.c = 6;
++		winx64_struct5 t_winx64_struct5 = new winx64_struct5 (4, 5, 6);
++		t_winx64_struct5.a = 4;
++		t_winx64_struct5.b = 5;
++		t_winx64_struct5.c = 6;
+ 
+-			if ((retCode = test_Winx64_struct5_in (t_winx64_struct5)) != 0)
++		if ((retCode = test_Winx64_struct5_in (t_winx64_struct5)) != 0)
++			return 100 + retCode;
++
++		winx64_struct6 t_winx64_struct6 = new winx64_struct6 (new winx64_struct1 (4), 5, 6);		
++
++		if ((retCode = test_Winx64_struct6_in (t_winx64_struct6)) != 0)
++			return 200 + retCode;
++
++		return 0;
++	}
++
++	static int Test_In_Args_Value_In_RCX_Managed ()
++	{
++		int retCode;
++
++		managed_struct1_delegate s1Del = new managed_struct1_delegate (managed_struct1_test);
++
++		if ((retCode = test_managed_Winx64_struct1_in (s1Del)) != 0)
+ 				return 100 + retCode;
+-		}
+ 
+ 		return 0;
+ 	}
++
++	static int managed_struct1_test (winx64_struct1 var)
++	{
++		if (var.a != 5)
++			return 1;
++
++		return 0;
++	}
+ }
+\ No newline at end of file

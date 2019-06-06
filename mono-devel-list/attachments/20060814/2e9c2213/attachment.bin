@@ -1,0 +1,957 @@
+Index: Win32ResultCode.cs
+===================================================================
+--- Win32ResultCode.cs	(revision 63710)
++++ Win32ResultCode.cs	(working copy)
+@@ -52,6 +52,8 @@
+ 		public const int AccessDenied = 5;
+ 		public const int InvalidParameter = 87;
+ 		public const int MoreData = 234;
+-		public const int NoMoreEntries = 259;	
++		public const int NoMoreEntries = 259;
++		public const int MarkedForDeletion = 1018;
++
+ 	}
+ }
+Index: RegistryKey.cs
+===================================================================
+--- RegistryKey.cs	(revision 63710)
++++ RegistryKey.cs	(working copy)
+@@ -4,8 +4,8 @@
+ // Author:
+ //   Miguel de Icaza (miguel@ximian.com)
+ //   Erik LeBel (eriklebel@yahoo.ca)
++//   Gert Driesen (drieseng@users.sourceforge.net)
+ //
+-
+ //
+ // Copyright (C) 2004 Novell, Inc (http://www.novell.com)
+ //
+@@ -50,12 +50,17 @@
+ 		//
+ 		internal object Data;
+ 		
+-		string qname;	// the fully qualified registry key name
+-		bool isRoot;	// is the an instance of a root key?
++		readonly string qname;	// the fully qualified registry key name
++		readonly bool isRoot;	// is the an instance of a root key?
++		readonly bool isWritable;	// is the key openen in writable mode
+ 
+ 		internal bool IsRoot {
+ 			get { return isRoot; }
+ 		}
++
++		internal bool IsWritable {
++			get { return isWritable; }
++		}
+ 		
+ 		static readonly IRegistryApi RegistryApi;
+ 
+@@ -75,16 +80,18 @@
+ 			Data = hiveId;
+ 			qname = keyName;
+ 			isRoot = true;
++			isWritable = true; // always consider root writable
+ 		}
+ 		
+ 		/// <summary>
+ 		///	Construct an instance of a registry key entry.
+ 		/// </summary>
+-		internal RegistryKey (object data, string keyName)
++		internal RegistryKey (object data, string keyName, bool writable)
+ 		{
+ 			Data = data;
+ 			qname = keyName;
+ 			isRoot = false;
++			isWritable = writable;
+ 		}
+ 
+ 		#region PublicAPI
+@@ -95,8 +102,8 @@
+ 		/// </summary>
+ 		void IDisposable.Dispose ()
+ 		{
++			GC.SuppressFinalize (this);
+ 			Close ();
+-			GC.SuppressFinalize (this);
+ 		}
+ 
+ 		
+@@ -128,11 +135,13 @@
+ 		
+ 		
+ 		/// <summary>
+-		///	Close the current registry key. This may not 
+-		///	flush the state of the registry right away.
++		///	Close the current registry key and flushes the state of the registry
++		/// right away.
+ 		/// </summary>
+ 		public void Close()
+ 		{
++			Flush ();
++
+ 			if (isRoot)
+ 				return;
+ 			
+@@ -171,13 +180,13 @@
+ 		public void SetValue (string name, object value)
+ 		{
+ 			AssertKeyStillValid ();
+-			
++
+ 			if (value == null)
+-				throw new ArgumentNullException ();
++				throw new ArgumentNullException ("value");
+ 
+-			if (isRoot)
+-				throw new UnauthorizedAccessException ();
+-			
++			if (!IsWritable)
++				throw new UnauthorizedAccessException ("Cannot write to the registry key.");
++
+ 			RegistryApi.SetValue (this, name, value);
+ 		}
+ 
+@@ -189,13 +198,13 @@
+ 			if (value == null)
+ 				throw new ArgumentNullException ();
+ 
+-			if (isRoot)
+-				throw new UnauthorizedAccessException ();
+-			
++			if (!IsWritable)
++				throw new UnauthorizedAccessException ("Cannot write to the registry key.");
++
+ 			RegistryApi.SetValue (this, name, value, valueKind);
+ 		}
+ #endif
+-	
++
+ 		/// <summary>
+ 		///	Open the sub key specified, for read access.
+ 		/// </summary>
+@@ -247,6 +256,9 @@
+ 			AssertKeyNameNotNull (subkey);
+ 			if (subkey.Length > 255)
+ 				throw new ArgumentException ("keyName length is larger than 255 characters", subkey);
++
++			if (!IsWritable)
++				throw new UnauthorizedAccessException ("Cannot write to the registry key.");
+ 			return RegistryApi.CreateSubKey (this, subkey);
+ 		}
+ 		
+@@ -268,16 +280,21 @@
+ 			AssertKeyStillValid ();
+ 			AssertKeyNameNotNull (subkey);
+ 
++			if (!IsWritable)
++				throw new UnauthorizedAccessException ("Cannot write to the registry key.");
++
+ 			RegistryKey child = OpenSubKey (subkey);
+ 			
+ 			if (child == null) {
+ 				if (throwOnMissingSubKey)
+-					throw new ArgumentException ("key missing: " + subkey, "subkey");
++					throw new ArgumentException ("Cannot delete a subkey tree"
++						+ " because the subkey does not exist.");
+ 				return;
+ 			}
+ 
+ 			if (child.SubKeyCount > 0){
+-				throw new InvalidOperationException ("key " + subkey + " has sub keys");
++				throw new InvalidOperationException ("Registry key has subkeys"
++					+ "and recursive removes are not supported by this method.");
+ 			}
+ 			
+ 			child.Close ();
+@@ -300,7 +317,8 @@
+ 			
+ 			RegistryKey child = OpenSubKey (keyName, true);
+ 			if (child == null)
+-				throw new ArgumentException ("key " + keyName + " at " + Name);
++				throw new ArgumentException ("Cannot delete a subkey tree"
++					+ " because the subkey does not exist.");
+ 
+ 			child.DeleteChildKeysAndValues ();
+ 			child.Close ();
+@@ -325,6 +343,9 @@
+ 			AssertKeyStillValid ();
+ 			AssertKeyNameNotNull (value);
+ 
++			if (!IsWritable)
++				throw new UnauthorizedAccessException ("Cannot write to the registry key.");
++
+ 			RegistryApi.DeleteValue (this, value, shouldThrowWhenKeyMissing);
+ 		}
+ 		
+@@ -423,10 +444,17 @@
+ 		{
+ 			string stringRep = Encoding.Unicode.GetString (data);
+ 			int idx = stringRep.IndexOf ('\0');
+-			if (idx >= 0)
+-				stringRep = stringRep.Substring (0, idx);
++			if (idx != -1)
++				stringRep = stringRep.TrimEnd ('\0');
+ 			return stringRep;
+ 		}
++
++		static internal IOException CreateMarkedForDeletionException ()
++		{
++			throw new IOException ("Illegal operation attempted on a"
++				+ " registry key that has been marked for deletion.");
++		}
++
+ 	}
+ }
+ 
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 63710)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,38 @@
++2006-08-14  Gert Driesen  <drieseng@users.sourceforge.net>
++
++	* Win32ResultCode.cs: Added error code for attempting to perform an
++	operation on registry key that is marked for deletion.
++	* RegistryKey.cs: Keep writable state. Automatically flush changes to
++	disk when closing key (to match MS). Allow values to be set on root
++	keys. Throw UnauthorizedAccessException when attempting to set/delete
++	value or create/delete sub key on registry key that is openen 
++	read-only. Fixed DecodeString to only strip trailing nullchars (as
++	documented).
++	* Win32RegistryApi.cs: For a key that is marked for deletion, return
++	null when attempting to get a value of that key (and no default value
++	was specified) or open a subkey. Throw an IOException when attempting
++	to perform the following operation on a key that is marked for
++	deletion:
++		1) set value on key
++	 	2) obtain SubKeyCount
++		3) obtain ValueCount
++		4) create a sub key
++		5) obtain value names
++	and ignore deleting a value. Ignore flushing changes of a key and
++	closing a when the key is closed.
++	* UnixRegistryApi.cs: Maintain handler cache per directory instead of
++	caching registry keys. This allows both a single key to be in memory
++	in both read-only and read-write key configuration, while sharing the
++	KeyHandler. Use case-insensitive hashtable for mapping directory to
++	KeyHandler. Added support for keys that have been marked for deletion
++	by another operation (eg. DeleteSubKeyTree). Allow different file store
++	for machine-level and user-level hives (but have them use the same
++	file store, needs further discussion). Allow KeyHandler failure when
++	create directory, or saving values file to bubble up. Do not save
++	values file when key is marked for deletion. Encapsulate access to
++	values collection. When setting value with null name, use zero-length
++	name instead.
++
+ 2006-08-14  Miguel de Icaza  <miguel@novell.com>
+ 
+ 	* RegistryValueKind.cs: Make this public in 2.0, and rename from
+Index: Win32RegistryApi.cs
+===================================================================
+--- Win32RegistryApi.cs	(revision 63710)
++++ Win32RegistryApi.cs	(working copy)
+@@ -128,6 +128,11 @@
+ 				: (IntPtr) key.Data;
+ 		}
+ 
++		static bool IsHandleValid (RegistryKey key)
++		{
++			return key.Data != null;
++		}
++
+ 		/// <summary>
+ 		///	Acctually read a registry value. Requires knoledge of the
+ 		///	value's type and size.
+@@ -140,7 +145,7 @@
+ 			IntPtr handle = GetHandle (rkey);
+ 			int result = RegQueryValueEx (handle, name, IntPtr.Zero, ref type, IntPtr.Zero, ref size);
+ 
+-			if (result == Win32ResultCode.FileNotFound) {
++			if (result == Win32ResultCode.FileNotFound || result == Win32ResultCode.MarkedForDeletion) {
+ 				if (returnDefaultValue) {
+ 					return defaultValue;
+ 				}
+@@ -268,6 +273,9 @@
+ 							rawValue.Length * NativeBytesPerCharacter);
+ 			}
+ 
++			if (result == Win32ResultCode.MarkedForDeletion)
++				throw RegistryKey.CreateMarkedForDeletionException ();
++
+ 			// handle the result codes
+ 			if (result != Win32ResultCode.Success)
+ 			{
+@@ -301,7 +309,10 @@
+ 			
+ 			for (index = 0; true; index ++) {
+ 				result = RegEnumKey (handle, index, stringBuffer, BufferMaxLength);
+-				
++
++				if (result == Win32ResultCode.MarkedForDeletion)
++					throw RegistryKey.CreateMarkedForDeletionException ();
++
+ 				if (result == Win32ResultCode.Success)
+ 					continue;
+ 				
+@@ -328,7 +339,10 @@
+ 						       buffer, ref bufferCapacity,
+ 						       IntPtr.Zero, ref type, 
+ 						       IntPtr.Zero, IntPtr.Zero);
+-				
++
++				if (result == Win32ResultCode.MarkedForDeletion)
++					throw RegistryKey.CreateMarkedForDeletionException ();
++
+ 				if (result == Win32ResultCode.Success || result == Win32ResultCode.MoreData)
+ 					continue;
+ 				
+@@ -341,32 +355,36 @@
+ 			return index;
+ 		}
+ 		
+-		public RegistryKey OpenSubKey (RegistryKey rkey, string keyName, bool writtable)
++		public RegistryKey OpenSubKey (RegistryKey rkey, string keyName, bool writable)
+ 		{
+ 			int access = OpenRegKeyRead;
+-			if (writtable) access |= OpenRegKeyWrite;
++			if (writable) access |= OpenRegKeyWrite;
+ 			IntPtr handle = GetHandle (rkey);
+ 			
+ 			IntPtr subKeyHandle;
+ 			int result = RegOpenKeyEx (handle, keyName, IntPtr.Zero, access, out subKeyHandle);
+ 
+-			if (result == Win32ResultCode.FileNotFound)
++			if (result == Win32ResultCode.FileNotFound || result == Win32ResultCode.MarkedForDeletion)
+ 				return null;
+ 			
+ 			if (result != Win32ResultCode.Success)
+ 				GenerateException (result);
+ 			
+-			return new RegistryKey (subKeyHandle, CombineName (rkey, keyName));
++			return new RegistryKey (subKeyHandle, CombineName (rkey, keyName), writable);
+ 		}
+ 
+ 		public void Flush (RegistryKey rkey)
+ 		{
++			if (!IsHandleValid (rkey))
++				return;
+ 			IntPtr handle = GetHandle (rkey);
+ 			RegFlushKey (handle);
+ 		}
+ 
+ 		public void Close (RegistryKey rkey)
+ 		{
++			if (!IsHandleValid (rkey))
++				return;
+ 			IntPtr handle = GetHandle (rkey);
+ 			RegCloseKey (handle);
+ 		}
+@@ -377,13 +395,15 @@
+ 			IntPtr subKeyHandle;
+ 			int result = RegCreateKey (handle , keyName, out subKeyHandle);
+ 
++			if (result == Win32ResultCode.MarkedForDeletion)
++				throw RegistryKey.CreateMarkedForDeletionException ();
++
+ 			if (result != Win32ResultCode.Success) {
+ 				GenerateException (result);
+ 			}
+ 			
+-			RegistryKey subKey = new RegistryKey (subKeyHandle, CombineName (rkey, keyName));
+-
+-			return subKey;
++			return new RegistryKey (subKeyHandle, CombineName (rkey, keyName),
++				true);
+ 		}
+ 
+ 		public void DeleteKey (RegistryKey rkey, string keyName, bool shouldThrowWhenKeyMissing)
+@@ -405,7 +425,10 @@
+ 		{
+ 			IntPtr handle = GetHandle (rkey);
+ 			int result = RegDeleteValue (handle, value);
+-			
++
++			if (result == Win32ResultCode.MarkedForDeletion)
++				return;
++
+ 			if (result == Win32ResultCode.FileNotFound){
+ 				if (shouldThrowWhenKeyMissing)
+ 					throw new ArgumentException ("value " + value);
+@@ -462,7 +485,10 @@
+ 				
+ 				if (result == Win32ResultCode.NoMoreEntries)
+ 					break;
+-					
++
++				if (result == Win32ResultCode.MarkedForDeletion)
++					throw RegistryKey.CreateMarkedForDeletionException ();
++
+ 				GenerateException (result);
+ 			}
+ 
+Index: UnixRegistryApi.cs
+===================================================================
+--- UnixRegistryApi.cs	(revision 63710)
++++ UnixRegistryApi.cs	(working copy)
+@@ -1,21 +1,20 @@
+ //
+-// Microsoft.Win32/IRegistryApi.cs
++// Microsoft.Win32/UnixRegistryApi.cs
+ //
+ // Authors:
+ //	Miguel de Icaza (miguel@gnome.org)
++//	Gert Driesen (drieseng@users.sourceforge.net)
+ //
+ // (C) 2005, 2006 Novell, Inc (http://www.novell.com)
+ // 
+ // MISSING:
+-//   Someone could the same subkey twice: once read/write once readonly,
+-//   currently since we use a unique hash based on the file name, we are unable
+-//   to have two versions of the same key and hence unable to throw an exception
+-//   if the user tries to write to a read-only key.
+-//
+-//   It would also be useful if we do case-insensitive expansion of variables,
++//   It would be useful if we do case-insensitive expansion of variables,
+ //   the registry is very windows specific, so we probably should default to
+ //   those semantics in expanding environment variables, for example %path%
+ //
++//   We should use an ordered collection for storing the values (instead of
++//   a Hashtable).
++//
+ // Copyright (C) 2004 Novell, Inc (http://www.novell.com)
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining
+@@ -84,28 +83,32 @@
+ 					}
+ 				} else {
+ 					sb.Append (value [i]);
+-				}		
++				}
+ 			}
+ 			return sb.ToString ();
+ 		}
+ 	}
+-	class KeyHandler {
++
++	class KeyHandler
++	{
+ 		static Hashtable key_to_handler = new Hashtable ();
+-		static Hashtable dir_to_key = new Hashtable ();
++		static Hashtable dir_to_handler = new Hashtable (
++			new CaseInsensitiveHashCodeProvider (), new CaseInsensitiveComparer ());
++
+ 		public string Dir;
+-		public IntPtr Handle;
+ 
+-		public Hashtable values;
++		Hashtable values;
+ 		string file;
+ 		bool dirty;
+-		bool valid = true;
+ 		
+ 		KeyHandler (RegistryKey rkey, string basedir)
+ 		{
+ 			if (!Directory.Exists (basedir)){
+ 				try {
+ 					Directory.CreateDirectory (basedir);
+-				} catch (Exception e){
++				} catch (UnauthorizedAccessException) {
++					throw;
++				} catch (Exception e) {
+ 					Console.Error.WriteLine ("KeyHandler error while creating directory {0}:\n{1}", basedir, e);
+ 				}
+ 			}
+@@ -184,35 +187,39 @@
+ 			}
+ 		}
+ 		
+-		public RegistryKey Ensure (RegistryKey rkey, string extra)
++		public RegistryKey Ensure (RegistryKey rkey, string extra, bool writable)
+ 		{
+ 			lock (typeof (KeyHandler)){
+ 				string f = Path.Combine (Dir, extra);
+-				if (dir_to_key.Contains (f))
+-					return (RegistryKey) dir_to_key [f];
+-
+-				KeyHandler kh = new KeyHandler (rkey, f);
+-				RegistryKey rk = new RegistryKey (kh, CombineName (rkey, extra));
++				KeyHandler kh = (KeyHandler) dir_to_handler [f];
++				if (kh == null)
++					kh = new KeyHandler (rkey, f);
++				RegistryKey rk = new RegistryKey (kh, CombineName (rkey, extra), writable);
+ 				key_to_handler [rk] = kh;
+-				dir_to_key [f] = rk;
++				dir_to_handler [f] = kh;
+ 				return rk;
+ 			}
+ 		}
+ 
+-		public RegistryKey Probe (RegistryKey rkey, string extra, bool write)
++		public RegistryKey Probe (RegistryKey rkey, string extra, bool writable)
+ 		{
++			RegistryKey rk = null;
++
+ 			lock (typeof (KeyHandler)){
+ 				string f = Path.Combine (Dir, extra);
+-				if (dir_to_key.Contains (f))
+-					return (RegistryKey) dir_to_key [f];
+-				if (Directory.Exists (f)){
+-					KeyHandler kh = new KeyHandler (rkey, f);
+-					RegistryKey rk = new RegistryKey (kh, CombineName (rkey, extra));
+-					dir_to_key [f] = rk;
++				KeyHandler kh = (KeyHandler) dir_to_handler [f];
++				if (kh != null) {
++					rk = new RegistryKey (kh, CombineName (rkey,
++						extra), writable);
+ 					key_to_handler [rk] = kh;
+-					return rk;
++				} else if (Directory.Exists (f)) {
++					kh = new KeyHandler (rkey, f);
++					rk = new RegistryKey (kh, CombineName (rkey, extra),
++						writable);
++					dir_to_handler [f] = kh;
++					key_to_handler [rk] = kh;
+ 				}
+-				return null;
++				return rk;
+ 			}
+ 		}
+ 
+@@ -224,24 +231,34 @@
+ 			return String.Concat (rkey.Name, "\\", extra);
+ 		}
+ 		
+-		public static KeyHandler Lookup (RegistryKey rkey)
++		public static KeyHandler Lookup (RegistryKey rkey, bool createNonExisting)
+ 		{
+ 			lock (typeof (KeyHandler)){
+ 				KeyHandler k = (KeyHandler) key_to_handler [rkey];
+ 				if (k != null)
+ 					return k;
+ 
++				// when a non-root key is requested for no keyhandler exist
++				// then that key must have been marked for deletion
++				if (!rkey.IsRoot || !createNonExisting)
++					return null;
++
+ 				RegistryHive x = (RegistryHive) rkey.Data;
+ 				switch (x){
++				case RegistryHive.CurrentUser:
++					string userDir = Path.Combine (UserStore, x.ToString ());
++					k = new KeyHandler (rkey, userDir);
++					dir_to_handler [userDir] = k;
++					break;
++				case RegistryHive.CurrentConfig:
+ 				case RegistryHive.ClassesRoot:
+-				case RegistryHive.CurrentConfig:
+-				case RegistryHive.CurrentUser:
+ 				case RegistryHive.DynData:
+ 				case RegistryHive.LocalMachine:
+ 				case RegistryHive.PerformanceData:
+ 				case RegistryHive.Users:
+-					string d = Path.Combine (RegistryStore, x.ToString ());
+-					k = new KeyHandler (rkey, d);
++					string machineDir = Path.Combine (MachineStore, x.ToString ());
++					k = new KeyHandler (rkey, machineDir);
++					dir_to_handler [machineDir] = k;
+ 					break;
+ 				default:
+ 					throw new Exception ("Unknown RegistryHive");
+@@ -253,24 +270,63 @@
+ 
+ 		public static void Drop (RegistryKey rkey)
+ 		{
+-			KeyHandler k = (KeyHandler) key_to_handler [rkey];
+-			if (k == null)
+-				return;
+-			k.valid = false;
+-			dir_to_key.Remove (k.Dir);
+-			key_to_handler.Remove (rkey);
++			lock (typeof (KeyHandler)) {
++				KeyHandler k = (KeyHandler) key_to_handler [rkey];
++				if (k == null)
++					return;
++				key_to_handler.Remove (rkey);
++
++				// remove cached KeyHandler if no other keys reference it
++				int refCount = 0;
++				foreach (DictionaryEntry de in key_to_handler)
++					if (de.Value == k)
++						refCount++;
++				if (refCount == 0)
++					dir_to_handler.Remove (k.Dir);
++			}
+ 		}
+ 
+ 		public static void Drop (string dir)
+ 		{
+-			if (dir_to_key.Contains (dir)){
+-				RegistryKey rkey = (RegistryKey) dir_to_key [dir];
+-				Drop (rkey);
++			lock (typeof (KeyHandler)) {
++				KeyHandler kh = (KeyHandler) dir_to_handler [dir];
++				if (kh == null)
++					return;
++
++				dir_to_handler.Remove (dir);
++
++				// remove (other) references to keyhandler
++				ArrayList keys = new ArrayList ();
++				foreach (DictionaryEntry de in key_to_handler)
++					if (de.Value == kh)
++						keys.Add (de.Key);
++
++				foreach (object key in keys)
++					key_to_handler.Remove (key);
+ 			}
+ 		}
+ 
++		public object GetValue (string name)
++		{
++			if (IsMarkedForDeletion)
++				return null;
++
++			if (name == null)
++				name = string.Empty;
++			object value = values [name];
++			if (value is ExpandString){
++				return ((ExpandString) value).Expand ();
++			}
++			return value;
++		}
++
+ 		public void SetValue (string name, object value)
+ 		{
++			AssertNotMarkedForDeletion ();
++
++			if (name == null)
++				name = string.Empty;
++
+ 			// immediately convert non-native registry values to string to avoid
+ 			// returning it unmodified in calls to UnixRegistryApi.GetValue
+ 			if (value is int || value is string || value is byte[] || value is string[])
+@@ -280,6 +336,17 @@
+ 			SetDirty ();
+ 		}
+ 
++		public string [] GetValueNames ()
++		{
++			AssertNotMarkedForDeletion ();
++
++			ICollection keys = values.Keys;
++
++			string [] vals = new string [keys.Count];
++			keys.CopyTo (vals, 0);
++			return vals;
++		}
++
+ #if NET_2_0
+ 		//
+ 		// This version has to do argument validation based on the valueKind
+@@ -345,7 +412,7 @@
+ 			throw new ArgumentException ("Value could not be converted to specified type", "valueKind");
+ 		}
+ #endif
+-		
++
+ 		void SetDirty ()
+ 		{
+ 			lock (typeof (KeyHandler)){
+@@ -360,15 +427,45 @@
+ 		{
+ 			Flush ();
+ 		}
+-		
++
+ 		public void Flush ()
+ 		{
+-			lock (typeof (KeyHandler)){
+-				Save ();
+-				dirty = false;
++			lock (typeof (KeyHandler)) {
++				if (dirty) {
++					Save ();
++					dirty = false;
++				}
+ 			}
+ 		}
+ 
++		public bool ValueExists (string name)
++		{
++			if (name == null)
++				name = string.Empty;
++
++			return values.Contains (name);
++		}
++
++		public int ValueCount {
++			get {
++				return values.Keys.Count;
++			}
++		}
++
++		public bool IsMarkedForDeletion {
++			get {
++				return !dir_to_handler.Contains (Dir);
++			}
++		}
++
++		public void RemoveValue (string name)
++		{
++			AssertNotMarkedForDeletion ();
++
++			values.Remove (name);
++			SetDirty ();
++		}
++
+ 		~KeyHandler ()
+ 		{
+ 			Flush ();
+@@ -376,9 +473,9 @@
+ 		
+ 		void Save ()
+ 		{
+-			if (!valid)
++			if (IsMarkedForDeletion)
+ 				return;
+-			
++
+ 			if (!File.Exists (file) && values.Count == 0)
+ 				return;
+ 
+@@ -395,7 +492,7 @@
+ 				} else if (val is int){
+ 					value.AddAttribute ("type", "int");
+ 					value.Text = val.ToString ();
+-				} else if (val is long){
++				} else if (val is long) {
+ 					value.AddAttribute ("type", "qword");
+ 					value.Text = val.ToString ();
+ 				} else if (val is byte []){
+@@ -416,25 +513,33 @@
+ 				se.AddChild (value);
+ 			}
+ 
+-			try {
+-				using (FileStream fs = File.Create (file)){
+-					StreamWriter sw = new StreamWriter (fs);
++			using (FileStream fs = File.Create (file)){
++				StreamWriter sw = new StreamWriter (fs);
+ 
+-					sw.Write (se.ToString ());
+-					sw.Flush ();
+-				}
+-			} catch (Exception e){
+-				Console.Error.WriteLine ("When saving {0} got {1}", file, e);
++				sw.Write (se.ToString ());
++				sw.Flush ();
+ 			}
+ 		}
+ 
+-		public static string RegistryStore {
++		private void AssertNotMarkedForDeletion ()
++		{
++			if (IsMarkedForDeletion)
++				throw RegistryKey.CreateMarkedForDeletionException ();
++		}
++
++		private static string UserStore {
+ 			get {
+ 				return Path.Combine (Environment.GetFolderPath (Environment.SpecialFolder.Personal),
+ 					".mono/registry");
+ 			}
+ 		}
+ 
++		private static string MachineStore {
++			get {
++				return UserStore;
++				// return "/var/lib/mono/registry";
++			}
++		}
+ 	}
+ 	
+ 	internal class UnixRegistryApi : IRegistryApi {
+@@ -461,16 +566,21 @@
+ 
+ 		public RegistryKey CreateSubKey (RegistryKey rkey, string keyname)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
+-			return self.Ensure (rkey, ToUnix (keyname));
++			return CreateSubKey (rkey, keyname, true);
+ 		}
+ 
+-		public RegistryKey OpenSubKey (RegistryKey rkey, string keyname, bool writtable)
++		public RegistryKey OpenSubKey (RegistryKey rkey, string keyname, bool writable)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
+-			RegistryKey result = self.Probe (rkey, ToUnix (keyname), writtable);
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null) {
++				// return null if parent is marked for deletion
++				return null;
++			}
++
++			RegistryKey result = self.Probe (rkey, ToUnix (keyname), writable);
+ 			if (result == null && IsWellKnownKey (rkey.Name, keyname)) {
+-				result = CreateSubKey (rkey, keyname);
++				// create the subkey even if its parent was opened read-only
++				result = CreateSubKey (rkey, keyname, false);
+ 			}
+ 
+ 			return result;
+@@ -478,7 +588,11 @@
+ 		
+ 		public void Flush (RegistryKey rkey)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
++			KeyHandler self = KeyHandler.Lookup (rkey, false);
++			if (self == null) {
++				// we do not need to flush changes as key is marked for deletion
++				return;
++			}
+ 			self.Flush ();
+ 		}
+ 		
+@@ -489,17 +603,14 @@
+ 		
+ 		public object GetValue (RegistryKey rkey, string name, bool return_default_value, object default_value)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null) {
++				// key was removed since it was opened
++				return default_value;
++			}
+ 
+-			if (self.values.Contains (name)){
+-				object r = self.values [name];
+-
+-				if (r is ExpandString){
+-					return ((ExpandString)r).Expand ();
+-				}
+-				
+-				return r;
+-			}
++			if (self.ValueExists (name))
++				return self.GetValue (name);
+ 			if (return_default_value)
+ 				return default_value;
+ 			return null;
+@@ -507,47 +618,65 @@
+ 		
+ 		public void SetValue (RegistryKey rkey, string name, object value)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null)
++				throw RegistryKey.CreateMarkedForDeletionException ();
+ 			self.SetValue (name, value);
+ 		}
+ 
+ #if NET_2_0
+ 		public void SetValue (RegistryKey rkey, string name, object value, RegistryValueKind valueKind)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null)
++				throw RegistryKey.CreateMarkedForDeletionException ();
+ 			self.SetValue (name, value, valueKind);
+ 		}
+ #endif
+-	
++
+ 		public int SubKeyCount (RegistryKey rkey)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
+-
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null)
++				throw RegistryKey.CreateMarkedForDeletionException ();
+ 			return Directory.GetDirectories (self.Dir).Length;
+ 		}
+ 		
+ 		public int ValueCount (RegistryKey rkey)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
+-
+-			return self.values.Keys.Count;
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null)
++				throw RegistryKey.CreateMarkedForDeletionException ();
++			return self.ValueCount;
+ 		}
+ 		
+ 		public void DeleteValue (RegistryKey rkey, string name, bool throw_if_missing)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null) {
++				// if key is marked for deletion, report success regardless of
++				// throw_if_missing
++				return;
++			}
+ 
+-			if (throw_if_missing && !self.values.Contains (name))
++			if (throw_if_missing && !self.ValueExists (name))
+ 				throw new ArgumentException ("the given value does not exist", "name");
+ 
+-			self.values.Remove (name);
++			self.RemoveValue (name);
+ 		}
+ 		
+ 		public void DeleteKey (RegistryKey rkey, string keyname, bool throw_if_missing)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
+-			string dir = Path.Combine (self.Dir, ToUnix (keyname));
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null) {
++				// key is marked for deletion
++				if (!throw_if_missing)
++					return;
++				throw new ArgumentException ("the given value does not exist", "value");
++			}
+ 
++			string dir = Path.Combine (self.Dir, keyname);
++			
+ 			if (Directory.Exists (dir)){
+ 				Directory.Delete (dir, true);
+ 				KeyHandler.Drop (dir);
+@@ -557,7 +686,7 @@
+ 		
+ 		public string [] GetSubKeyNames (RegistryKey rkey)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
+ 			DirectoryInfo selfDir = new DirectoryInfo (self.Dir);
+ 			DirectoryInfo[] subDirs = selfDir.GetDirectories ();
+ 			string[] subKeyNames = new string[subDirs.Length];
+@@ -570,17 +699,23 @@
+ 		
+ 		public string [] GetValueNames (RegistryKey rkey)
+ 		{
+-			KeyHandler self = KeyHandler.Lookup (rkey);
+-			ICollection keys = self.values.Keys;
+-
+-			string [] vals = new string [keys.Count];
+-			keys.CopyTo (vals, 0);
+-			return vals;
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null)
++				throw RegistryKey.CreateMarkedForDeletionException ();
++			return self.GetValueNames ();
+ 		}
+ 
+ 		public string ToString (RegistryKey rkey)
+ 		{
+ 			return rkey.Name;
+ 		}
++
++		private RegistryKey CreateSubKey (RegistryKey rkey, string keyname, bool writable)
++		{
++			KeyHandler self = KeyHandler.Lookup (rkey, true);
++			if (self == null)
++				throw RegistryKey.CreateMarkedForDeletionException ();
++			return self.Ensure (rkey, ToUnix (keyname), writable);
++		}
+ 	}
+ }

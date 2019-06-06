@@ -1,0 +1,185 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Patch: Ternary ops in mini and general ATOMIC_CAS
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%3A%20Ternary%20ops%20in%20mini%20and%20general%20ATOMIC_CAS&In-Reply-To=f54ff3e80903130730y6c5295fbv1ca1b43dc0047b8f%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="031374.html">
+   <LINK REL="Next"  HREF="031447.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Patch: Ternary ops in mini and general ATOMIC_CAS</H1>
+    <B>Rodrigo Kumpera</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%3A%20Ternary%20ops%20in%20mini%20and%20general%20ATOMIC_CAS&In-Reply-To=f54ff3e80903130730y6c5295fbv1ca1b43dc0047b8f%40mail.gmail.com"
+       TITLE="[Mono-dev] Patch: Ternary ops in mini and general ATOMIC_CAS">kumpera at gmail.com
+       </A><BR>
+    <I>Wed Mar 18 17:07:04 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="031374.html">[Mono-dev] Patch: Ternary ops in mini and general ATOMIC_CAS
+</A></li>
+        <LI>Next message: <A HREF="031447.html">[Mono-dev] Patch: Ternary ops in mini and general ATOMIC_CAS
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#31424">[ date ]</a>
+              <a href="thread.html#31424">[ thread ]</a>
+              <a href="subject.html#31424">[ subject ]</a>
+              <a href="author.html#31424">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I quite like this patch, it removes more code than it adds back. The results
+should look clear
+and if we end wishing optimizing a spot we can trade the loop for an inlined
+function or macro. [1]
+
+But there are a few things that I dislike about this patch.
+
+
+--- a/mono/mini/cfold.c
++++ b/mono/mini/cfold.c
+@@ -58,13 +58,18 @@ mono_is_power_of_two (guint32 val)
+         res = (cast)arg1-&gt;inst_c0 op (cast)arg2-&gt;inst_c0;    \
+         break; \
+
++#define MONO_INST_NULLIFY_SREGS(dest) do {                \
++        (dest)-&gt;sreg1 = (dest)-&gt;sreg2 = (dest)-&gt;sreg3 = -1;    \
++    } while (0)
++
+ #undef MONO_INST_NEW
+ #define MONO_INST_NEW(cfg,dest,op) do {    \
+         (dest) = mono_mempool_alloc ((cfg)-&gt;mempool, sizeof (MonoInst));
+\
+         (dest)-&gt;inst_p0 = (dest)-&gt;inst_p1 = (dest)-&gt;next = NULL; \
+         (dest)-&gt;opcode = (op);    \
+         (dest)-&gt;flags = 0; \
+-        (dest)-&gt;dreg = (dest)-&gt;sreg1 = (dest)-&gt;sreg2 = -1;  \
++        (dest)-&gt;dreg = -1;                    \
++    MONO_INST_NULLIFY_SREGS ((dest));            \
+     } while (0)
+
+This is pure code duplication, kill it instead of patching.
+
+@@ -138,6 +142,15 @@ ins_info[] = {
+ #include &quot;mini-ops.h&quot;
+ };
+ #undef MINI_OP
++#undef MINI_OP3
++
++#define MINI_OP(a,b,dest,src1,src2) -1,
++#define MINI_OP3(a,b,dest,src1,src2,src3) -1,
++gint8 ins_sreg_counts[] = {
++#include &quot;mini-ops.h&quot;
++};
++#undef MINI_OP
++#undef MINI_OP3
+
+
+This information can be calculated at compile time. All we get from running
+mini_init_op_sreg_counts
+is an increased private RSS with no advantage. This information should be
+packaged in the ins_info array.
+
+
+@@ -437,7 +450,7 @@ struct MonoInst {
+     guint8  flags  : 5;
+
+     /* used by the register allocator */
+-    gint32 dreg, sreg1, sreg2;
++    gint32 dreg, sreg1, sreg2, sreg3;
+
+
+This change increases the JIT working set significantly. Have you thought
+about doing something like
+struct MonoCallInst?
+
+It would allow us to have 3 sregs and only pay the size price when needed.
+It would be trivial to have
+a function to detect such instructions by expanding mini-ops.h to avoid
+hitting the ins_info array.
+
+Besides that, I'm eager to have this patch in so I can exploit it on
+Mono.Simd :)
+
+
+[1] Doing something like like:
+for (i = 0; i &lt; sreg_count (ins); ++i)
+  zzzzz
+
+to
+
+static inline foo() { zzzzz } //OR
+
+#define FOO() do { zzzzz; } while (0)
+
+if (has_sreg1)
+  foo ();
+if (has_sreg2)
+  foo ();
+if (unlikely (has_sreg3)
+ foo ();
+
+
+
+2009/3/13 Mark Probst &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">mark.probst at gmail.com</A>&gt;
+
+&gt;<i> On Mon, Feb 23, 2009 at 10:10 PM, Zoltan Varga &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">vargaz at gmail.com</A>&gt; wrote:
+</I>&gt;<i> &gt; All this to add support for exactly one rarely used instruction, CAS.
+</I>&gt;<i>
+</I>&gt;<i> As per Paolo's request I timed a --compile-all of
+</I>&gt;<i> System.Windows.Forms.dll (which I chose instead of mscorlib.dll
+</I>&gt;<i> because it's larger) with and without the patch.  It turns out with
+</I>&gt;<i> the patch we're about 10% slower.  With the attached revised patch,
+</I>&gt;<i> which uses macros for all the getter functions, the difference is
+</I>&gt;<i> barely 3% (2.3166s vs 2.2522s, on x86).
+</I>&gt;<i>
+</I>&gt;<i> Mark
+</I>&gt;<i>
+</I>&gt;<i> _______________________________________________
+</I>&gt;<i> Mono-devel-list mailing list
+</I>&gt;<i> <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">Mono-devel-list at lists.ximian.com</A>
+</I>&gt;<i> <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">http://lists.ximian.com/mailman/listinfo/mono-devel-list</A>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20090318/6135b975/attachment.html">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20090318/6135b975/attachment.html</A> 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="031374.html">[Mono-dev] Patch: Ternary ops in mini and general ATOMIC_CAS
+</A></li>
+	<LI>Next message: <A HREF="031447.html">[Mono-dev] Patch: Ternary ops in mini and general ATOMIC_CAS
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#31424">[ date ]</a>
+              <a href="thread.html#31424">[ thread ]</a>
+              <a href="subject.html#31424">[ subject ]</a>
+              <a href="author.html#31424">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

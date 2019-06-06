@@ -1,0 +1,297 @@
+Index: System.IO/DirectoryInfo.cs
+===================================================================
+--- System.IO/DirectoryInfo.cs	(revision 72268)
++++ System.IO/DirectoryInfo.cs	(working copy)
+@@ -124,7 +124,20 @@
+ 		public DirectoryInfo CreateSubdirectory (string name) {
+ 			CheckPath (name);
+ 			
++            if (Path.IsPathRooted(name))
++                throw new ArgumentException();
++
++            if (Environment.IsRunningOnWindows)
++	            if (name.IndexOf(':') != -1)
++	                throw new NotSupportedException("The given path's format is not supported.");
++			
+ 			string path = Path.Combine (FullPath, name);
++
++            string subdirectoryPath = Path.GetFullPath(path);
++
++            if (!subdirectoryPath.StartsWith(FullPath))
++                throw new ArgumentException(String.Format("The directory specified, '{0}', is not a subdirectory of '{1}'.", name, FullPath));
++
+ 			Directory.CreateDirectory (path);
+ 
+ 			return new DirectoryInfo (path);
+@@ -195,6 +208,7 @@
+ 
+ 		public void MoveTo (string dest) {
+  			Directory.Move (FullPath, Path.GetFullPath (dest));
++            this.FullPath = Path.GetFullPath(dest);
+ 		}
+ 
+ 		public override string ToString () {
+Index: System.IO/Directory.cs
+===================================================================
+--- System.IO/Directory.cs	(revision 72268)
++++ System.IO/Directory.cs	(working copy)
+@@ -66,15 +66,15 @@
+ 			if (path == null)
+ 				throw new ArgumentNullException ("path");
+ 			
++            path = path.TrimEnd();
++			
+ 			if (path == "")
+ 				throw new ArgumentException ("Path is empty");
+ 			
+ 			if (path.IndexOfAny (Path.InvalidPathChars) != -1)
+ 				throw new ArgumentException ("Path contains invalid chars");
++          
+ 
+-			if (path.Trim ().Length == 0)
+-				throw new ArgumentException ("Only blank characters in path");
+-
+ #if NET_2_0
+ 			if (File.Exists(path))
+ 				throw new IOException ("Cannot create " + path + " because a file with the same name already exists.");
+@@ -98,6 +98,8 @@
+ 			if (info.Parent != null && !info.Parent.Exists)
+ 				 info.Parent.Create ();
+ 
++			path = Path.GetFullPath(path);
++			
+ 			MonoIOError error;
+ 			if (!MonoIO.CreateDirectory (path, out error)) {
+ 				// LAMESPEC: 1.1 and 1.2alpha allow CreateDirectory on a file path.
+@@ -192,7 +194,7 @@
+ 
+ 		public static bool Exists (string path)
+ 		{
+-			if (path == null)
++			if (path == null || path.Trim().Length == 0)
+ 				return false;
+ 				
+ 			MonoIOError error;
+Index: Test/System.IO/DirectoryInfoTest.cs
+===================================================================
+--- Test/System.IO/DirectoryInfoTest.cs	(revision 72268)
++++ Test/System.IO/DirectoryInfoTest.cs	(working copy)
+@@ -22,6 +22,14 @@
+ 
+ 		static readonly char DSC = Path.DirectorySeparatorChar;
+ 		string current;
++        static OsType OS;
++
++        bool Windows
++	    {
++		    get {
++			    return OS == OsType.Windows;
++		    }
++	    }
+ 
+         	[SetUp]
+         	protected void SetUp ()
+@@ -30,6 +38,15 @@
+ 			if (Directory.Exists (TempFolder))
+ 				Directory.Delete (TempFolder, true);
+ 			Directory.CreateDirectory (TempFolder);
++
++            if ('/' == DSC) {
++		        OS = OsType.Unix;
++	        } else if ('\\' == DSC) {
++		        OS = OsType.Windows;
++	        } else {
++		        OS = OsType.Mac;
++		        //FIXME: For Mac. figure this out when we need it
++	        }
+         	}
+         
+         	[TearDown]
+@@ -180,6 +197,44 @@
+ 			new DirectoryInfo (".").CreateSubdirectory ("");
+ 		}
+ 
++        [Test]
++        [ExpectedException(typeof(ArgumentException))]
++        public void CreateSubdirectory_ArgumentException1()
++        {
++            string path = TempFolder + DSC + "DIT.CreateSubdirectory.Test";
++            string fullsubpath = Path.GetFullPath(path + DSC + "Subdir");
++            DirectoryInfo info = new DirectoryInfo(path);
++
++            info.CreateSubdirectory(fullsubpath);
++        }
++
++        [Test]
++        [ExpectedException(typeof(ArgumentException))]
++        public void CreateSubdirectory_ArgumentException2()
++        {
++            string path = TempFolder + DSC + "DIT.CreateSubdirectory.Test";
++            string subpath = ".." + DSC + "Subdir";
++            DirectoryInfo info = new DirectoryInfo(path);
++
++            info.CreateSubdirectory(subpath);
++        }
++
++        [Test]
++        public void CreateSubdirectory_NotSupportedException()
++        {
++            if (Windows) {
++                string path = TempFolder + DSC + "DIT.CreateSubdirectory.Test";
++                string subpath = "Sub:dir";
++                DirectoryInfo info = new DirectoryInfo(path);
++
++                try {
++                    info.CreateSubdirectory(subpath);
++                    Fail("Path containing ':' is not legal on Windows");
++                }
++                catch(NotSupportedException e) {}
++            }
++        }
++
+ 		[Test]
+ 		public void Delete1 ()
+ 		{
+@@ -512,8 +567,31 @@
+ 				DeleteDir (path1);
+ 				DeleteDir (path2);
+ 			}
+-		}
++		}
++
++        [Test]
++        public void MoveTo2()
++        {
++            string path1 = TempFolder + DSC + "DIT.MoveTo.Soucre.Test";
++            string path2 = TempFolder + DSC + "DIT.MoveTo.Dest.Test" + DSC;
++            DeleteDir(path1);
++            DeleteDir(path2);
++
++            try
++            {
++                DirectoryInfo info1 = Directory.CreateDirectory(path1);
++
++                info1.MoveTo(path2);
++                AssertEquals("#01", path2, info1.FullName);
++            }
++            finally
++            {
++                DeleteDir(path1);
++                DeleteDir(path2);
++            }
++        }
+ 
++
+ 		[Test]
+ 		[ExpectedException (typeof (ArgumentNullException))]
+ 		public void MoveToArgumentNullException ()
+Index: Test/System.IO/DirectoryTest.cs
+===================================================================
+--- Test/System.IO/DirectoryTest.cs	(revision 72268)
++++ Test/System.IO/DirectoryTest.cs	(working copy)
+@@ -26,7 +26,15 @@
+ {
+ 	string TempFolder = Path.Combine (Path.GetTempPath (), "MonoTests.System.IO.Tests");
+ 	static readonly char DSC = Path.DirectorySeparatorChar;
++    static OsType OS;
+ 
++    bool Windows
++	{
++		get {
++			return OS == OsType.Windows;
++		}
++	}
++
+ 	[SetUp]
+ 	public void SetUp ()
+ 	{
+@@ -34,6 +42,15 @@
+ 			Directory.CreateDirectory (TempFolder);
+ 
+ 		Thread.CurrentThread.CurrentCulture = new CultureInfo ("en-US");
++
++        if ('/' == DSC) {
++			OS = OsType.Unix;
++		} else if ('\\' == DSC) {
++			OS = OsType.Windows;
++		} else {
++			OS = OsType.Mac;
++			//FIXME: For Mac. figure this out when we need it
++		}
+ 	}
+ 	
+ 	[TearDown]
+@@ -61,15 +78,31 @@
+ 	[Test]
+ 	public void CreateDirectoryNotSupportedException ()
+ 	{
+-		DeleteDirectory (":");
+-		try {
+-			DirectoryInfo info = Directory.CreateDirectory (":");
+-			Assert.Fail ();
+-		} catch (ArgumentException) {
+-		}
+-		DeleteDirectory (":");
++        if (Windows) {
++		    try {
++			    DirectoryInfo info = Directory.CreateDirectory ("aa:");
++			    Assert.Fail("Path containing ':' is not legal on Windows");
++		    } 
++            catch (NotSupportedException) {}
++        }
+ 	}
+ 
++    [Test]
++    public void CreateDirectoryPathTooLongException()
++    {
++        if (Windows) {
++            string path = TempFolder + DSC;
++            for (int i = 0; i < 280; i++)
++                path = path + "a";
++
++            try {
++                Directory.CreateDirectory(path);
++                Assert.Fail("Path longer than 256 chars is not legal on Windows");
++            }
++            catch (PathTooLongException e) {}
++        }
++    }
++
+ 	[Test]
+ 	[ExpectedException(typeof(ArgumentNullException))]
+ 	public void CreateDirectoryArgumentNullException ()
+@@ -106,6 +139,25 @@
+ 		}
+ 	}
+ 
++    [Test]
++    [ExpectedException(typeof(ArgumentException))]
++    public void CreateDirectoryArgumentException4()
++    {
++        string path = TempFolder + DSC + "DirectoryTest.Test";
++        DirectoryInfo info = Directory.CreateDirectory("\t\t\t  " + path);
++    }
++
++    [Test]
++    public void CreateDirectory2()
++    {
++        string path = TempFolder + DSC + "DirectoryTest.Test";
++        DeleteDirectory(path);
++
++        DirectoryInfo info = Directory.CreateDirectory(path + "\t\t\t  ");
++        Assert.IsTrue(info.Exists, "#1");
++        DeleteDirectory(path);
++    }
++
+ 	[Test]
+ 	public void CreateDirectoryAlreadyExists ()
+ 	{
+@@ -1404,7 +1456,7 @@
+ 		info = Directory.GetParent (Path.GetPathRoot (Path.GetTempPath ()));
+ 		Assert.IsNull (info);
+ 	}
+-	
++
+ 	[Test]
+ 	public void GetFiles ()
+ 	{

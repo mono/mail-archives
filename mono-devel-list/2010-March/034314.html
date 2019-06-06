@@ -1,0 +1,281 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Fixing Thread:Abort handling of finally clauses
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Fixing%20Thread%3AAbort%20handling%20of%20finally%20clauses&In-Reply-To=8cca42d81003091639p44e72fa0j5eb0fa8f05907281%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034313.html">
+   <LINK REL="Next"  HREF="034317.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Fixing Thread:Abort handling of finally clauses</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Fixing%20Thread%3AAbort%20handling%20of%20finally%20clauses&In-Reply-To=8cca42d81003091639p44e72fa0j5eb0fa8f05907281%40mail.gmail.com"
+       TITLE="[Mono-dev] Fixing Thread:Abort handling of finally clauses">lupus at ximian.com
+       </A><BR>
+    <I>Wed Mar 10 06:57:01 EST 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034313.html">[Mono-dev] Fixing Thread:Abort handling of finally clauses
+</A></li>
+        <LI>Next message: <A HREF="034317.html">[Mono-dev] Mono 2.6.x
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34314">[ date ]</a>
+              <a href="thread.html#34314">[ thread ]</a>
+              <a href="subject.html#34314">[ subject ]</a>
+              <a href="author.html#34314">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 03/09/10 Rodrigo Kumpera wrote:
+&gt;<i> One is to patch the return address of a finally clause to jump into runtime
+</I>&gt;<i> code that will handle raising the ThreadAbortException.
+</I>&gt;<i> This is very tricky because we need to store precise unwind information to
+</I>&gt;<i> be able to figure out where that value is. The advantage is
+</I>&gt;<i> that is doesn't slow down the fast path.
+</I>
+Note that sooner or later we must implement the precise info anyway
+since we need it for reliable exception handling, precise GC of stack
+locations etc.
+It willl also be considerably easier once we move the x86 jit to
+allocate enough stack for the calls at method entry, so avoiding all the
+overhead of adjusting esp all the time before and after the calls
+(instead of push instructions we'll use store from the esp base reg).
+At the end there is no difference in complexity between storing a flag
+and storing to the return address.
+
+&gt;<i> The other option is to change how finally clauses work so they make this
+</I>&gt;<i> easier. Zoltan mentioned that we should restore from EH context and use a
+</I>&gt;<i> variable to tell what to do next. The pseudo-code for the fast-path are
+</I>&gt;<i> something like:
+</I>&gt;<i> 
+</I>&gt;<i> Currently:
+</I>&gt;<i> try_body:
+</I>&gt;<i>    ...
+</I>&gt;<i>   call finally
+</I>&gt;<i>   jmp rest_of_function
+</I>&gt;<i> finally:
+</I>&gt;<i>   ...
+</I>&gt;<i>   ret
+</I>&gt;<i> rest_of_function:
+</I>&gt;<i>   ...
+</I>&gt;<i> 
+</I>&gt;<i> Zoltan's suggestion:
+</I>&gt;<i> 
+</I>&gt;<i> try body:
+</I>&gt;<i>   ...
+</I>&gt;<i>   mov 0, [EBP + ?] //this is the variable that tells to resume unwinding or
+</I>&gt;<i> not
+</I>&gt;<i>   jmp finally;
+</I>&gt;<i> finally:
+</I>&gt;<i>  ...
+</I>&gt;<i>  cmp 0, [EBP + ?]
+</I>&gt;<i>  jmp_if_zero rest_of_function
+</I>&gt;<i>  call resume_unwinding
+</I>&gt;<i> rest_of_function:
+</I>&gt;<i>  ...
+</I>&gt;<i> 
+</I>&gt;<i> Looking at the pseudo code, currently we do 3 branches (call, ret, jmp) with
+</I>&gt;<i> Zoltan's suggestion
+</I>&gt;<i> we would do only two (jmp, jz), thou one is conditional. The memory
+</I>&gt;<i> bandwidth is the same,
+</I>&gt;<i> both require one load and one store. Zoltan's suggestion should result in
+</I>&gt;<i> larger code thou.
+</I>
+If you want to go that route, the call/jmp pair could be optimized to
+a push rest_of_function/jmp finally and still maintain correctness.
+
+&gt;<i> &gt;&gt;From our irc log, you raised a few issues with this approach, first that is
+</I>&gt;<i> might cause
+</I>&gt;<i> issues with the ppc ABI. This approach is basically the same to how we
+</I>&gt;<i> handle catch
+</I>&gt;<i> clauses and the later doesn't seen to have issues.
+</I>
+As I said on irc, finally clauses and catch clauses are fundamentally
+different.
+
+&gt;<i> You also mentioned that a finally clause can be called in a different stack
+</I>&gt;<i> frame that
+</I>&gt;<i> of its original method. I fail to see how could that happen, specially if
+</I>&gt;<i> we'll be restoring to it.
+</I>
+Consider this code:
+void method () {
+	try {
+		if (boolean)
+			throw ex;
+	} finally {
+		...
+	}
+}
+
+Now, the finally clause can be reached in two different ways, I will
+list the stack frames involved:
+
+boolean		TRUE		FALSE
+		method		method
+		runtime EH	finally
+		finally
+
+Note the difference. In both cases we need to maintain correctness wrt
+the ABI (as I explained for the PPC case, MIPS is similar and likely
+other archs follow the same pattern) and also for our own ability to
+handle stack walks from within the finally handler, both for exception
+handling and for the precise GC support.
+
+With a catch cluase, instead, you have the following:
+
+void method () {
+	try {
+		if (boolean)
+			throw ex;
+	} catch {
+		...
+	}
+}
+
+boolean		TRUE		FALSE
+		method		method
+		catch		catch
+
+So the two cases are different.
+
+&gt;<i> I do support Zoltan that this approach is the way to go, but I rather hear
+</I>&gt;<i> your opinion first.
+</I>&gt;<i> Even if it ends up been marginally slower, it has the advantage of been much
+</I>&gt;<i> much simpler,
+</I>&gt;<i> which wins us in development time and reliability.
+</I>
+I don't think Zoltan's code is correct in this case, apart from the
+above issues of stack frame consistency and additional code size.
+There is an additional complication with finally clauses, in that
+a leave instruction may leave multiple nested protected blocks and all
+the finally clauses must be executed.
+I attached a sample that should print just &quot;1&quot;, from your pseudocode
+above this case wouldn't be handled correctly, though I don't have an
+llvmono uild to try it out. AFAIK, it should also verify correctly.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+-------------- next part --------------
+.assembly extern mscorlib
+{
+  .ver 2:0:0:0
+  .publickeytoken = (B7 7A 5C 56 19 34 E0 89 ) // .z\V.4..
+}
+.assembly 'finally'
+{
+  .custom instance void class [mscorlib]System.Runtime.CompilerServices.RuntimeCompatibilityAttribute::'.ctor'() =  (
+		01 00 01 00 54 02 16 57 72 61 70 4E 6F 6E 45 78   // ....T..WrapNonEx
+		63 65 70 74 69 6F 6E 54 68 72 6F 77 73 01       ) // ceptionThrows.
+
+  .hash algorithm 0x00008004
+  .ver  0:0:0:0
+}
+.module finally.exe // GUID = {5B003E11-5CB3-450F-A0E4-42E364A764C7}
+
+
+  .class private auto ansi beforefieldinit T
+  	extends [mscorlib]System.Object
+  {
+
+    // method line 1
+    .method public hidebysig  specialname  rtspecialname 
+           instance default void '.ctor' ()  cil managed 
+    {
+        // Method begins at RVA 0x2050
+	// Code size 7 (0x7)
+	.maxstack 8
+	IL_0000:  ldarg.0 
+	IL_0001:  call instance void object::'.ctor'()
+	IL_0006:  ret 
+    } // end of method T::.ctor
+
+    // method line 2
+    .method private static  hidebysig 
+           default void Main ()  cil managed 
+    {
+        // Method begins at RVA 0x2058
+	.entrypoint
+	// Code size 39 (0x27)
+	.maxstack 3
+	.locals init (
+		int32	V_0)
+	IL_0000:  ldc.i4.0 
+	IL_0001:  stloc.0 
+	.try { // 1
+	  .try { // 0
+	    IL_0002:  ldloc.0 
+	    IL_0003:  ldc.i4.1 
+	    IL_0004:  add 
+	    IL_0005:  stloc.0 
+	    IL_0006:  leave IL_0020
+
+	  } // end .try 0
+	  finally  { // 0
+	    IL_000b:  ldloc.0 
+	    IL_000c:  ldc.i4.1 
+	    IL_000d:  sub 
+	    IL_000e:  stloc.0 
+	    IL_000f:  endfinally 
+	  } // end handler 0
+	  IL_0010:  ldloc.0 
+	  IL_0011:  call void class [mscorlib]System.Console::WriteLine(int32)
+	  IL_0016:  leave IL_0020
+
+	} // end .try 1
+	finally  { // 1
+	  IL_001b:  ldloc.0 
+	  IL_001c:  ldc.i4.1 
+	  IL_001d:  add 
+	  IL_001e:  stloc.0 
+	  IL_001f:  endfinally 
+	} // end handler 1
+	IL_0020:  ldloc.0 
+	IL_0021:  call void class [mscorlib]System.Console::WriteLine(int32)
+	IL_0026:  ret 
+    } // end of method T::Main
+
+  } // end of class T
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034313.html">[Mono-dev] Fixing Thread:Abort handling of finally clauses
+</A></li>
+	<LI>Next message: <A HREF="034317.html">[Mono-dev] Mono 2.6.x
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34314">[ date ]</a>
+              <a href="thread.html#34314">[ thread ]</a>
+              <a href="subject.html#34314">[ subject ]</a>
+              <a href="author.html#34314">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

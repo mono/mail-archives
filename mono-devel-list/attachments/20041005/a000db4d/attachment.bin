@@ -1,0 +1,405 @@
+Index: ChangeLog
+from  Raja R Harinath  <rharinath@novell.com>
+
+	More DeclSpace.ResolveType avoidance.
+	* decl.cs (MemberCore.InUnsafe): New property.
+	* class.cs (MemberBase.DoDefine): Use ResolveAsTypeTerminal 
+	with newly created EmitContext.
+	(FieldMember.Define): Likewise.
+	* delegate.cs (Delegate.Define): Likewise.
+	* ecore.cs (SimpleName.ResolveAsTypeStep): Lookup with alias
+	only if normal name-lookup fails.
+	(TypeExpr.DoResolve): Enable error-checking.
+	* expression.cs (ArrayCreation.DoResolve): Use ResolveAsTypeTerminal.
+	(SizeOf.DoResolve): Likewise.
+	(ComposedCase.DoResolveAsTypeStep): Likewise.
+	(StackAlloc.DoResolve): Likewise.
+	* statement.cs (Block.Flags): Add new flag 'Unsafe'.
+	(Block.Unsafe): New property.
+	(Block.EmitMeta): Set ec.InUnsafe as appropriate.
+	(Unsafe): Set 'unsafe' flag of contained block.
+	(LocalInfo.Resolve): Use ResolveAsTypeTerminal.
+	(Fixed.Resolve): Likewise.
+	(Catch.Resolve): Likewise.
+	(Using.ResolveLocalVariableDecls): Likewise.
+	(Foreach.Resolve): Likewise.
+
+Index: class.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/class.cs,v
+retrieving revision 1.517
+diff -u -u -r1.517 class.cs
+--- class.cs	1 Oct 2004 05:16:01 -0000	1.517
++++ class.cs	5 Oct 2004 11:43:14 -0000
+@@ -4757,6 +4757,9 @@
+ 
+ 		protected virtual bool DoDefine ()
+ 		{
++			EmitContext ec = new EmitContext (Parent, Location, null, null, 0);
++			ec.InUnsafe = InUnsafe;
++
+ 			if (Name == null)
+ 				throw new InternalErrorException ();
+ 
+@@ -4778,10 +4781,12 @@
+ 			}
+ 
+ 			// Lookup Type, verify validity
+-			MemberType = Parent.ResolveType (Type, false, Location);
+-			if (MemberType == null)
++			Type = Type.ResolveAsTypeTerminal (ec, false);
++			if (Type == null)
+ 				return false;
+ 
++			MemberType = Type.Type;
++
+ 			if ((Parent.ModFlags & Modifiers.SEALED) != 0){
+ 				if ((ModFlags & (Modifiers.VIRTUAL|Modifiers.ABSTRACT)) != 0){
+ 					Report.Error (549, Location, "Virtual method can not be contained in sealed class");
+@@ -4824,12 +4829,13 @@
+ 				return false;
+ 
+ 			if (IsExplicitImpl) {
+-				InterfaceType = Parent.ResolveType (
+-					ExplicitInterfaceName.GetTypeExpression (Location),
+-					false, Location);
+-				if (InterfaceType == null)
++				Expression expr = ExplicitInterfaceName.GetTypeExpression (Location);
++				expr = expr.ResolveAsTypeTerminal (ec, false);
++				if (expr == null)
+ 					return false;
+ 
++				InterfaceType = expr.Type;
++
+ 				if (InterfaceType.IsClass) {
+ 					Report.Error (538, Location, "'{0}' in explicit interface declaration is not an interface", ExplicitInterfaceName);
+ 					return false;
+@@ -5088,10 +5094,14 @@
+ 
+ 		public override bool Define()
+ 		{
+-			MemberType = Parent.ResolveType (Type, false, Location);
+-			
+-			if (MemberType == null)
++			EmitContext ec = new EmitContext (Parent, Location, null, null, 0);
++			ec.InUnsafe = InUnsafe;
++
++			Type = Type.ResolveAsTypeTerminal (ec, false);
++			if (Type == null)
+ 				return false;
++
++			MemberType = Type.Type;
+ 
+ 			if (!CheckBase ())
+ 				return false;
+Index: decl.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/decl.cs,v
+retrieving revision 1.146
+diff -u -u -r1.146 decl.cs
+--- decl.cs	1 Oct 2004 05:16:01 -0000	1.146
++++ decl.cs	5 Oct 2004 11:43:14 -0000
+@@ -209,6 +209,12 @@
+ 			VerifyClsCompliance (Parent);
+ 		}
+ 
++		public bool InUnsafe {
++			get {
++				return ((ModFlags & Modifiers.UNSAFE) != 0) || Parent.UnsafeContext;
++			}
++		}
++
+ 		// 
+ 		// Whehter is it ok to use an unsafe pointer in this type container
+ 		//
+Index: delegate.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/delegate.cs,v
+retrieving revision 1.118
+diff -u -u -r1.118 delegate.cs
+--- delegate.cs	20 Sep 2004 15:36:26 -0000	1.118
++++ delegate.cs	5 Oct 2004 11:43:14 -0000
+@@ -178,7 +178,7 @@
+ 					return false;
+ 			}
+ 			
+- 			ReturnType = ResolveTypeExpr (ReturnType, false, Location);
++ 			ReturnType = ReturnType.ResolveAsTypeTerminal (ec, false);
+                         if (ReturnType == null)
+                             return false;
+                         
+Index: ecore.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/ecore.cs,v
+retrieving revision 1.308
+diff -u -u -r1.308 ecore.cs
+--- ecore.cs	4 Oct 2004 20:43:48 -0000	1.308
++++ ecore.cs	5 Oct 2004 11:43:14 -0000
+@@ -2032,25 +2033,17 @@
+ 				}
+ 			}
+ 
+-			//
+-			// First, the using aliases
+-			//
+-			if (alias_value != null){
++			if ((t = RootContext.LookupType (ds, Name, true, loc)) != null)
++				return new TypeExpression (t, loc);
++
++			if (alias_value != null) {
+ 				if ((t = RootContext.LookupType (ds, alias_value, true, loc)) != null)
+ 					return new TypeExpression (t, loc);
+ 				
+ 				// we have alias value, but it isn't Type, so try if it's namespace
+ 				return new SimpleName (alias_value, loc);
+ 			}
+-			
+-			//
+-			// Stage 2: Lookup up if we are an alias to a type
+-			// or a namespace.
+-			//
+ 
+-			if ((t = RootContext.LookupType (ds, Name, true, loc)) != null)
+-				return new TypeExpression (t, loc);
+-				
+ 			// No match, maybe our parent can compose us
+ 			// into something meaningful.
+ 			return this;
+@@ -2256,7 +2249,7 @@
+ 
+ 		override public Expression DoResolve (EmitContext ec)
+ 		{
+-			return ResolveAsTypeTerminal (ec, true);
++			return ResolveAsTypeTerminal (ec, false);
+ 		}
+ 
+ 		override public void Emit (EmitContext ec)
+Index: expression.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/expression.cs,v
+retrieving revision 1.620
+diff -u -u -r1.620 expression.cs
+--- expression.cs	4 Oct 2004 01:38:46 -0000	1.620
++++ expression.cs	5 Oct 2004 11:43:15 -0000
+@@ -6062,10 +6062,11 @@
+ 			//
+ 			Expression array_type_expr;
+ 			array_type_expr = new ComposedCast (requested_base_type, array_qualifier.ToString (), loc);
+-			type = ec.DeclSpace.ResolveType (array_type_expr, false, loc);
+-
+-			if (type == null)
++			array_type_expr = array_type_expr.ResolveAsTypeTerminal (ec, false);
++			if (array_type_expr == null)
+ 				return false;
++
++			type = array_type_expr.Type;
+ 			
+ 			if (!type.IsArray) {
+ 				Error (622, "Can only use array initializer expressions to assign to array types. Try using a new expression instead.");
+@@ -6829,7 +6830,7 @@
+ 	///   Implements the sizeof expression
+ 	/// </summary>
+ 	public class SizeOf : Expression {
+-		public readonly Expression QueriedType;
++		public Expression QueriedType;
+ 		Type type_queried;
+ 		
+ 		public SizeOf (Expression queried_type, Location l)
+@@ -6846,11 +6847,13 @@
+ 					"(consider using System.Runtime.InteropServices.Marshal.SizeOf");
+ 				return null;
+ 			}
+-				
+-			type_queried = ec.DeclSpace.ResolveType (QueriedType, false, loc);
+-			if (type_queried == null)
++
++			QueriedType = QueriedType.ResolveAsTypeTerminal (ec, false);
++			if (QueriedType == null)
+ 				return null;
+ 
++			type_queried = QueriedType.Type;
++
+ 			CheckObsoleteAttribute (type_queried);
+ 
+ 			if (!TypeManager.IsUnmanagedType (type_queried)){
+@@ -8389,10 +8392,12 @@
+ 
+ 		public override TypeExpr DoResolveAsTypeStep (EmitContext ec)
+ 		{
+-			Type ltype = ec.DeclSpace.ResolveType (left, false, loc);
+-			if (ltype == null)
++			left = left.ResolveAsTypeTerminal (ec, false);
++			if (left == null)
+ 				return null;
+ 
++			Type ltype = left.Type;
++
+ 			if ((ltype == TypeManager.void_type) && (dim != "*")) {
+ 				Report.Error (1547, Location,
+ 					      "Keyword 'void' cannot be used in this context");
+@@ -8550,10 +8555,11 @@
+ 				return null;
+ 			}
+ 
+-			otype = ec.DeclSpace.ResolveType (t, false, loc);
+-
+-			if (otype == null)
++			t = t.ResolveAsTypeTerminal (ec, false);
++			if (t == null)
+ 				return null;
++
++			otype = t.Type;
+ 
+ 			if (!TypeManager.VerifyUnManaged (otype, loc))
+ 				return null;
+Index: statement.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/statement.cs,v
+retrieving revision 1.283
+diff -u -u -r1.283 statement.cs
+--- statement.cs	22 Sep 2004 16:00:20 -0000	1.283
++++ statement.cs	5 Oct 2004 11:43:16 -0000
+@@ -1010,8 +1010,14 @@
+ 
+ 		public bool Resolve (EmitContext ec)
+ 		{
+-			if (VariableType == null)
+-				VariableType = ec.DeclSpace.ResolveType (Type, false, Location);
++			if (VariableType == null) {
++				Type = Type.ResolveAsTypeTerminal (ec, false);
++
++				if (Type == null)
++					return false;
++				
++				VariableType = Type.Type;
++			}
+ 
+ 			if (VariableType == TypeManager.void_type) {
+ 				Report.Error (1547, Location,
+@@ -1019,9 +1025,6 @@
+ 				return false;
+ 			}
+ 
+-			if (VariableType == null)
+-				return false;
+-
+ 			if (VariableType.IsAbstract && VariableType.IsSealed) {
+ 				Report.Error (723, Location, "Cannot declare variable of static type '{0}'", TypeManager.CSharpName (VariableType));
+ 				return false;
+@@ -1119,7 +1122,8 @@
+ 			VariablesInitialized = 8,
+ 			HasRet = 16,
+ 			IsDestructor = 32,
+-			HasVarargs = 64	
++			HasVarargs = 64,
++			Unsafe = 128,
+ 		}
+ 		Flags flags;
+ 
+@@ -1138,6 +1142,15 @@
+ 			}
+ 		}
+ 
++		public bool Unsafe {
++			get {
++				return (flags & Flags.Unsafe) != 0;
++			}
++			set {
++				flags |= Flags.Unsafe;
++			}
++		}
++
+ 		public bool HasVarargs {
+ 			get {
+ 				if (Parent != null)
+@@ -1642,6 +1655,12 @@
+ 		{
+ 			ILGenerator ig = ec.ig;
+ 
++			bool old_unsafe = ec.InUnsafe;
++
++			// If some parent block was unsafe, we remain unsafe even if this block
++			// isn't explicitly marked as such.
++			ec.InUnsafe |= Unsafe;
++
+ 			//
+ 			// Compute the VariableMap's.
+ 			//
+@@ -1745,6 +1764,8 @@
+ 				foreach (Block b in children)
+ 					b.EmitMeta (ec, ip);
+ 			}
++
++			ec.InUnsafe = old_unsafe;
+ 		}
+ 
+ 		void UsageWarning (FlowBranching.UsageVector vector)
+@@ -2973,6 +2994,7 @@
+ 		public Unsafe (Block b)
+ 		{
+ 			Block = b;
++			Block.Unsafe = true;
+ 		}
+ 
+ 		public override bool Resolve (EmitContext ec)
+@@ -3030,10 +3052,12 @@
+ 				return false;
+ 			}
+ 			
+-			expr_type = ec.DeclSpace.ResolveType (type, false, loc);
+-			if (expr_type == null)
++			type = type.ResolveAsTypeTerminal (ec, false);
++			if (type == null)
+ 				return false;
+ 
++			expr_type = type.Type;
++
+ 			CheckObsolete (expr_type);
+ 
+ 			if (ec.RemapToProxy){
+@@ -3297,10 +3321,12 @@
+ 		public override bool Resolve (EmitContext ec)
+ 		{
+ 			if (type_expr != null) {
+-				type = ec.DeclSpace.ResolveType (type_expr, false, loc);
+-				if (type == null)
++				TypeExpr te = type_expr.ResolveAsTypeTerminal (ec, false);
++				if (te == null)
+ 					return false;
+ 
++				type = te.Type;
++
+ 				CheckObsolete (type);
+ 
+ 				if (type != TypeManager.exception_type && !type.IsSubclassOf (TypeManager.exception_type)){
+@@ -3499,12 +3525,14 @@
+ 		//
+ 		bool ResolveLocalVariableDecls (EmitContext ec)
+ 		{
+-			expr_type = ec.DeclSpace.ResolveType (expr, false, loc);
+ 			int i = 0;
+ 
+-			if (expr_type == null)
++			expr = expr.ResolveAsTypeTerminal (ec, false);
++			if (expr == null)
+ 				return false;
+ 
++			expr_type = expr.Type;
++
+ 			//
+ 			// The type must be an IDisposable or an implicit conversion
+ 			// must exist.
+@@ -3771,9 +3799,11 @@
+ 			if (expr == null)
+ 				return false;
+ 
+-			var_type = ec.DeclSpace.ResolveType (type, false, loc);
+-			if (var_type == null)
++			type = type.ResolveAsTypeTerminal (ec, false);
++			if (type == null)
+ 				return false;
++
++			var_type = type.Type;
+ 			
+ 			//
+ 			// We need an instance variable.  Not sure this is the best

@@ -1,0 +1,183 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Control-C handler
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Control-C%20handler&In-Reply-To=1199301548.3676.39.camel%40lina.magi.jprl.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026437.html">
+   <LINK REL="Next"  HREF="026548.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Control-C handler</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Control-C%20handler&In-Reply-To=1199301548.3676.39.camel%40lina.magi.jprl.com"
+       TITLE="[Mono-dev] Control-C handler">lupus at ximian.com
+       </A><BR>
+    <I>Tue Jan  8 15:17:32 EST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026437.html">[Mono-dev] Control-C handler
+</A></li>
+        <LI>Next message: <A HREF="026548.html">[Mono-dev] Control-C handler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26547">[ date ]</a>
+              <a href="thread.html#26547">[ thread ]</a>
+              <a href="subject.html#26547">[ subject ]</a>
+              <a href="author.html#26547">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 01/02/08 Jonathan Pryor wrote:
+&gt;<i> That said, I think that there should be a way to use signals from C#.
+</I>&gt;<i> Even if such use is severely limited -- e.g. only setting a volatile
+</I>&gt;<i> variable within the signal handler -- signals are required for decent
+</I>&gt;<i> integration with Unix platforms, so saying &quot;don't use them&quot; isn't an
+</I>&gt;<i> adequate answer.  We need to have a well defined, supported, set of
+</I>&gt;<i> things that signal handlers can do.
+</I>
+We can't arbitrarily add gurantees: only things defined in the pthread
+and posix standards are allowed in a signal context, we can handwave as
+much as you want, but those are the limitations.
+And I didn't say you can't use signals in a mono app, you can (by using C
+signal handlers).
+
+&gt;<i> The alternative -- requiring that all signal handlers be written in C --
+</I>&gt;<i> isn't as useful.  It would require that every Gnome Gtk# app (Tomboy,
+</I>&gt;<i> Beagle, etc) have a C library to properly handle session ending (SIGTERM
+</I>&gt;<i> followed by SIGKILL), which just sounds like severe overkill.
+</I>
+No, it would simply require that Mono.Posix provide a sane interface
+instead of the current broken one. I'll propose one below.
+
+&gt;<i> So why can't setting a volatile variable within a signal handler be
+</I>&gt;<i> supported?  And/or use a Constrained Execution Region to *ensure* that
+</I>&gt;<i> the signal handler is JITed before the signal is emitted (does mono even
+</I>&gt;<i> support CERs yet?)?
+</I>
+The issue is not in the setting of a volatile variable, it is in the
+need to execute managed code. CERs have no relevance to this issue.
+As you may not be familiar with the details, I'll explain them.
+Installing a C# signal handler means creating a delegate and then
+marshaling it to unmanaged code as a function pointer. The function
+pointer then enters managed code and executes the delegate.
+
+The first problem is that all this code needs to be already compiled to
+native code as running the jit in the signal handler breaks all the
+signal context limitations. In particular this means that both the
+target method and the delegate Invoke function itself are already
+compiled. In addition to this, any runtime service that they may use
+must be signal context safe. At the minimum this requires that the same
+delegate object instance that is marshaled is actually executed
+(as this involves a number of delegate invoke optimizazions in the
+runtime that we won't make signal context safe as it doesn't make
+sense). After this of course the delegate method itself must be
+very simple. I'll ignore multicast delegate issues.
+
+Once you start to realize all these restrictions you know that
+there is no way that you can make sure that any average C# programmer
+follows half of them. The existing Mono.Posix signal interface just
+tricks people into thinking that they can do this safely, while they
+can't.
+
+But let's assume that all the above is doable (and making a runtime
+guarantee that it is would also mean that the runtime will be severily
+constrained in the changes it can do for a lot of implementation details
+that actually matter for performance like delegate invocation).
+The next thing to consider is the code that the callback needs to
+execute. The first thing it does is to ensure the application domain
+for the thread where the signal handler executes actually matches the
+appdomain the delegate comes from, if it isn't it may need to set it and
+do several things that we can't guarantee are signal context safe
+(like the recently discussed deserialization of the culture info).
+If the delegate is of an instance method we also need to retrieve
+the object reference, which may require taking locks (for a non-moving
+collector we'll need a handle as we can't embed the object address in
+the native code stream).
+
+Given the above, there is basically no chance that anyone could
+correctly install a signal handler and if it was possible it would
+constrain and likely slow down many parts of the mono runtime.
+
+All of this can be easily overcome with a sane interface for signals
+provided by Mono.Posix (the implementation can be in either the helper
+lib or in the runtime).
+This would export a class like (pseudo code):
+
+	class UnixSignalHandler {
+		IntPtr flag_var_ptr;
+
+		pulic UnixSignalHandler (int signal) {
+			flag_var_ptr = Install (signal);
+			if (flag_var_ptr == null)
+				throw new Exception ();
+		}
+
+		~UnixSignalHandler () {
+			Uninstall (signal, flag_var_ptr);
+		}
+
+		public bool IsSignalled {
+			get {
+				if (*(int*)flag_var_ptr) {
+					*(int*)flag_var_ptr = 0;
+					return true;
+				}
+				return false;
+			}
+		}
+	}
+
+Install is implemented in C and will reserve a slot in an array for
+storing a variable which is set in the actual signal handler
+and return its pointer after calling signal().
+The class should also implement the Dispose pattern, imho.
+IsSignalled could be also made non-destructive.
+
+This class can also be trivially extended with a Wait() method
+(which is much more useful and allows a non-polling behaviour)
+which can read from a pipe (the signal handler will write a byte to it)
+or use sem_wait (the signal handler will sem_post on a semaphore:
+this has more portability issues as the POS OSX doesn't allow easy
+creation of semaphores). This would be enabled with a different
+constructor (maybe it should be the default behaviour and we'd have a
+separate ctor that takes a pollable bool).
+With the pipe implementation multiple signals can be waited on
+with a single call (using select on the C side) and timeouts can be used
+as well.
+
+This API implements what 99% of the users need from signal handlers
+in a safe and portable way.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026437.html">[Mono-dev] Control-C handler
+</A></li>
+	<LI>Next message: <A HREF="026548.html">[Mono-dev] Control-C handler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26547">[ date ]</a>
+              <a href="thread.html#26547">[ thread ]</a>
+              <a href="subject.html#26547">[ subject ]</a>
+              <a href="author.html#26547">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

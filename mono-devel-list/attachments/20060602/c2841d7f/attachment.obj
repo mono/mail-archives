@@ -1,0 +1,344 @@
+Index: mono/mono/metadata/domain.c
+===================================================================
+--- mono/mono/metadata/domain.c	(revision 61369)
++++ mono/mono/metadata/domain.c	(working copy)
+@@ -797,6 +797,9 @@
+ 	mono_defaults.internals_visible_class = mono_class_from_name (
+ 	        mono_defaults.corlib, "System.Runtime.CompilerServices", "InternalsVisibleToAttribute");
+ 
++	mono_defaults.variant_class = mono_class_from_name (
++	        mono_defaults.corlib, "System", "Variant");
++
+ 	/*
+ 	 * Note that mono_defaults.generic_*_class is only non-NULL if we're
+ 	 * using the 2.0 corlib.
+Index: mono/mono/metadata/class-internals.h
+===================================================================
+--- mono/mono/metadata/class-internals.h	(revision 61369)
++++ mono/mono/metadata/class-internals.h	(working copy)
+@@ -688,6 +688,7 @@
+ 	MonoClass *internals_visible_class;
+ 	MonoClass *generic_array_class;
+ 	MonoClass *generic_nullable_class;
++	MonoClass *variant_class;
+ } MonoDefaults;
+ 
+ extern MonoDefaults mono_defaults MONO_INTERNAL;
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 61369)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -5257,7 +5257,8 @@
+ 	MonoClass *klass = t->data.klass;
+ 	int pos, pos2, loc;
+ 
+-	if (mono_class_from_mono_type (t) == mono_defaults.object_class) {
++	if (mono_class_from_mono_type (t) == mono_defaults.object_class && 
++		(!spec || (spec && spec->native != MONO_NATIVE_STRUCT))) {
+ 		mono_raise_exception (mono_get_exception_not_implemented ("Marshalling of type object is not implemented"));
+ 	}
+ 
+@@ -5268,7 +5269,24 @@
+ 
+ 		m->orig_conv_args [argnum] = 0;
+ 
+-		if (klass->delegate) {
++		if (spec && spec->native == MONO_NATIVE_STRUCT)
++		{
++			static MonoMethod *get_native_variant_for_object = NULL;
++			int local_variant;
++			if (!get_native_variant_for_object)
++				get_native_variant_for_object = mono_class_get_method_from_name (mono_defaults.marshal_class, "GetNativeVariantForObject", 2);
++
++			*conv_arg_type = &mono_defaults.variant_class->byval_arg;
++
++			local_variant = mono_mb_add_local (mb, &mono_defaults.variant_class->byval_arg);
++			conv_arg = local_variant;
++			mono_mb_emit_ldarg (mb, argnum);
++			if (t->byref)
++				mono_mb_emit_byte(mb, CEE_LDIND_REF);
++			mono_mb_emit_ldloc_addr (mb, local_variant);
++			mono_mb_emit_managed_call (mb, get_native_variant_for_object, NULL);
++		}
++		else if (klass->delegate) {
+ 			g_assert (!t->byref);
+ 			mono_mb_emit_ldarg (mb, argnum);
+ 			mono_mb_emit_icall (mb, conv_to_icall (MONO_MARSHAL_CONV_DEL_FTN));
+@@ -5357,6 +5375,24 @@
+ 		break;
+ 
+ 	case MARSHAL_ACTION_CONV_OUT:
++		if (spec && spec->native == MONO_NATIVE_STRUCT)	{
++			static MonoMethod *variant_clear = NULL;
++			static MonoMethod *get_object_for_native_variant = NULL;
++			if (!variant_clear)
++				variant_clear = mono_class_get_method_from_name (mono_defaults.variant_class, "Clear", 0);
++			if (!get_object_for_native_variant)
++				get_object_for_native_variant = mono_class_get_method_from_name (mono_defaults.marshal_class, "GetObjectForNativeVariant", 1);
++			if (t->byref) {
++				mono_mb_emit_ldarg (mb, argnum);
++				mono_mb_emit_ldloc_addr (mb, conv_arg);
++				mono_mb_emit_managed_call (mb, get_object_for_native_variant, NULL);
++				mono_mb_emit_byte (mb, CEE_STIND_REF);
++			}
++
++			mono_mb_emit_ldloc_addr (mb, conv_arg);
++			mono_mb_emit_managed_call (mb, variant_clear, NULL);
++			break;
++		}
+ 		if (klass == mono_defaults.stringbuilder_class) {
+ 			gboolean need_free;
+ 			MonoMarshalNative encoding;
+Index: mcs/class/corlib/corlib.dll.sources
+===================================================================
+--- mcs/class/corlib/corlib.dll.sources	(revision 61369)
++++ mcs/class/corlib/corlib.dll.sources	(working copy)
+@@ -235,6 +235,7 @@
+ System/UnhandledExceptionEventHandler.cs
+ System/UnitySerializationHolder.cs
+ System/ValueType.cs
++System/Variant.cs
+ System/Version.cs
+ System/Void.cs
+ System/WeakReference.cs
+Index: mcs/class/corlib/System/Variant.cs
+===================================================================
+--- mcs/class/corlib/System/Variant.cs	(revision 0)
++++ mcs/class/corlib/System/Variant.cs	(revision 0)
+@@ -0,0 +1,206 @@
++//
++// System.Variant
++//
++// Authors:
++//   Jonathan Chambers <jonathan.chambers@ansys.com>
++//
++// Copyright (C) 2006 Novell (http://www.novell.com)
++//
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System.Runtime.InteropServices;
++
++namespace System
++{
++	[StructLayout(LayoutKind.Explicit, Size = 16)]
++	internal unsafe struct Variant
++	{
++		[FieldOffset(0)]
++		public short vt;
++
++		[FieldOffset(2)]
++		public ushort wReserved1;
++
++		[FieldOffset(4)]
++		public ushort wReserved2;
++
++		[FieldOffset(6)]
++		public ushort wReserved3;
++
++		[FieldOffset(8)]
++		public long llVal;
++
++		[FieldOffset(8)]
++		public int lVal;
++
++		[FieldOffset(8)]
++		public byte bVal;
++
++		[FieldOffset(8)]
++		public short iVal;
++
++		[FieldOffset(8)]
++		public float fltVal;
++
++		[FieldOffset(8)]
++		public double dblVal;
++
++		[FieldOffset(8)]
++		public short boolVal;
++
++		[FieldOffset(8)]
++		public IntPtr bstrVal;
++
++		[FieldOffset(8)]
++		public sbyte cVal;
++
++		[FieldOffset(8)]
++		public ushort uiVal;
++
++		[FieldOffset(8)]
++		public uint ulVal;
++
++		[FieldOffset(8)]
++		public ulong ullVal;
++
++		[FieldOffset(8)]
++		public int intVal;
++
++		[FieldOffset(8)]
++		public uint uintVal;
++
++		public void SetValue(object obj) {
++			vt = (short)VarEnum.VT_EMPTY;
++			if (obj == null)
++				return;
++
++			Type t = obj.GetType();
++			if (t == typeof(sbyte))
++			{
++				vt = (short)VarEnum.VT_I1;
++				cVal = (sbyte)obj;
++			}
++			else if (t == typeof(byte))
++			{
++				vt = (short)VarEnum.VT_UI1;
++				bVal = (byte)obj;
++			}
++			else if (t == typeof(short))
++			{
++				vt = (short)VarEnum.VT_I2;
++				iVal = (short)obj;
++			}
++			else if (t == typeof(ushort))
++			{
++				vt = (short)VarEnum.VT_UI2;
++				uiVal = (ushort)obj;
++			}
++			else if (t == typeof(int))
++			{
++				vt = (short)VarEnum.VT_I4;
++				lVal = (int)obj;
++			}
++			else if (t == typeof(uint))
++			{
++				vt = (short)VarEnum.VT_UI4;
++				ulVal = (uint)obj;
++			}
++			else if (t == typeof(long))
++			{
++				vt = (short)VarEnum.VT_I8;
++				llVal = (long)obj;
++			}
++			else if (t == typeof(ulong))
++			{
++				vt = (short)VarEnum.VT_UI8;
++				ullVal = (ulong)obj;
++			}
++			else if (t == typeof(float))
++			{
++				vt = (short)VarEnum.VT_R4;
++				fltVal = (float)obj;
++			}
++			else if (t == typeof(double))
++			{
++				vt = (short)VarEnum.VT_R8;
++				dblVal = (double)obj;
++			}
++			else if (t == typeof(string))
++			{
++				vt = (short)VarEnum.VT_BSTR;
++				bstrVal = Marshal.StringToBSTR((string)obj);
++			}
++			else
++			{
++				throw new NotImplementedException(string.Format("Variant couldn't handle object of type {0}", obj.GetType()));
++			}
++		}
++
++		public object GetValue() {
++			object obj = null;
++			switch ((VarEnum)vt)
++			{
++			case VarEnum.VT_I1:
++			obj = cVal;
++			break;
++			case VarEnum.VT_UI1:
++				obj = bVal;
++				break;
++			case VarEnum.VT_I2:
++				obj = iVal;
++				break;
++			case VarEnum.VT_UI2:
++				obj = uiVal;
++				break;
++			case VarEnum.VT_I4:
++				obj = lVal;
++				break;
++			case VarEnum.VT_UI4:
++				obj = ulVal;
++				break;
++			case VarEnum.VT_I8:
++				obj = llVal;
++				break;
++			case VarEnum.VT_UI8:
++				obj = ullVal;
++				break;
++			case VarEnum.VT_R4:
++				obj = fltVal;
++				break;
++			case VarEnum.VT_R8:
++				obj = dblVal;
++				break;
++			case VarEnum.VT_BSTR:
++				obj = Marshal.PtrToStringBSTR(bstrVal);
++				break;
++			}
++			return obj;
++		}
++
++		public void Clear() {
++			if ((VarEnum)vt == VarEnum.VT_BSTR)
++			{
++				Marshal.FreeBSTR(bstrVal);
++			}
++		}
++	}
++}
+\ No newline at end of file
+Index: mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(revision 61369)
++++ mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(working copy)
+@@ -317,9 +317,10 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO]
+ 		public static void GetNativeVariantForObject (object obj, IntPtr pDstNativeVariant) {
+-			throw new NotImplementedException ();
++			Variant vt = new Variant();
++			vt.SetValue(obj);
++			Marshal.StructureToPtr(vt, pDstNativeVariant, false);
+ 		}
+ 
+ 		[MonoTODO]
+@@ -327,9 +328,9 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO]
+ 		public static object GetObjectForNativeVariant (IntPtr pSrcNativeVariant) {
+-			throw new NotImplementedException ();
++			Variant vt = (Variant)Marshal.PtrToStructure(pSrcNativeVariant, typeof(Variant));
++			return vt.GetValue();
+ 		}
+ 
+ 		[MonoTODO]

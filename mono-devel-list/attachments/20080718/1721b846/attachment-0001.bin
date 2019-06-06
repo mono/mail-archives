@@ -1,0 +1,631 @@
+Index: metadata/class.c
+===================================================================
+--- metadata/class.c	(revision 108246)
++++ metadata/class.c	(working copy)
+@@ -7440,42 +7440,8 @@
+ gboolean
+ mono_class_generic_sharing_enabled (MonoClass *class)
+ {
+-#if defined(__i386__) || defined(__x86_64__)
+-	static gboolean supported = TRUE;
+-#else
+-	/* Not supported by the JIT backends */
+-	static gboolean supported = FALSE;
+-#endif
+-	static int generic_sharing = MONO_GENERIC_SHARING_NONE;
+-	static gboolean inited = FALSE;
++	int generic_sharing = mono_generic_sharing_get_mode ();
+ 
+-	if (!inited) {
+-		const char *option;
+-
+-		if (supported)
+-			generic_sharing = MONO_GENERIC_SHARING_COLLECTIONS;
+-		else
+-			generic_sharing = MONO_GENERIC_SHARING_NONE;
+-
+-		if ((option = g_getenv ("MONO_GENERIC_SHARING"))) {
+-			if (strcmp (option, "corlib") == 0)
+-				generic_sharing = MONO_GENERIC_SHARING_CORLIB;
+-			else if (strcmp (option, "collections") == 0)
+-				generic_sharing = MONO_GENERIC_SHARING_COLLECTIONS;
+-			else if (strcmp (option, "all") == 0)
+-				generic_sharing = MONO_GENERIC_SHARING_ALL;
+-			else if (strcmp (option, "none") == 0)
+-				generic_sharing = MONO_GENERIC_SHARING_NONE;
+-			else
+-				g_warning ("Unknown generic sharing option `%s'.", option);
+-		}
+-
+-		if (!supported)
+-			generic_sharing = MONO_GENERIC_SHARING_NONE;
+-
+-		inited = TRUE;
+-	}
+-
+ 	switch (generic_sharing) {
+ 	case MONO_GENERIC_SHARING_NONE:
+ 		return FALSE;
+Index: metadata/generic-sharing.c
+===================================================================
+--- metadata/generic-sharing.c	(revision 108246)
++++ metadata/generic-sharing.c	(working copy)
+@@ -21,7 +21,10 @@
+ #include "class-internals.h"
+ #include "marshal.h"
+ #include "debug-helpers.h"
++#include "tabledefs.h"
+ 
++static MonoCreateRGCTXFetchTrampoline create_rgctx_fetch_trampoline;
++
+ static int
+ type_check_context_used (MonoType *type, gboolean recursive)
+ {
+@@ -515,7 +518,7 @@
+ }
+ 
+ static gpointer
+-inflate_other_data (gpointer data, int info_type, MonoGenericContext *context)
++inflate_other_data (gpointer data, int info_type, MonoGenericContext *context, MonoClass *class)
+ {
+ 	g_assert (data);
+ 
+@@ -533,7 +536,9 @@
+ 
+ 	case MONO_RGCTX_INFO_METHOD:
+ 	case MONO_RGCTX_INFO_GENERIC_METHOD_CODE:
+-	case MONO_RGCTX_INFO_METHOD_RGCTX: {
++	case MONO_RGCTX_INFO_METHOD_RGCTX:
++	case MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE_FETCH_TRAMPOLINE:
++	case MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX_FETCH_TRAMPOLINE: {
+ 		MonoMethod *method = data;
+ 		MonoMethod *inflated_method;
+ 		MonoType *inflated_type = mono_class_inflate_generic_type (&method->klass->byval_arg, context);
+@@ -569,15 +574,37 @@
+ 		return &inflated_class->fields [i];
+ 	}
+ 
++	case MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE:
++	case MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX: {
++		MonoMethod *method = data;
++		MonoMethod *declaring = mono_method_get_declaring_generic_method (method);
++		MonoMethod *res;
++
++		g_assert (!declaring->is_inflated);
++
++		res = mono_class_get_virtual_method (class, method, FALSE);
++
++		if (!res) {
++			g_assert (method->flags & METHOD_ATTRIBUTE_ABSTRACT);
++			return NULL;
++		}
++
++		res = mono_class_inflate_generic_method (res, mono_method_get_context (method));
++
++		g_assert (res->is_inflated && !((MonoMethodInflated*)res)->context.method_inst->is_open);
++
++		return res;
++	}
++
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+ }
+ 
+ static gpointer
+-inflate_other_info (MonoRuntimeGenericContextOtherInfoTemplate *oti, MonoGenericContext *context)
++inflate_other_info (MonoRuntimeGenericContextOtherInfoTemplate *oti, MonoGenericContext *context, MonoClass *class)
+ {
+-	return inflate_other_data (oti->data, oti->info_type, context);
++	return inflate_other_data (oti->data, oti->info_type, context, class);
+ }
+ 
+ static MonoRuntimeGenericContextOtherInfoTemplate
+@@ -684,7 +711,7 @@
+ 
+ 		oti = class_get_rgctx_template_oti (class->generic_class->container_class, type_argc, slot);
+ 		if (oti.data)
+-			oti.data = inflate_other_info (&oti, &class->generic_class->context);
++			oti.data = inflate_other_info (&oti, &class->generic_class->context, class);
+ 
+ 		return oti;
+ 	} else {
+@@ -723,14 +750,15 @@
+ }
+ 
+ static gpointer
+-instantiate_other_info (MonoDomain *domain, MonoRuntimeGenericContextOtherInfoTemplate *oti, MonoGenericContext *context)
++instantiate_other_info (MonoDomain *domain, MonoRuntimeGenericContextOtherInfoTemplate *oti,
++	MonoGenericContext *context, MonoClass *class)
+ {
+ 	gpointer data;
+ 
+ 	if (!oti->data)
+ 		return NULL;
+ 
+-	data = inflate_other_info (oti, context);
++	data = inflate_other_info (oti, context, class);
+ 
+ 	switch (oti->info_type) {
+ 	case MONO_RGCTX_INFO_STATIC_DATA:
+@@ -749,10 +777,12 @@
+ 	case MONO_RGCTX_INFO_METHOD:
+ 		return data;
+ 	case MONO_RGCTX_INFO_GENERIC_METHOD_CODE:
++	case MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE:
+ 		return mono_compile_method (data);
+ 	case MONO_RGCTX_INFO_CLASS_FIELD:
+ 		return data;
+-	case MONO_RGCTX_INFO_METHOD_RGCTX: {
++	case MONO_RGCTX_INFO_METHOD_RGCTX:
++	case MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX: {
+ 		MonoMethodInflated *method = data;
+ 
+ 		g_assert (method->method.method.is_inflated);
+@@ -761,6 +791,30 @@
+ 		return mono_method_lookup_rgctx (mono_class_vtable (domain, method->method.method.klass),
+ 			method->context.method_inst);
+ 	}
++	case MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE_FETCH_TRAMPOLINE:
++	case MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX_FETCH_TRAMPOLINE: {
++		MonoMethod *method = data;
++		MonoMethod *register_method;
++		guint32 slot;
++		int info_type;
++
++		if (oti->info_type == MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE_FETCH_TRAMPOLINE)
++			info_type = MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE;
++		else
++			info_type = MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX;
++
++		if (method->klass->generic_class) {
++			MonoClass *class = method->klass->generic_class->container_class;
++
++			register_method = mono_class_get_method_generic (class, method);
++		} else {
++			register_method = method;
++		}
++
++		slot = mono_method_lookup_or_register_other_info (register_method, FALSE, method,
++			info_type, NULL);
++		return create_rgctx_fetch_trampoline (slot);
++	}
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+@@ -874,8 +928,12 @@
+ 		return mono_class_from_mono_type (data1) == mono_class_from_mono_type (data2);
+ 	case MONO_RGCTX_INFO_METHOD:
+ 	case MONO_RGCTX_INFO_GENERIC_METHOD_CODE:
++	case MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE:
++	case MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX:
+ 	case MONO_RGCTX_INFO_CLASS_FIELD:
+ 	case MONO_RGCTX_INFO_METHOD_RGCTX:
++	case MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE_FETCH_TRAMPOLINE:
++	case MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX_FETCH_TRAMPOLINE:
+ 		return data1 == data2;
+ 	default:
+ 		g_assert_not_reached ();
+@@ -895,7 +953,14 @@
+ 	int i;
+ 
+ 	g_assert (!class->generic_class);
+-	g_assert (class->generic_container || type_argc);
++	if (info_type == MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE ||
++			info_type == MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX) {
++		g_assert (!type_argc);
++	} else {
++		g_assert (class->generic_container || type_argc);
++	}
++	if (info_type == MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE || info_type == MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX)
++		g_assert (((MonoMethod*)data)->is_inflated && !((MonoMethodInflated*)data)->context.method_inst->is_open);
+ 
+ 	templates_lock ();
+ 
+@@ -905,7 +970,7 @@
+ 		if (!oti || oti->info_type != info_type || !oti->data)
+ 			continue;
+ 
+-		inflated_data = inflate_other_info (oti, generic_context);
++		inflated_data = inflate_other_info (oti, generic_context, class);
+ 
+ 		if (other_info_equal (data, inflated_data, info_type)) {
+ 			templates_unlock ();
+@@ -1077,7 +1142,7 @@
+ 		g_print ("filling mrgctx slot %d table %d index %d\n", slot, i, rgctx_index);
+ 	*/
+ 
+-	info = rgctx [rgctx_index] = instantiate_other_info (domain, &oti, &context);
++	info = rgctx [rgctx_index] = instantiate_other_info (domain, &oti, &context, class);
+ 
+ 	return info;
+ }
+@@ -1211,3 +1276,67 @@
+ 
+ 	return mrgctx;
+ }
++
++/*
++ * mono_install_create_rgctx_fetch_trampoline:
++ * @func: a function pointer
++ *
++ * Installs the function for creating a RGCTX lazy fetch trampoline.
++ */
++void
++mono_install_create_rgctx_fetch_trampoline (MonoCreateRGCTXFetchTrampoline func)
++{
++	create_rgctx_fetch_trampoline = func;
++}
++
++/*
++ * mono_generic_sharing_get_mode:
++ *
++ * Returns the generic sharing mode, which can be one of:
++ *
++ * MONO_GENERIC_SHARING_NONE: share nothing
++ * MONO_GENERIC_SHARING_COLLECTIONS: share System.Collections.Generic
++ * MONO_GENERIC_SHARING_CORLIB: share everything in corlib
++ * MONO_GENERIC_SHARING_ALL: share everything
++ */
++int
++mono_generic_sharing_get_mode (void)
++{
++#if defined(__i386__) || defined(__x86_64__)
++	static gboolean supported = TRUE;
++#else
++	/* Not supported by the JIT backends */
++	static gboolean supported = FALSE;
++#endif
++	static int generic_sharing = MONO_GENERIC_SHARING_NONE;
++	static gboolean inited = FALSE;
++
++	if (!inited) {
++		const char *option;
++
++		if (supported)
++			generic_sharing = MONO_GENERIC_SHARING_COLLECTIONS;
++		else
++			generic_sharing = MONO_GENERIC_SHARING_NONE;
++
++		if ((option = g_getenv ("MONO_GENERIC_SHARING"))) {
++			if (strcmp (option, "corlib") == 0)
++				generic_sharing = MONO_GENERIC_SHARING_CORLIB;
++			else if (strcmp (option, "collections") == 0)
++				generic_sharing = MONO_GENERIC_SHARING_COLLECTIONS;
++			else if (strcmp (option, "all") == 0)
++				generic_sharing = MONO_GENERIC_SHARING_ALL;
++			else if (strcmp (option, "none") == 0)
++				generic_sharing = MONO_GENERIC_SHARING_NONE;
++			else
++				g_warning ("Unknown generic sharing option `%s'.", option);
++		}
++
++		if (!supported)
++			generic_sharing = MONO_GENERIC_SHARING_NONE;
++
++		inited = TRUE;
++	}
++
++	return generic_sharing;
++}
+Index: metadata/object.c
+===================================================================
+--- metadata/object.c	(revision 108246)
++++ metadata/object.c	(working copy)
+@@ -2047,29 +2047,13 @@
+ }
+ 
+ 
+-/**
+- * mono_object_get_virtual_method:
+- * @obj: object to operate on.
+- * @method: method 
+- *
+- * Retrieves the MonoMethod that would be called on obj if obj is passed as
+- * the instance of a callvirt of method.
+- */
+ MonoMethod*
+-mono_object_get_virtual_method (MonoObject *obj, MonoMethod *method)
++mono_class_get_virtual_method (MonoClass *klass, MonoMethod *method, gboolean is_proxy)
+ {
+-	MonoClass *klass;
+ 	MonoMethod **vtable;
+-	gboolean is_proxy;
+ 	MonoMethod *res = NULL;
+ 
+-	klass = mono_object_class (obj);
+-	if (klass == mono_defaults.transparent_proxy_class) {
+-		klass = ((MonoTransparentProxy *)obj)->remote_class->proxy_class;
+-		is_proxy = TRUE;
+-	} else {
+-		is_proxy = FALSE;
+-	}
++	g_assert (klass != mono_defaults.transparent_proxy_class);
+ 
+ 	if (!is_proxy && ((method->flags & METHOD_ATTRIBUTE_FINAL) || !(method->flags & METHOD_ATTRIBUTE_VIRTUAL)))
+ 			return method;
+@@ -2104,14 +2088,44 @@
+ 		else
+ 			res = mono_marshal_get_remoting_invoke (res);
+ 	} else {
++		if (!res)
++			return NULL;
++
+ 		if (method->is_inflated && !res->is_inflated) {
+ 			/* Have to inflate the result */
+ 			res = mono_class_inflate_generic_method (res, &((MonoMethodInflated*)method)->context);
+ 		}
+ 	}
+ 
++	return res;
++}
++
++/**
++ * mono_object_get_virtual_method:
++ * @obj: object to operate on.
++ * @method: method 
++ *
++ * Retrieves the MonoMethod that would be called on obj if obj is passed as
++ * the instance of a callvirt of method.
++ */
++MonoMethod*
++mono_object_get_virtual_method (MonoObject *obj, MonoMethod *method)
++{
++	MonoClass *klass;
++	gboolean is_proxy;
++	MonoMethod *res;
++
++	klass = mono_object_class (obj);
++	if (klass == mono_defaults.transparent_proxy_class) {
++		klass = ((MonoTransparentProxy *)obj)->remote_class->proxy_class;
++		is_proxy = TRUE;
++	} else {
++		is_proxy = FALSE;
++	}
++
++	res = mono_class_get_virtual_method (klass, method, is_proxy);
+ 	g_assert (res);
+-	
++
+ 	return res;
+ }
+ 
+Index: metadata/class-internals.h
+===================================================================
+--- metadata/class-internals.h	(revision 108246)
++++ metadata/class-internals.h	(working copy)
+@@ -217,7 +217,11 @@
+ 	MONO_RGCTX_INFO_METHOD,
+ 	MONO_RGCTX_INFO_GENERIC_METHOD_CODE,
+ 	MONO_RGCTX_INFO_CLASS_FIELD,
+-	MONO_RGCTX_INFO_METHOD_RGCTX
++	MONO_RGCTX_INFO_METHOD_RGCTX,
++	MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE,
++	MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE_FETCH_TRAMPOLINE,
++	MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX,
++	MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX_FETCH_TRAMPOLINE
+ };
+ 
+ typedef struct _MonoRuntimeGenericContextOtherInfoTemplate {
+@@ -243,6 +247,7 @@
+ #define MONO_RGCTX_SLOT_INDEX(s)	((s) & 0x7fffffff)
+ #define MONO_RGCTX_SLOT_IS_MRGCTX(s)	(((s) & 0x80000000) ? TRUE : FALSE)
+ 
++typedef gpointer (*MonoCreateRGCTXFetchTrampoline) (guint32 slot);
+ 
+ #define MONO_CLASS_PROP_EXCEPTION_DATA 0
+ 
+@@ -1016,6 +1021,9 @@
+ int
+ mono_class_rgctx_get_array_size (int n, gboolean mrgctx) MONO_INTERNAL;
+ 
++void
++mono_install_create_rgctx_fetch_trampoline (MonoCreateRGCTXFetchTrampoline func) MONO_INTERNAL;
++
+ guint32
+ mono_method_lookup_or_register_other_info (MonoMethod *method, gboolean in_mrgctx, gpointer data,
+ 	int info_type, MonoGenericContext *generic_context) MONO_INTERNAL;
+@@ -1026,6 +1034,12 @@
+ int
+ mono_class_check_context_used (MonoClass *class) MONO_INTERNAL;
+ 
++MonoMethod*
++mono_class_get_virtual_method (MonoClass *klass, MonoMethod *method, gboolean is_proxy) MONO_INTERNAL;
++
++int
++mono_generic_sharing_get_mode (void) MONO_INTERNAL;
++
+ void
+ mono_class_unregister_image_generic_subclasses (MonoImage *image) MONO_INTERNAL;
+ 
+Index: mini/mini.c
+===================================================================
+--- mini/mini.c	(revision 108246)
++++ mini/mini.c	(working copy)
+@@ -2827,6 +2827,20 @@
+ }
+ 
+ inline static int
++mono_emit_native_calli (MonoCompile *cfg, MonoBasicBlock *bblock, MonoInst *addr, MonoMethodSignature *sig,
++	MonoInst **args, const guint8 *ip, gboolean ret_object, gboolean to_end)
++{
++	MonoCallInst *call;
++
++	g_assert (sig);
++
++	call = mono_emit_call_args (cfg, bblock, sig, args, TRUE, FALSE, ip, to_end);
++	call->inst.inst_i0 = addr;
++
++	return mono_spill_call (cfg, bblock, call, sig, ret_object, ip, to_end);
++}
++
++inline static int
+ mono_emit_jit_icall (MonoCompile *cfg, MonoBasicBlock *bblock, gconstpointer func, MonoInst **args, const guint8 *ip)
+ {
+ 	MonoJitICallInfo *info = mono_find_jit_icall_by_addr (func);
+@@ -4465,8 +4479,11 @@
+ }
+ 
+ static MonoInst*
+-get_runtime_generic_context (MonoCompile *cfg, MonoMethod *method, int context_used, MonoInst *this, unsigned char *ip)
++get_runtime_generic_context (MonoCompile *cfg, MonoMethod *method, int context_used, MonoInst *this, const unsigned char *ip)
+ {
++	if (context_used)
++		g_assert (cfg->generic_sharing_context);
++
+ 	g_assert (!method->klass->valuetype);
+ 
+ 	if (context_used & MONO_GENERIC_CONTEXT_USED_METHOD) {
+@@ -4606,6 +4623,49 @@
+ 	return get_runtime_generic_context_other_table_ptr (cfg, bblock, rgctx, slot, ip);
+ }
+ 
++static MonoInst*
++get_runtime_generic_context_virtual_method_data (MonoCompile *cfg, MonoMethod *method, int context_used,
++	MonoBasicBlock *bblock, MonoMethod *cmethod, MonoGenericContext *generic_context, MonoInst *rgctx,
++	const unsigned char *ip, int info_type, int this_temp)
++{
++	MonoInst *this, *tramp = NULL;
++	MonoInst *res;
++
++	if (context_used) {
++		int tramp_info_type;
++
++		if (info_type == MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX)
++			tramp_info_type = MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX_FETCH_TRAMPOLINE;
++		else if (info_type == MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE)
++			tramp_info_type = MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE_FETCH_TRAMPOLINE;
++		else
++			g_assert_not_reached ();
++
++		g_assert (rgctx);
++		tramp = get_runtime_generic_context_method (cfg, method, context_used, bblock, cmethod,
++			generic_context, rgctx, tramp_info_type, ip);
++	} else {
++		g_assert (!rgctx);
++	}
++
++	/* get RGCTX from callee's class */
++	NEW_TEMPLOAD (cfg, this, this_temp);
++	rgctx = get_runtime_generic_context (cfg, cmethod, 0, this, ip);
++
++	if (tramp) {
++		MonoMethodSignature *sig = helper_sig_rgctx_lazy_fetch_trampoline;
++		int temp;
++
++		temp = mono_emit_native_calli (cfg, bblock, tramp, sig, &rgctx, ip, FALSE, FALSE);
++		NEW_TEMPLOAD (cfg, res, temp);
++	} else {
++		res = get_runtime_generic_context_method (cfg, cmethod, 0, bblock,
++			cmethod, generic_context, rgctx, info_type, ip);
++	}
++
++	return res;
++}
++
+ static gboolean
+ generic_class_is_reference_type (MonoCompile *cfg, MonoClass *klass)
+ {
+@@ -5891,27 +5951,30 @@
+ 			if (pass_mrgctx) {
+ 				g_assert (!vtable_arg);
+ 
++				if (virtual)
++					check_this = TRUE;
++				if (!(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL) ||
++						(cmethod->flags & METHOD_ATTRIBUTE_FINAL)) {
++					virtual = 0;
++				}
++			}
++
++			if (pass_mrgctx && !virtual) {
+ 				if (context_used) {
+ 					MonoInst *rgctx;
+ 
+ 					GET_RGCTX (rgctx, context_used);
+ 					vtable_arg = get_runtime_generic_context_method_rgctx (cfg, method,
+-						context_used, bblock, cmethod, generic_context, rgctx, ip);
++							context_used, bblock, cmethod, generic_context, rgctx, ip);
+ 				} else {
++					MonoVTable *vtable = mono_class_vtable (cfg->domain, cmethod->klass);
+ 					MonoMethodRuntimeGenericContext *mrgctx;
+ 
+-					mrgctx = mono_method_lookup_rgctx (mono_class_vtable (cfg->domain, cmethod->klass),
+-						mini_method_get_context (cmethod)->method_inst);
++					mrgctx = mono_method_lookup_rgctx (vtable,
++							mini_method_get_context (cmethod)->method_inst);
+ 
+ 					NEW_PCONST (cfg, vtable_arg, mrgctx);
+ 				}
+-
+-				if (!(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL) ||
+-						(cmethod->flags & METHOD_ATTRIBUTE_FINAL)) {
+-					if (virtual)
+-						check_this = TRUE;
+-					virtual = 0;
+-				}
+ 			}
+ 
+ 			if (pass_imt_from_rgctx) {
+@@ -5951,6 +6014,53 @@
+ 				NEW_TEMPSTORE (cfg, store, this_temp->inst_c0, sp [0]);
+ 				MONO_ADD_INS (bblock, store);
+ 
++				if (!(cmethod->klass->flags & TYPE_ATTRIBUTE_INTERFACE)) {
++					MonoInst *rgctx;
++
++					g_assert (!cmethod->klass->valuetype);
++
++					/* Since we have to account
++					 * for the sharability not
++					 * only of cmethod but of any
++					 * method which might derive
++					 * from cmethod, the only
++					 * simple way we can know that
++					 * we don't need to pass an
++					 * MRGCTX is if sharing is
++					 * turned off completely.
++					 */
++					if (mono_generic_context_is_sharable (mini_method_get_context (cmethod), TRUE) &&
++							mono_generic_sharing_get_mode () != MONO_GENERIC_SHARING_NONE) {
++						g_assert (!vtable_arg);
++						if (context_used)
++							GET_RGCTX (rgctx, context_used);
++						else
++							rgctx = NULL;
++						vtable_arg = get_runtime_generic_context_virtual_method_data (cfg, method,
++							context_used, bblock, cmethod, generic_context, rgctx, ip,
++							MONO_RGCTX_INFO_VIRTUAL_METHOD_RGCTX, this_temp->inst_c0);
++					}
++
++					if (context_used)
++						GET_RGCTX (rgctx, context_used);
++					else
++						rgctx = NULL;
++					addr = get_runtime_generic_context_virtual_method_data (cfg, method, context_used,
++						bblock, cmethod, generic_context, rgctx, ip,
++						MONO_RGCTX_INFO_VIRTUAL_GENERIC_METHOD_CODE, this_temp->inst_c0);
++
++					NEW_TEMPLOAD (cfg, sp [0], this_temp->inst_c0);
++
++					if ((temp = mono_emit_rgctx_calli_spilled (cfg, bblock, fsig, sp, addr, vtable_arg, ip)) != -1) {
++						NEW_TEMPLOAD (cfg, *sp, temp);
++						sp++;
++					}
++
++					ip += 5;
++					ins_flag = 0;
++					break;
++				}
++
+ 				/* FIXME: This should be a managed pointer */
+ 				this_arg_temp = mono_compile_create_var (cfg, &mono_defaults.int_class->byval_arg, OP_LOCAL);
+ 
+@@ -13984,6 +14094,7 @@
+ 	mono_install_get_cached_class_info (mono_aot_get_cached_class_info);
+ 	mono_install_get_class_from_name (mono_aot_get_class_from_name);
+  	mono_install_jit_info_find_in_aot (mono_aot_find_jit_info);
++	mono_install_create_rgctx_fetch_trampoline (create_rgctx_lazy_fetch_trampoline);
+ 
+ 	if (debug_options.collect_pagefault_stats) {
+ 		mono_raw_buffer_set_make_unreadable (TRUE);

@@ -1,0 +1,144 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Control-C handler
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Control-C%20handler&In-Reply-To=32541b130801090852y12fd3b73w895dc0d06e96aea2%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026565.html">
+   <LINK REL="Next"  HREF="026567.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Control-C handler</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Control-C%20handler&In-Reply-To=32541b130801090852y12fd3b73w895dc0d06e96aea2%40mail.gmail.com"
+       TITLE="[Mono-dev] Control-C handler">jonpryor at vt.edu
+       </A><BR>
+    <I>Wed Jan  9 13:30:41 EST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026565.html">[Mono-dev] Control-C handler
+</A></li>
+        <LI>Next message: <A HREF="026567.html">[Mono-dev] Control-C handler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26568">[ date ]</a>
+              <a href="thread.html#26568">[ thread ]</a>
+              <a href="subject.html#26568">[ subject ]</a>
+              <a href="author.html#26568">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Wed, 2008-01-09 at 11:52 -0500, Avery Pennarun wrote:
+&gt;<i> On 08/01/2008, Jonathan Pryor &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">jonpryor at vt.edu</A>&gt; wrote:
+</I>&gt;<i> &gt; I don't see why we need a new API to support this.  It seems that we
+</I>&gt;<i> &gt; could retrofit the existing Stdlib.signal() API to use the
+</I>&gt;<i> &gt; implementation you described, with one difference: a runtime internal
+</I>&gt;<i> &gt; thread could be used to block on the internal pipe, and when the pipe is
+</I>&gt;<i> &gt; readable it could dispatch the appropriate signal via delegate
+</I>&gt;<i> &gt; registered with Stdlib.signal().  No polling, and no new public API
+</I>&gt;<i> &gt; would be required.
+</I>&gt;<i> 
+</I>&gt;<i> It seems to me that lupus's suggestion is more general than this.  In
+</I>&gt;<i> other words, you could implement your desired API above on top of his
+</I>&gt;<i> without any extra overhead (ie. the overhead is inherent to the
+</I>&gt;<i> interface), while you couldn't implement his on top of yours without
+</I>&gt;<i> doing a lot of unnecessary work (ie. bouncing into a thread and then
+</I>&gt;<i> back again).
+</I>
+Fair point.
+
+&gt;<i> Since mono's signal API is already (presumably) non-standard, it
+</I>&gt;<i> should be harmless to correct it by introducing a new nonstandard one
+</I>&gt;<i> that works properly.
+</I>
+Now what do you mean by &quot;non-standard,&quot; i.e. what's the &quot;standard&quot;
+here?  .NET?  Windows has no signals, so .NET won't expose such a
+concept.
+
+On the other hand, the Mono.Unix.Native types have existed for quite
+some time and intend to follow the Standard C and POSIX interfaces as
+closely as possible.  signal(2) is part of the C standard, and is thus
+exposed via Stdlib.signal().  It's as standard as you're going to get.
+
+&gt;<i> Note that polling a variable is a fine way to handle signals in many C
+</I>&gt;<i> programs.  I often write mainloops of the form &quot;while (!want_to_die)&quot;,
+</I>&gt;<i> where want_to_die is set by my SIGTERM/SIGINT/etc handler.  Involving
+</I>&gt;<i> a thread for this purpose would be overkill.  While this method does
+</I>&gt;<i> count as &quot;polling&quot;, it is syscall-free polling and only happens at the
+</I>&gt;<i> places where you would want to shut down cleanly anyway.
+</I>&gt;<i> 
+</I>&gt;<i> This reminds me, though: what happens to things like socket
+</I>&gt;<i> read/write/connect system calls in mono when a signal comes in?  In C,
+</I>&gt;<i> they get interrupted and return EINTR/EAGAIN, which is why you pop
+</I>&gt;<i> back to the mainloop and get a chance to poll your signal variable.
+</I>
+The same thing would happen if you use the low-level Syscall methods --
+-1 would be returned and Stdlib.GetLastError() would return Errno.EINTR
+or Errno.EAGAIN.  The higher-level Mono.Unix types like UnixStream
+ignore EINTR.
+
+However, this does raise an interesting problem with a thread-based
+approach: since signal dispatching would happen on another thread, there
+is no guarantee (and no way to guarantee) that the signal will be
+dispatched before the system call returns:
+
+        1. Thread 1: Syscall.write()
+        2. kernel dispatches signal to process
+        3. Thread 1: Syscall.write() returns -1/EINTR
+        # some future point in time...
+        4. Thread 2: Dispatches signal originally raised in (2).
+
+Thread 1 can't safely check e.g. a variable after the EINTR return (in
+the normal C fashion) because it might not have been set by the signal
+handler yet.  It would instead need to wait on a semaphore/condition
+variable, which the signal handler could set, to ensure that the threads
+are properly synchronized.
+
+On the plus side, the signal handler thread can actually use
+semaphores/etc. as it's not running within signal handler context.
+
+So perhaps it would make more sense to expose lupus' approach and layer
+Stdlib.signal() atop of it.  Though to do that we'd need a better name:
+there is already a Mono.Unix.Native.SignalHandler type, and trying to
+describe the difference between SignalHandler and UnixSignalHandler is
+something I don't look forward to.  Perhaps instead:
+
+        public class Signal  : System.Threading.WaitHandle {
+                public Signal (Signum signal);
+                ~Signal ();
+                public Signum Signum { get; }
+                public bool IsSignaled { get; set; }
+        }
+
+though the WaitHandle base type might be pure crack (not sure);
+regardless, IDisposable should certainly be implemented.
+
+ - Jon
+
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026565.html">[Mono-dev] Control-C handler
+</A></li>
+	<LI>Next message: <A HREF="026567.html">[Mono-dev] Control-C handler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26568">[ date ]</a>
+              <a href="thread.html#26568">[ thread ]</a>
+              <a href="subject.html#26568">[ subject ]</a>
+              <a href="author.html#26568">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,194 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] mono WebResponse caching
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=Re%3A%20%5BMono-dev%5D%20mono%20WebResponse%20caching&In-Reply-To=%3C7658FF2E8FA2224BAC0A9358C48DE830368BE2%40ORD2MBX05D.mex05.mlsrvr.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="040490.html">
+   <LINK REL="Next"  HREF="040496.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] mono WebResponse caching</H1>
+    <B>Mark Lintner</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=Re%3A%20%5BMono-dev%5D%20mono%20WebResponse%20caching&In-Reply-To=%3C7658FF2E8FA2224BAC0A9358C48DE830368BE2%40ORD2MBX05D.mex05.mlsrvr.com%3E"
+       TITLE="[Mono-dev] mono WebResponse caching">mlintner at sinenomine.net
+       </A><BR>
+    <I>Tue Jun  4 18:02:36 UTC 2013</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="040490.html">[Mono-dev] Building Mono from Git with MSVC
+</A></li>
+        <LI>Next message: <A HREF="040496.html">[Mono-dev] mono WebResponse caching
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#40495">[ date ]</a>
+              <a href="thread.html#40495">[ thread ]</a>
+              <a href="subject.html#40495">[ subject ]</a>
+              <a href="author.html#40495">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>We have noticed that parts of the Mono Web functionality are not yet implemented. We are hoping to be able to add some of these missing pieces. Caching of
+
+HttpWebResponses is the first one we took a look at. It would appear that Microsoft takes advantage of the internet explorer caching. Since it would appear
+
+that an HttpWebResponse is fully populated when it is returned from the cache and the only content in the urls that are cached are the bytes that come in on
+
+the wire, Microsoft must return things from the cache at a very low level and and let the response populate the normal way. This did not seem possible to
+
+emulate when I looked at mono. I also wanted to cache to a directory so that the urls can be inspected or deleted.
+
+ After looking at the code for awhile I realized that I could save additional information from the response, ie: headercollection, cookiecontainer, Status
+
+code etc in the same file as the responsestream. A response can be serialized but not all of it, most importantly the responsestream is not serialized. I
+
+wrote a prototype with some helper functions, the only change to existing mono code would be in  HttpWebRequest.GetResponse. Before calling BeginGetResponse
+
+I call a function that tries to retrieve the url from the cache. If it is not there, BeginGetResponse is called as normal, the response is grabbed from
+
+EndGetResponse and passed to a method to insert into the cache. This insert method will open a filename in a directory designated as mono_cache with the name
+
+produced by calling HttpUtility.Encode so it is a legal filename. Also you can only read from the responsestream once, which means that if read from it, save
+
+it to a file, then the responsestream is no longer accessible from the WebResponse when it is returned to the calling code. If sream copy worked it could be
+
+used here. One way to fix the problem is to call GetResponseStream(), read it to the end, which produces a string, then finally convert the string to bytes.
+
+Then you can serialize the bytes to the open file, serialize the headercollection and ultimately individually add any field you want in the response when it
+
+is retrieved from the cache, then close the file. Then create a new WebConnectionData instance and populate it with headers and all the relevent fields from
+
+the old response, finally passing the bytes of data to a memory stream constructor and assign it to the WebConnectionData's stream member. Then I construct a
+
+new HttpWebResponse, passing the WebConnectionData and other arguments which are taken from the existing request and the recently retrieved response. The
+
+response is then returned to getResponse then finally to the calling code, good as new. Next time the url is requested the cached file is deserialized, one
+
+member at a time then a WebConnectionData is setup and finally, a HttpWebResponse is constructed with the info read from the file, the WebConnectionData and
+
+from the members of the new request. I concentrated on prototyping caching of HttpWebResponses. Only a simple cache algorithm, no Ftp, no File etc. No cache
+
+aging etc. There are many other things that would have to be done for this to be usable.
+  Using the prototype I requested www.google.com&lt;<A HREF="http://www.google.com">http://www.google.com</A>&gt; and it took .1601419 sec to retrieve and cache it, including all the mechanics described above. The
+
+second time returning it from the cache, building the HttpWebResponse took .0007671. This is a 288 times speedup. That kind of performance increase, from a
+
+prototype that is not yet optimized, is compelling. I must add that I measured the same experiment with google under the .Net 4.5 implementation and the
+
+speedup is 769x. Obviously thats something to work toward. Even falling short of that level of speedup, some implementation of response caching for mono
+
+would greatly benefit the users who need better performance of services, rest etc.
+
+So far this is the only mono code that would change to support caching,
+
+from HttpWebRequest.cs:
+
+
+
+  public override WebResponse GetResponse()
+
+  {
+
+   WebResponse response = ResponseCache.TryRetrieve (this);
+
+
+
+   if (response == null)
+
+   {
+
+    WebAsyncResult result = (WebAsyncResult) BeginGetResponse (null, null);
+
+    response = EndGetResponse (result);
+
+    response.IsFromCache = false;
+
+    HttpWebResponse response2 = ResponseCache.TryInsert ((HttpWebRequest)this, (HttpWebResponse)response);
+
+    response.Close ();
+
+    return response2;
+
+   }
+
+
+
+   return response;
+
+  }
+
+
+
+The code can stand some improvement. It is a prototype and it shows.  I have included the file ResponseCache.cs which the above
+
+code hooks into. We were wondering whether anyone has tried to implement response caching before and whether there is any intent to in the future. What are
+
+your thoughts about the approach described above and shown in the ResponseCache.cs file and the 3 other files I included. Bear in mind it
+
+would be refactored so that it fit into the mono architecture a bit better, it needs to be generalized, different strategies for different concrete response
+
+types need to be plugged in, configuration. and a plethora of things I missed. If you feel this approach has merit I can detail all that seperatly. If you
+
+feel a different approach would work better, please let us know, in the end were looking to make mono more robust in some of the ways that are expected but
+
+not yet implemented.
+ The main thing I want to show here is how it is possible, to wedge a cache strategy into mono's request pipeline without changing or destabilizing
+
+mono itself. The cache implementation could change also, which is one way that this is code falls short is it totally violates open-closed.  Is this a
+
+viable approach? There would of course be much more to do, that I have not even mentioned here. Your comments would be appreciated.
+
+The files can be found here.
+
+
+<A HREF="http://pastebin.com/FCefsiDx">http://pastebin.com/FCefsiDx</A>
+<A HREF="http://pastebin.com/8qBh8mMW">http://pastebin.com/8qBh8mMW</A>
+<A HREF="http://pastebin.com/xVKLaidG">http://pastebin.com/xVKLaidG</A>
+<A HREF="http://pastebin.com/NMVNv30T">http://pastebin.com/NMVNv30T</A>
+
+
+
+
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20130604/8abbd69e/attachment-0001.html">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20130604/8abbd69e/attachment-0001.html</A>&gt;
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="040490.html">[Mono-dev] Building Mono from Git with MSVC
+</A></li>
+	<LI>Next message: <A HREF="040496.html">[Mono-dev] mono WebResponse caching
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#40495">[ date ]</a>
+              <a href="thread.html#40495">[ thread ]</a>
+              <a href="subject.html#40495">[ subject ]</a>
+              <a href="author.html#40495">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,470 @@
+diff --git a/mono/metadata/domain.c b/mono/metadata/domain.c
+index 4629b35..26f7578 100644
+--- a/mono/metadata/domain.c
++++ b/mono/metadata/domain.c
+@@ -158,12 +158,7 @@ mono_jit_info_find_aot_module (guint8* addr);
+ guint32
+ mono_domain_get_tls_key (void)
+ {
+-#ifdef NO_TLS_SET_VALUE
+-	g_assert_not_reached ();
+-	return 0;
+-#else
+ 	return appdomain_thread_id;
+-#endif
+ }
+ 
+ gint32
+diff --git a/mono/metadata/sgen-gc.c b/mono/metadata/sgen-gc.c
+index 002f349..e6a6276 100644
+--- a/mono/metadata/sgen-gc.c
++++ b/mono/metadata/sgen-gc.c
+@@ -208,6 +208,10 @@
+ 
+ #include <mono/utils/memcheck.h>
+ 
++#if defined(__MACH__)
++#include "utils/mach-support.h"
++#endif
++
+ #define OPDEF(a,b,c,d,e,f,g,h,i,j) \
+ 	a = i,
+ 
+@@ -5347,6 +5351,82 @@ wait_for_suspend_ack (int count)
+ static int
+ thread_handshake (int signum)
+ {
++#if defined(__MACH__) && MONO_MACH_ARCH_SUPPORTED
++	thread_port_t cur_thread = mach_thread_self ();
++	thread_act_array_t thread_list;
++	mach_msg_type_number_t num_threads;
++	mach_msg_type_number_t num_state;
++	thread_state_t state;
++	kern_return_t ret;
++	ucontext_t ctx;
++
++	SgenThreadInfo *info;
++	gpointer regs [ARCH_NUM_REGS];
++	gpointer stack_start;
++
++	int count, i;
++
++	mono_mach_get_threads (&thread_list, &num_threads);
++
++	for (i = 0, count = 0; i < num_threads; i++) {
++		thread_port_t t = thread_list [i];
++		if (t != cur_thread) {
++			if (signum == suspend_signal_num) {
++				ret = mono_mach_thread_suspend (t);
++				if (ret != KERN_SUCCESS) {
++					mono_mach_port_deallocate (t);
++					continue;
++				}
++
++				ret = mono_mach_arch_get_thread_state (t, &state, &num_state);
++				if (ret != KERN_SUCCESS) {
++					mono_mach_port_deallocate (t);
++					continue;
++				}
++
++
++				info = thread_info_lookup (pthread_from_mach_thread_np (t));
++
++				/* Ensure that the runtime is aware of this thread */
++				if (info != NULL) {
++					ctx.uc_mcontext = mono_mach_arch_thread_state_to_context (state);
++
++					info->stopped_domain = mono_mach_arch_get_tls_value_from_thread (t, mono_pthread_key_for_tls (mono_domain_get_tls_key ()));
++					info->stopped_ip = (gpointer) mono_mach_arch_get_ip (state);
++					stack_start = (char*) mono_mach_arch_get_sp (state) - REDZONE_SIZE;
++					/* If stack_start is not within the limits, then don't set it in info and we will be restarted. */
++					if (stack_start >= info->stack_start_limit && info->stack_start <= info->stack_end) {
++						info->stack_start = stack_start;
++
++						ARCH_COPY_SIGCTX_REGS (regs, &ctx);
++						info->stopped_regs = regs;
++					} else {
++						g_assert (!info->stack_start);
++					}
++
++					/* Notify the JIT */
++					if (gc_callbacks.thread_suspend_func)
++						gc_callbacks.thread_suspend_func (info->runtime_data, &ctx);
++
++					g_free (ctx.uc_mcontext);
++				}
++			} else {
++				ret = mono_mach_thread_resume (t);
++				if (ret != KERN_SUCCESS) {
++					mono_mach_port_deallocate (t);
++					continue;
++				}
++			}
++			count ++;
++
++			mono_mach_port_deallocate (t);
++		}
++	}
++
++	mono_mach_port_deallocate (cur_thread);
++
++	return count;
++#else
+ 	int count, i, result;
+ 	SgenThreadInfo *info;
+ 	pthread_t me = pthread_self ();
+@@ -5375,6 +5455,7 @@ thread_handshake (int signum)
+ 	wait_for_suspend_ack (count);
+ 
+ 	return count;
++#endif
+ }
+ 
+ static int
+@@ -5395,7 +5476,11 @@ restart_threads_until_none_in_managed_allocator (void)
+ 				if (!info->stack_start || info->in_critical_region ||
+ 						is_ip_in_managed_allocator (info->stopped_domain, info->stopped_ip)) {
+ 					binary_protocol_thread_restart ((gpointer)info->id);
++#if defined(__MACH__) && MONO_MACH_ARCH_SUPPORTED
++					result = mono_mach_thread_resume (pthread_mach_thread_np (info->id));
++#else
+ 					result = pthread_kill (info->id, restart_signal_num);
++#endif
+ 					if (result == 0) {
+ 						++restart_count;
+ 					} else {
+@@ -5416,8 +5501,12 @@ restart_threads_until_none_in_managed_allocator (void)
+ 		if (restart_count == 0)
+ 			break;
+ 
++#if defined(__MACH__) && MONO_MACH_ARCH_SUPPORTED
++		/* mach thread_resume is synchronous so we dont need to wait for them */
++#else
+ 		/* wait for the threads to signal their restart */
+ 		wait_for_suspend_ack (restart_count);
++#endif
+ 
+ 		if (sleep_duration < 0) {
+ 			sched_yield ();
+@@ -5432,7 +5521,11 @@ restart_threads_until_none_in_managed_allocator (void)
+ 			for (info = thread_table [i]; info; info = info->next) {
+ 				if (info->skip || info->stopped_ip == NULL)
+ 					continue;
++#if defined(__MACH__) && MONO_MACH_ARCH_SUPPORTED
++				result = mono_mach_thread_suspend (pthread_mach_thread_np (info->id));
++#else
+ 				result = pthread_kill (info->id, suspend_signal_num);
++#endif
+ 				if (result == 0) {
+ 					++restarted_count;
+ 				} else {
+@@ -5442,9 +5535,13 @@ restart_threads_until_none_in_managed_allocator (void)
+ 		}
+ 		/* some threads might have died */
+ 		num_threads_died += restart_count - restarted_count;
++#if defined(__MACH__) && MONO_MACH_ARCH_SUPPORTED
++		/* mach thread_resume is synchronous so we dont need to wait for them */
++#else
+ 		/* wait for the threads to signal their suspension
+ 		   again */
+ 		wait_for_suspend_ack (restart_count);
++#endif
+ 	}
+ 
+ 	return num_threads_died;
+diff --git a/mono/utils/Makefile.am b/mono/utils/Makefile.am
+index 528876f..7cad3ad 100644
+--- a/mono/utils/Makefile.am
++++ b/mono/utils/Makefile.am
+@@ -11,7 +11,7 @@ mono-dtrace.h: $(top_srcdir)/data/mono.d
+ 
+ endif
+ 
+-libmonoutils_la_SOURCES = \
++monoutils_sources = \
+ 	mono-hash.c		\
+ 	mono-md5.c		\
+ 	mono-sha1.c		\
+@@ -78,8 +78,21 @@ libmonoutils_la_SOURCES = \
+ 	mono-uri.h	\
+ 	mono-stdlib.h	\
+ 	valgrind.h	\
++	mach-support.c	\
++	mach-support.h  \
+ 	memcheck.h
+ 
++arch_sources = 
++
++if X86
++arch_sources += mach-support-x86.c
++endif
++
++if AMD64
++arch_sources += mach-support-amd64.c
++endif
++
++libmonoutils_la_SOURCES = $(monoutils_sources) $(arch_sources)
+ libmonoutilsincludedir = $(includedir)/mono-$(API_VER)/mono/utils
+ 
+ libmonoutilsinclude_HEADERS = \
+diff --git a/mono/utils/mach-support-amd64.c b/mono/utils/mach-support-amd64.c
+new file mode 100644
+index 0000000..2cc779b
+--- /dev/null
++++ b/mono/utils/mach-support-amd64.c
+@@ -0,0 +1,74 @@
++/*
++ * mach-support-x86.c: mach support for x86
++ *
++ * Authors:
++ *   Geoff Norton (gnorton@novell.com)
++ *
++ * (C) 2010 Ximian, Inc.
++ */
++
++#include <config.h>
++
++#if defined(__MACH__)
++#include <stdint.h>
++#include <glib.h>
++#include <pthread.h>
++#include "utils/mono-sigcontext.h"
++#include "mach-support.h"
++
++void *
++mono_mach_arch_get_ip (thread_state_t state)
++{
++	x86_thread_state64_t *arch_state = (x86_thread_state64_t *) state;
++
++	return (void *) arch_state->__rip;
++}
++
++void *
++mono_mach_arch_get_sp (thread_state_t state)
++{
++	x86_thread_state64_t *arch_state = (x86_thread_state64_t *) state;
++
++	return (void *) arch_state->__rsp;
++}
++
++void *
++mono_mach_arch_thread_state_to_context (thread_state_t state)
++{
++	x86_thread_state64_t *arch_state = (x86_thread_state64_t *) state;
++	struct __darwin_mcontext64 *ctx;
++
++	ctx = (struct __darwin_mcontext64 *) g_new0 (struct __darwin_mcontext64, 1);
++	ctx->__ss = *arch_state;
++
++	return ctx;
++}
++
++kern_return_t
++mono_mach_arch_get_thread_state (thread_port_t thread, thread_state_t *state, mach_msg_type_number_t *count)
++{
++	x86_thread_state64_t *arch_state = (x86_thread_state64_t *) g_new0 (x86_thread_state64_t, 1);
++	kern_return_t ret;
++
++	*count = x86_THREAD_STATE64_COUNT;
++
++	ret = thread_get_state (thread, x86_THREAD_STATE64, (thread_state_t) arch_state, count);
++
++	*state = (thread_state_t) arch_state;
++
++	return ret;
++}
++
++void *
++mono_mach_arch_get_tls_value_from_thread (thread_port_t thread, guint32 key)
++{
++	/* OSX stores TLS values in a hidden array inside the pthread_t structure
++	 * They are keyed off a giant array offset 0x60 into the pointer.  This value
++	 * is baked into their pthread_getspecific implementation
++	 */
++	intptr_t *p = (intptr_t *) pthread_from_mach_thread_np (thread);
++	intptr_t **tsd = (intptr_t **) (p + 0x60);
++
++	return (void *) tsd [key];
++}
++#endif
+diff --git a/mono/utils/mach-support-x86.c b/mono/utils/mach-support-x86.c
+new file mode 100644
+index 0000000..9834d04
+--- /dev/null
++++ b/mono/utils/mach-support-x86.c
+@@ -0,0 +1,74 @@
++/*
++ * mach-support-x86.c: mach support for x86
++ *
++ * Authors:
++ *   Geoff Norton (gnorton@novell.com)
++ *
++ * (C) 2010 Ximian, Inc.
++ */
++
++#include <config.h>
++
++#if defined(__MACH__)
++#include <stdint.h>
++#include <glib.h>
++#include <pthread.h>
++#include "utils/mono-sigcontext.h"
++#include "mach-support.h"
++
++void *
++mono_mach_arch_get_ip (thread_state_t state)
++{
++	x86_thread_state32_t *arch_state = (x86_thread_state32_t *) state;
++
++	return (void *) arch_state->__eip;
++}
++
++void *
++mono_mach_arch_get_sp (thread_state_t state)
++{
++	x86_thread_state32_t *arch_state = (x86_thread_state32_t *) state;
++
++	return (void *) arch_state->__esp;
++}
++
++void *
++mono_mach_arch_thread_state_to_context (thread_state_t state)
++{
++	x86_thread_state32_t *arch_state = (x86_thread_state32_t *) state;
++	struct __darwin_mcontext32 *ctx;
++
++	ctx = (struct __darwin_mcontext32 *) g_new0 (struct __darwin_mcontext32, 1);
++	ctx->__ss = *arch_state;
++
++	return ctx;
++}
++
++kern_return_t
++mono_mach_arch_get_thread_state (thread_port_t thread, thread_state_t *state, mach_msg_type_number_t *count)
++{
++	x86_thread_state32_t *arch_state = (x86_thread_state32_t *) g_new0 (x86_thread_state32_t, 1);
++	kern_return_t ret;
++
++	*count = x86_THREAD_STATE32_COUNT;
++
++	ret = thread_get_state (thread, x86_THREAD_STATE32, (thread_state_t) arch_state, count);
++
++	*state = (thread_state_t) arch_state;
++
++	return ret;
++}
++
++void *
++mono_mach_arch_get_tls_value_from_thread (thread_port_t thread, guint32 key)
++{
++	/* OSX stores TLS values in a hidden array inside the pthread_t structure
++	 * They are keyed off a giant array offset 0x48 into the pointer.  This value
++	 * is baked into their pthread_getspecific implementation
++	 */
++	intptr_t *p = (intptr_t *) pthread_from_mach_thread_np (thread);
++	intptr_t **tsd = (intptr_t **) (p + 0x48);
++
++	return (void *) tsd [key];
++}
++#endif
+diff --git a/mono/utils/mach-support.c b/mono/utils/mach-support.c
+new file mode 100644
+index 0000000..ab66ae2
+--- /dev/null
++++ b/mono/utils/mach-support.c
+@@ -0,0 +1,56 @@
++/*
++ * mach-support-x86.c: mach support for x86
++ *
++ * Authors:
++ *   Geoff Norton (gnorton@novell.com)
++ *
++ * (C) 2010 Ximian, Inc.
++ */
++
++#include <config.h>
++#if defined(__MACH__)
++#include <glib.h>
++#include <mach/mach.h>
++#include <mach/task.h>
++#include <mach/mach_port.h>
++#include <mach/thread_act.h>
++#include <mach/thread_status.h>
++
++#include <mono/arch/x86/x86-codegen.h>
++#include <mono/metadata/appdomain.h>
++#include <mono/metadata/debug-helpers.h>
++#include <mono/metadata/mono-debug.h>
++#include <mono/utils/mono-mmap.h>
++
++#include "mach-support.h"
++
++kern_return_t
++mono_mach_thread_suspend (thread_port_t thread)
++{
++	return thread_suspend (thread);
++}
++
++kern_return_t
++mono_mach_thread_resume (thread_port_t thread)
++{
++	return thread_resume (thread);
++}
++
++kern_return_t
++mono_mach_get_threads (thread_act_array_t *threads, guint32 *count)
++{
++	kern_return_t ret;
++
++	do {
++		ret = task_threads (current_task (), threads, count);
++	} while (ret != KERN_SUCCESS);
++
++	return ret;
++}
++
++void
++mono_mach_port_deallocate (mach_port_t port)
++{
++	mach_port_deallocate (current_task (), port);
++}
++#endif
+diff --git a/mono/utils/mach-support.h b/mono/utils/mach-support.h
+new file mode 100644
+index 0000000..150c765
+--- /dev/null
++++ b/mono/utils/mach-support.h
+@@ -0,0 +1,33 @@
++#ifndef __MONO_MACH_SUPPORT_H__
++#define __MONO_MACH_SUPPORT_H__
++
++#include "config.h"
++#if defined(__MACH__)
++#include <glib.h>
++#include <pthread.h>
++#include "mono/utils/mono-compiler.h"
++#include <mach/task.h>
++#include <mach/mach_port.h>
++#include <mach/thread_act.h>
++#include <mach/thread_status.h>
++
++#if defined(__i386__) || defined (__x86_64__)
++#define MONO_MACH_ARCH_SUPPORTED 1
++#endif
++
++// We need to define this here since we need _XOPEN_SOURCE for mono
++// and the pthread header guards against this
++extern pthread_t pthread_from_mach_thread_np(mach_port_t);
++
++kern_return_t mono_mach_thread_suspend (thread_port_t thread) MONO_INTERNAL;
++kern_return_t mono_mach_thread_resume (thread_port_t thread) MONO_INTERNAL;
++void *mono_mach_arch_get_ip (thread_state_t state) MONO_INTERNAL;
++void *mono_mach_arch_get_sp (thread_state_t state) MONO_INTERNAL;
++void mono_mach_port_deallocate (mach_port_t port) MONO_INTERNAL;
++kern_return_t mono_mach_get_threads (thread_act_array_t *threads, guint32 *count) MONO_INTERNAL;
++void *mono_mach_arch_thread_state_to_context (thread_state_t state) MONO_INTERNAL;
++kern_return_t mono_mach_arch_get_thread_state (thread_port_t thread, thread_state_t *state, mach_msg_type_number_t *count) MONO_INTERNAL;
++void *mono_mach_arch_get_tls_value_from_thread (thread_port_t thread, guint32 key) MONO_INTERNAL;
++
++#endif
++#endif /* __MONO_MACH_SUPPORT_H__ */

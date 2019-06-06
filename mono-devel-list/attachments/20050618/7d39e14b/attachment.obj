@@ -1,0 +1,526 @@
+Index: class/corlib/System.Collections.Generic/ChangeLog
+===================================================================
+--- class/corlib/System.Collections.Generic/ChangeLog	(revision 46184)
++++ class/corlib/System.Collections.Generic/ChangeLog	(working copy)
+@@ -1,3 +1,23 @@
++2005-06-16  David Waite  <mass@akuma.org>
++
++    * Dictionary.cs (EnumerationMode): Remove.
++    (Enumerator): Remove return type flag - legacy return is expected to
++    always return a DictionaryEntry
++    (Enumerator): Make constructor internal, it is not public on ms.net 
++    beta 2
++    (Enumerator.MoveNext): Fix endless loop
++    (VerifyState): Added method to check state preconditions and throw
++    appropriate exceptions.
++    (KeyCollection,ValueCollection): Mark sealed to match ms.net beta 2
++    (KeyCollection.Enumerator._hostEnumerator): make exact struct type,
++    rather than boxing and using by interface
++    (KeyCollection.Enumerator.Dispose): use default to clear Enumerator
++    (ValueCollection.Enumerator._hostEnumerator): make exact struct type,
++    rather than boxing and using by interface
++    (ValueCollection.Enumerator.Dispose): use default to clear Enumerator
++    * EqualityComparer.cs (DefaultComparer, IEquatableOfTEqualityComparer):
++    Mark as serializable.
++
+ 2005-06-16  Raja R Harinath  <rharinath@novell.com>
+ 
+ 	* Dictionary.cs (GetKeys, GetValues): Remove.
+Index: class/corlib/System.Collections.Generic/Dictionary.cs
+===================================================================
+--- class/corlib/System.Collections.Generic/Dictionary.cs	(revision 46184)
++++ class/corlib/System.Collections.Generic/Dictionary.cs	(working copy)
+@@ -316,7 +316,7 @@
+ 		}
+ 
+ 		//
+-		// Returns the index of the chain containing key.  Also ensures that the found key is the first element of the chain.
++		// Returns the index of the chain containing key.	 Also ensures that the found key is the first element of the chain.
+ 		// If the key is not found, returns -h-1, where 'h' is the index of the chain that would've contained the key.
+ 		// 
+ 		private int GetSlot (TKey key)
+@@ -464,7 +464,7 @@
+ 
+ 		IEnumerator IEnumerable.GetEnumerator ()
+ 		{
+-			return new Enumerator (this, EnumerationMode.DictionaryEntry);
++			return new Enumerator (this);
+ 		}
+ 	
+ 		IEnumerator<KeyValuePair<TKey, TValue>> IEnumerable<KeyValuePair<TKey, TValue>>.GetEnumerator ()
+@@ -474,36 +474,29 @@
+ 
+ 		IDictionaryEnumerator IDictionary.GetEnumerator ()
+ 		{
+-			return new Enumerator (this, EnumerationMode.DictionaryEntry);
++			return new Enumerator (this);
+ 		}
+ 	
+ 		public Enumerator GetEnumerator ()
+ 		{
+-			return new Enumerator (this, EnumerationMode.KeyValuePair);
++			return new Enumerator (this);
+ 		}
+ 	
+-		internal enum EnumerationMode { DictionaryEntry, KeyValuePair };
+-	
+ 		[Serializable]
+ 		public struct Enumerator : IEnumerator<KeyValuePair<TKey,TValue>>,
+ 			IDisposable, IDictionaryEnumerator, IEnumerator
+ 		{
+ 			Slot [] _dictionaryTable;
+-			EnumerationMode _navigationMode;
+ 
+ 			Slot _current;
+ 			int _nextIndex;
+ 	
+-			public Enumerator (Dictionary<TKey, TValue> dictionary) : this (dictionary, EnumerationMode.KeyValuePair)
++			internal Enumerator (Dictionary<TKey, TValue> dictionary)
+ 			{
+-			}
+-	
+-			internal Enumerator (Dictionary<TKey, TValue> dictionary, EnumerationMode mode)
+-			{
+ 				_dictionaryTable = dictionary._table;
+-				_navigationMode = mode;
+ 
+-				// The following stanza is identical to IEnumerator.Reset (), but because of the
++				// The following stanza is identical to IEnumerator.Reset (),
++				// but because of the
+ 				// definite assignment rule, we cannot call it here.
+ 				_nextIndex = 0;
+ 				_current = null;
+@@ -511,9 +504,20 @@
+ 
+ 			public bool MoveNext ()
+ 			{
++				if (_dictionaryTable == null)
++				{
++					throw new ObjectDisposedException(null);
++				}
++
++				// if we are on an entry, try to move to the next linked entry
++				// (in the bucket)
+ 				if (_current != null)
++				{
+ 					_current = _current.Next;
+-
++				}
++				// if we are not on an entry, assume we are either finished 
++				// with a bucket, or not currently on the first bucket. walk
++				// the table searching for a non-null entry 
+ 				while (_current == null && _nextIndex < _dictionaryTable.Length)
+ 					_current = _dictionaryTable [_nextIndex++];
+ 
+@@ -522,35 +526,22 @@
+ 
+ 			public KeyValuePair<TKey, TValue> Current {
+ 				get {
+-					if (_current == null)
+-						throw new InvalidOperationException ();
++					VerifyState();
+ 					return _current.Data;
+ 				}
+ 			}
+ 	
+ 			object IEnumerator.Current {
+ 				get {
+-					if (_current == null)
+-						throw new InvalidOperationException ();
+-					switch (_navigationMode) {
+-					case EnumerationMode.DictionaryEntry:
+-						DictionaryEntry de = new DictionaryEntry (_current.Data.Key, _current.Data.Value);
+-						return de;
+-					case EnumerationMode.KeyValuePair:
+-					default:
+-						return _current.Data;
+-					}
++					VerifyState();
++					return new DictionaryEntry(_current.Data.Key, _current.Data.Value);
+ 				}
+ 			}
+ 	
+-			DictionaryEntry IDictionaryEnumerator.Entry
+-			{
+-				get
+-				{
+-					if (_current == null)
+-						throw new InvalidOperationException ();
+-					DictionaryEntry entry = new DictionaryEntry (_current.Data.Key, _current.Data.Value);
+-					return entry;
++			DictionaryEntry IDictionaryEnumerator.Entry {
++				get {
++					VerifyState();
++					return new DictionaryEntry (_current.Data.Key, _current.Data.Value);
+ 				}
+ 			}
+ 	
+@@ -564,8 +555,7 @@
+ 			{
+ 				get
+ 				{
+-					if (_current == null)
+-						throw new InvalidOperationException ();
++					VerifyState();
+ 					return _current.Data.Key;
+ 				}
+ 			}
+@@ -573,12 +563,22 @@
+ 			{
+ 				get
+ 				{
+-					if (_current == null)
+-						throw new InvalidOperationException ();
++					VerifyState();
+ 					return _current.Data.Value;
+ 				}
+ 			}
+-	
++
++			void VerifyState()
++			{
++				if (_dictionaryTable == null)
++				{
++					throw new ObjectDisposedException(null);
++				}
++				if (_current == null)
++				{
++					throw new InvalidOperationException();
++				}
++			}	
+ 			public void Dispose ()
+ 			{
+ 				_current = null;
+@@ -588,7 +588,7 @@
+ 	
+ 		// This collection is a read only collection
+ 		[Serializable]
+-		public class KeyCollection : ICollection<TKey>, IEnumerable<TKey>, ICollection, IEnumerable {
++		public sealed class KeyCollection : ICollection<TKey>, IEnumerable<TKey>, ICollection, IEnumerable {
+ 			Dictionary<TKey, TValue> _dictionary;
+ 	
+ 			public KeyCollection (Dictionary<TKey, TValue> dictionary)
+@@ -671,16 +671,16 @@
+ 			}
+ 	
+ 			public struct Enumerator : IEnumerator<TKey>, IDisposable, IEnumerator {
+-				IEnumerator<KeyValuePair<TKey, TValue>> _hostEnumerator;
++				Dictionary<TKey, TValue>.Enumerator _hostEnumerator;
+ 
+-				internal Enumerator (IEnumerator<KeyValuePair<TKey, TValue>> hostEnumerator)
++				internal Enumerator (Dictionary<TKey, TValue>.Enumerator hostEnumerator)
+ 				{
+ 					_hostEnumerator = hostEnumerator;
+ 				}
+ 				
+ 				public void Dispose ()
+ 				{
+-					_hostEnumerator = null;
++					_hostEnumerator = default(Dictionary<TKey,TValue>.Enumerator);
+ 				}
+ 				
+ 				public bool MoveNext ()
+@@ -702,14 +702,14 @@
+ 				
+ 				void IEnumerator.Reset ()
+ 				{
+-					_hostEnumerator.Reset ();
++					((IEnumerator)_hostEnumerator).Reset ();
+ 				}
+ 			}
+ 		}
+ 
+ 		// This collection is a read only collection
+ 		[Serializable]
+-		public class ValueCollection : ICollection<TValue>, IEnumerable<TValue>, ICollection, IEnumerable {
++		public sealed class ValueCollection : ICollection<TValue>, IEnumerable<TValue>, ICollection, IEnumerable {
+ 			Dictionary<TKey, TValue> _dictionary;
+ 	
+ 			public ValueCollection (Dictionary<TKey, TValue> dictionary)
+@@ -792,16 +792,16 @@
+ 			}
+ 	
+ 			public struct Enumerator : IEnumerator<TValue>, IDisposable, IEnumerator {
+-				IEnumerator<KeyValuePair<TKey, TValue>> _hostEnumerator;
++				Dictionary<TKey, TValue>.Enumerator _hostEnumerator;
+ 
+-				internal Enumerator (IEnumerator<KeyValuePair<TKey, TValue>> hostEnumerator)
++				internal Enumerator (Dictionary<TKey,TValue>.Enumerator hostEnumerator)
+ 				{
+ 					_hostEnumerator = hostEnumerator;
+ 				}
+ 				
+ 				public void Dispose ()
+ 				{
+-					_hostEnumerator = null;
++					_hostEnumerator = default(Dictionary<TKey, TValue>.Enumerator);
+ 				}
+ 				
+ 				public bool MoveNext ()
+@@ -823,7 +823,7 @@
+ 				
+ 				void IEnumerator.Reset ()
+ 				{
+-					_hostEnumerator.Reset ();
++					((IEnumerator)_hostEnumerator).Reset ();
+ 				}
+ 			}
+ 		}
+Index: class/corlib/System.Collections.Generic/EqualityComparer.cs
+===================================================================
+--- class/corlib/System.Collections.Generic/EqualityComparer.cs	(revision 46184)
++++ class/corlib/System.Collections.Generic/EqualityComparer.cs	(working copy)
+@@ -53,7 +53,7 @@
+ 				return _default;
+ 			}
+ 		}
+-		
++		[Serializable]
+ 		class DefaultComparer : EqualityComparer<T> {
+ 	
+ 			public override int GetHashCode (T obj)
+@@ -71,6 +71,7 @@
+ 		}
+ 	}
+ 	
++	[Serializable]
+ 	class IEquatableOfTEqualityComparer <T> : EqualityComparer <T> where T : IEquatable <T> {
+ 
+ 		public override int GetHashCode (T obj)
+Index: class/corlib/Test/System.Collections.Generic/ChangeLog
+===================================================================
+--- class/corlib/Test/System.Collections.Generic/ChangeLog	(revision 46184)
++++ class/corlib/Test/System.Collections.Generic/ChangeLog	(working copy)
+@@ -1,3 +1,15 @@
++2005-06-18  David Waite  <mass@akuma.org>
++
++    * DictionaryTest.cs (AddTest3): Added test of simple interaction with
++    struct dictionary
++    (AddDuplicateTest,IndexerGetNullTest,IndexerSetNullTest): Added tests
++    for exceptional cases to verify correct exceptions
++    (TryGetValueTest): check return value from TryGetValue
++    (KeyValueEnumeratorTest): Added test from verification of ms.net beta2
++    behavior for non-generic IEnumerator/IDictionaryEnumerator behavior
++    against Dictionary<>
++    (SerializationTest): Added test to utilize serialization routines.
++    
+ 2005-06-16  Raja R Harinath  <rharinath@novell.com>
+ 
+ 	* DictionaryTest.cs (SliceCollectionsEnumeratorTest): New test
+Index: class/corlib/Test/System.Collections.Generic/DictionaryTest.cs
+===================================================================
+--- class/corlib/Test/System.Collections.Generic/DictionaryTest.cs	(revision 46184)
++++ class/corlib/Test/System.Collections.Generic/DictionaryTest.cs	(working copy)
+@@ -32,6 +32,8 @@
+ using System;
+ using System.Collections;
+ using System.Collections.Generic;
++using System.IO;
++using System.Runtime.Serialization.Formatters.Binary;
+ using System.Text;
+ using NUnit.Framework;
+ 
+@@ -67,12 +69,14 @@
+ 	
+ 		Dictionary <string, object> _dictionary = null;
+ 		Dictionary <MyClass, MyClass> _dictionary2 = null;
++		Dictionary <int, int> _dictionary3 = null;
+ 	
+ 		[SetUp]
+ 		public void SetUp ()
+ 		{
+ 			_dictionary = new Dictionary <string, object> ();
+ 			_dictionary2 = new Dictionary <MyClass, MyClass> ();
++			_dictionary3 = new Dictionary <int, int>();
+ 		}
+ 	
+ 		[Test]
+@@ -96,26 +100,43 @@
+ 			Assert.AreEqual (12, _dictionary2 [m3].Value, "#3");
+ 		}
+ 
++		[Test]
++		public void AddTest3 ()
++		{
++			_dictionary3.Add (1, 2);
++			_dictionary3.Add (2, 3);
++			_dictionary3.Add (3, 4);
++			Assert.AreEqual (2, _dictionary3[1], "#1");
++			Assert.AreEqual (3, _dictionary3[2], "#2");
++			Assert.AreEqual (4, _dictionary3[3], "#3");
++		}
++
+ 		[Test, ExpectedException(typeof(ArgumentNullException))]
+-		public void NullTest ()
++		public void AddNullTest ()
+ 		{
+ 			_dictionary.Add (null, "");
+ 		}
+ 	
++		[Test, ExpectedException(typeof(ArgumentException))]
++		public void AddDuplicateTest ()
++		{
++			_dictionary.Add("foo", "bar");
++			_dictionary.Add("foo", "bar");
++		}
++
+ 		//Tests Add when resize takes place
+ 		[Test]
+ 		public void AddLargeTest ()
+ 		{
+-			Dictionary <int, int> _dict = new Dictionary <int, int> ();
+ 			int i, numElems = 50;
+ 	
+ 			for (i = 0; i < numElems; i++)
+ 			{
+-				_dict.Add (i, i);
++				_dictionary3.Add (i, i);
+ 			}
+ 	
+ 			i = 0;
+-			foreach (KeyValuePair <int, int> entry in _dict)
++			foreach (KeyValuePair <int, int> entry in _dictionary3)
+ 			{
+ 				i++;
+ 			}
+@@ -136,6 +157,12 @@
+ 			object foo = _dictionary ["foo"];
+ 		}
+ 
++		[Test, ExpectedException(typeof(ArgumentNullException))]
++		public void IndexerGetNullTest()
++		{
++			object s = _dictionary[null];
++		}
++
+ 		[Test]
+ 		public void IndexerSetExistingTest ()
+ 		{
+@@ -156,10 +183,10 @@
+ 		[Test]
+ 		public void RemoveTest ()
+ 		{
+-			_dictionary.Add ("key1", (object)"value1");
+-			_dictionary.Add ("key2", (object)"value2");
+-			_dictionary.Add ("key3", (object)"value3");
+-			_dictionary.Add ("key4", (object)"value4");
++			_dictionary.Add ("key1", "value1");
++			_dictionary.Add ("key2", "value2");
++			_dictionary.Add ("key3", "value3");
++			_dictionary.Add ("key4", "value4");
+ 			Assert.IsTrue (_dictionary.Remove ("key3"));
+ 			Assert.IsFalse (_dictionary.Remove ("foo"));
+ 			Assert.AreEqual (3, _dictionary.Count);
+@@ -180,6 +207,12 @@
+ 			
+ 		}
+ 	
++		[Test, ExpectedException(typeof(ArgumentNullException))]
++		public void IndexerSetNullTest()
++		{
++			_dictionary[null] = "bar";
++		}
++	
+ 		[Test]
+ 		public void ClearTest ()
+ 		{
+@@ -226,10 +259,12 @@
+ 			_dictionary.Add ("key3", (object)"value3");
+ 			_dictionary.Add ("key4", (object)"value4");
+ 			object value = "";
+-			_dictionary.TryGetValue ("key4", out value);
++			bool retrieved = _dictionary.TryGetValue ("key4", out value);
++			Assert.IsTrue (retrieved);
+ 			Assert.AreEqual ("value4", (string)value, "TryGetValue does not return value!");
+ 	
+-			_dictionary.TryGetValue ("key7", out value);
++			retrieved = _dictionary.TryGetValue ("key7", out value);
++			Assert.IsFalse (retrieved);
+ 			Assert.IsNull (value, "value for non existant value should be null!");
+ 		}
+ 	
+@@ -363,26 +398,22 @@
+ 			foreach (KeyValuePair <string, object> entry in _dictionary)
+ 			{
+ 				i++;
+-				Console.WriteLine (entry.ToString());
+ 			}
+-			if (i != 4)
+-				Assert.Fail("fail1: foreach entry failed!");
++			Assert.AreEqual(4, i, "fail1: foreach entry failed!");
+ 	
+ 			i = 0;
+ 			foreach (DictionaryEntry entry in ((IEnumerable)_dictionary))
+ 			{
+ 				i++;
+ 			}
+-			if (i != 4)
+-				Assert.Fail("fail2: foreach entry failed!");
++			Assert.AreEqual(4, i, "fail2: foreach entry failed!");
+ 	
+ 			i = 0;
+ 			foreach (DictionaryEntry entry in ((IDictionary)_dictionary))
+ 			{
+ 				i++;
+ 			}
+-			if (i != 4)
+-				Assert.Fail ("fail3: foreach entry failed!");
++			Assert.AreEqual (4, i, "fail3: foreach entry failed!");
+ 		}
+ 	
+ 		[Test]
+@@ -416,7 +447,6 @@
+ 			int i = 0;
+ 			foreach (string key in keys)
+ 			{
+-				Console.WriteLine("keys collection : " + key);
+ 				i++;
+ 			}
+ 			Assert.AreEqual(4, i);
+@@ -459,6 +489,46 @@
+ 			Assert.IsTrue (ke is Dictionary<string, int>.KeyCollection.Enumerator);
+ 			Assert.IsTrue (ve is Dictionary<string, int>.ValueCollection.Enumerator);
+ 		}
++
++		[Test]
++		public void PlainEnumeratorReturnTest ()
++		{
++			// Test that we return a DictionaryEntry for non-generic dictionary iteration
++			_dictionary["foo"] = "bar";
++			IEnumerator<KeyValuePair<string, object>> enumerator = _dictionary.GetEnumerator();
++			Assert.IsTrue(enumerator.MoveNext());
++			Assert.IsTrue(((IEnumerator)enumerator).Current is DictionaryEntry);
++			Assert.IsTrue(((IDictionaryEnumerator)enumerator).Current is DictionaryEntry);
++			Assert.IsFalse(((object)enumerator.Current) is DictionaryEntry);
++		}
++
++		[Test]
++		public void SerializationTest()
++		{
++			for (int i = 0; i < 50; i++)
++			{
++				_dictionary3.Add(i, i);
++			}
++
++			BinaryFormatter formatter = new BinaryFormatter();
++			MemoryStream stream = new MemoryStream();
++			formatter.Serialize(stream, _dictionary3);
++
++			stream.Position = 0;
++			object deserialized = formatter.Deserialize(stream);
++
++			Assert.IsNotNull(deserialized);
++			Assert.IsFalse(deserialized == _dictionary3);
++
++			Assert.IsTrue(deserialized is Dictionary<int, int>);
++			Dictionary<int, int> d3 = deserialized as Dictionary<int, int>;
++
++			Assert.AreEqual(50, d3.Count);
++			for (int i = 0; i < 50; i++)
++			{
++				Assert.AreEqual(i, d3[i]);
++			}
++		}
+ 	}
+ }
+ 

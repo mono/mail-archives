@@ -1,0 +1,324 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Mono 2.4 crashes due to accessing freed data structures
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Mono%202.4%20crashes%20due%20to%20accessing%20freed%20data%20structures&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032299.html">
+   <LINK REL="Next"  HREF="032302.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Mono 2.4 crashes due to accessing freed data structures</H1>
+    <B>Ulrich Weigand</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Mono%202.4%20crashes%20due%20to%20accessing%20freed%20data%20structures&In-Reply-To="
+       TITLE="[Mono-dev] Mono 2.4 crashes due to accessing freed data structures">uweigand at de.ibm.com
+       </A><BR>
+    <I>Fri May 29 16:14:34 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032299.html">[Mono-dev] Gtk# 2.x release status and thoughts on 3.0
+</A></li>
+        <LI>Next message: <A HREF="032302.html">[Mono-dev] Mono 2.4 crashes due to accessing freed data	structures
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32301">[ date ]</a>
+              <a href="thread.html#32301">[ thread ]</a>
+              <a href="subject.html#32301">[ subject ]</a>
+              <a href="author.html#32301">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+we've been running into random mono crashes due to what appears to
+be accesses to data structures that were already freed.
+
+The test case is the OpenSim build and unit-test process using NAnt.
+For some reason I don't quite understand the bug seems to trigger
+very frequently on PowerPC64 (to the extent that 75% or so of all
+OpenSim build attempts never complete), and sometimes on x86-64,
+but rarely (never?) on 32-bit ppc or i386.
+
+Here's some results of my debugging attempts of this problem.  This
+is my first look at the mono sources -- I may be off track with some
+of my conclusions here.  I'd appreciate any help in getting this fixed.
+
+All tests and the discussion below refer to the mono 2.4 sources.
+
+
+The first problem occurs during mono_metadata_clean_for_image, and
+seems related to a recent change introduce to fix bug
+<A HREF="https://bugzilla.novell.com/show_bug.cgi?id=458168.">https://bugzilla.novell.com/show_bug.cgi?id=458168.</A>
+This change added a call to
+  signature_in_image (mono_method_signature ((MonoMethod*)method), image)
+to the inflated_method_in_image routine.
+
+Now the problem with this is that if the inflated method in question
+doesn't yet have a signature allocated.  In this case, the above call
+will *cause* the allocation to happen at this time.  In particular,
+this can cause new MonoGenericInst or MonoGenericClass structures to
+be allocated at this point.
+
+However, this happens at a time where mono_metadata_clean_for_image
+is currently traversing the generic_inst_cache / generic_class_cache
+structures, and does not expect new elements to be added to them
+while that traversal is ongoing.
+
+In the case I was debugging, a new MonoGenericInst was created in
+such a way that pointed to an already existing MonoGenericClass.
+This MonoGenericClass structure, however, was marked as unneeded
+during that very same traversal -- but the freshly created
+MonoGenericInst was not, as it was added too late.
+
+This had the effect that at the end of the mono_metadata_clean_for_image
+call, the MonoGenericClass was deleted -- but the new MonoGenericInst
+was still pointing to it.   During *another* invocation of
+mono_metadata_clean_for_image, the ginst_in_image routine would be
+called on that broken MonoGenericInst and traverse the pointer to
+the freed MonoGenericClass.  Depending on what happened to the memory
+in the meantime, crashes or failed assertions result.
+
+
+It seems to be that it is wrong to allocate new data structures
+during mono_metadata_clean_for_image, so I guess mono_method_signature
+should not be called here.  While I'm not completely sure this is the
+right fix, the following patch makes the problem go away for me:
+
+diff -urNp mono-2.4-orig/mono/metadata/metadata.c mono-2.4/mono/metadata/metadata.c
+--- mono-2.4-orig/mono/metadata/metadata.c	2009-02-14 00:33:05.000000000 +0100
++++ mono-2.4/mono/metadata/metadata.c	2009-05-28 20:12:38.000000000 +0200
+@@ -2196,7 +2197,8 @@ inflated_method_in_image (gpointer key, 
+ 	// <A HREF="https://bugzilla.novell.com/show_bug.cgi?id=458168">https://bugzilla.novell.com/show_bug.cgi?id=458168</A>
+ 	return method-&gt;declaring-&gt;klass-&gt;image == image ||
+ 		(method-&gt;context.class_inst &amp;&amp; ginst_in_image (method-&gt;context.class_inst, image)) ||
+-		(method-&gt;context.method_inst &amp;&amp; ginst_in_image (method-&gt;context.method_inst, image)) || signature_in_image (mono_method_signature ((MonoMethod*)method), image);
++		(method-&gt;context.method_inst &amp;&amp; ginst_in_image (method-&gt;context.method_inst, image)) ||
++		(((MonoMethod*)method)-&gt;signature &amp;&amp; signature_in_image (((MonoMethod*)method)-&gt;signature, image));
+ }
+ 
+ static gboolean
+
+
+The second problem is related to wrapper classes allocated by the
+routines in marshal.c.  I've been seeing various instances of crashes
+caused by those routines returning apparently clobbered method structures.
+
+It turns out this was caused by stale entried in the caches maintained
+by the marshal.c routines.  For example, the
+MonoMethod *mono_marshal_get_static_rgctx_invoke (MonoMethod *method)
+routine will store the MonoMethod structure describing the wrapper for
+&quot;method&quot; into a cache allocated on the mempool associated with the
+image related to the method's class.  For &quot;normal&quot; methods, the method
+structure itself was already allocated on that same mempool, so the
+wrapper has identical lifetime as the method it wraps.
+
+However, there is one case where things are more complex: &quot;inflated&quot;
+generic methods.  These are *not* allocated on a mempool, but on the
+heap, and will be freed at a certain point in time.  However, nothing
+ensures that any previously allocated wrapper for such a method is
+also freed at this time.
+
+For the most part, this does not matter much, as the wrapper cache is
+indexed using the address of the MonoMethod structure as key.  If the
+method no longer exists, it isn't looked up, so it doesn't matter that
+a stale value is still in the hash table.
+
+However, it *can* happen that a later allocation of a fresh MonoMethod
+just happens to reside at the same address as a method that was deleted
+previously.  Now, when looking up a wrapper for the new method, the
+stale entry for the old method may indeed be found.  This causes various
+problems; in particular, while the cached wrapper method itself is still
+live, some of the structures it points to (type, signature) may themselves
+have been deleted in the meantime, so random memory may be accessed.
+
+A similar problem seems to occur for dynamic methods, and for those it
+seems special care is taken to remove wrappers for such methods from the
+cache when the method is deleted (mono_marshal_free_dynamic_wrappers).
+
+It looks like a similar approach ought to be taken for inflated methods.
+The following patch implements this.  Again, I'm not complete sure this
+is the right approach, but it fixes the symptoms for me.
+
+diff -urNp mono-2.4-orig/mono/metadata/marshal.c mono-2.4/mono/metadata/marshal.c
+--- mono-2.4-orig/mono/metadata/marshal.c	2009-02-23 19:43:32.000000000 +0100
++++ mono-2.4/mono/metadata/marshal.c	2009-05-28 19:45:27.000000000 +0200
+@@ -75,6 +75,7 @@ typedef struct _MonoRemotingMethods Mono
+ #define mono_marshal_lock() EnterCriticalSection (&amp;marshal_mutex)
+ #define mono_marshal_unlock() LeaveCriticalSection (&amp;marshal_mutex)
+ static CRITICAL_SECTION marshal_mutex;
++static gboolean marshal_mutex_initialized;
+ 
+ /* This mutex protects the various cominterop related caches in MonoImage */
+ #define mono_cominterop_lock() EnterCriticalSection (&amp;cominterop_mutex)
+@@ -599,6 +600,7 @@ mono_marshal_init (void)
+ 		char* com_provider_env = NULL;
+ 		module_initialized = TRUE;
+ 		InitializeCriticalSection (&amp;marshal_mutex);
++		marshal_mutex_initialized = TRUE;
+ 		InitializeCriticalSection (&amp;cominterop_mutex);
+ 		last_error_tls_id = TlsAlloc ();
+ 		load_type_info_tls_id = TlsAlloc ();
+@@ -673,6 +675,7 @@ mono_marshal_cleanup (void)
+ 	TlsFree (load_type_info_tls_id);
+ 	TlsFree (last_error_tls_id);
+ 	DeleteCriticalSection (&amp;marshal_mutex);
++	marshal_mutex_initialized = FALSE;
+ 	DeleteCriticalSection (&amp;cominterop_mutex);
+ }
+ 
+@@ -12908,3 +12911,81 @@ mono_marshal_free_dynamic_wrappers (Mono
+ 		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;runtime_invoke_direct_cache, method);
+ 	mono_marshal_unlock ();
+ }
++
++/*
++ * mono_marshal_free_inflated_wrappers:
++ *
++ *   Free wrappers of the inflated method METHOD.
++ */
++
++static gboolean
++signature_method_pair_matches_signature (gpointer key, gpointer value, gpointer user_data)
++{
++	SignatureMethodPair *pair = (SignatureMethodPair*)key;
++	MonoMethodSignature *sig = (MonoMethodSignature*)user_data;
++
++	return mono_metadata_signature_equal (pair-&gt;sig, sig);
++}
++
++void
++mono_marshal_free_inflated_wrappers (MonoMethod *method)
++{
++	MonoMethodSignature *sig = method-&gt;signature;
++
++	g_assert (method-&gt;is_inflated);
++
++	/* Ignore calls occuring late during cleanup.  */
++	if (!marshal_mutex_initialized)
++		return;
++
++	mono_marshal_lock ();
++	/* 
++	 * FIXME: We currently leak the wrappers. Freeing them would be tricky as
++	 * they could be shared with other methods ?
++	 */
++
++        /*
++         * indexed by MonoMethodSignature
++         */
++	if (sig &amp;&amp; method-&gt;klass-&gt;image-&gt;delegate_begin_invoke_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;delegate_begin_invoke_cache, sig);
++	if (sig &amp;&amp; method-&gt;klass-&gt;image-&gt;delegate_end_invoke_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;delegate_end_invoke_cache, sig);
++	if (sig &amp;&amp; method-&gt;klass-&gt;image-&gt;delegate_invoke_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;delegate_invoke_cache, sig);
++	if (sig &amp;&amp; method-&gt;klass-&gt;image-&gt;runtime_invoke_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;runtime_invoke_cache, sig);
++
++        /*
++         * indexed by SignatureMethodPair
++         */
++	if (sig &amp;&amp; method-&gt;klass-&gt;image-&gt;delegate_abstract_invoke_cache)
++		g_hash_table_foreach_remove (method-&gt;klass-&gt;image-&gt;delegate_abstract_invoke_cache,
++					     signature_method_pair_matches_signature, (gpointer)sig);
++
++        /*
++         * indexed by MonoMethod pointers
++         */
++	if (method-&gt;klass-&gt;image-&gt;runtime_invoke_direct_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;runtime_invoke_direct_cache, method);
++	if (method-&gt;klass-&gt;image-&gt;managed_wrapper_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;managed_wrapper_cache, method);
++	if (method-&gt;klass-&gt;image-&gt;native_wrapper_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;native_wrapper_cache, method);
++	if (method-&gt;klass-&gt;image-&gt;remoting_invoke_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;remoting_invoke_cache, method);
++	if (method-&gt;klass-&gt;image-&gt;synchronized_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;synchronized_cache, method);
++	if (method-&gt;klass-&gt;image-&gt;unbox_wrapper_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;unbox_wrapper_cache, method);
++	if (method-&gt;klass-&gt;image-&gt;cominterop_invoke_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;cominterop_invoke_cache, method);
++	if (method-&gt;klass-&gt;image-&gt;cominterop_wrapper_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;cominterop_wrapper_cache, method);
++	if (method-&gt;klass-&gt;image-&gt;static_rgctx_invoke_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;static_rgctx_invoke_cache, method);
++	if (method-&gt;klass-&gt;image-&gt;thunk_invoke_cache)
++		g_hash_table_remove (method-&gt;klass-&gt;image-&gt;thunk_invoke_cache, method);
++
++	mono_marshal_unlock ();
++}
+diff -urNp mono-2.4-orig/mono/metadata/marshal.h mono-2.4/mono/metadata/marshal.h
+--- mono-2.4-orig/mono/metadata/marshal.h	2009-02-23 19:43:32.000000000 +0100
++++ mono-2.4/mono/metadata/marshal.h	2009-05-27 16:05:38.000000000 +0200
+@@ -201,6 +201,9 @@ mono_marshal_get_thunk_invoke_wrapper (M
+ void
+ mono_marshal_free_dynamic_wrappers (MonoMethod *method) MONO_INTERNAL;
+ 
++void
++mono_marshal_free_inflated_wrappers (MonoMethod *method) MONO_INTERNAL;
++
+ /* marshaling internal calls */
+ 
+ void * 
+diff -urNp mono-2.4-orig/mono/metadata/metadata.c mono-2.4/mono/metadata/metadata.c
+--- mono-2.4-orig/mono/metadata/metadata.c	2009-02-14 00:33:05.000000000 +0100
++++ mono-2.4/mono/metadata/metadata.c	2009-05-28 20:12:38.000000000 +0200
+@@ -21,6 +21,7 @@
+ #include &quot;metadata-internals.h&quot;
+ #include &quot;class-internals.h&quot;
+ #include &quot;class.h&quot;
++#include &quot;marshal.h&quot;
+ 
+ static gboolean do_mono_metadata_parse_type (MonoType *type, MonoImage *m, MonoGenericContainer *container,
+ 					 const char *ptr, const char **rptr);
+@@ -2245,6 +2247,8 @@ free_inflated_method (MonoMethodInflated
+ 	int i;
+ 	MonoMethod *method = (MonoMethod*)imethod;
+ 
++	mono_marshal_free_inflated_wrappers (method);
++
+ 	if (method-&gt;signature)
+ 		mono_metadata_free_inflated_signature (method-&gt;signature);
+
+
+With those two patches, I'm no longer able to reproduce crashes during
+OpenSim build and unit-test.
+
+Bye,
+Ulrich
+ 
+-- 
+  Dr. Ulrich Weigand
+  GNU Toolchain for Linux on System z and Cell BE
+  <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">Ulrich.Weigand at de.ibm.com</A>
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032299.html">[Mono-dev] Gtk# 2.x release status and thoughts on 3.0
+</A></li>
+	<LI>Next message: <A HREF="032302.html">[Mono-dev] Mono 2.4 crashes due to accessing freed data	structures
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32301">[ date ]</a>
+              <a href="thread.html#32301">[ thread ]</a>
+              <a href="subject.html#32301">[ subject ]</a>
+              <a href="author.html#32301">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

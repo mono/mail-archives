@@ -1,0 +1,413 @@
+diff --git a/mono/metadata/ChangeLog b/mono/metadata/ChangeLog
+index ad764b2..38f362a 100644
+--- a/mono/metadata/ChangeLog
++++ b/mono/metadata/ChangeLog
+@@ -1,3 +1,9 @@
++2009-10-10  Joel W. Reed <joelwreed@gmail.com>
++
++	* mono-perfcounters.c, mono-perfcounters-def.h: Add
++	network performance counters for bytes sent per second, bytes
++	received per second, and bytes total per second.
++
+ 2009-10-07  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* marshal.c (emit_marshal_vtype): Emit marshalling of DateTime to OLE DATE.
+diff --git a/mono/metadata/mono-perfcounters-def.h b/mono/metadata/mono-perfcounters-def.h
+index d59cd7f..b73ae60 100644
+--- a/mono/metadata/mono-perfcounters-def.h
++++ b/mono/metadata/mono-perfcounters-def.h
+@@ -125,3 +125,7 @@ PERFCTR_COUNTER(THREADPOOL_WORKITEMS_PSEC, "Work Items Added/Sec", "", RateOfCou
+ PERFCTR_COUNTER(THREADPOOL_IOWORKITEMS, "IO Work Items Added", "", NumberOfItems64, threadpool_ioworkitems)
+ PERFCTR_COUNTER(THREADPOOL_IOWORKITEMS_PSEC, "IO Work Items Added/Sec", "", RateOfCountsPerSecond32, threadpool_ioworkitems)
+ 
++PERFCTR_CAT(NETWORK, "Network Interface", "", MultiInstance, NetworkInterface, NETWORK_BYTESRECSEC)
++PERFCTR_COUNTER(NETWORK_BYTESRECSEC, "Bytes Received/sec", "", RateOfCountsPerSecond64, unused)
++PERFCTR_COUNTER(NETWORK_BYTESSENTSEC, "Bytes Sent/sec", "", RateOfCountsPerSecond64, unused)
++PERFCTR_COUNTER(NETWORK_BYTESTOTALSEC, "Bytes Total/sec", "", RateOfCountsPerSecond64, unused)
+diff --git a/mono/metadata/mono-perfcounters.c b/mono/metadata/mono-perfcounters.c
+index bd869bf..a87e561 100644
+--- a/mono/metadata/mono-perfcounters.c
++++ b/mono/metadata/mono-perfcounters.c
+@@ -22,6 +22,7 @@
+ #include "utils/mono-time.h"
+ #include "utils/mono-mmap.h"
+ #include "utils/mono-proclib.h"
++#include "utils/mono-networkinterfaces.h"
+ #include <mono/io-layer/io-layer.h>
+ 
+ /* map of CounterSample.cs */
+@@ -98,6 +99,7 @@ enum {
+ 	ThreadInstance,
+ 	CPUInstance,
+ 	MonoInstance,
++	NetworkInterfaceInstance,
+ 	CustomInstance
+ };
+ 
+@@ -283,6 +285,11 @@ struct _ImplVtable {
+ };
+ 
+ typedef struct {
++	int id;
++	char *name;
++} NetworkVtableArg;
++
++typedef struct {
+ 	ImplVtable vtable;
+ 	MonoPerfCounters *counters;
+ 	int pid;
+@@ -686,6 +693,60 @@ cpu_get_impl (MonoString* counter, MonoString* instance, int *type, MonoBoolean
+ }
+ 
+ static MonoBoolean
++get_network_counter (ImplVtable *vtable, MonoBoolean only_value, MonoCounterSample *sample)
++{
++	MonoNetworkError error = MONO_NETWORK_ERROR_OTHER;
++	NetworkVtableArg *narg = (NetworkVtableArg*) vtable->arg;
++	if (!only_value) {
++		fill_sample (sample);
++	}
++
++	sample->counterType = predef_counters [predef_categories [CATEGORY_NETWORK].first_counter + narg->id].type;
++	switch (narg->id) {
++	case COUNTER_NETWORK_BYTESRECSEC:
++		sample->rawValue = mono_network_get_data (narg->name, MONO_NETWORK_BYTESREC, &error);
++		break;
++	case COUNTER_NETWORK_BYTESSENTSEC:
++		sample->rawValue = mono_network_get_data (narg->name, MONO_NETWORK_BYTESSENT, &error);
++		break;
++	case COUNTER_NETWORK_BYTESTOTALSEC:
++		sample->rawValue = mono_network_get_data (narg->name, MONO_NETWORK_BYTESTOTAL, &error);
++		break;
++	}
++
++	if (error == MONO_NETWORK_ERROR_NONE)
++		return TRUE;
++	else
++		return FALSE;
++}
++
++static void
++network_cleanup (ImplVtable *vtable)
++{
++	if (vtable->arg) 
++		g_free(vtable->arg);
++}
++
++static void*
++network_get_impl (MonoString* counter, MonoString* instance, int *type, MonoBoolean *custom)
++{
++	const CounterDesc *cdesc;
++	NetworkVtableArg *narg;
++	ImplVtable *vtable;
++	*custom = FALSE;
++	if ((cdesc = get_counter_in_category (&predef_categories [CATEGORY_NETWORK], counter))) {
++		narg = g_new0 (NetworkVtableArg, 1);
++		narg->id = cdesc->id;
++		narg->name = mono_string_to_utf8 (instance);
++		*type = cdesc->type;
++		vtable = create_vtable (narg, get_network_counter, NULL);
++		vtable->cleanup = network_cleanup;
++		return vtable;
++	}
++	return NULL;
++}
++
++static MonoBoolean
+ get_process_counter (ImplVtable *vtable, MonoBoolean only_value, MonoCounterSample *sample)
+ {
+ 	int id = GPOINTER_TO_INT (vtable->arg);
+@@ -1071,6 +1132,8 @@ mono_perfcounter_get_impl (MonoString* category, MonoString* counter, MonoString
+ 		return process_get_impl (counter, instance, type, custom);
+ 	case CATEGORY_MONO_MEM:
+ 		return mono_mem_get_impl (counter, instance, type, custom);
++	case CATEGORY_NETWORK:
++		return network_get_impl (counter, instance, type, custom);
+ 	case CATEGORY_JIT:
+ 	case CATEGORY_EXC:
+ 	case CATEGORY_GC:
+@@ -1382,6 +1445,20 @@ get_string_array (void **array, int count, gboolean is_process)
+ }
+ 
+ static MonoArray*
++get_string_array_of_strings (void **array, int count)
++{
++	int i;
++	MonoDomain *domain = mono_domain_get ();
++	MonoArray * res = mono_array_new (mono_domain_get (), mono_get_string_class (), count);
++	for (i = 0; i < count; ++i) {
++		char* p = array[i];
++		mono_array_setref (res, i, mono_string_new (domain, p));
++	}
++
++	return res;
++}
++
++static MonoArray*
+ get_mono_instances (void)
+ {
+ 	int count = 64;
+@@ -1428,6 +1505,19 @@ get_processes_instances (void)
+ }
+ 
+ static MonoArray*
++get_networkinterface_instances (void)
++{
++	MonoArray *array;
++	int count = 0;
++	void **buf = mono_networkinterface_list (&count);
++	if (!buf)
++		return get_string_array_of_strings (NULL, 0);
++	array = get_string_array_of_strings (buf, count);
++	g_strfreev((char**) buf);
++	return array;
++}
++
++static MonoArray*
+ get_custom_instances (MonoString *category)
+ {
+ 	SharedCategory *scat;
+@@ -1464,6 +1554,8 @@ mono_perfcounter_instance_names (MonoString *category, MonoString *machine)
+ 		return get_cpu_instances ();
+ 	case ProcessInstance:
+ 		return get_processes_instances ();
++	case NetworkInterfaceInstance:
++		return get_networkinterface_instances ();
+ 	case ThreadInstance:
+ 	default:
+ 		return mono_array_new (mono_domain_get (), mono_get_string_class (), 0);
+diff --git a/mono/utils/ChangeLog b/mono/utils/ChangeLog
+index 0910779..06dfbac 100644
+--- a/mono/utils/ChangeLog
++++ b/mono/utils/ChangeLog
+@@ -1,3 +1,8 @@
++2009-10-10  Joel W. Reed <joelwreed@gmail.com>
++
++	* mono-networkinterfaces.c, mono-networkinterfaces.h: Read
++	network statistics from "/proc/net/dev" for performance counters.
++
+ 2009-09-29  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* mono-compiler.h (MONO_INTERNAL): Disable this on solaris as it produces a
+diff --git a/mono/utils/Makefile.am b/mono/utils/Makefile.am
+index 519b95f..bf6f2ac 100644
+--- a/mono/utils/Makefile.am
++++ b/mono/utils/Makefile.am
+@@ -38,6 +38,8 @@ libmonoutils_la_SOURCES = \
+ 	mono-math.c  		\
+ 	mono-mmap.c  		\
+ 	mono-mmap.h  		\
++	mono-networkinterfaces.c		\
++	mono-networkinterfaces.h		\
+ 	mono-proclib.c		\
+ 	mono-proclib.h		\
+ 	mono-string.h		\
+diff --git a/mono/utils/Makefile.in b/mono/utils/Makefile.in
+index cadf472..e777fd9 100644
+--- a/mono/utils/Makefile.in
++++ b/mono/utils/Makefile.in
+@@ -57,7 +57,8 @@ am__libmonoutils_la_SOURCES_DIST = mono-hash.c mono-ehash.c mono-md5.c \
+ 	mono-internal-hash.c mono-internal-hash.h \
+ 	mono-io-portability.c mono-io-portability.h monobitset.c \
+ 	mono-filemap.c mono-math.c mono-mmap.c mono-mmap.h \
+-	mono-proclib.c mono-proclib.h mono-string.h mono-time.c \
++	mono-proclib.c mono-proclib.h mono-networkinterfaces.c \
++	mono-networkinterfaces.h mono-time.c mono-time.h strtod.h \
+ 	mono-time.h strtod.h strtod.c strenc.h strenc.c mono-uri.c \
+ 	mono-poll.c mono-path.c mono-semaphore.h mono-sigcontext.h \
+ 	mono-stdlib.c mono-property-hash.h mono-property-hash.c \
+@@ -70,9 +71,9 @@ am_libmonoutils_la_OBJECTS = $(am__objects_1) mono-md5.lo mono-sha1.lo \
+ 	mono-logger.lo mono-codeman.lo dlmalloc.lo mono-counters.lo \
+ 	mono-dl.lo mono-internal-hash.lo mono-io-portability.lo \
+ 	monobitset.lo mono-filemap.lo mono-math.lo mono-mmap.lo \
+-	mono-proclib.lo mono-time.lo strtod.lo strenc.lo mono-uri.lo \
+-	mono-poll.lo mono-path.lo mono-stdlib.lo mono-property-hash.lo \
+-	mono-value-hash.lo
++	mono-proclib.lo mono-networkinterfaces.lo mono-time.lo \
++	strtod.lo strenc.lo mono-uri.lo mono-poll.lo mono-path.lo \
++	mono-stdlib.lo mono-property-hash.lo mono-value-hash.lo
+ libmonoutils_la_OBJECTS = $(am_libmonoutils_la_OBJECTS)
+ DEFAULT_INCLUDES = -I.@am__isrc@ -I$(top_builddir)
+ depcomp = $(SHELL) $(top_srcdir)/depcomp
+@@ -416,6 +417,7 @@ distclean-compile:
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mono-math.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mono-md5.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mono-mmap.Plo@am__quote@
++@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mono-networkinterfaces.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mono-path.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mono-poll.Plo@am__quote@
+ @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/mono-proclib.Plo@am__quote@
+diff --git a/mono/utils/mono-networkinterfaces.c b/mono/utils/mono-networkinterfaces.c
+new file mode 100644
+index 0000000..030c0b2
+--- /dev/null
++++ b/mono/utils/mono-networkinterfaces.c
+@@ -0,0 +1,134 @@
++#include "config.h"
++#include "utils/mono-networkinterfaces.h"
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++
++/* FIXME: bsds untested */
++
++/**
++ * mono_networkinterface_list:
++ * @size: a pointer to a location where the size of the returned array is stored
++ *
++ * Return an array of names for the interfaces currently on the system.
++ * The size of the array is stored in @size.
++ */
++gpointer*
++mono_networkinterface_list (int *size)
++{
++	int i = 0, count = 0;
++	void **nilist = NULL;
++	char buf[512];
++	char name[256];
++	FILE *f;
++
++	f = fopen ("/proc/net/dev", "r");
++	if (!f) 
++		return NULL;
++
++	if (! fgets (buf, sizeof(buf)/sizeof(char), f))
++		goto out;
++
++	if (!fgets (buf, sizeof(buf)/sizeof(char), f))
++		goto out;
++
++	while (fgets (buf, sizeof(buf), f) != NULL) {
++
++		char *ptr;
++		buf[sizeof(buf) - 1] = 0;
++		if ((ptr = strchr(buf, ':')) == NULL ||
++				(*ptr++ = 0, sscanf(buf, "%s", name) != 1))
++			goto out;
++
++		if (i >= count) {
++			if (!count)
++				count = 16;
++			else
++				count *= 2;
++		}
++
++		nilist = g_realloc (nilist, count * sizeof (void*));
++		nilist [i++] = g_strdup(name);
++	}
++
++ out:
++	if (f) fclose(f);
++	if (size)
++		*size = i;
++
++	nilist [i] = NULL;
++	return nilist;
++}
++
++/**
++ * mono_network_get_data:
++ * @name: name of the interface
++ * @data: description of data to return
++ *
++ * Return a data item of a network adapter like bytes sent per sec, etc
++ * according to the @data argumet.
++ */
++gint64
++mono_network_get_data (char* name, MonoNetworkData data, MonoNetworkError *error)
++{
++	gint64 val = 0;
++	char buf[512];
++	char cname[256];
++	FILE *f;
++
++	unsigned long rx_bytes, rx_packets, rx_errs, rx_drops,
++		rx_fifo, rx_frame, tx_bytes, tx_packets, tx_errs, tx_drops,
++		tx_fifo, tx_colls, tx_carrier, rx_multi;
++
++	if (error)
++		*error = MONO_NETWORK_ERROR_OTHER;
++
++	f = fopen ("/proc/net/dev", "r");
++	if (!f) 
++		return -1;
++
++	if (! fgets (buf, sizeof(buf)/sizeof(char), f))
++		goto out;
++
++	if (!fgets (buf, sizeof(buf)/sizeof(char), f))
++		goto out;
++
++	while (fgets (buf, sizeof(buf), f) != NULL) {
++
++		char *ptr;
++		buf[sizeof(buf) - 1] = 0;
++		if ((ptr = strchr(buf, ':')) == NULL ||
++				(*ptr++ = 0, sscanf(buf, "%s", cname) != 1))
++			goto out;
++
++		if (strcmp(name, cname) != 0) continue;
++
++		if (sscanf(ptr, "%ld%ld%ld%ld%ld%ld%ld%*d%ld%ld%ld%ld%ld%ld%ld",
++							 &rx_bytes, &rx_packets, &rx_errs, &rx_drops,
++							 &rx_fifo, &rx_frame, &rx_multi,
++							 &tx_bytes, &tx_packets, &tx_errs, &tx_drops,
++							 &tx_fifo, &tx_colls, &tx_carrier) != 14) 
++			goto out;
++
++		switch (data) {
++		case MONO_NETWORK_BYTESSENT:
++			val = tx_bytes;
++			*error = MONO_NETWORK_ERROR_NONE;
++			goto out;
++		case MONO_NETWORK_BYTESREC:
++			val = rx_bytes;
++			*error = MONO_NETWORK_ERROR_NONE;
++			goto out;
++		case MONO_NETWORK_BYTESTOTAL:
++			val = rx_bytes + tx_bytes;
++			*error = MONO_NETWORK_ERROR_NONE;
++			goto out;
++		}
++	}
++
++ out:
++	if (f) fclose(f);
++	return val;
++}
++
+diff --git a/mono/utils/mono-networkinterfaces.h b/mono/utils/mono-networkinterfaces.h
+new file mode 100644
+index 0000000..3352610
+--- /dev/null
++++ b/mono/utils/mono-networkinterfaces.h
+@@ -0,0 +1,28 @@
++#ifndef __MONO_NETWORK_INTERFACES_H__
++#define __MONO_NETWORK_INTERFACES_H__
++/*
++ * Utility functions to access network information.
++ */
++
++#include <glib.h>
++#include <mono/utils/mono-compiler.h>
++
++/* never remove or reorder these enums values: they are used in corlib/System */
++
++typedef enum {
++	MONO_NETWORK_BYTESREC,
++	MONO_NETWORK_BYTESSENT,
++	MONO_NETWORK_BYTESTOTAL
++} MonoNetworkData;
++
++typedef enum {
++	MONO_NETWORK_ERROR_NONE, /* no error happened */
++	MONO_NETWORK_ERROR_NOT_FOUND, /* adapter name invalid */
++	MONO_NETWORK_ERROR_OTHER
++} MonoNetworkError;
++
++gpointer* mono_networkinterface_list     (int *size) MONO_INTERNAL;
++gint64    mono_network_get_data (char* name, MonoNetworkData data, MonoNetworkError *error) MONO_INTERNAL;
++
++#endif /* __MONO_NETWORK_INTERFACES_H__ */
++

@@ -1,0 +1,219 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] [PATCH] GC Profiling Interfaces
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5BPATCH%5D%20GC%20Profiling%20Interfaces&In-Reply-To=1106447434.14342.47.camel%40omega.maurer">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009966.html">
+   <LINK REL="Next"  HREF="009970.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] [PATCH] GC Profiling Interfaces</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5BPATCH%5D%20GC%20Profiling%20Interfaces&In-Reply-To=1106447434.14342.47.camel%40omega.maurer"
+       TITLE="[Mono-devel-list] [PATCH] GC Profiling Interfaces">lupus at ximian.com
+       </A><BR>
+    <I>Sun Jan 23 06:16:44 EST 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009966.html">[Mono-devel-list] [PATCH] GC Profiling Interfaces
+</A></li>
+        <LI>Next message: <A HREF="009970.html">[Mono-devel-list] [PATCH] GC Profiling Interfaces
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9967">[ date ]</a>
+              <a href="thread.html#9967">[ thread ]</a>
+              <a href="subject.html#9967">[ subject ]</a>
+              <a href="author.html#9967">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 01/22/05 Ben Maurer wrote:
+&gt;<i> This is the patch that is being used for the heap profiler. I would like
+</I>&gt;<i> to get this into the main repo, so that people don't have to patch the
+</I>&gt;<i> tree.
+</I>
+There are several problems with the patch.
+First, it's not 64 bit clean. You need to use at least size_t
+for heap sizes, but maybe it's better to just use a 64 bit int
+unconditionally.
+Second, you broke the build for the non-internal libgc builds
+and non-libgc builds.
+More below.
+
+&gt;<i>       * Get a call back during every gc. During the call back:
+</I>&gt;<i>               * The world is stopped
+</I>&gt;<i>               * Mark bits are set
+</I>&gt;<i>               * Objects that do not have the mark bit set are still
+</I>&gt;<i>                 intact (ie, they have not bee been cleared
+</I>&gt;<i>         The goal here is to allow the profiler to do a quick heap walk,
+</I>&gt;<i>         so that it can see what is still alive. Paolo before commented
+</I>&gt;<i>         that it would be better to make this a generalized heap walk.
+</I>&gt;<i>         However, this ends up being less useful for my profiler -- I
+</I>&gt;<i>         need to store some extra data for each object (the backtrace of
+</I>&gt;<i>         who allocated it). So, if I did a generalized heap walk, I would
+</I>&gt;<i>         need to store this information in a hashtable. Also, the heap
+</I>&gt;<i>         walk would tell me who *survived* each gc. But what I want to
+</I>&gt;<i>         know is who *died* in each gc. So I have to do even more work.
+</I>&gt;<i>         This just ends up being more useful.
+</I>&gt;<i>       * Test the mark bit for any object -- only useful during the above
+</I>&gt;<i>         callback.
+</I>
+The interface is wrong, IMHO. First, mono_profiler_mark_set() is misnamed:
+it should be mono_object_is_alive () and it should not be included in
+the profiler interface. But even with these changes, I'm not sure we
+can support that interface and the way you use it. Think for example a GC
+that sets the mark bits in the least significant bits of the object header:
+the function can be implemented, but you can't use the object directly.
+I don't want to export assumptions on a GC implementation in a public
+interface.
+As for knowing that an object died vs knowing which objects are alive, it's
+a simple difference which you could do when post processing, too, if needed.
+Either way, we may consider exporting such an ugly interface only if
+the overhead with the heap walk is significant.
+
+&gt;<i>       * Get a callback each time the heap is resized
+</I>
+This is ok, except the 64 bit brokeness and the name: it doesn't need
+to have _profile_ in the name.
+
+&gt;<i>       * Query the (upper bound on) the number of live bytes and the size
+</I>&gt;<i>         of the GC heap at any time.
+</I>
+This is done the wrong way. See below.
+
+&gt;<i> Index: libgc/include/gc.h
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- libgc/include/gc.h	(revision 39325)
+</I>&gt;<i> +++ libgc/include/gc.h	(working copy)
+</I>&gt;<i> @@ -91,7 +91,22 @@
+</I>&gt;<i>  			/* If it returns, it must return 0 or a valid	*/
+</I>&gt;<i>  			/* pointer to a previously allocated heap 	*/
+</I>&gt;<i>  			/* object.					*/
+</I>&gt;<i> +			
+</I>&gt;<i> +GC_API GC_PTR (*GC_profile_marks_set) GC_PROTO((int col_num));
+</I>&gt;<i> +			/* Invoked on every collection. At this time mark
+</I>&gt;<i> +			 * bits are set. A profiler would use this to do 
+</I>&gt;<i> +			 * a heap profile: so it can see what objects are
+</I>&gt;<i> +			 * alive at a given time.
+</I>&gt;<i> +			 */
+</I>&gt;<i> +			 
+</I>&gt;<i> +GC_API GC_PTR (*GC_profile_heap_resize) GC_PROTO((int new_size));
+</I>&gt;<i> +			/* Invoked when the heap grows                  */
+</I>&gt;<i>  
+</I>&gt;<i> +/* Slow/general mark bit manipulation: */
+</I>&gt;<i> +GC_API int GC_is_marked GC_PROTO((char * p));
+</I>&gt;<i> +GC_API void GC_clear_mark_bit GC_PROTO((char * p));
+</I>&gt;<i> +GC_API void GC_set_mark_bit GC_PROTO((char * p));
+</I>
+Why do you export GC_clear_mark_bit and GC_set_mark_bit even if they are not used.
+The fact that they are in the gc_priv.h header should be a strong enough
+hint that care should be applied when exporting them.
+
+&gt;<i> Index: mono/metadata/profiler.c
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- mono/metadata/profiler.c	(revision 39325)
+</I>&gt;<i> +++ mono/metadata/profiler.c	(working copy)
+</I>&gt;<i> @@ -12,6 +12,7 @@
+</I>&gt;<i>  #ifdef HAVE_BACKTRACE_SYMBOLS
+</I>&gt;<i>  #include &lt;execinfo.h&gt;
+</I>&gt;<i>  #endif
+</I>&gt;<i> +#include &lt;mono/os/gc_wrapper.h&gt;
+</I>
+It's not acceptable to depend on the guts of the GC in this file.
+Don't use any Boehm GC specific call here, we need to provide an API,
+not hack the code until it seems to work.
+
+&gt;<i> +void
+</I>&gt;<i> +mono_profiler_gc_get_heap_stats (int* arena_size, int* live_bytes)
+</I>&gt;<i> +{
+</I>&gt;<i> +	if (arena_size)
+</I>&gt;<i> +		*arena_size = GC_get_heap_size ();
+</I>&gt;<i> +	
+</I>&gt;<i> +	if (live_bytes)
+</I>&gt;<i> +		*live_bytes = GC_get_heap_size () - GC_get_free_bytes ();
+</I>&gt;<i> +}
+</I>
+arena_size is not needed, since you have already the heap_resized callback.
+Also, there is no need to have this callback to get the live data size:
+we have already a function in metadata/gc.c that does
+	GC_get_heap_size () - GC_get_free_bytes ()
+to calculate it, so we should simply export two non-GC specific functions:
+
+	void   mono_gc_collect          (int generation_num);
+	gint64 mono_gc_get_total_memory (void);
+
+Note that you can use mono_gc_get_total_memory() when you want and your code
+won't depend on the GC implementation details.
+
+&gt;<i>  MonoProfileCoverageInfo* 
+</I>&gt;<i> Index: mono/metadata/profiler.h
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- mono/metadata/profiler.h	(revision 39325)
+</I>&gt;<i> +++ mono/metadata/profiler.h	(working copy)
+</I>&gt;<i> @@ -64,6 +64,8 @@
+</I>&gt;<i>  typedef void (*MonoProfileThreadFunc)     (MonoProfiler *prof, guint32 tid);
+</I>&gt;<i>  typedef void (*MonoProfileAllocFunc)      (MonoProfiler *prof, MonoObject *obj, MonoClass *klass);
+</I>&gt;<i>  typedef void (*MonoProfileStatFunc)       (MonoProfiler *prof, guchar *ip, void *context);
+</I>&gt;<i> +typedef void (*MonoProfileGCFunc)       (MonoProfiler *prof, int gc_num);
+</I>
+This interface is wrong: it should provide GC events such as GC start
+and GC end and it should include the generation number.
+
+enum {
+	/* maybe also add suspend and resume events */
+	MONO_GC_EVENT_START,
+	MONO_GC_EVENT_RECLAIM,
+	MONO_GC_EVENT_END
+};
+
+typedef void (*MonoProfileGCFunc)         (MonoProfiler *prof, int event_type, int gen_num);
+
+Of course for the current GC the generation number will be always 0, but
+the interface will work with the new GC. Note also that the generation number
+is not needed, since you can easily keep your counter when the MONO_GC_EVENT_START
+event is received.
+
+&gt;<i> +typedef void (*MonoProfileGCHeapResizeFunc)       (MonoProfiler *prof, int new_size);
+</I>
+Note again it's not 64 bit clean.
+
+&gt;<i> +/* data gathering */
+</I>&gt;<i> +
+</I>&gt;<i> +gboolean mono_profiler_mark_set (MonoObject* o);
+</I>&gt;<i> +void mono_profiler_gc_get_heap_stats (int* arena_size, int* live_bytes);
+</I>
+These have nothing to do with the profiler, so they should not be here.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009966.html">[Mono-devel-list] [PATCH] GC Profiling Interfaces
+</A></li>
+	<LI>Next message: <A HREF="009970.html">[Mono-devel-list] [PATCH] GC Profiling Interfaces
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9967">[ date ]</a>
+              <a href="thread.html#9967">[ thread ]</a>
+              <a href="subject.html#9967">[ subject ]</a>
+              <a href="author.html#9967">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

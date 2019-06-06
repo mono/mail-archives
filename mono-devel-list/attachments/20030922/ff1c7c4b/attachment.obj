@@ -1,0 +1,419 @@
+diff -uN c:\DIFF\old\System.Data\System.Data/DataRow.cs c:\DIFF\new\System.Data\System.Data/DataRow.cs
+--- c:\DIFF\old\System.Data\System.Data/DataRow.cs	2003-08-24 08:38:53.000000000 +0300
++++ c:\DIFF\new\System.Data\System.Data/DataRow.cs	2003-09-16 09:32:11.009783300 +0300
+@@ -71,8 +71,11 @@
+ 					this [Col] = Col.AutoIncrementValue();
+ 				}
+ 			}
++
++			_table.Columns.CollectionChanged += new System.ComponentModel.CollectionChangeEventHandler(CollectionChanged);
+ 		}
+ 
++		
+ 		#endregion
+ 
+ 		#region Properties
+@@ -812,8 +815,89 @@
+ 		{
+ 			throw new NotImplementedException ();
+ 		}
++		
++		//Copy all values of this DataaRow to the row parameter.
++		internal void CopyValuesToRow(DataRow row)
++		{
++			if (row == null)
++				throw new ArgumentNullException("row");
++			if (row == this)
++				throw new ArgumentException("'row' is the same as this object");
++
++			DataColumnCollection columns = Table.Columns;
++			
++			for(int i = 0; i < columns.Count; i++){
++				string columnName = columns[i].ColumnName;
++				int index = row.Table.Columns.IndexOf(columnName);
++				//if a column withe the same name exists in bote rows copy the values
++				if(index != -1) {
++					row.original[index] = row.SetColumnValue(this[i, DataRowVersion.Original], index);
++					row.current[index] = row.SetColumnValue(this[i, DataRowVersion.Current], index);
++					row.proposed[index] = row.SetColumnValue(this[i, DataRowVersion.Proposed], index);
++				}
++			}
++
++			row.rowState = RowState;
++			row.RowError = RowError;
++			row.columnErrors = columnErrors;
++		}
+ 
+ 		
++		public void CollectionChanged(object sender, System.ComponentModel.CollectionChangeEventArgs args)
++		{
++			// if a column is added we hava to add an additional value the 
++			// the priginal, current and propoed arrays.
++			// this scenario can happened in merge operation.
++
++			if (args.Action == System.ComponentModel.CollectionChangeAction.Add)
++			{
++				object[] tmp = new object[current.Length + 1];
++				Array.Copy (current, tmp, current.Length);
++				tmp[tmp.Length - 1] = DBNull.Value;
++				current = tmp;
++
++				if (proposed != null)
++				{
++					tmp = new object[proposed.Length + 1];
++					Array.Copy (proposed, tmp, proposed.Length);
++					proposed = tmp;
++				}
++				if(original != null)
++				{
++					tmp = new object[original.Length + 1];
++					Array.Copy (original, tmp, original.Length);
++					original = tmp;
++				}
++
++			}
++		}
++
++		internal bool IsRowChanged(DataRowState rowState) {
++			if((RowState & rowState) != 0)
++				return true;
++
++			//we need to find if child rows of this row changed.
++			//if yes - we should return true
++
++			// if the rowState is deleted we should get the original version of the row
++			// else - we should get the current version of the row.
++			DataRowVersion version = (rowState == DataRowState.Deleted) ? DataRowVersion.Original : DataRowVersion.Current;
++			int count = Table.ChildRelations.Count;
++			for (int i = 0; i < count; i++){
++				DataRelation rel = Table.ChildRelations[i];
++				DataRow[] childRows = GetChildRows(rel, version);
++				for (int j = 0; j < childRows.Length; j++){
++					if (childRows[j].IsRowChanged(rowState))
++						return true;
++				}
++			}
++
++			return false;
++		}
++
+ 		#endregion // Methods
+ 	}
++
++	
++
+ }
+diff -uN c:\DIFF\old\System.Data\System.Data/DataSet.cs c:\DIFF\new\System.Data\System.Data/DataSet.cs
+--- c:\DIFF\old\System.Data\System.Data/DataSet.cs	2003-08-24 08:38:54.000000000 +0300
++++ c:\DIFF\new\System.Data\System.Data/DataSet.cs	2003-09-22 15:56:55.572047400 +0300
+@@ -23,6 +23,7 @@
+ using System.Xml;
+ using System.Xml.Schema;
+ using System.Xml.Serialization;
++using System.Data.Common;
+ 
+ namespace System.Data {
+ 	/// <summary>
+@@ -160,19 +161,42 @@
+ 		[MonoTODO]
+ 		public void Merge (DataRow[] rows, bool preserveChanges, MissingSchemaAction missingSchemaAction)
+ 		{
+-			throw new NotImplementedException();
++			if(rows == null)
++				throw new ArgumentNullException("rows");
++			if(!IsLegalSchemaAction(missingSchemaAction))
++				throw new ArgumentOutOfRangeException("missingSchemaAction");
++			
++			MergeManager.Merge(this, rows, preserveChanges, missingSchemaAction);
+ 		}
+ 		
+ 		[MonoTODO]
+ 		public void Merge (DataSet dataSet, bool preserveChanges, MissingSchemaAction missingSchemaAction)
+ 		{
+-			throw new NotImplementedException();
++			if(dataSet == null)
++				throw new ArgumentNullException("dataSet");
++			if(!IsLegalSchemaAction(missingSchemaAction))
++				throw new ArgumentOutOfRangeException("missingSchemaAction");
++			
++			MergeManager.Merge(this, dataSet, preserveChanges, missingSchemaAction);
+ 		}
+ 		
+ 		[MonoTODO]
+ 		public void Merge (DataTable table, bool preserveChanges, MissingSchemaAction missingSchemaAction)
+ 		{
+-			throw new NotImplementedException();
++			if(table == null)
++				throw new ArgumentNullException("table");
++			if(!IsLegalSchemaAction(missingSchemaAction))
++				throw new ArgumentOutOfRangeException("missingSchemaAction");
++			
++			MergeManager.Merge(this, table, preserveChanges, missingSchemaAction);
++		}
++
++		private static bool IsLegalSchemaAction(MissingSchemaAction missingSchemaAction)
++		{
++			if (missingSchemaAction == MissingSchemaAction.Add || missingSchemaAction == MissingSchemaAction.AddWithKey
++				|| missingSchemaAction == MissingSchemaAction.Error || missingSchemaAction == MissingSchemaAction.Ignore)
++				return true;
++			return false;
+ 		}
+ 		
+ 		[DataCategory ("Data")]
+@@ -298,15 +322,40 @@
+ 
+ 		public DataSet GetChanges()
+ 		{
+-			throw new NotImplementedException ();
++			return GetChanges(DataRowState.Added | DataRowState.Deleted | DataRowState.Modified);
+ 		}
+ 
+ 		
+ 		public DataSet GetChanges(DataRowState rowStates)
+ 		{
+-			throw new NotImplementedException ();
++			if(!HasChanges(rowStates))
++				return null;
++			
++			DataSet copySet = Clone();
++			IEnumerator tableEnumerator = Tables.GetEnumerator();
++			DataTable origTable;
++			DataTable copyTable;
++			while (tableEnumerator.MoveNext())
++			{
++				origTable = (DataTable)tableEnumerator.Current;
++				copyTable = copySet.Tables[origTable.TableName];
++
++				IEnumerator rowEnumerator = origTable.Rows.GetEnumerator();
++				while (rowEnumerator.MoveNext())
++				{
++					DataRow row = (DataRow)rowEnumerator.Current;
++					if (row.IsRowChanged(rowStates))
++					{
++						DataRow newRow = copyTable.NewRow();
++						copyTable.Rows.Add(newRow);
++						row.CopyValuesToRow(newRow);
++					}
++				}
++			}
++			return copySet;
+ 		}
+ 
++		
+ 		public string GetXml()
+ 		{
+ 			StringWriter Writer = new StringWriter ();
+@@ -324,13 +373,32 @@
+ 		[MonoTODO]
+ 		public bool HasChanges()
+ 		{
+-			throw new NotImplementedException ();
++			return HasChanges(DataRowState.Added | DataRowState.Deleted | DataRowState.Modified);
+ 		}
+ 
+ 		[MonoTODO]
+ 		public bool HasChanges(DataRowState rowState)
+ 		{
+-			throw new NotImplementedException ();
++			if(((int)rowState & 0xffffffe0) != 0)
++				throw new ArgumentOutOfRangeException("rowState");
++
++			DataTableCollection tableCollection = Tables;
++			DataTable table;
++			DataRowCollection rowCollection;
++			DataRow row;
++			for (int i = 0; i < tableCollection.Count; i++)
++			{
++				table = tableCollection[i];
++				rowCollection = table.Rows;
++				for (int j = 0; j < rowCollection.Count; j++)
++				{
++					row = rowCollection[j];
++					if((row.RowState & rowState) != 0)
++						return true;
++				}
++			}
++
++			return false;		
+ 		}
+ 
+ 		[MonoTODO]
+@@ -360,7 +428,7 @@
+ 
+ 		public virtual void RejectChanges()
+ 		{
+-			throw new NotImplementedException ();
++			throw new NotImplementedException();
+ 		}
+ 
+ 		public virtual void Reset()
+diff -uN c:\DIFF\old\System.Data\System.Data/MergeManager.cs c:\DIFF\new\System.Data\System.Data/MergeManager.cs
+--- c:\DIFF\old\System.Data\System.Data/MergeManager.cs	1970-01-01 02:00:00.000000000 +0200
++++ c:\DIFF\new\System.Data\System.Data/MergeManager.cs	2003-09-17 07:26:07.911791100 +0300
+@@ -0,0 +1,166 @@
++using System;
++
++namespace System.Data
++{
++	/// <summary>
++	/// Summary description for MergeManager.
++	/// </summary>
++	internal class MergeManager
++	{
++		internal static void Merge(DataSet targetSet, DataSet sourceSet, bool preserveChanges, MissingSchemaAction missingSchemaAction)
++		{
++			if(targetSet == null)
++				throw new ArgumentNullException("targetSet");
++			if(sourceSet == null)
++				throw new ArgumentNullException("sourceSet");
++
++			foreach (DataTable t in sourceSet.Tables)
++				MergeManager.Merge(targetSet, t, preserveChanges, missingSchemaAction);
++
++		}
++
++		internal static void Merge(DataSet targetSet, DataTable sourceTable, bool preserveChanges, MissingSchemaAction missingSchemaAction)
++		{
++			if(targetSet == null)
++				throw new ArgumentNullException("targetSet");
++			if(sourceTable == null)
++				throw new ArgumentNullException("sourceTable");
++
++			
++			AdjustSchema(targetSet, sourceTable, missingSchemaAction);
++			checkColumnTypes(targetSet.Tables[sourceTable.TableName], sourceTable); // check that the colums datatype is the same
++			fillData(targetSet.Tables[sourceTable.TableName], sourceTable, preserveChanges);
++			
++		}
++
++		internal static void Merge(DataSet targetSet, DataRow[] sourceRows, bool preserveChanges, MissingSchemaAction missingSchemaAction)
++		{
++			if(targetSet == null)
++				throw new ArgumentNullException("targetSet");
++			if(sourceRows == null)
++				throw new ArgumentNullException("sourceRows");
++
++			for (int i = 0; i < sourceRows.Length; i++)
++			{
++				DataRow row = sourceRows[i];
++				DataTable sourceTable = row.Table;
++				AdjustSchema(targetSet, sourceTable, missingSchemaAction);
++				checkColumnTypes(targetSet.Tables[row.Table.TableName], row.Table);
++				MergeRow(targetSet.Tables[sourceTable.TableName], row, preserveChanges);
++			}
++		}
++
++		// merge a row into a target table.
++		private static void MergeRow(DataTable targetTable, DataRow row, bool preserveChanges)
++		{
++			DataColumnCollection columns = row.Table.Columns;
++			DataColumn[] primaryKeys = targetTable.PrimaryKey;
++			DataRow targetRow = null;
++			if (primaryKeys != null && primaryKeys.Length > 0) // if there are any primary key.
++			{
++				bool foundKeyInSourceTable = true;
++				// check that all primary keys exists in the source table.
++				for (int j = 0; j < primaryKeys.Length; j++)
++				{
++					if(!row.Table.Columns.Contains(primaryKeys[j].ColumnName))
++					{
++						foundKeyInSourceTable = false;
++						break;
++					}
++				}
++				// if all primary key found in the source table
++				if(foundKeyInSourceTable)
++				{
++					// initiate an array that has the values of the primary keys.
++					object[] keyValues = new object[primaryKeys.Length];
++					for (int j = 0; j < keyValues.Length; j++)
++					{
++						keyValues[j] = row[primaryKeys[j].ColumnName];
++					}
++				
++					// find the row in the target table.
++					targetRow = targetTable.Rows.Find(keyValues);
++				}
++			}
++			// row doesn't exist in target table, or there are no primary keys.
++			// create new row and copy values from source row to the new row.
++			if (targetRow == null)
++			{ 
++				targetRow = targetTable.NewRow();
++				for(int j = 0; j < columns.Count; j++)
++				{
++					targetRow[columns[j].ColumnName] = row[columns[j].ColumnName];
++				}
++				targetTable.Rows.Add(targetRow);
++			}
++			// row exists in target table, and presere changes is false - 
++			// change the values of the target row to the values of the source row.
++			else if (!preserveChanges)
++			{
++				for(int j = 0; j < columns.Count; j++)
++				{
++					targetRow[columns[j].ColumnName] = row[columns[j].ColumnName];
++				}
++			}
++
++		}
++			
++		
++		
++		// adjust the table schema according to the missingschemaaction param.
++		private static void AdjustSchema(DataSet targetSet, DataTable sourceTable, MissingSchemaAction missingSchemaAction)
++		{
++			string tableName = sourceTable.TableName;
++			
++			// if the source table not exists in the target dataset
++			// we act according to the missingschemaaction param.
++			if (!targetSet.Tables.Contains(tableName))
++			{
++				if (missingSchemaAction == MissingSchemaAction.Ignore)
++					return;
++				if (missingSchemaAction == MissingSchemaAction.Error)
++					throw new ArgumentException(Res.GetString("DataMerge_MissingDefinition", new object[] {tableName}));
++				targetSet.Tables.Add((DataTable)sourceTable.Clone());
++			}
++			
++			DataTable table = targetSet.Tables[tableName];
++			for (int i = 0; i < sourceTable.Columns.Count; i++)
++			{
++				DataColumn col = sourceTable.Columns[i];
++				// if a column from the source table doesn't exists in the target table
++				// we act according to the missingschemaaction param.
++				if(!table.Columns.Contains(col.ColumnName))
++				{
++					if (missingSchemaAction == MissingSchemaAction.Ignore)
++						continue;
++					if (missingSchemaAction == MissingSchemaAction.Error)
++						throw new ArgumentException(("Column '" + col.ColumnName + "' does not belong to table Items."));
++					
++					table.Columns.Add(new DataColumn(col.ColumnName, col.DataType, col.Expression, col.ColumnMapping));
++				}
++			}
++		}
++		
++		// fill the data from the source table to the target table
++		private static void fillData(DataTable targetTable, DataTable sourceTable, bool preserveChanges)
++		{
++			for (int i = 0; i < sourceTable.Rows.Count; i++)
++			{
++				DataRow row = sourceTable.Rows[i];
++				MergeRow(targetTable, row, preserveChanges);
++			}
++		}
++		
++		// check tha column from 2 tables that has the same name also has the same datatype.
++		private static void checkColumnTypes(DataTable targetTable, DataTable sourceTable)
++		{
++			for (int i = 0; i < sourceTable.Columns.Count; i++)
++			{
++				DataColumn fromCol = sourceTable.Columns[i];
++				DataColumn toCol = targetTable.Columns[fromCol.ColumnName];
++				if(toCol.DataType != fromCol.DataType)
++					throw new DataException(Res.GetString("DataMerge_DataTypeMismatch", new Object[] {fromCol.ColumnName}));
++			}
++		}
++	}
++}

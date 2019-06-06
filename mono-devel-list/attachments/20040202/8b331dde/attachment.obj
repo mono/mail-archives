@@ -1,0 +1,411 @@
+Index: corlib_test.dll.sources
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/corlib_test.dll.sources,v
+retrieving revision 1.24
+diff -u -r1.24 corlib_test.dll.sources
+--- corlib_test.dll.sources	15 Jan 2004 04:28:34 -0000	1.24
++++ corlib_test.dll.sources	2 Feb 2004 16:25:05 -0000
+@@ -1,4 +1,5 @@
+ System/AppDomainSetupTest.cs
++System/AppDomainTest.cs
+ System/ArrayTest.cs
+ System/AttributeTest.cs
+ System/BitConverterTest.cs
+Index: System/AppDomain.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System/AppDomain.cs,v
+retrieving revision 1.53
+diff -u -r1.53 AppDomain.cs
+--- System/AppDomain.cs	12 Jan 2004 16:01:29 -0000	1.53
++++ System/AppDomain.cs	2 Feb 2004 16:25:05 -0000
+@@ -7,8 +7,10 @@
+ //   Miguel de Icaza (miguel@ximian.com)
+ //   Gonzalo Paniagua (gonzalo@ximian.com)
+ //   Patrik Torstensson
++//   Sebastien Pouliot (sebastien@ximian.com)
+ //
+ // (C) 2001, 2002 Ximian, Inc.  http://www.ximian.com
++// (C) 2004 Novell (http://www.novell.com)
+ //
+ 
+ using System;
+@@ -24,9 +26,10 @@
+ using System.Runtime.Remoting.Contexts;
+ using System.Runtime.Remoting.Channels;
+ using System.Runtime.Remoting.Messaging;
+-using System.Security.Principal;
+-using System.Security.Policy;
+ using System.Security;
++using System.Security.Permissions;
++using System.Security.Policy;
++using System.Security.Principal;
+ using System.Configuration.Assemblies;
+ 
+ namespace System {
+@@ -45,6 +48,12 @@
+ 
+ 		// Evidence evidence;
+ 
++		[ThreadStatic]
++		private PrincipalPolicy _principalPolicy;
++
++		[ThreadStatic]
++		private IPrincipal _principal;
++
+ 		AppDomain () {}
+ 
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+@@ -103,6 +112,23 @@
+ 				//return evidence;
+ 			}
+ 		}
++
++		internal IPrincipal DefaultPrincipal {
++			get { 
++				if (_principal == null) {
++					switch (_principalPolicy) {
++						case PrincipalPolicy.UnauthenticatedPrincipal:
++							_principal = new GenericPrincipal (
++								new GenericIdentity (String.Empty, String.Empty), null);
++							break;
++						case PrincipalPolicy.WindowsPrincipal:
++							_principal = new WindowsPrincipal (WindowsIdentity.GetCurrent ());
++							break;
++					}
++				}
++				return _principal; 
++			}
++		}
+ 		
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+ 		private static extern AppDomain getCurDomain ();
+@@ -517,10 +543,13 @@
+ 			SetupInformation.CachePath = s;
+ 		}
+ 		
+-		[MonoTODO]
+ 		public void SetPrincipalPolicy (PrincipalPolicy policy)
+ 		{
+-			throw new NotImplementedException ();
++			new SecurityPermission (SecurityPermissionFlag.ControlPrincipal).Demand ();
++			if (IsFinalizingForUnload ())
++				throw new AppDomainUnloadedException ();
++
++			_principalPolicy = policy;
+ 		}
+ 
+ 		public void SetShadowCopyFiles()
+@@ -533,12 +562,19 @@
+ 			SetupInformation.ShadowCopyDirectories = s;
+ 		}
+ 		
+-		[MonoTODO]
+ 		public void SetThreadPrincipal (IPrincipal principal)
+ 		{
+-			throw new NotImplementedException ();
++			new SecurityPermission (SecurityPermissionFlag.ControlPrincipal).Demand ();
++			if (principal == null)
++				throw new ArgumentNullException ("principal");
++			if (_principal != null)
++				throw new PolicyException ("principal already present");
++			if (IsFinalizingForUnload ())
++				throw new AppDomainUnloadedException ();
++
++			_principal = principal;
+ 		}
+-		
++
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+ 		private static extern AppDomain InternalSetDomainByID (int domain_id);
+  
+Index: System.Threading/Thread.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.Threading/Thread.cs,v
+retrieving revision 1.43
+diff -u -r1.43 Thread.cs
+--- System.Threading/Thread.cs	22 Jan 2004 03:29:37 -0000	1.43
++++ System.Threading/Thread.cs	2 Feb 2004 16:25:05 -0000
+@@ -8,6 +8,7 @@
+ //
+ 
+ using System.Runtime.Remoting.Contexts;
++using System.Security.Permissions;
+ using System.Security.Principal;
+ using System.Globalization;
+ using System.Runtime.CompilerServices;
+@@ -41,6 +42,7 @@
+ 		private ThreadStart threadstart;
+ 		private string thread_name=null;
+ 		
++		private IPrincipal _principal;
+ 		
+ 		public static Context CurrentContext {
+ 			get {
+@@ -48,16 +50,16 @@
+ 			}
+ 		}
+ 
+-		[MonoTODO]
+ 		public static IPrincipal CurrentPrincipal {
+ 			get {
+-				// FIXME -
+-				// System.Security.Principal.IPrincipal
+-				// not yet implemented
+-				return(null);
++				IPrincipal p = CurrentThread._principal;
++				if (p == null)
++					p = GetDomain ().DefaultPrincipal;
++				return p;
+ 			}
+-			
+ 			set {
++				new SecurityPermission (SecurityPermissionFlag.ControlPrincipal).Demand ();
++				CurrentThread._principal = value;
+ 			}
+ 		}
+ 
+Index: Test/System.Threading/ThreadTest.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/Test/System.Threading/ThreadTest.cs,v
+retrieving revision 1.4
+diff -u -r1.4 ThreadTest.cs
+--- Test/System.Threading/ThreadTest.cs	28 Jan 2003 09:52:07 -0000	1.4
++++ Test/System.Threading/ThreadTest.cs	2 Feb 2004 16:25:05 -0000
+@@ -1,20 +1,78 @@
+ // ThreadTest.cs - NUnit Test Cases for the System.Threading.Thread class
+ //
+-// Eduardo Garcia Cebollero (kiwnix@yahoo.es)
++// Authors
++//	Eduardo Garcia Cebollero (kiwnix@yahoo.es)
++//	Sebastien Pouliot  <sebastien@ximian.com>
+ //
+ // (C) Eduardo Garcia Cebollero.
+ // (C) Ximian, Inc.  http://www.ximian.com
++// (C) 2004 Novell (http://www.novell.com)
+ //
+ 
+ using NUnit.Framework;
+ using System;
++using System.Security.Principal;
+ using System.Threading;
+ 
+-namespace MonoTests.System.Threading
+-{
+-	[Ignore("these tests fail randomly")]
+-	public class ThreadTest : TestCase
+-	{
++namespace MonoTests.System.Threading {
++
++	public class ThreadedPrincipalTest : Assertion {
++
++		public static void NoPrincipal () 
++		{
++			AppDomain.CurrentDomain.SetPrincipalPolicy (PrincipalPolicy.NoPrincipal);
++			IPrincipal p = Thread.CurrentPrincipal;
++			AssertNull ("Thread.CurrentPrincipal-1", p);
++
++			Thread.CurrentPrincipal = new GenericPrincipal (new GenericIdentity ("mono"), null);
++			AssertNotNull ("Thread.CurrentPrincipal-2", Thread.CurrentPrincipal);
++
++			Thread.CurrentPrincipal = null;
++			AssertNull ("Thread.CurrentPrincipal-3", Thread.CurrentPrincipal);
++			// in this case we can return to null
++		}
++
++		public static void UnauthenticatedPrincipal () 
++		{
++			AppDomain.CurrentDomain.SetPrincipalPolicy (PrincipalPolicy.UnauthenticatedPrincipal);
++			IPrincipal p = Thread.CurrentPrincipal;
++			AssertNotNull ("Thread.CurrentPrincipal", p);
++			Assert ("Type", (p is GenericPrincipal));
++			AssertEquals ("Name", String.Empty, p.Identity.Name);
++			AssertEquals ("AuthenticationType", String.Empty, p.Identity.AuthenticationType);
++			Assert ("IsAuthenticated", !p.Identity.IsAuthenticated);
++
++			Thread.CurrentPrincipal = new GenericPrincipal (new GenericIdentity ("mono"), null);
++			AssertNotNull ("Thread.CurrentPrincipal-2", Thread.CurrentPrincipal);
++
++			Thread.CurrentPrincipal = null;
++			AssertNotNull ("Thread.CurrentPrincipal-3", Thread.CurrentPrincipal);
++			// in this case we can't return to null
++		}
++
++		public static void WindowsPrincipal () 
++		{
++			AppDomain.CurrentDomain.SetPrincipalPolicy (PrincipalPolicy.WindowsPrincipal);
++			IPrincipal p = Thread.CurrentPrincipal;
++			AssertNotNull ("Thread.CurrentPrincipal", p);
++			Assert ("Type", (p is WindowsPrincipal));
++			Assert ("Name", (p.Identity.Name.IndexOf (@"\") > 0)); // DOMAIN\User
++			AssertEquals ("AuthenticationType", "NTLM", p.Identity.AuthenticationType);
++			Assert ("IsAuthenticated", p.Identity.IsAuthenticated);
++
++			// note: we can switch from a WindowsPrincipal to a GenericPrincipal
++			Thread.CurrentPrincipal = new GenericPrincipal (new GenericIdentity ("mono"), null);
++			AssertNotNull ("Thread.CurrentPrincipal-2", Thread.CurrentPrincipal);
++
++			Thread.CurrentPrincipal = null;
++			AssertNotNull ("Thread.CurrentPrincipal-3", Thread.CurrentPrincipal);
++			// in this case we can't return to null
++		}
++	}
++
++	[TestFixture]
++	public class ThreadTest : Assertion {
++
+ 		//Some Classes to test as threads
+ 		private class C1Test
+ 		{
+@@ -47,6 +105,7 @@
+ 				endm2 = true;
+ 			}
+ 		}
++
+ 		private class C2Test
+ 		{
+ 			public int cnt;
+@@ -130,6 +189,7 @@
+ 			}
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestCtor1()
+ 		{			
+ 			C1Test test1 = new C1Test();
+@@ -143,6 +203,7 @@
+ 			}
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestStart()
+ 		{
+ 		{
+@@ -186,6 +247,7 @@
+ 		}
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestApartment()
+ 		{
+ 			C2Test test1 = new C2Test();
+@@ -198,6 +260,7 @@
+ 			AssertEquals("#21 Apartment State Changed when not needed",before,after);
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestApartmentState()
+ 		{
+ 			C2Test test1 = new C2Test();
+@@ -210,6 +273,7 @@
+ 			AssertEquals("#31 Apartment State Changed when not needed: ",before,after);
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestPriority1()
+ 		{
+ 			C2Test test1 = new C2Test();
+@@ -223,6 +287,7 @@
+ 			AssertEquals("#41 Unexpected Priority Change: ",before,after);
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestPriority2()
+ 		{
+ 			C2Test test1 = new C2Test();
+@@ -235,6 +300,7 @@
+ 			AssertEquals("#44 Incorrect Priority in Aborted thread: ",ThreadPriority.Normal, TestThread.Priority);
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestPriority3()
+ 		{
+ 			
+@@ -255,6 +321,7 @@
+ 		}
+ 
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestIsBackground1()
+ 		{
+ 			C2Test test1 = new C2Test();
+@@ -266,6 +333,7 @@
+ 			Assert("#51 IsBackground not set at the default state: ",!(state));
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestIsBackground2()
+ 		{
+ 			C2Test test1 = new C2Test();
+@@ -277,6 +345,7 @@
+ 		}
+ 
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestName()
+ 		{
+ 			C2Test test1 = new C2Test();
+@@ -291,6 +360,7 @@
+ 			TestThread.Abort();
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestNestedThreads1()
+ 		{
+ 			C3Test  test1 = new C3Test();
+@@ -326,6 +396,7 @@
+ 			}
+ 		}
+ 
++		[Ignore("these tests fail randomly")]
+ 		public void TestJoin1()
+ 		{
+ 			C1Test test1 = new C1Test();
+@@ -349,6 +420,7 @@
+ 			}
+ 		}
+ 		
++		[Ignore("these tests fail randomly")]
+ 		public void TestThreadState()
+ 		{
+ 			//TODO: Test The rest of the possible transitions
+@@ -365,9 +437,36 @@
+ 			Assert("#103 Wrong Thread State", ThreadState.Stopped == TestThread.ThreadState 
+ 				|| ThreadState.Aborted == TestThread.ThreadState);
+ 		} 
+-	}
+ 
++		[Test]
++		public void CurrentPrincipal_PrincipalPolicy_NoPrincipal () 
++		{
++			// note: switching from PrincipalPolicy won't work inside the same thread
++			// because as soon as a Principal object is created the Policy doesn't matter anymore
++			Thread t = new Thread (new ThreadStart (ThreadedPrincipalTest.NoPrincipal));
++			t.Start ();
++			while (t.IsAlive) {}
++		}
++
++		[Test]
++		public void CurrentPrincipal_PrincipalPolicy_UnauthenticatedPrincipal () 
++		{
++			// note: switching from PrincipalPolicy won't work inside the same thread
++			// because as soon as a Principal object is created the Policy doesn't matter anymore
++			Thread t = new Thread (new ThreadStart (ThreadedPrincipalTest.UnauthenticatedPrincipal));
++			t.Start ();
++			while (t.IsAlive) {}
++		}
++
++		[Test]
++		[Ignore ("WindowsPrincipal is not yet supported on Mono")]
++		public void CurrentPrincipal_PrincipalPolicy_WindowsPrincipal () 
++		{
++			// note: switching from PrincipalPolicy won't work inside the same thread
++			// because as soon as a Principal object is created the Policy doesn't matter anymore
++			Thread t = new Thread (new ThreadStart (ThreadedPrincipalTest.WindowsPrincipal));
++			t.Start ();
++			while (t.IsAlive) {}
++		}
++	}
+ }
+-		
+-
+-

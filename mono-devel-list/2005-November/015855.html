@@ -1,0 +1,218 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Wishlist for the new IR
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Wishlist%20for%20the%20new%20IR&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="015894.html">
+   <LINK REL="Next"  HREF="015858.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Wishlist for the new IR</H1>
+    <B>Massimiliano Mantione</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Wishlist%20for%20the%20new%20IR&In-Reply-To="
+       TITLE="[Mono-dev] Wishlist for the new IR">massi at ximian.com
+       </A><BR>
+    <I>Thu Nov 17 07:12:22 EST 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="015894.html">[Mono-dev] Gnome.Vfs Initialization
+</A></li>
+        <LI>Next message: <A HREF="015858.html">[Mono-dev] XSL tranform result without some white spaces
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15855">[ date ]</a>
+              <a href="thread.html#15855">[ thread ]</a>
+              <a href="subject.html#15855">[ subject ]</a>
+              <a href="author.html#15855">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+I see that work on the new IR will start soon...
+
+Here is a list of things that I think it should have.
+This is just from the top of my head, I didn't re-read all of the
+HSSA code to see every point in which I would have liked something
+more, but anyway if we'll have the infrastructure to handle all the
+issues I present here adding the missing bits will be trivial ;-)
+
+Of course these are just &quot;wishes&quot;, let's discuss them...
+I just wanted to discuss them before the work starts.
+
+
+*** Declarative opcode metadata
+
+For each opcode, these informations should be easily available,
+also to offline tools that could be used to generate pieces of
+C code at build time:
+
+- Arity: now there's mono_burg_arity, and it is invaluable, but I
+  wish the information were provided offline (and just checked by
+  monoburg or anything that will replace instruction selection).
+
+- Possible (i.e. allowed) &quot;stack types&quot; for arguments and result.
+  I know we'll not have the concept of &quot;evaluation stack&quot; anymore
+  because the IR will be linear, but the info is still useful in
+  itself applied to input and output virtual registers.
+  Moreover, it should be exactly known which are the input values
+  used in the opcode, and in which MonoInst field they can be
+  found.
+
+- It should be clear if the opcode has special &quot;side effects&quot; (like
+  OP_CALL), or if its *only* effect is read from its argument[s]
+  and write to its destination virtual registers.
+  Moreover, it should be clear if the semantics of the opcode is
+  such that, given identical input values, it will always give the
+  same result.
+  This is really important because certain classes of optimizations
+  can be applied (or not) depending on this.
+  Now in HSSA, SSAPRE, alias analysis, and in practice everything
+  else I rely on giant switch statements, which are *fugly* (and
+  often quite fragile, because there's always some opcode which I
+  don't fully understand so the &quot;default&quot; case is generally a
+  &quot;safe fallback&quot; and not an &quot;assert this doesn't happen&quot;).
+
+- It should also be clearly stated in which &quot;stage&quot; of the JIT
+  each opcode can be legally found.
+  Now we have a general distinction between CEE_* and OP_*, but
+  it is almost meaningless because most CEE_* opcodes are re-used
+  in the IR.
+  If it were for me, I'd also consider a radical change, which
+  would be avoid reusing CEE_* values at all (and of course create
+  all the necessary OP_* values to handle this).
+  Quite often, the semantics of CEE_ opcodes changes subtly between
+  their use in the CIL stream and their use in the IR, and this
+  would give us troubles in keeping the opcode metadata meaningful.
+  Also, consider that mono_method_to_ir is a giant switch anyway,
+  and inside it the benefit of reusing the CEE_* values is so small
+  that I would say it is nonexistent.
+  This would also make things much clearer &quot;by default&quot;: CEE_*
+  opcodes would be allowed in the CIL stream (plus the CEE_MONO_*
+  additions in the case of wrappers I guess).
+  Inside the IR we'd just have OP_* opcodes, ant their numbers
+  would have *nothing* to do with the CEE_ ones (they would simply
+  restart from zero).
+  Note that in any case we should have declarative knowledge of which
+  OP_* opcodes are allowed in each JIT stage.
+
+- Then there are a couple of operations where we lose too much
+  information in our IR: field accesses and method calls.
+  We keep CEE_LDELEMA opcodes, but we lose field access opcodes
+  after mono_method_to_ir. In HSSA I coded around this, but having
+  the information explicit would makes things easier, and also
+  allow more effective alias analysis.
+  And about method calls the issue I have is that it is not possible
+  to relate each OP_OUTARG[_*] opcode (which is an actual argument)
+  to its formal argument. Again, I coded around this but in the
+  future having the information would allow more precise alias
+  analysis (distinction between out and in-out parameters comes to
+  mind, but most of all *global* analysis when doing AOT).
+  Also, sometimes we read vtable values, which are likely to be
+  read-only in practice (or under the right conditions).
+  Now this information is totally lost, in the IR there's just a
+  lot of pointer arithmetic.
+
+- I'd also like to see a general rework of the &quot;ssa_op&quot; and &quot;flags&quot;
+  MonoInst fields. Quite often they encode information that should
+  be known at build time, or information that belongs to local
+  variables (see below for a discussion on how they should change).
+  And anyway, we should have declarative knowledge of the exact set
+  of flags allowed for each opcode.
+
+
+*** Storage (local variables and virtual registers):
+
+- Local variables should not have a MonoInst anymore IMHO (which
+  means that OP_LOCAL and OP_ARG opcodes shuld disappear).
+  The rationale is that in a linear IR it is obvious that the
+  instruction operands are virtual registers and not MonoInst
+  structs, so it's pointless having special MonoInst opcodes to
+  represent locations.
+  This would have the nice side effect of making the two parallel
+  arrays for locals (&quot;varinfo&quot; and &quot;vars&quot;) go away, and be replaced
+  by a single one.
+
+- As part of this change, we should make &quot;MonoMethodVar&quot; go on a
+  diet :-)
+  Without jokes, with the linear IR the number of locals will go
+  up, so it would be nice to make them cheaper.
+  Ideally, every virtual register (VR) should just have:
+  - An id (a number).
+  - A MonoType (what kind of value can be stored in the VR).
+  - A few flags (volatile, address needed =&gt; don't allocate on
+    a HW register...).
+  - Liveness info, and maybe space for &quot;regalloc hints&quot;.
+  Note that with HSSA all the following fields are *not* needed:
+  dfrontier, def_in, def, def_bb, uses, cpstate.
+  HSSA is already working *without* them, so when HSSA will replace
+  SSA they could just go away.
+
+- More generally, this means we should think about how exactly we
+  should represent VRs and their relation to the original locals
+  and arguments in the CIL code.
+
+- Another idea I have about VRs: now many values are &quot;homeless&quot;,
+  because they implicitly &quot;flow&quot; in the MonoInst tree nodes (which
+  is just another representation for an evaluation stack).
+  These &quot;homeless&quot; values are necessarily local to one BB (the BB
+  which now contains the MonoInst tree).
+  Moreover, various &quot;temp&quot; locals created by the JIT (but not all
+  of them) clearly have the same property.
+  Increasing the number of local variables (VRs) has bad effects
+  on the performance of global data flow analysis (like liveness,
+  but in general those kind of algorithms).
+  I would propose to have two kinds of VRs:
+  - Global to the method.
+  - Local to a specific BB.
+  This way, if we keep the global ones indexed by one single array
+  where the local ones do not appear, every pass of &quot;global data
+  flow analysis&quot; will just work on this array, which will likely be
+  much smaller than the full set of VRs used in the method.
+  Also, &quot;local&quot; versions of algorithms will be allowed to work freely
+  on the local VRs, knowing that they will be dead at the end of the
+  BB, which is very handy.
+
+- All the opcodes that now represent &quot;special&quot; storage and/or values
+  (OP_RETARG, OP_THREAD_LOCAL, OP_AOTCONST...) should be handled in
+  one of these two ways:
+  - They become &quot;special VRs&quot; that contain the &quot;special value&quot;.
+  - They become special operations, with no arguments, that write
+    that &quot;special value&quot; in their destination VR.
+  In any case their semantics should be clarified.
+
+
+OK, that's it.
+Take this list as something between &quot;requests&quot;, &quot;suggestions&quot; and
+&quot;wishes&quot;, and anyway as a starting point for discussion :-)
+
+Ciao,
+  Massi
+
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="015894.html">[Mono-dev] Gnome.Vfs Initialization
+</A></li>
+	<LI>Next message: <A HREF="015858.html">[Mono-dev] XSL tranform result without some white spaces
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#15855">[ date ]</a>
+              <a href="thread.html#15855">[ thread ]</a>
+              <a href="subject.html#15855">[ subject ]</a>
+              <a href="author.html#15855">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

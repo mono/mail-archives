@@ -1,0 +1,199 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Ideas on the ABC removal code
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Ideas%20on%20the%20ABC%20removal%20code&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006048.html">
+   <LINK REL="Next"  HREF="006056.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Ideas on the ABC removal code</H1>
+    <B>Ben Maurer</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Ideas%20on%20the%20ABC%20removal%20code&In-Reply-To="
+       TITLE="[Mono-devel-list] Ideas on the ABC removal code">05mauben at hawken.edu
+       </A><BR>
+    <I>Fri May 28 09:13:58 EDT 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006048.html">[Mono-devel-list] XSP PROBLEM - GetOSVersionString()
+</A></li>
+        <LI>Next message: <A HREF="006056.html">[Mono-devel-list] Ideas on the ABC removal code
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6037">[ date ]</a>
+              <a href="thread.html#6037">[ thread ]</a>
+              <a href="subject.html#6037">[ subject ]</a>
+              <a href="author.html#6037">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>We could make under/overflow easy for you if someone does:
+
+object [] a;
+foreach (object o in a) {
+....
+}
+
+I think it would be valid for mcs to emit an unsigned comparison in the loop. This would mean for that case you need not worry about overflow.
+
+Of course, some people will still write out manual for loops. I could do some checking to see the frequency of `foreach' vs `for' when looping through an array.
+
+I am not sure why the Jikes code does not handle the overflow case though...
+
+-- Ben
+&gt;&gt;&gt;<i> Massimiliano Mantione &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">massi at ximian.com</A>&gt; 05/28/04 08:50 AM &gt;&gt;&gt;
+</I>
+I finally &quot;digested&quot; the ABCD paper:
+
+<A HREF="http://citeseer.ist.psu.edu/bodik00abcd.html">http://citeseer.ist.psu.edu/bodik00abcd.html</A>
+
+All in all, their approach is surprisingly similar to ours
+(explained in the file &quot;docs/abc-removal.txt&quot; in the mono
+source tree).
+If it wasn't because they actually were there first, I would
+say that they have stolen my code and improved on it :-)
+
+The main difference between the two approaches is the way in
+which the &quot;relation graph&quot; is explored. What my code does is
+the most stupid (but also easiest) thing: the graph is stored
+as a matrix (each cell is a potential graph arc), and the
+whole matrix is fully processed multiple times, until all the
+possible consequences are exhausted (it is the computation of
+the &quot;closure&quot; of the relation graph, where &quot;implied&quot; relations
+are made explicit).
+At that point, the eventual presence of specific arcs states
+if specific ABCs can be removed.
+
+In the ABCD paper, on the other hand, the idea is simply to
+&quot;explore&quot; the graph locally, starting from nodes defining
+arrays, and seeing if the paths that lead to the index used
+accessing the array has certain properties (if this is true,
+the ABC can be removed).
+It turns out that the &quot;exploration&quot; algorithm is simply a
+depth first traversal, with special care taken to break cycles.
+It also turns out that the logic used to break cycles is just
+the one we use now (luckily).
+
+One minor difference (but very important) is that the ABCD
+approach requires the extension of the SSA form with PI nodes.
+Basically, these nodes are there to mark the fact that a given
+SSA variable actually has &quot;different&quot; values inside different
+BBs, because these BBs are &quot;guarded&quot; by conditions on that
+variable. We keep up without this extended SSA form simply
+because we reconstruct the evaluation graph at each BB, taking
+into account the proper entry condition of the BB.
+However, this reconstruction (which in itself is not so bad)
+causes the need for the re-evaluation (exploration) of the
+*whole* graph at each BB (which is very bad).
+
+I have been thinking about this for a while, and there is a
+solution that is sound (not a hack) and that can have a good
+performance.
+
+The goals are:
+[1] Avoid scanning the whole graph, just examine it locally.
+[2] Avoid re-examining the same variable in different BBs
+    if this is not strictly needed (the variable would have
+    had a PI definition in this case, or would &quot;depend&quot; from
+    a PI definition in the ABCD approach).
+
+Now, to achieve [1] we should avoid the current &quot;brute force&quot;
+approach, store the graph properly, and navigate it locally
+with a depth first algorithm. This does not sound that hard,
+as the logic for breaking cycles in the the traversal is the
+one we already have.
+
+The hard part (IMHO) is achieving [2] without the extended SSA
+form (the additional PI definitions).
+The problem is that in the ABCD paper they can safely assume
+that *one* single graph describes the whole method, because
+when a variable is subject to different conditions in different
+BBs they actually create different variables. In our approach,
+we have (at least logically) on different graph for each BB, and
+in fact we re-evaluate everything in each BB.
+
+To get out of this mess, consider a depth-first traversal of
+the idominator tree, and consider how the evaluation graphs
+change in this traversal.
+Basically, we have the following facts:
+
+- In the start BB, the graph is composed by all the SSA
+  variable definitions, no more, and no less. This is true
+  for two reasons:
+  - All the SSA definitions are &quot;statically valid&quot; in the
+    whole method. Maybe each given variable is not used in
+    every BB, but its single static assignment is OK.
+  - The entry BB has no entry condition, so no other arcs
+    can be added to the graph.
+- Entering each BB in the depth first traversal of the
+  idominator tree, the graph is the previous graph *plus*
+  the arcs representing the relations implied by the entry
+  condition of this BB. Every evaluation that has so far been
+  performed on a variable is still valid, and can only be made
+  &quot;more specific&quot; (or more &quot;powerful&quot;, or &quot;detailed&quot;, think of
+  it as you like) by the conditions added in this BB.
+
+This second observation is really important: every evaluation
+performed early in the depth first traversal on the idominator
+tree is still valid, so we can avoid repeating it (this is
+what we aimed for in point [2]). We can, of course, &quot;refine&quot;
+it using the new conditions, but these new results must be
+discarded when we exit from the evaluation phase of this BB
+(by definition, they are valid only in the region of the tree
+that is dominated by this BB).
+
+This suggests to restructure the evaluation phase as a depth
+first traversal of the idominator tree. The function that
+performs the evaluation should be properly recursive, and the
+results for each BB should be kept (on the stack, or pointed to
+by some context on the stack) to be used by the other BBs down
+the tree.
+
+I really hope this makes sense to somebody ;-) otherwise just
+ask...
+
+I'm going to decide the exact data structures to be used in
+the next days, and then rewrite the thing, but comments on the
+approach are really appreciated.
+
+Ciao,
+  Massimiliano
+
+P.S. One thing the ABCD paper totally overlooks is the issue
+of array indexes (over)|(under)flowing after an arithmetical
+operation. Has anybody a clue of why this is not an issue for
+them?
+
+
+_______________________________________________
+Mono-devel-list mailing list
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">Mono-devel-list at lists.ximian.com</A>
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">http://lists.ximian.com/mailman/listinfo/mono-devel-list</A>
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006048.html">[Mono-devel-list] XSP PROBLEM - GetOSVersionString()
+</A></li>
+	<LI>Next message: <A HREF="006056.html">[Mono-devel-list] Ideas on the ABC removal code
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6037">[ date ]</a>
+              <a href="thread.html#6037">[ thread ]</a>
+              <a href="subject.html#6037">[ subject ]</a>
+              <a href="author.html#6037">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,170 @@
+Don't suspend exception thread on darwin.
+
+From: Mark Probst <mark.probst@gmail.com>
+
+
+---
+ mono/metadata/gc-internal.h  |    5 +++++
+ mono/metadata/gc.c           |   16 ++++++++++++++++
+ mono/metadata/sgen-gc.c      |   14 ++++++++++----
+ mono/metadata/sgen-gc.h      |    6 ++++--
+ mono/metadata/sgen-os-mach.c |    6 ++++--
+ mono/mini/mini-darwin.c      |    6 ++++++
+ 6 files changed, 45 insertions(+), 8 deletions(-)
+
+diff --git a/mono/metadata/gc-internal.h b/mono/metadata/gc-internal.h
+index c9a4ee9..8df916e 100644
+--- a/mono/metadata/gc-internal.h
++++ b/mono/metadata/gc-internal.h
+@@ -252,5 +252,10 @@ int mono_gc_get_los_limit (void) MONO_INTERNAL;
+  */
+ gboolean mono_gc_is_disabled (void) MONO_INTERNAL;
+ 
++#if defined(__MACH__)
++void mono_gc_register_mach_exception_thread (pthread_t thread) MONO_INTERNAL;
++pthread_t mono_gc_get_mach_exception_thread (void) MONO_INTERNAL;
++#endif
++
+ #endif /* __MONO_METADATA_GC_INTERNAL_H__ */
+ 
+diff --git a/mono/metadata/gc.c b/mono/metadata/gc.c
+index 80104e6..a6fbcda 100644
+--- a/mono/metadata/gc.c
++++ b/mono/metadata/gc.c
+@@ -1205,3 +1205,19 @@ mono_gc_is_finalizer_thread (MonoThread *thread)
+ {
+ 	return mono_gc_is_finalizer_internal_thread (thread->internal_thread);
+ }
++
++#if defined(__MACH__)
++static pthread_t mach_exception_thread;
++
++void
++mono_gc_register_mach_exception_thread (pthread_t thread)
++{
++	mach_exception_thread = thread;
++}
++
++pthread_t
++mono_gc_get_mach_exception_thread (void)
++{
++	return mach_exception_thread;
++}
++#endif
+diff --git a/mono/metadata/sgen-gc.c b/mono/metadata/sgen-gc.c
+index 59e3a22..89ea183 100644
+--- a/mono/metadata/sgen-gc.c
++++ b/mono/metadata/sgen-gc.c
+@@ -228,6 +228,10 @@ enum {
+ 
+ #undef OPDEF
+ 
++#undef pthread_create
++#undef pthread_join
++#undef pthread_detach
++
+ /*
+  * ######################################################################
+  * ########  Types and constants used by the GC.
+@@ -6126,10 +6130,6 @@ mono_gc_register_thread (void *baseptr)
+ 
+ #if USE_PTHREAD_INTERCEPT
+ 
+-#undef pthread_create
+-#undef pthread_join
+-#undef pthread_detach
+-
+ typedef struct {
+ 	void *(*start_routine) (void *);
+ 	void *arg;
+@@ -7828,4 +7828,10 @@ mono_gc_is_disabled (void)
+ 	return FALSE;
+ }
+ 
++gboolean
++mono_sgen_is_worker_thread (pthread_t thread)
++{
++	return FALSE;
++}
++
+ #endif /* HAVE_SGEN_GC */
+diff --git a/mono/metadata/sgen-gc.h b/mono/metadata/sgen-gc.h
+index 60a74fc..59432ac 100644
+--- a/mono/metadata/sgen-gc.h
++++ b/mono/metadata/sgen-gc.h
+@@ -29,8 +29,8 @@
+ #include <glib.h>
+ #include <pthread.h>
+ #include <signal.h>
+-#include "utils/mono-compiler.h"
+-#include "metadata/class-internals.h"
++#include <mono/utils/mono-compiler.h>
++#include <mono/metadata/class-internals.h>
+ 
+ #define THREAD_HASH_SIZE 11
+ 
+@@ -117,5 +117,7 @@ SgenThreadInfo* mono_sgen_thread_info_lookup (ARCH_THREAD_TYPE id) MONO_INTERNAL
+ SgenThreadInfo** mono_sgen_get_thread_table (void) MONO_INTERNAL;
+ void mono_sgen_wait_for_suspend_ack (int count) MONO_INTERNAL;
+ 
++gboolean mono_sgen_is_worker_thread (pthread_t thread) MONO_INTERNAL;
++
+ #endif /* __MONO_SGENGC_H__ */
+ 
+diff --git a/mono/metadata/sgen-os-mach.c b/mono/metadata/sgen-os-mach.c
+index 93311f1..ea74a4d 100644
+--- a/mono/metadata/sgen-os-mach.c
++++ b/mono/metadata/sgen-os-mach.c
+@@ -54,6 +54,7 @@ mono_sgen_thread_handshake (int signum)
+ 	kern_return_t ret;
+ 	ucontext_t ctx;
+ 	mcontext_t mctx;
++	pthread_t exception_thread = mono_gc_get_mach_exception_thread ();
+ 
+ 	SgenThreadInfo *info;
+ 	gpointer regs [ARCH_NUM_REGS];
+@@ -65,7 +66,8 @@ mono_sgen_thread_handshake (int signum)
+ 
+ 	for (i = 0, count = 0; i < num_threads; i++) {
+ 		thread_port_t t = thread_list [i];
+-		if (t != cur_thread) {
++		pthread_t pt = pthread_from_mach_thread_np (t);
++		if (t != cur_thread && pt != exception_thread && !mono_sgen_is_worker_thread (pt)) {
+ 			if (signum == suspend_signal_num) {
+ 				ret = thread_suspend (t);
+ 				if (ret != KERN_SUCCESS) {
+@@ -81,7 +83,7 @@ mono_sgen_thread_handshake (int signum)
+ 				}
+ 
+ 
+-				info = mono_sgen_thread_info_lookup (pthread_from_mach_thread_np (t));
++				info = mono_sgen_thread_info_lookup (pt);
+ 
+ 				/* Ensure that the runtime is aware of this thread */
+ 				if (info != NULL) {
+diff --git a/mono/mini/mini-darwin.c b/mono/mini/mini-darwin.c
+index 0b2ff12..f80cff8 100644
+--- a/mono/mini/mini-darwin.c
++++ b/mono/mini/mini-darwin.c
+@@ -43,6 +43,7 @@
+ #include <mono/metadata/verify-internals.h>
+ #include <mono/metadata/mempool-internals.h>
+ #include <mono/metadata/attach.h>
++#include <mono/metadata/gc-internal.h>
+ #include <mono/utils/mono-math.h>
+ #include <mono/utils/mono-compiler.h>
+ #include <mono/utils/mono-counters.h>
+@@ -179,8 +180,13 @@ macosx_register_exception_handler ()
+ 					    mach_exception_port,
+ 					    EXCEPTION_DEFAULT,
+ 					    MACHINE_THREAD_STATE) == KERN_SUCCESS);
++
++	mono_gc_register_mach_exception_thread (thread);
+ }
+ 
++/* This is #define'd by Boehm GC to _GC_dlopen. */
++#undef dlopen
++
+ void
+ mono_runtime_install_handlers (void)
+ {

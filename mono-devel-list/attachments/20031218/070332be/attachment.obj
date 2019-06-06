@@ -1,0 +1,295 @@
+Index: System.Data.OracleClient/OracleCommand.cs
+===================================================================
+RCS file: /mono/mcs/class/System.Data.OracleClient/System.Data.OracleClient/OracleCommand.cs,v
+retrieving revision 1.13
+diff -u -r1.13 OracleCommand.cs
+--- System.Data.OracleClient/OracleCommand.cs	16 Dec 2003 10:42:29 -0000	1.13
++++ System.Data.OracleClient/OracleCommand.cs	18 Dec 2003 15:00:47 -0000
+@@ -212,8 +212,7 @@
+ 			statement.ExecuteNonQuery ();
+ 
+ 			int rowsAffected = statement.GetAttributeInt32 (OciAttributeType.RowCount, ErrorHandle);
+-			
+-			statement.Dispose ();
++		
+ 			return rowsAffected;
+ 		}
+ 
+@@ -226,7 +225,13 @@
+ 			if (Transaction != null)
+ 				Transaction.AttachToServiceContext ();
+ 
+-			return ExecuteNonQueryInternal (GetStatementHandle ());
++			OciStatementHandle statement = GetStatementHandle ();
++			try {
++				return ExecuteNonQueryInternal (statement);
++			}
++			finally	{
++				SafeDisposeHandle (statement);
++			}
+ 		}
+ 
+ 		public int ExecuteOracleNonQuery (out OracleString rowid)
+@@ -240,14 +245,19 @@
+ 
+ 			OciStatementHandle statement = GetStatementHandle ();
+ 
+-			int retval = ExecuteNonQueryInternal (statement);
++			try {
++				int retval = ExecuteNonQueryInternal (statement);
+ 
+-			OciRowIdDescriptor descriptor = (OciRowIdDescriptor) Environment.Allocate (OciHandleType.RowId);
+-			descriptor.SetHandle (statement.GetAttributeIntPtr (OciAttributeType.RowId, ErrorHandle));
++				OciRowIdDescriptor descriptor = (OciRowIdDescriptor) Environment.Allocate (OciHandleType.RowId);
++				descriptor.SetHandle (statement.GetAttributeIntPtr (OciAttributeType.RowId, ErrorHandle));
+ 
+-			rowid = new OracleString (descriptor.GetRowId (ErrorHandle));
++				rowid = new OracleString (descriptor.GetRowId (ErrorHandle));
+ 
+-			return retval;
++				return retval;
++			}
++			finally	{
++				SafeDisposeHandle (statement);
++			}
+ 		}
+ 
+ 		[MonoTODO]
+@@ -272,13 +282,24 @@
+ 				Transaction.AttachToServiceContext ();
+ 
+ 			OciStatementHandle statement = GetStatementHandle ();
++			OracleDataReader rd = null;
++			try	{
++				if (preparedStatement == null)
++					statement.Prepare (CommandText);
++				else
++					preparedStatement = null;	// OracleDataReader releases the statement handle
++
++				BindParameters (statement);
++				statement.ExecuteQuery ();
++
++				rd = new OracleDataReader (this, statement);
++			}
++			finally	{
++				if (statement != null && rd == null)
++					statement.Dispose();
++			}
+ 
+-			if (preparedStatement == null)
+-				statement.Prepare (CommandText);
+-			BindParameters (statement);
+-			statement.ExecuteQuery ();
+-
+-			return new OracleDataReader (this, statement);
++			return rd;
+ 		}
+ 
+ 		public object ExecuteScalar ()
+@@ -293,16 +314,21 @@
+ 				Transaction.AttachToServiceContext ();
+ 
+ 			OciStatementHandle statement = GetStatementHandle ();
+-			if (preparedStatement == null)
+-				statement.Prepare (CommandText);
+-			BindParameters (statement);
+-
+-			statement.ExecuteQuery ();
+-
+-			if (statement.Fetch ()) 
+-				output = ((OciDefineHandle) statement.Values [0]).GetValue ();
+-			else
+-				output = DBNull.Value;
++			try {
++				if (preparedStatement == null)
++					statement.Prepare (CommandText);
++				BindParameters (statement);
++
++				statement.ExecuteQuery ();
++
++				if (statement.Fetch ()) 
++					output = ((OciDefineHandle) statement.Values [0]).GetValue ();
++				else
++					output = DBNull.Value;
++			}
++			finally {
++				SafeDisposeHandle (statement);
++			}
+ 
+ 			return output;
+ 		}
+@@ -317,6 +343,12 @@
+ 			h.ErrorHandle = Connection.ErrorHandle;
+ 			h.Service = Connection.ServiceContext;
+ 			return h;
++		}
++
++		private void SafeDisposeHandle (OciStatementHandle h)
++		{
++			if (h != null && h != preparedStatement) 
++				h.Dispose();
+ 		}
+ 
+ 		IDbDataParameter IDbCommand.CreateParameter ()
+Index: System.Data.OracleClient/OracleDataReader.cs
+===================================================================
+RCS file: /mono/mcs/class/System.Data.OracleClient/System.Data.OracleClient/OracleDataReader.cs,v
+retrieving revision 1.14
+diff -u -r1.14 OracleDataReader.cs
+--- System.Data.OracleClient/OracleDataReader.cs	16 Aug 2003 17:29:28 -0000	1.14
++++ System.Data.OracleClient/OracleDataReader.cs	18 Dec 2003 15:00:47 -0000
+@@ -57,7 +57,7 @@
+ 
+ 		~OracleDataReader ()
+ 		{
+-			Dispose ();
++			Dispose (false);
+ 		}
+ 
+ 		#endregion // Constructors
+@@ -103,6 +103,7 @@
+ 
+ 		public void Close ()
+ 		{
++			statement.Dispose();
+ 			if (!isClosed) 
+ 				command.CloseDataReader ();
+ 			isClosed = true;
+Index: System.Data.OracleClient/OracleTransaction.cs
+===================================================================
+RCS file: /mono/mcs/class/System.Data.OracleClient/System.Data.OracleClient/OracleTransaction.cs,v
+retrieving revision 1.4
+diff -u -r1.4 OracleTransaction.cs
+--- System.Data.OracleClient/OracleTransaction.cs	18 Feb 2003 05:32:32 -0000	1.4
++++ System.Data.OracleClient/OracleTransaction.cs	18 Dec 2003 15:00:47 -0000
+@@ -82,7 +82,10 @@
+ 		{
+ 			if (!disposed) {
+ 				if (disposing) {
+-					Rollback ();
++					if (isOpen)
++						Rollback ();
++
++					transaction.Dispose();
+ 				}
+ 				disposed = true;
+ 			}
+Index: System.Data.OracleClient.Oci/OciHandle.cs
+===================================================================
+RCS file: /mono/mcs/class/System.Data.OracleClient/System.Data.OracleClient.Oci/OciHandle.cs,v
+retrieving revision 1.3
+diff -u -r1.3 OciHandle.cs
+--- System.Data.OracleClient.Oci/OciHandle.cs	8 Mar 2003 22:37:09 -0000	1.3
++++ System.Data.OracleClient.Oci/OciHandle.cs	18 Dec 2003 15:00:47 -0000
+@@ -137,17 +137,17 @@
+ 
+ 			if (type < OciHandleType.LobLocator)
+ 				status = OCIHandleAlloc (this,
+-							out newHandle,
+-							type,
+-							0,
+-							IntPtr.Zero);
++					out newHandle,
++					type,
++					0,
++					IntPtr.Zero);
+ 			else
+ 				status = OCIDescriptorAlloc (this,
+-							out newHandle,
+-							type,
+-							0,
+-							IntPtr.Zero);
+-
++					out newHandle,
++					type,
++					0,
++					IntPtr.Zero);
++		
+ 			if (status != 0 && status != 1)
+ 				throw new Exception (String.Format ("Could not allocate new OCI Handle of type {0}", type));
+ 
+@@ -175,10 +175,10 @@
+ 		protected virtual void Dispose (bool disposing)
+ 		{
+ 			if (!disposed) {
++				FreeHandle ();
+ 				if (disposing) {
+ 					parent = null;
+ 				}
+-				FreeHandle ();
+ 				disposed = true;
+ 			}
+ 		}
+@@ -191,7 +191,25 @@
+ 
+ 		protected virtual void FreeHandle ()
+ 		{
+-			OCIHandleFree (Handle, HandleType);
++			switch (type) {
++				case OciHandleType.Bind:
++				case OciHandleType.Define:
++					// Bind and Define handles are freed when Statement handle is disposed
++					break;
++				case OciHandleType.Environment:
++					if (handle != IntPtr.Zero) {
++						OCIHandleFree (handle, type);
++					}
++					break;
++				default:
++					if ( handle != IntPtr.Zero &&
++						 parent != null && 
++						 parent.Handle != IntPtr.Zero )	{
++
++							OCIHandleFree (handle, type);
++					}
++					break;
++			}
+ 			handle = IntPtr.Zero;
+ 		}
+ 
+Index: System.Data.OracleClient.Oci/OciDescriptorHandle.cs
+===================================================================
+RCS file: /mono/mcs/class/System.Data.OracleClient/System.Data.OracleClient.Oci/OciDescriptorHandle.cs,v
+retrieving revision 1.3
+diff -u -r1.3 OciDescriptorHandle.cs
+--- System.Data.OracleClient.Oci/OciDescriptorHandle.cs	8 Mar 2003 22:37:09 -0000	1.3
++++ System.Data.OracleClient.Oci/OciDescriptorHandle.cs	18 Dec 2003 15:00:47 -0000
+@@ -38,8 +38,10 @@
+ 
+ 		protected override void FreeHandle ()
+ 		{
+-			int status = 0;
+-			status = OCIDescriptorFree (this, HandleType);
++			if (HandleType != OciHandleType.Parameter) {	// Parameter handles are disposed implicitely
++				int status = 0;
++				status = OCIDescriptorFree (this, HandleType);
++			}
+ 		}
+ 
+ 		#endregion // Methods
+Index: ChangeLog
+===================================================================
+RCS file: /mono/mcs/class/System.Data.OracleClient/ChangeLog,v
+retrieving revision 1.23
+diff -u -r1.23 ChangeLog
+--- ChangeLog	16 Dec 2003 10:42:29 -0000	1.23
++++ ChangeLog	18 Dec 2003 15:00:47 -0000
+@@ -1,3 +1,18 @@
++2003-12-18  Joerg Rosenkranz  <joergr@voelcker.com>
++
++	* System.Data.OracleClient.Oci/OciHandle.cs:
++		Introduced special handling for Bind, Define and
++		Environment handles in FreeHandle. Revised the handling for
++		other types. Minor change in Dispose.
++	* System.Data.OracleClient.Oci/OciDescriptorHandle.cs:
++		Special handling for Parameter handles in FreeHandle.
++	* System.Data.OracleClient/OracleCommand.cs:
++		Dispose created OciStatementHandles.
++	* System.Data.OracleClient/OracleDataReader.cs:
++		Dispose used OciStatementHandle.
++	* System.Data.OracleClient/OracleTransaction.cs:
++		Dispose transaction handle.
++	
+ 2003-12-16  Joerg Rosenkranz  <joergr@voelcker.com>
+ 
+ 	* System.Data.OracleClient/OracleCommand.cs:

@@ -1,0 +1,899 @@
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/ChangeLog,v
+retrieving revision 1.77
+diff -u -B -w -r1.77 ChangeLog
+--- ChangeLog	27 Oct 2003 09:55:39 -0000	1.77
++++ ChangeLog	2 Nov 2003 09:24:52 -0000
+@@ -1,4 +1,28 @@
+ 2003-10-27  Eran Domb  <erand@mainsoft.com>
++	* DataColeumn.cs (DefaultValue) : Changing null value to DBNull. Checking that the type of the new default value 
++	can be converted to the column type.
++	
++	* DataRelationCollection.cs (AddCore) : Give the new FK the name of the relation.
++	
++	* DataRow.cs (EndEdit) : Check if we need to vlidate the constraints.
++	(GetParentRows, GetChildRows) : Checking that the row has the wanted version, before accessing the row's value.
++	
++	* DataRowCollection.cs (Add) : Fixing a bug. 
++	(Clear) : Before clearing the array check that there is no violation of FK constraint.
++	
++	* DataSet.cs (Prefix) : If value is null chage it to empty string.
++	(GetXml) : Removing the Processing Instractions from the xml string as in MS ADO.NET.
++	
++	* ExpressionElement : Adding support for IN expresion.
++	
++	* DataTable (CopyConstraints) : New method that copy the tables constraints to the copy table.
++	(Select) : Adding support for DataViewwRowState.
++	
++	* ForeignKeyConstraint.cs (AssertConstraint) : Adding implementation.
++	
++	* MergeManager.cs (MergeRow) : Fix bugs.
++	
++2003-10-27  Eran Domb  <erand@mainsoft.com>
+ 	* DataRow.cs (SetColumnValue): Donot check null value when in midle of loading data.
+ 	check null values when ending loading data.
+ 	
+Index: DataColumn.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataColumn.cs,v
+retrieving revision 1.24
+diff -u -B -w -r1.24 DataColumn.cs
+--- DataColumn.cs	25 Sep 2003 17:33:15 -0000	1.24
++++ DataColumn.cs	2 Nov 2003 09:24:52 -0000
+@@ -323,7 +323,9 @@
+ 				return _defaultValue;
+ 			}
+ 			set {
+-				
++				object tmpObj;
++				if ((this._defaultValue == null) || (!this._defaultValue.Equals(value)))
++				{
+ 				//If autoIncrement == true throw
+ 				if (AutoIncrement) 
+ 				{
+@@ -331,16 +333,28 @@
+ 							" AutoIncrement is true on this column.");
+ 				}
+ 					
+-				//Will throw invalid cast exception
+-				//if value is not the correct type
+-				//FIXME: some types can be casted
+-				if (value.GetType() != _dataType)
++					if (value == null) 
++					{
++						tmpObj = DBNull.Value;
++					}
++					else
++						tmpObj = value;
++
++					if ((this.DataType != typeof (object))&& (tmpObj != DBNull.Value))
++					{
++						try
++						{
++							//Casting to the new type
++							tmpObj= Convert.ChangeType(tmpObj,this.DataType);
++						}
++						catch (InvalidCastException)
+ 				{
+ 					throw new InvalidCastException("Default Value type is not compatible with" + 
+ 							" column type.");
+ 				}
+-					
+-				_defaultValue = value;
++					}
++					_defaultValue = tmpObj;
++				}
+ 			}
+ 		}
+ 
+Index: DataRelationCollection.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataRelationCollection.cs,v
+retrieving revision 1.12
+diff -u -B -w -r1.12 DataRelationCollection.cs
+--- DataRelationCollection.cs	22 Oct 2003 05:55:54 -0000	1.12
++++ DataRelationCollection.cs	2 Nov 2003 09:24:52 -0000
+@@ -83,7 +83,7 @@
+ 				ForeignKeyConstraint foreignKeyConstraint = null;
+ 				if (relation.createConstraints) 
+ 				{
+-					foreignKeyConstraint = new ForeignKeyConstraint (relation.ParentColumns, relation.ChildColumns);
++					foreignKeyConstraint = new ForeignKeyConstraint (relation.RelationName, relation.ParentColumns, relation.ChildColumns);
+ 					relation.ChildTable.Constraints.Add (foreignKeyConstraint);
+ 				
+ 					UniqueConstraint uniqueConstraint = null;
+Index: DataRow.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataRow.cs,v
+retrieving revision 1.41
+diff -u -B -w -r1.41 DataRow.cs
+--- DataRow.cs	27 Oct 2003 09:55:39 -0000	1.41
++++ DataRow.cs	2 Nov 2003 09:24:53 -0000
+@@ -624,7 +624,16 @@
+ 				
+ 				//Calling next method validates UniqueConstraints
+ 				//and ForeignKeys.
++				try
++				{
++					if (_table.DataSet == null || _table.DataSet.EnforceConstraints)
+ 				_table.Rows.ValidateDataRowInternal(this);
++				}
++				catch (Exception e)
++				{
++					proposed = null;
++					throw e;
++				}
+ 				// check all child rows.
+ 				CheckChildRows(DataRowAction.Change);
+ 				current = proposed;
+@@ -661,17 +670,27 @@
+ 			DataColumn[] parentColumns = relation.ParentColumns;
+ 			DataColumn[] childColumns = relation.ChildColumns;
+ 			int numColumn = parentColumns.Length;
+-			foreach (DataRow row in relation.ChildTable.Rows) {
+-				bool allColumnsMatch = true;
+-				for (int columnCnt = 0; columnCnt < numColumn; ++columnCnt) {
++			if (HasVersion(version)) 
++			{
++				foreach (DataRow row in relation.ChildTable.Rows) 
++				{
++					bool allColumnsMatch = false;
++					if (row.HasVersion(DataRowVersion.Default))
++					{
++						allColumnsMatch = true;
++						for (int columnCnt = 0; columnCnt < numColumn; ++columnCnt) 
++						{
+ 					if (!this[parentColumns[columnCnt], version].Equals(
+-					    row[childColumns[columnCnt], version])) {
++								row[childColumns[columnCnt], DataRowVersion.Default])) 
++							{
+ 						allColumnsMatch = false;
+ 						break;
+ 					}
+ 				}
++					}
+ 				if (allColumnsMatch) rows.Add(row);
+ 			}
++			}
+ 			return rows.ToArray(typeof(DataRow)) as DataRow[];
+ 		}
+ 
+@@ -795,16 +814,26 @@
+ 			DataColumn[] parentColumns = relation.ParentColumns;
+ 			DataColumn[] childColumns = relation.ChildColumns;
+ 			int numColumn = parentColumns.Length;
+-			foreach (DataRow row in relation.ParentTable.Rows) {
+-				bool allColumnsMatch = true;
+-				for (int columnCnt = 0; columnCnt < numColumn; ++columnCnt) {
++			if (HasVersion(version))
++			{
++				foreach (DataRow row in relation.ParentTable.Rows) 
++				{
++					bool allColumnsMatch = false;
++					if (row.HasVersion(DataRowVersion.Default))
++					{
++						allColumnsMatch = true;
++						for (int columnCnt = 0; columnCnt < numColumn; ++columnCnt) 
++						{
+ 					if (!this[parentColumns[columnCnt], version].Equals(
+-					    row[childColumns[columnCnt], version])) {
++								row[childColumns[columnCnt], DataRowVersion.Default])) 
++							{
+ 						allColumnsMatch = false;
+ 						break;
+ 					}
+ 				}
++					}
+ 				if (allColumnsMatch) rows.Add(row);
++				}
+ 			}
+ 			return rows.ToArray(typeof(DataRow)) as DataRow[];
+ 		}
+Index: DataRowCollection.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataRowCollection.cs,v
+retrieving revision 1.21
+diff -u -B -w -r1.21 DataRowCollection.cs
+--- DataRowCollection.cs	22 Oct 2003 05:55:54 -0000	1.21
++++ DataRowCollection.cs	2 Nov 2003 09:24:53 -0000
+@@ -65,7 +65,7 @@
+ 			if (list.IndexOf(row) != -1)
+ 				throw new ArgumentException ("This row already belongs to this table.");
+ 			
+-			if (table.DataSet != null && table.DataSet.EnforceConstraints)
++			if (table.DataSet == null || table.DataSet.EnforceConstraints)
+ 				// we have to check that the new row doesn't colide with existing row
+ 				ValidateDataRowInternal(row);
+ 			
+@@ -90,6 +90,20 @@
+ 		/// </summary>
+ 		public void Clear () 
+ 		{
++			if (this.table.DataSet != null)
++			{
++				foreach (DataTable table in this.table.DataSet.Tables)
++				{
++					foreach (Constraint c in table.Constraints)
++					{
++						if (c is ForeignKeyConstraint)
++						{
++							if (((ForeignKeyConstraint) c).RelatedTable.Equals(this.table))
++								throw new InvalidConstraintException("Cannot clear table Parent because ForeignKeyConstraint " + c.ConstraintName + " enforces Child.");
++						}
++					}
++				}
++			}
+ 			list.Clear ();
+ 		}
+ 
+Index: DataSet.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataSet.cs,v
+retrieving revision 1.47
+diff -u -B -w -r1.47 DataSet.cs
+--- DataSet.cs	27 Oct 2003 09:55:39 -0000	1.47
++++ DataSet.cs	2 Nov 2003 09:24:53 -0000
+@@ -228,6 +228,8 @@
+ 			get { return prefix; } 
+ 			[MonoTODO]
+ 			set {
++				//TODO - trigger an event if this happens?
++
+ 				if (value == null)
+ 				{
+ 					value = string.Empty;
+@@ -427,7 +429,9 @@
+ 		public string GetXml()
+ 		{
+ 			StringWriter Writer = new StringWriter ();
+-			WriteXml (Writer, XmlWriteMode.IgnoreSchema);
++
++			// Sending false for not printing the Processing instruction
++			WriteXml (Writer, XmlWriteMode.IgnoreSchema,false);
+ 			return Writer.ToString ();
+ 		}
+ 
+@@ -499,7 +503,7 @@
+ 			int i;
+ 			bool oldEnforceConstraints = this.EnforceConstraints;
+ 			this.EnforceConstraints = false;
+-			for (i = 0; i < this.Tables.Count; i++)
++			for (i=0;(i<this.Tables.Count);i++)
+ 			{
+ 				this.Tables[i].RejectChanges();
+ 			}
+@@ -555,35 +559,35 @@
+ 
+ 		public void WriteXml(XmlWriter writer)
+ 		{
+-			WriteXml( writer, XmlWriteMode.IgnoreSchema );
++			WriteXml( writer, XmlWriteMode.IgnoreSchema,false);
+ 		}
+ 
+-		public void WriteXml(Stream stream, XmlWriteMode mode)
++		public void WriteXml(Stream stream, XmlWriteMode mode,bool writePI)
+ 		{
+ 			XmlWriter writer = new XmlTextWriter(stream, null );
+ 			
+-			WriteXml( writer, mode );
++			WriteXml( writer, mode, writePI );
+ 		}
+ 
+-		public void WriteXml(string fileName, XmlWriteMode mode)
++		public void WriteXml(string fileName, XmlWriteMode mode, bool writePI)
+ 		{
+ 			XmlWriter writer = new XmlTextWriter(fileName, null );
+ 			
+-			WriteXml( writer, mode );
++			WriteXml( writer, mode, writePI );
+ 			
+ 			writer.Close();
+ 		}
+ 
+-		public void WriteXml(TextWriter writer,	XmlWriteMode mode)
++		public void WriteXml(TextWriter writer,	XmlWriteMode mode, bool writePI)
+ 		{
+ 			XmlWriter xwriter = new XmlTextWriter(writer);
+ 			
+-			WriteXml( xwriter, mode );
++			WriteXml( xwriter, mode, writePI);
+ 		}
+ 
+-		public void WriteXml(XmlWriter writer, XmlWriteMode mode)
++		public void WriteXml(XmlWriter writer, XmlWriteMode mode, bool writePI)
+ 		{
+-			if (writer.WriteState == WriteState.Start)
++			if (writePI && (writer.WriteState == WriteState.Start))
+ 				writer.WriteStartDocument (true);
+ 
+ 			((XmlTextWriter)writer).Formatting = Formatting.Indented;
+@@ -839,7 +843,7 @@
+ 		void IXmlSerializable.WriteXml(XmlWriter writer)
+ 		{
+ 			DoWriteXmlSchema (writer);
+-			WriteXml(writer, XmlWriteMode.IgnoreSchema);
++			WriteXml(writer, XmlWriteMode.IgnoreSchema, true);
+ 		}
+ 
+ 		protected virtual bool ShouldSerializeRelations ()
+Index: DataTable.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataTable.cs,v
+retrieving revision 1.40
+diff -u -B -w -r1.40 DataTable.cs
+--- DataTable.cs	27 Oct 2003 09:55:39 -0000	1.40
++++ DataTable.cs	2 Nov 2003 09:24:53 -0000
+@@ -56,6 +56,7 @@
+ 		private bool dataSetPrevEnforceConstraints;
+ 
+ 		
++		
+ 		// If CaseSensitive property is changed once it does not anymore follow owner DataSet's 
+ 		// CaseSensitive property. So when you lost you virginity it's gone for ever
+ 		private bool _virginCaseSensitive = true;
+@@ -476,6 +477,7 @@
+ 					this.dataSet.EnforceConstraints = false;
+ 				}
+ 			}
++			return;
+ 		}
+ 
+ 		/// <summary>
+@@ -523,6 +525,7 @@
+ 		public virtual DataTable Clone () 
+ 		{
+ 			DataTable Copy = new DataTable ();			
++			
+ 			CopyProperties (Copy);
+ 			return Copy;
+ 		}
+@@ -583,6 +586,7 @@
+ 		[MonoTODO]
+ 		private void CopyProperties (DataTable Copy) 
+ 		{
++					
+ 			Copy.CaseSensitive = CaseSensitive;
+ 			Copy.VirginCaseSensitive = VirginCaseSensitive;
+ 
+@@ -601,11 +605,15 @@
+ 			Copy.Site = Site;
+ 			Copy.TableName = TableName;
+ 
++
++
+ 			// Copy columns
+ 			foreach (DataColumn Column in Columns) {
++				
+ 				Copy.Columns.Add (CopyColumn (Column));				
+ 			}
+ 
++			CopyConstraints(Copy);
+ 			// add primary key to the copy
+ 			if (PrimaryKey.Length > 0)
+ 			{
+@@ -615,7 +623,25 @@
+ 
+ 				Copy.PrimaryKey = pColumns;
+ 			}
++		}
+ 
++		private void CopyConstraints(DataTable copy)
++		{
++			UniqueConstraint origUc;
++			UniqueConstraint copyUc;
++			for (int i = 0; i < this.Constraints.Count; i++)
++			{
++				if (this.Constraints[i] is UniqueConstraint)
++				{
++					origUc = (UniqueConstraint)this.Constraints[i];
++					DataColumn[] columns = new DataColumn[origUc.Columns.Length];
++					for (int j = 0; j < columns.Length; j++)
++						columns[j] = copy.Columns[origUc.Columns[j].ColumnName];
++					
++					copyUc = new UniqueConstraint(origUc.ConstraintName, columns, origUc.IsPrimaryKey);
++					copy.Constraints.Add(copyUc);
++				}
++			}
+ 		}
+ 		/// <summary>
+ 		/// Ends the initialization of a DataTable that is used 
+@@ -871,9 +898,7 @@
+ 		/// </summary>
+ 		public DataRow[] Select () 
+ 		{
+-			DataRow[] dataRows = new DataRow[_rows.Count];
+-			_rows.CopyTo (dataRows, 0);
+-			return dataRows;
++			return Select(String.Empty, String.Empty, DataViewRowState.CurrentRows);
+ 		}
+ 
+ 		/// <summary>
+@@ -883,15 +908,7 @@
+ 		/// </summary>
+ 		public DataRow[] Select (string filterExpression) 
+ 		{
+-			ExpressionElement Expression = new ExpressionMainElement (filterExpression);
+-
+-			ArrayList List = new ArrayList ();
+-			foreach (DataRow Row in Rows) {
+-				if (Expression.Test (Row))
+-					List.Add (Row);
+-			}
+-			
+-			return (DataRow [])List.ToArray (typeof (DataRow));
++			return Select(filterExpression, String.Empty, DataViewRowState.CurrentRows);
+ 		}
+ 
+ 		/// <summary>
+@@ -901,14 +918,41 @@
+ 		/// </summary>
+ 		public DataRow[] Select (string filterExpression, string sort) 
+ 		{
++			return Select(filterExpression, sort, DataViewRowState.CurrentRows);
++		}
++
++		/// <summary>
++		/// Gets an array of all DataRow objects that match
++		/// the filter in the order of the sort, that match 
++		/// the specified state.
++		/// </summary>
++		[MonoTODO]
++		public DataRow[] Select(string filterExpression, string sort, DataViewRowState recordStates) 
++		{
+ 			DataRow[] dataRows = null;
++			if (filterExpression == null)
++				filterExpression = String.Empty;
+ 
+-			if (filterExpression != null && filterExpression.Equals (String.Empty) == false)
+-				dataRows = Select (filterExpression);
+-			else
+-				dataRows = Select ();
++			ExpressionElement Expression = null;
++			if (filterExpression != null && filterExpression.Length != 0)
++				Expression = new ExpressionMainElement(filterExpression);
++
++			ArrayList List = new ArrayList();
++			int recordStateFilter = GetRowStateFilter(recordStates);
++			foreach (DataRow Row in Rows) 
++			{
++				if (((int)Row.RowState & recordStateFilter) != 0)
++				{
++					if (Expression == null || Expression.Test(Row))
++						List.Add(Row);
++				}
++			}
+ 
+-			if (sort != null && !sort.Equals (String.Empty)) {
++			dataRows = (DataRow[])List.ToArray(typeof(DataRow));
++			
++
++			if (sort != null && !sort.Equals(String.Empty)) 
++			{
+ 				SortableColumn[] sortableColumns = null;
+ 
+ 				sortableColumns = ParseTheSortString (sort);
+@@ -924,23 +968,26 @@
+ 				rowSorter = null;
+ 			}
+ 
++			
+ 			return dataRows;
+ 		}
+ 
+-		/// <summary>
+-		/// Gets an array of all DataRow objects that match
+-		/// the filter in the order of the sort, that match 
+-		/// the specified state.
+-		/// </summary>
+-		[MonoTODO]
+-		public DataRow[] Select(string filterExpression, string sort, DataViewRowState recordStates) 
++		private static int GetRowStateFilter(DataViewRowState recordStates)
+ 		{
+-			DataRow[] dataRows = null;
++			int flag = 0;
+ 
+-			// TODO: do something with recordStates
+-			dataRows = Select (filterExpression, sort);
++			if ((recordStates & DataViewRowState.Added) != 0)
++				flag |= (int)DataRowState.Added;
++			if ((recordStates & DataViewRowState.Deleted) != 0)
++				flag |= (int)DataRowState.Deleted;
++			if ((recordStates & DataViewRowState.ModifiedCurrent) != 0)
++				flag |= (int)DataRowState.Modified;
++			if ((recordStates & DataViewRowState.ModifiedOriginal) != 0)
++				flag |= (int)DataRowState.Modified;
++			if ((recordStates & DataViewRowState.Unchanged) != 0)
++				flag |= (int)DataRowState.Unchanged;
+ 
+-			return dataRows;
++			return flag;
+ 		}
+ 
+ 		/// <summary>
+@@ -1050,8 +1097,8 @@
+ 			Copy.ColumnMapping = Column.ColumnMapping;
+ 			Copy.ColumnName = Column.ColumnName;
+ 			// Copy.Container
+-			// Copy.DataType
+-			// Copy.DefaultValue			
++			Copy.DataType = Column.DataType;
++			Copy.DefaultValue = Column.DefaultValue;			
+ 			Copy.Expression = Column.Expression;
+ 			//Copy.ExtendedProperties
+ 			Copy.MaxLength = Column.MaxLength;
+@@ -1059,7 +1106,8 @@
+ 			Copy.Prefix = Column.Prefix;
+ 			Copy.ReadOnly = Column.ReadOnly;
+ 			//Copy.Site
+-			Copy.Unique = Column.Unique;
++			//we do not copy the unique value - it will be copyied when copying the constraints.
++			//Copy.Unique = Column.Unique;
+ 			
+ 			return Copy;
+ 		}			
+Index: ExpressionElement.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/ExpressionElement.cs,v
+retrieving revision 1.7
+diff -u -B -w -r1.7 ExpressionElement.cs
+--- ExpressionElement.cs	12 Oct 2003 01:39:58 -0000	1.7
++++ ExpressionElement.cs	2 Nov 2003 09:24:53 -0000
+@@ -69,6 +69,7 @@
+ 			string newExp = "";
+ 			bool isDigit = false;
+ 			bool litOperator = false;
++			s = s.Trim();
+ 			
+ 			for (int i = 0; i < s.Length; i++) {
+ 
+@@ -1633,6 +1634,74 @@
+         }
+ 
+         /// <summary>
++	///  Class for In (exp, exp, exp, ...) function
++	/// </summary>
++	internal class ExpressionIn : ExpressionElement
++	{
++		public ExpressionIn (string exp1, string exp2)
++		{       
++			ParseExpression(exp1);
++			ParseParameters (exp2);
++		}
++
++		/// <summary>
++		///  IsNull function does not return boolean value, so throw exception
++		/// </summary>
++		public override bool Test (DataRow Row) 
++		{
++			ExpressionElement E;
++			ExpressionElement columnElement = (ExpressionElement)Elements [0];
++
++			for (int i = 1; i < Elements.Count; i++)
++			{
++				E = (ExpressionElement)Elements [i];
++				if(ExpressionElement.Compare (columnElement, E, Row) == 0)
++					return true;
++			}
++			return false;
++		}
++
++		/// <summary>
++		///  Parses parameters of function and invoke ParseExpression methods
++		/// </summary>
++		private void ParseParameters (string s)
++		{
++			bool inString = false;
++			ArrayList parameters = new ArrayList();
++			
++			// find (
++			while (!s.StartsWith ("("))
++				s = s.Remove (0, 1);
++
++			// remove (
++			s = s.Remove (0, 1);
++			int parentheses = 0;
++			for (int i = 0; i < s.Length; i++) 
++			{
++
++				if (s [i] == '\'')
++					inString = !inString;
++				else if (s [i] == '(')
++					parentheses++;
++				else if (s [i] == ')')
++					parentheses--;
++
++
++				if ((s [i] == ',' && !inString && parentheses == 0) || 
++					(s [i] == ')' && i == (s.Length -1))) 
++				{
++					parameters.Add(s.Substring (0, i));
++					s = s.Substring (i + 1);
++					i = 0;
++				}
++			}
++			
++			for (int i = 0; i < parameters.Count; i++)
++				ParseExpression((string)parameters[i]);
++		}
++	}
++
++        /// <summary>
+         ///  Class for just one element for example string, int, ...
+         /// </summary>
+         internal class ExpressionSingleElement : ExpressionElement
+@@ -1646,14 +1715,14 @@
+ 				Element = s.Substring (1, s.Length - 2);
+ 				_ResultType = typeof (string);
+ 			}
+-			else if (s.StartsWith ("#") && s.EndsWith ("#")) {
+-				Element = DateTime.Parse (s.Substring (1, s.Length - 2));
+-				_ResultType = typeof (DateTime);
+-			}
+ 			else if (!Char.IsDigit (s [0]) && s [0] != '-' && s [0] != '+') {
+ 				Element = s;
+ 				_ResultType = typeof (DataColumn);
+ 			}
++			else if (s.StartsWith ("#") && s.EndsWith ("#")) {
++				Element = DateTime.Parse (s.Substring (1, s.Length - 2));
++				_ResultType = typeof (DateTime);
++			}
+ 			else {
+ 				try {
+ 					Element = int.Parse (s);
+@@ -1673,7 +1742,13 @@
+ 				if (!Row.Table.Columns.Contains (Element.ToString ()))
+ 					throw new EvaluateException ("Column name '" + Element.ToString () + "' not found.");
+ 				else
+-					Result = Row [Element.ToString ()];
++				{
++					DataRowVersion rowVersion = DataRowVersion.Default;
++					// if this row is deleted we get the original version, or else we get an exception.
++					if (Row.RowState == DataRowState.Deleted)
++						rowVersion = DataRowVersion.Original;
++					Result = Row [Element.ToString (), rowVersion];
++				}
+ 			}
+ 			else
+ 				Result = Element;
+@@ -1779,7 +1854,6 @@
+ 
+ 			if (t1 == typeof (string) || t2 == typeof (string)) {
+ 				// FIXME: If one of elements are string they both should be???				
+-				
+ 				//TempType = typeof (string);				
+ 				if (t1 != typeof (string))
+ 					value1 = Convert.ChangeType (value1, Type.GetTypeCode (t2));
+@@ -1846,7 +1920,7 @@
+ 				    !functionName.EndsWith ("sum") && !functionName.EndsWith ("avg") &&
+ 				    !functionName.EndsWith ("min") && !functionName.EndsWith ("max") &&
+ 				    !functionName.EndsWith ("count") && !functionName.EndsWith ("stdev") &&
+-				    !functionName.EndsWith ("var")) {
++				    !functionName.EndsWith ("var")&& !functionName.EndsWith ("in")) {
+ 
+ 					int startIndex = s.IndexOf ("(");
+ 					int i = startIndex + 1;
+@@ -1882,6 +1956,10 @@
+ 			else if (FindLikeElement (s, ref string1, ref string2))
+ 				CreateLikeElement (string1, string2, inside);
+ 
++			// find IN
++			else if (FindInElement (s, ref string1, ref string2))
++				CreateInElement (string1, string2, inside);
++
+ 			// find =
+ 			else if (FindEqualElement (s, ref string1, ref string2))
+ 				CreateEqualsElement (string1, string2, inside);
+@@ -1970,7 +2048,7 @@
+ 			else if (FindIsNullElement (s))
+ 				Elements.Add (new ExpressionIsNull (s.Trim ()));
+ 
+-			// find substrin
++			// find substring
+ 			else if (FindSubstringElement (s))
+ 				Elements.Add (new ExpressionSubstring (s.Trim ()));
+ 
+@@ -2897,6 +2975,48 @@
+ 			return false;			
+ 		}
+ 
++		private bool FindInElement (string s, ref string s1, ref string s2)
++		{
++			string stemp = s.ToLower ();
++			int indexOf = stemp.IndexOf ("in");
++
++			if (indexOf == -1)
++				return false;
++
++			int oldIndex = -1;
++			while ((indexOf = stemp.IndexOf ("in", oldIndex + 1)) != -1 && indexOf > oldIndex) 
++			{
++				oldIndex = indexOf;
++				
++				// check is the 'and' element part of string element
++				if (IsPartOfStringElement (stemp, indexOf))
++					continue;
++
++
++				// Check is or part of something else for example column name
++				if (indexOf != 0) 
++				{	
++					if (stemp [indexOf - 1] != ' ' && stemp [indexOf - 1] != '\'')
++						continue;
++				}
++				
++				if (indexOf < stemp.Length + 2) 
++				{
++					if (stemp [indexOf + 2] != ' ' && stemp [indexOf + 2] != '\'')
++						continue;
++				}
++
++				if (IsPartOfFunction (stemp, indexOf))
++					continue;
++
++				s1 = s.Substring (0, indexOf).Trim ();
++				s2 = s.Substring (indexOf + 2).Trim ();
++				return true;
++			}
++		
++			return false;			
++		}
++
+ 		
+ 		#endregion // CheckElement methods
+ 
+@@ -2922,6 +3042,12 @@
+ 		{
+ 			CheckParenthesis (inside, ref s1, ref s2);
+ 			Elements.Add (new ExpressionLike (s1.Trim (), s2.Trim ()));
++		}
++
++		private void CreateInElement (string s1, string s2, string inside)
++		{
++			CheckParenthesis (inside, ref s1, ref s2);
++			Elements.Add (new ExpressionIn (s1.Trim (), s2.Trim ()));
+ 		}
+ 
+ 		private void CreateEqualsElement (string s1, string s2, string inside)
+Index: ForeignKeyConstraint.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/ForeignKeyConstraint.cs,v
+retrieving revision 1.10
+diff -u -B -w -r1.10 ForeignKeyConstraint.cs
+--- ForeignKeyConstraint.cs	25 Sep 2003 17:33:15 -0000	1.10
++++ ForeignKeyConstraint.cs	2 Nov 2003 09:24:53 -0000
+@@ -147,7 +147,7 @@
+ 					{
+ 						//LAMESPEC: spec says throw InvalidConstraintException
+ 						//		implementation throws InvalidOperationException
+-						throw new InvalidOperationException("Parent column is not type compatible with it's child"
++						throw new InvalidConstraintException("Parent column is not type compatible with it's child"
+ 								+ " column.");
+ 					}
+ 				}	
+@@ -385,6 +385,26 @@
+ 		{
+ 			//Implement: this should be used to validate ForeignKeys constraints 
+ 			//when modifiying the DataRow values of a DataTable.
++
++			foreach (DataRow parentRow in this.RelatedTable.Rows)
++			{
++				if (parentRow.RowState != DataRowState.Deleted)
++				{
++					bool match = true;
++					// check if the values in the constraints columns are equal
++					int i = 0;
++					for (; i < _parentColumns.Length; i++)
++					{
++						if (!row[_childColumns[i]].Equals(parentRow[_parentColumns[i]]))
++						{
++							match = false;
++							break;
++						}	
++					}
++					if (!match)
++						throw new InvalidConstraintException("ForeignKeyConstraint " + ConstraintName + " requires the child key values (" + row[_childColumns[i]].ToString() + ") to exist in the parent table.");					
++				}
++			}
+ 		}
+ 		
+ 		#endregion // Methods
+Index: MergeManager.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/MergeManager.cs,v
+retrieving revision 1.2
+diff -u -B -w -r1.2 MergeManager.cs
+--- MergeManager.cs	22 Oct 2003 06:48:25 -0000	1.2
++++ MergeManager.cs	2 Nov 2003 09:24:53 -0000
+@@ -58,51 +58,36 @@
+ 			DataColumnCollection columns = row.Table.Columns;
+ 			DataColumn[] primaryKeys = targetTable.PrimaryKey;
+ 			DataRow targetRow = null;
++			DataRowVersion version = DataRowVersion.Default;
++			if (row.RowState == DataRowState.Deleted)
++				version = DataRowVersion.Original;
++
+ 			if (primaryKeys != null && primaryKeys.Length > 0) // if there are any primary key.
+ 			{
+-				bool foundKeyInSourceTable = true;
+-				// check that all primary keys exists in the source table.
+-				for (int j = 0; j < primaryKeys.Length; j++)
+-				{
+-					if(!row.Table.Columns.Contains(primaryKeys[j].ColumnName))
+-					{
+-						foundKeyInSourceTable = false;
+-						break;
+-					}
+-				}
+-				// if all primary key found in the source table
+-				if(foundKeyInSourceTable)
+-				{
+ 					// initiate an array that has the values of the primary keys.
+ 					object[] keyValues = new object[primaryKeys.Length];
++				
+ 					for (int j = 0; j < keyValues.Length; j++)
+ 					{
+-						keyValues[j] = row[primaryKeys[j].ColumnName];
++					keyValues[j] = row[primaryKeys[j].ColumnName, version];
+ 					}
+ 				
+ 					// find the row in the target table.
+ 					targetRow = targetTable.Rows.Find(keyValues);
+ 				}
+-			}
+ 			// row doesn't exist in target table, or there are no primary keys.
+ 			// create new row and copy values from source row to the new row.
+ 			if (targetRow == null)
+ 			{ 
+ 				targetRow = targetTable.NewRow();
+-				for(int j = 0; j < columns.Count; j++)
+-				{
+-					targetRow[columns[j].ColumnName] = row[columns[j].ColumnName];
+-				}
++				row.CopyValuesToRow(targetRow);
+ 				targetTable.Rows.Add(targetRow);
+ 			}
+ 			// row exists in target table, and presere changes is false - 
+ 			// change the values of the target row to the values of the source row.
+ 			else if (!preserveChanges)
+ 			{
+-				for(int j = 0; j < columns.Count; j++)
+-				{
+-					targetRow[columns[j].ColumnName] = row[columns[j].ColumnName];
+-				}
++				row.CopyValuesToRow(targetRow);
+ 			}
+ 
+ 		}
+@@ -155,7 +140,6 @@
+ 		// return true if there is a match, else return false and raise a MergeFailedEvent.
+ 		private static bool CheckPrimaryKeys(DataTable targetTable, DataTable sourceTable)
+ 		{
+-			bool retVal = true;
+ 			// if the length of one of the tables primarykey if 0 - there is nothing to check.
+ 			if (targetTable.PrimaryKey.Length != 0 && sourceTable.PrimaryKey.Length != 0)
+ 			{
+@@ -187,7 +171,6 @@
+ 						{
+ 							if (srcDataColumns[j].ColumnName == col.ColumnName)
+ 							{
+-								retVal = false;
+ 								foundMatch = true;
+ 								break;
+ 							}
+@@ -197,13 +180,14 @@
+ 							string message = "Mismatch columns in the PrimaryKey : <target>." + col.ColumnName + " versus <source>." + srcDataColumns[i].ColumnName + ".";
+ 							MergeFailedEventArgs e = new MergeFailedEventArgs(sourceTable, message);
+ 							targetTable.DataSet.OnMergeFailed(e);
++							return false;
+ 						}
+ 						
+ 					}
+ 				}
+ 			}
+ 
+-			return retVal;
++			return true;
+ 		}
+ 		
+ 		// fill the data from the source table to the target table

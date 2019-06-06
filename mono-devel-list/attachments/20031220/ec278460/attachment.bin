@@ -1,0 +1,140 @@
+This patch is a rewrite of StreamReader.ReadLine ().
+
+Before, every call to the method would allocate a StringBuilder. However,
+in the most common case, the entire string was able to fit in the buffer.
+In this case we can just create a new string from the char [] without
+passing through the StringBuilder.
+
+As well, the calls to Read () required argument checking that had already
+been done. The Read calls probably were not getting inlined, making it pretty slow.
+
+As a test, I ran the following program:
+
+using System;
+using System.IO;
+
+class T {
+	static void Main ()
+	{
+		StreamReader sr = new StreamReader ("/usr/share/dict/words");
+		while (sr.ReadLine () != null)
+			;
+	}
+}
+
+And ran it before and after this patch. The results were:
+
+OLD CODE   0.24 seconds
+NEW CODE   0.15 seconds
+
+Under the profiler, I was able to see memory allocation:
+
+OLD CODE   4735 KB
+NEW CODE   1380 KB
+
+Quite a dramatic improvement!
+
+I ran the corlib test suite for StreamReader and there were no failures either
+before or after the patch. I was also able to bootstrap corlib and MCS using this
+patch.
+
+Index: StreamReader.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.IO/StreamReader.cs,v
+retrieving revision 1.35
+diff -u -r1.35 StreamReader.cs
+--- StreamReader.cs	14 Nov 2003 22:32:04 -0000	1.35
++++ StreamReader.cs	20 Dec 2003 18:13:52 -0000
+@@ -342,42 +342,57 @@
+ 			if (base_stream == null)
+ 				throw new ObjectDisposedException ("StreamReader", "Cannot read from a closed StreamReader");
+ 			
+-			bool foundCR = false;
+-			StringBuilder text = new StringBuilder ();
+-
+-			while (true) {
+-				int c = Read ();
+-
+-				if (c == -1) {				// end of stream
+-					if (text.Length == 0)
+-						return null;
+-
+-					if (foundCR)
+-						text.Length--;
+-
+-					break;
+-				}
+-
+-				if (c == '\n') {			// newline
+-					if ((text.Length > 0) && (text [text.Length - 1] == '\r'))
+-						text.Length--;
+-
+-					foundCR = false;
+-					break;
+-				} else if (foundCR) {
+-					pos--;
+-					text.Length--;
+-					break;
+-				}
+-
+-				if (c == '\r')
+-					foundCR = true;
++			// Quick way out -- nothing left == return null
++			if (pos >= decoded_count && ReadBuffer () == 0)
++				return null;
++			
++			StringBuilder sb = null;
++			// Keep on reading till either 1) nothing is left
++			// or 2) we hit a cr or lf.
++			do {
++				int p = pos;
++				
++				// Look for a cr or lf in the buffer
++				
++				// Note this is not a for loop because
++				// we can avoid the check the first time
++				do {
++					char c = decoded_buffer [p];
+ 					
+-
+-				text.Append ((char) c);
+-			}
+-
+-			return text.ToString ();
++					// ok, not a line ending, move on
++					if (c != '\r' && c != '\n')
++						continue;
++					
++					// Line ending, so we are going to exit here
++					string ret;
++					
++					// It all fit in one buffer, so lets just make that string
++					if (sb == null) ret = new String (decoded_buffer, pos, p - pos);
++					// Ok, so we have to use the StringBuilder, because
++					// we need to go on to the next buffer
++					else            ret = sb.Append (decoded_buffer, pos, p - pos).ToString ();
++					
++					pos = p + 1;
++					// make sure we account for the \r\n on windows
++					if (c == '\r' && (pos < decoded_count || ReadBuffer () > 0) && decoded_buffer [pos] == '\n')
++						pos++;
++					
++					return ret;
++				} while (++p < decoded_count);
++				
++				// Is 20 a good constant here? We shouldnt hit here often, so it probably doesnt
++				// matter what we choose to do. The most common reason for hitting here would
++				// be if the line was split across two buffers. It would still be a short line
++				// so we dont want to add a huge constant.
++				if (sb == null)
++					sb = new StringBuilder (decoded_count - pos + 20);
++				
++				// Append what we found, keep on going
++				sb.Append (decoded_buffer, pos, decoded_count - pos);
++			} while (ReadBuffer () > 0);
++			
++			// ok, we reached the end of the buffer.
++			return sb.ToString ();
+ 		}
+ 
+ 		public override string ReadToEnd()

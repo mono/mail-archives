@@ -1,0 +1,1082 @@
+Index: metadata/domain.c
+===================================================================
+--- metadata/domain.c	(revision 114206)
++++ metadata/domain.c	(working copy)
+@@ -1971,6 +1971,10 @@
+ 		g_hash_table_destroy (domain->method_code_hash);
+ 		domain->method_code_hash = NULL;
+ 	}
++	if (domain->generic_virtual_cases) {
++		g_hash_table_destroy (domain->generic_virtual_cases);
++		domain->generic_virtual_cases = NULL;
++	}
+ 
+ 	DeleteCriticalSection (&domain->assemblies_lock);
+ 	DeleteCriticalSection (&domain->jit_code_hash_lock);
+Index: metadata/object.c
+===================================================================
+--- metadata/object.c	(revision 114206)
++++ metadata/object.c	(working copy)
+@@ -35,6 +35,7 @@
+ #include "mono/metadata/mono-debug-debugger.h"
+ #include <mono/metadata/gc-internal.h>
+ #include <mono/utils/strenc.h>
++#include <mono/utils/mono-counters.h>
+ 
+ #ifdef HAVE_BOEHM_GC
+ #define NEED_TO_ZERO_PTRFREE 1
+@@ -1049,8 +1050,8 @@
+ 	}
+ 
+ 	entry = malloc (sizeof (MonoImtBuilderEntry));
+-	entry->method = method;
+-	entry->vtable_slot = vtable_slot;
++	entry->key = method;
++	entry->value.vtable_slot = vtable_slot;
+ 	entry->next = imt_builder [imt_slot];
+ 	if (imt_builder [imt_slot] != NULL) {
+ 		entry->children = imt_builder [imt_slot]->children + 1;
+@@ -1092,7 +1093,7 @@
+ 	MonoImtBuilderEntry *e1 = *(MonoImtBuilderEntry**) p1;
+ 	MonoImtBuilderEntry *e2 = *(MonoImtBuilderEntry**) p2;
+ 	
+-	return (e1->method < e2->method) ? -1 : ((e1->method > e2->method) ? 1 : 0);
++	return (e1->key < e2->key) ? -1 : ((e1->key > e2->key) ? 1 : 0);
+ }
+ 
+ static int
+@@ -1104,8 +1105,8 @@
+ 		int i;
+ 		for (i = start; i < end; ++i) {
+ 			MonoIMTCheckItem *item = g_new0 (MonoIMTCheckItem, 1);
+-			item->method = sorted_array [i]->method;
+-			item->vtable_slot = sorted_array [i]->vtable_slot;
++			item->key = sorted_array [i]->key;
++			item->value = sorted_array [i]->value;
+ 			item->is_equals = TRUE;
+ 			if (i < end - 1)
+ 				item->check_target_idx = out_array->len + 1;
+@@ -1117,7 +1118,7 @@
+ 		int middle = start + count / 2;
+ 		MonoIMTCheckItem *item = g_new0 (MonoIMTCheckItem, 1);
+ 
+-		item->method = sorted_array [middle]->method;
++		item->key = sorted_array [middle]->key;
+ 		item->is_equals = FALSE;
+ 		g_ptr_array_add (out_array, item);
+ 		imt_emit_ir (sorted_array, start, middle, out_array);
+@@ -1154,13 +1155,14 @@
+ 	if (imt_builder_entry != NULL) {
+ 		if (imt_builder_entry->children == 0) {
+ 			/* No collision, return the vtable slot contents */
+-			return vtable->vtable [imt_builder_entry->vtable_slot];
++			return vtable->vtable [imt_builder_entry->value.vtable_slot];
+ 		} else {
+ 			/* Collision, build the thunk */
+ 			GPtrArray *imt_ir = imt_sort_slot_entries (imt_builder_entry);
+ 			gpointer result;
+ 			int i;
+-			result = imt_thunk_builder (vtable, domain, (MonoIMTCheckItem**)imt_ir->pdata, imt_ir->len);
++			result = imt_thunk_builder (vtable, domain,
++				(MonoIMTCheckItem**)imt_ir->pdata, imt_ir->len, NULL);
+ 			for (i = 0; i < imt_ir->len; ++i)
+ 				g_free (g_ptr_array_index (imt_ir, i));
+ 			g_ptr_array_free (imt_ir, TRUE);
+@@ -1294,6 +1296,241 @@
+ 	mono_domain_unlock (vtable->domain);
+ }
+ 
++
++/*
++ * The first two free list entries both belong to the wait list: The
++ * first entry is the pointer to the head of the list and the second
++ * entry points to the last element.  That way appending and removing
++ * the first element are both O(1) operations.
++ */
++#define NUM_FREE_LISTS		12
++#define FIRST_FREE_LIST_SIZE	64
++#define MAX_WAIT_LENGTH 	50
++#define THUNK_THRESHOLD		100
++
++/*
++ * LOCKING: The domain lock must be held.
++ */
++static void
++init_thunk_free_lists (MonoDomain *domain)
++{
++	if (domain->thunk_free_lists)
++		return;
++	domain->thunk_free_lists = mono_mempool_alloc0 (domain->mp, sizeof (gpointer) * NUM_FREE_LISTS);
++}
++
++static int
++list_index_for_size (int item_size)
++{
++	int i = 2;
++	int size = FIRST_FREE_LIST_SIZE;
++
++	while (item_size > size && i < NUM_FREE_LISTS - 1) {
++		i++;
++		size <<= 1;
++	}
++
++	return i;
++}
++
++/**
++ * mono_method_alloc_generic_virtual_thunk:
++ * @domain: a domain
++ * @size: size in bytes
++ *
++ * Allocs size bytes to be used for the code of a generic virtual
++ * thunk.  It's either allocated from the domain's code manager or
++ * reused from a previously invalidated piece.
++ *
++ * LOCKING: The domain lock must be held.
++ */
++gpointer
++mono_method_alloc_generic_virtual_thunk (MonoDomain *domain, int size)
++{
++	static gboolean inited = FALSE;
++	static int generic_virtual_thunks_size = 0;
++
++	guint32 *p;
++	int i;
++	MonoThunkFreeList **l;
++
++	init_thunk_free_lists (domain);
++
++	size += sizeof (guint32);
++	if (size < sizeof (MonoThunkFreeList))
++		size = sizeof (MonoThunkFreeList);
++
++	i = list_index_for_size (size);
++	for (l = &domain->thunk_free_lists [i]; *l; l = &(*l)->next) {
++		if ((*l)->size >= size) {
++			MonoThunkFreeList *item = *l;
++			*l = item->next;
++			return ((guint32*)item) + 1;
++		}
++	}
++
++	/* no suitable item found - search lists of larger sizes */
++	while (++i < NUM_FREE_LISTS) {
++		MonoThunkFreeList *item = domain->thunk_free_lists [i];
++		if (!item)
++			continue;
++		g_assert (item->size > size);
++		domain->thunk_free_lists [i] = item->next;
++		return ((guint32*)item) + 1;
++	}
++
++	/* still nothing found - allocate it */
++	if (!inited) {
++		mono_counters_register ("Generic virtual thunk bytes",
++				MONO_COUNTER_GENERICS | MONO_COUNTER_INT, &generic_virtual_thunks_size);
++		inited = TRUE;
++	}
++	generic_virtual_thunks_size += size;
++
++	p = mono_code_manager_reserve (domain->code_mp, size);
++	*p = size;
++
++	return p + 1;
++}
++
++/*
++ * LOCKING: The domain lock must be held.
++ */
++static void
++invalidate_generic_virtual_thunk (MonoDomain *domain, gpointer code)
++{
++	guint32 *p = code;
++	MonoThunkFreeList *l = (MonoThunkFreeList*)(p - 1);
++
++	init_thunk_free_lists (domain);
++
++	while (domain->thunk_free_lists [0] && domain->thunk_free_lists [0]->length >= MAX_WAIT_LENGTH) {
++		MonoThunkFreeList *item = domain->thunk_free_lists [0];
++		int length = item->length;
++		int i;
++
++		/* unlink the first item from the wait list */
++		domain->thunk_free_lists [0] = item->next;
++		domain->thunk_free_lists [0]->length = length - 1;
++
++		i = list_index_for_size (item->size);
++
++		g_print ("putting thunk of size %d in list %d\n", item->size, i);
++
++		/* put it in the free list */
++		item->next = domain->thunk_free_lists [i];
++		domain->thunk_free_lists [i] = item;
++	}
++
++	l->next = NULL;
++	if (domain->thunk_free_lists [1]) {
++		domain->thunk_free_lists [1] = domain->thunk_free_lists [1]->next = l;
++		domain->thunk_free_lists [0]->length++;
++	} else {
++		g_assert (!domain->thunk_free_lists [0]);
++
++		domain->thunk_free_lists [0] = domain->thunk_free_lists [1] = l;
++		domain->thunk_free_lists [0]->length = 1;
++	}
++}
++
++typedef struct _GenericVirtualCase {
++	MonoGenericInst *inst;
++	gpointer code;
++	int count;
++	struct _GenericVirtualCase *next;
++} GenericVirtualCase;
++
++/**
++ * mono_method_add_generic_virtual_case:
++ * @domain: a domain
++ * @vtable_slot: pointer to the vtable slot
++ * @method_inst: the method's method_inst
++ * @code: the method's code
++ *
++ * Registers a call via unmanaged code to a generic virtual method
++ * instantiation.  If the number of calls reaches a threshold
++ * (THUNK_THRESHOLD), the method is added to the vtable slot's generic
++ * virtual method thunk.
++ */
++void
++mono_method_add_generic_virtual_case (MonoDomain *domain, gpointer *vtable_slot,
++	MonoGenericInst *method_inst, gpointer code)
++{
++	static gboolean inited = FALSE;
++	static int num_added = 0;
++
++	GenericVirtualCase *gvc, *list;
++	MonoImtBuilderEntry *entries;
++	int i;
++	GPtrArray *sorted;
++
++	mono_domain_lock (domain);
++	if (!domain->generic_virtual_cases)
++		domain->generic_virtual_cases = g_hash_table_new (mono_aligned_addr_hash, NULL);
++
++	/* Check whether the case was already added */
++	gvc = g_hash_table_lookup (domain->generic_virtual_cases, vtable_slot);
++	while (gvc) {
++		if (gvc->inst == method_inst)
++			break;
++		gvc = gvc->next;
++	}
++
++	/* If not found, make a new one */
++	if (!gvc) {
++		gvc = mono_mempool_alloc (domain->mp, sizeof (GenericVirtualCase));
++		gvc->inst = method_inst;
++		gvc->code = code;
++		gvc->count = 0;
++		gvc->next = g_hash_table_lookup (domain->generic_virtual_cases, vtable_slot);
++
++		g_hash_table_insert (domain->generic_virtual_cases, vtable_slot, gvc);
++
++		if (!inited) {
++			mono_counters_register ("Generic virtual cases", MONO_COUNTER_GENERICS | MONO_COUNTER_INT, &num_added);
++			inited = TRUE;
++		}
++		num_added++;
++	}
++
++	if (++gvc->count < THUNK_THRESHOLD) {
++		mono_domain_unlock (domain);
++		return;
++	}
++
++	entries = NULL;
++	for (list = gvc; list; list = list->next) {
++		MonoImtBuilderEntry *entry = g_new0 (MonoImtBuilderEntry, 1);
++		entry->key = list->inst;
++		entry->value.target_code = list->code;
++		if (entries)
++			entry->children = entries->children + 1;
++		entry->next = entries;
++		entries = entry;
++	}
++
++	sorted = imt_sort_slot_entries (entries);
++
++	if (*vtable_slot != vtable_trampoline)
++		invalidate_generic_virtual_thunk (domain, *vtable_slot);
++
++	*vtable_slot = imt_thunk_builder (NULL, domain, (MonoIMTCheckItem**)sorted->pdata, sorted->len,
++		vtable_trampoline);
++
++	mono_domain_unlock (domain);
++
++	while (entries) {
++		MonoImtBuilderEntry *next = entries->next;
++		g_free (entries);
++		entries = next;
++	}
++
++	for (i = 0; i < sorted->len; ++i)
++		g_free (g_ptr_array_index (sorted, i));
++	g_ptr_array_free (sorted, TRUE);
++}
++
+ static MonoVTable *mono_class_create_runtime_vtable (MonoDomain *domain, MonoClass *class);
+ 
+ /**
+Index: metadata/class-internals.h
+===================================================================
+--- metadata/class-internals.h	(revision 114206)
++++ metadata/class-internals.h	(working copy)
+@@ -217,7 +217,8 @@
+ 	MONO_RGCTX_INFO_METHOD,
+ 	MONO_RGCTX_INFO_GENERIC_METHOD_CODE,
+ 	MONO_RGCTX_INFO_CLASS_FIELD,
+-	MONO_RGCTX_INFO_METHOD_RGCTX
++	MONO_RGCTX_INFO_METHOD_RGCTX,
++	MONO_RGCTX_INFO_METHOD_CONTEXT
+ };
+ 
+ typedef struct _MonoRuntimeGenericContextOtherInfoTemplate {
+Index: metadata/object-internals.h
+===================================================================
+--- metadata/object-internals.h	(revision 114206)
++++ metadata/object-internals.h	(working copy)
+@@ -1203,19 +1203,24 @@
+ 
+ #define MONO_IMT_SIZE 19
+ 
++typedef union {
++	int vtable_slot;
++	gpointer target_code;
++} MonoImtItemValue;
++
+ typedef struct _MonoImtBuilderEntry {
+-	MonoMethod *method;
++	gpointer key;
+ 	struct _MonoImtBuilderEntry *next;
+-	int vtable_slot;
++	MonoImtItemValue value;
+ 	int children;
+ } MonoImtBuilderEntry;
+ 
+ typedef struct _MonoIMTCheckItem MonoIMTCheckItem;
+ 
+ struct _MonoIMTCheckItem {
+-	MonoMethod       *method;
++	gpointer          key;
+ 	int               check_target_idx;
+-	int               vtable_slot;
++	MonoImtItemValue  value;
+ 	guint8           *jmp_code;
+ 	guint8           *code_target;
+ 	guint8            is_equals;
+@@ -1224,7 +1229,8 @@
+ 	guint8            short_branch;
+ };
+ 
+-typedef gpointer (*MonoImtThunkBuilder) (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count);
++typedef gpointer (*MonoImtThunkBuilder) (MonoVTable *vtable, MonoDomain *domain,
++		MonoIMTCheckItem **imt_entries, int count, gpointer fail_trunk);
+ 
+ void
+ mono_install_imt_thunk_builder (MonoImtThunkBuilder func) MONO_INTERNAL;
+@@ -1241,6 +1247,13 @@
+ guint32
+ mono_method_get_imt_slot (MonoMethod *method) MONO_INTERNAL;
+ 
++void
++mono_method_add_generic_virtual_case (MonoDomain *domain, gpointer *vtable_slot,
++	MonoGenericInst *method_inst, gpointer code) MONO_INTERNAL;
++
++gpointer
++mono_method_alloc_generic_virtual_thunk (MonoDomain *domain, int size) MONO_INTERNAL;
++
+ typedef enum {
+ 	MONO_UNHANLED_POLICY_LEGACY,
+ 	MONO_UNHANLED_POLICY_CURRENT
+Index: metadata/domain-internals.h
+===================================================================
+--- metadata/domain-internals.h	(revision 114206)
++++ metadata/domain-internals.h	(working copy)
+@@ -141,6 +141,12 @@
+ 	MONO_APPDOMAIN_UNLOADED
+ } MonoAppDomainState;
+ 
++typedef struct _MonoThunkFreeList {
++	guint32 size;
++	struct _MonoThunkFreeList *next;
++	int length;		/* only valid for the wait list */
++} MonoThunkFreeList;
++
+ typedef struct _MonoJitCodeHash MonoJitCodeHash;
+ 
+ struct _MonoDomain {
+@@ -217,6 +223,9 @@
+ 	GHashTable	   *method_rgctx_hash;
+ 	GHashTable     *method_code_hash;
+ 
++	GHashTable	   *generic_virtual_cases;
++	MonoThunkFreeList **thunk_free_lists;
++
+ 	/* Information maintained by the JIT engine */
+ 	gpointer runtime_info;
+ };
+Index: metadata/generic-sharing.c
+===================================================================
+--- metadata/generic-sharing.c	(revision 114206)
++++ metadata/generic-sharing.c	(working copy)
+@@ -535,7 +535,8 @@
+ 
+ 	case MONO_RGCTX_INFO_METHOD:
+ 	case MONO_RGCTX_INFO_GENERIC_METHOD_CODE:
+-	case MONO_RGCTX_INFO_METHOD_RGCTX: {
++	case MONO_RGCTX_INFO_METHOD_RGCTX:
++	case MONO_RGCTX_INFO_METHOD_CONTEXT: {
+ 		MonoMethod *method = data;
+ 		MonoMethod *inflated_method;
+ 		MonoType *inflated_type = mono_class_inflate_generic_type (&method->klass->byval_arg, context);
+@@ -820,6 +821,14 @@
+ 		return mono_method_lookup_rgctx (mono_class_vtable (domain, method->method.method.klass),
+ 			method->context.method_inst);
+ 	}
++	case MONO_RGCTX_INFO_METHOD_CONTEXT: {
++		MonoMethodInflated *method = data;
++
++		g_assert (method->method.method.is_inflated);
++		g_assert (method->context.method_inst);
++
++		return method->context.method_inst;
++	}
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+@@ -921,6 +930,7 @@
+ 	case MONO_RGCTX_INFO_GENERIC_METHOD_CODE:
+ 	case MONO_RGCTX_INFO_CLASS_FIELD:
+ 	case MONO_RGCTX_INFO_METHOD_RGCTX:
++	case MONO_RGCTX_INFO_METHOD_CONTEXT:
+ 		return data1 == data2;
+ 	default:
+ 		g_assert_not_reached ();
+Index: mini/method-to-ir.c
+===================================================================
+--- mini/method-to-ir.c	(revision 114206)
++++ mini/method-to-ir.c	(working copy)
+@@ -2372,6 +2372,10 @@
+ 		} else {
+ 			slot_reg = vtable_reg;
+ 			call->inst.inst_offset = G_STRUCT_OFFSET (MonoVTable, vtable) + (method->slot * SIZEOF_VOID_P);
++			if (imt_arg) {
++				g_assert (mono_method_signature (method)->generic_param_count);
++				emit_imt_argument (cfg, call, imt_arg);
++			}
+ 		}
+ 
+ 		call->inst.sreg1 = slot_reg;
+@@ -5943,28 +5947,47 @@
+ 				/* Prevent inlining of methods that contain indirect calls */
+ 				INLINE_FAILURE;
+ 
+-				this_temp = mono_compile_create_var (cfg, type_from_stack_type (sp [0]), OP_LOCAL);
+-				NEW_TEMPSTORE (cfg, store, this_temp->inst_c0, sp [0]);
+-				MONO_ADD_INS (bblock, store);
+- 
+-				/* FIXME: This should be a managed pointer */
+-				this_arg_temp = mono_compile_create_var (cfg, &mono_defaults.int_class->byval_arg, OP_LOCAL);
++#if MONO_ARCH_HAVE_GENERALIZED_IMT_THUNK
++				if (!(cmethod->klass->flags & TYPE_ATTRIBUTE_INTERFACE)) {
++					g_assert (!imt_arg);
++					if (context_used) {
++						imt_arg = emit_get_rgctx_method (cfg, context_used,
++							cmethod, MONO_RGCTX_INFO_METHOD_CONTEXT);
+ 
+-				EMIT_NEW_TEMPLOAD (cfg, iargs [0], this_temp->inst_c0);
+-				if (context_used) {
+-					iargs [1] = emit_get_rgctx_method (cfg, context_used, cmethod, MONO_RGCTX_INFO_METHOD);
+-					EMIT_NEW_TEMPLOADA (cfg, iargs [2], this_arg_temp->inst_c0);
+-					addr = mono_emit_jit_icall (cfg,
+-						mono_helper_compile_generic_method, iargs);
+-				} else {
+-					EMIT_NEW_METHODCONST (cfg, iargs [1], cmethod);
+-					EMIT_NEW_TEMPLOADA (cfg, iargs [2], this_arg_temp->inst_c0);
+-					addr = mono_emit_jit_icall (cfg, mono_helper_compile_generic_method, iargs);
++					} else {
++						g_assert (cmethod->is_inflated);
++						EMIT_NEW_PCONST (cfg, imt_arg,
++							((MonoMethodInflated*)cmethod)->context.method_inst);
++					}
++					ins = mono_emit_method_call_full (cfg, cmethod, fsig, sp, sp [0], imt_arg);
++				} else
++#endif
++				{
++					this_temp = mono_compile_create_var (cfg, type_from_stack_type (sp [0]), OP_LOCAL);
++					NEW_TEMPSTORE (cfg, store, this_temp->inst_c0, sp [0]);
++					MONO_ADD_INS (bblock, store);
++
++					/* FIXME: This should be a managed pointer */
++					this_arg_temp = mono_compile_create_var (cfg, &mono_defaults.int_class->byval_arg, OP_LOCAL);
++
++					EMIT_NEW_TEMPLOAD (cfg, iargs [0], this_temp->inst_c0);
++					if (context_used) {
++						iargs [1] = emit_get_rgctx_method (cfg, context_used,
++							cmethod, MONO_RGCTX_INFO_METHOD);
++						EMIT_NEW_TEMPLOADA (cfg, iargs [2], this_arg_temp->inst_c0);
++						addr = mono_emit_jit_icall (cfg,
++								mono_helper_compile_generic_method, iargs);
++					} else {
++						EMIT_NEW_METHODCONST (cfg, iargs [1], cmethod);
++						EMIT_NEW_TEMPLOADA (cfg, iargs [2], this_arg_temp->inst_c0);
++						addr = mono_emit_jit_icall (cfg, mono_helper_compile_generic_method, iargs);
++					}
++
++					EMIT_NEW_TEMPLOAD (cfg, sp [0], this_arg_temp->inst_c0);
++
++					ins = (MonoInst*)mono_emit_calli (cfg, fsig, sp, addr);
+ 				}
+ 
+-				EMIT_NEW_TEMPLOAD (cfg, sp [0], this_arg_temp->inst_c0);
+-
+-				ins = (MonoInst*)mono_emit_calli (cfg, fsig, sp, addr);
+ 				if (!MONO_TYPE_IS_VOID (fsig->ret))
+ 					*sp++ = ins;
+ 
+Index: mini/mini.h
+===================================================================
+--- mini/mini.h	(revision 114206)
++++ mini/mini.h	(working copy)
+@@ -1513,7 +1513,7 @@
+ void        mono_arch_emit_imt_argument         (MonoCompile *cfg, MonoCallInst *call, MonoInst *imt_arg) MONO_INTERNAL;
+ MonoMethod* mono_arch_find_imt_method           (gpointer *regs, guint8 *code) MONO_INTERNAL;
+ MonoVTable* mono_arch_find_static_call_vtable   (gpointer *regs, guint8 *code) MONO_INTERNAL;
+-gpointer    mono_arch_build_imt_thunk           (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count) MONO_INTERNAL;
++gpointer    mono_arch_build_imt_thunk           (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count, gpointer fail_tramp) MONO_INTERNAL;
+ void    mono_arch_notify_pending_exc            (void) MONO_INTERNAL;
+ void    mono_arch_fixup_jinfo                   (MonoCompile *cfg) MONO_INTERNAL;
+ 
+Index: mini/mini-amd64.c
+===================================================================
+--- mini/mini-amd64.c	(revision 114206)
++++ mini/mini-amd64.c	(working copy)
+@@ -6254,19 +6254,22 @@
+  * LOCKING: called with the domain lock held
+  */
+ gpointer
+-mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count)
++mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count,
++	gpointer fail_tramp)
+ {
+ 	int i;
+ 	int size = 0;
+ 	guint8 *code, *start;
+ 	gboolean vtable_is_32bit = ((gsize)(vtable) == (gsize)(int)(gsize)(vtable));
+ 
++	g_assert (!fail_tramp);
++
+ 	for (i = 0; i < count; ++i) {
+ 		MonoIMTCheckItem *item = imt_entries [i];
+ 		if (item->is_equals) {
+ 			if (item->check_target_idx) {
+ 				if (!item->compare_done) {
+-					if (amd64_is_imm32 (item->method))
++					if (amd64_is_imm32 (item->key))
+ 						item->chunk_size += CMP_SIZE;
+ 					else
+ 						item->chunk_size += MOV_REG_IMM_SIZE + CMP_REG_REG_SIZE;
+@@ -6287,7 +6290,7 @@
+ 				 */
+ 			}
+ 		} else {
+-			if (amd64_is_imm32 (item->method))
++			if (amd64_is_imm32 (item->key))
+ 				item->chunk_size += CMP_SIZE;
+ 			else
+ 				item->chunk_size += MOV_REG_IMM_SIZE + CMP_REG_REG_SIZE;
+@@ -6304,31 +6307,31 @@
+ 		if (item->is_equals) {
+ 			if (item->check_target_idx) {
+ 				if (!item->compare_done) {
+-					if (amd64_is_imm32 (item->method))
+-						amd64_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)(gssize)item->method);
++					if (amd64_is_imm32 (item->key))
++						amd64_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)(gssize)item->key);
+ 					else {
+-						amd64_mov_reg_imm (code, AMD64_R10, item->method);
++						amd64_mov_reg_imm (code, AMD64_R10, item->key);
+ 						amd64_alu_reg_reg (code, X86_CMP, MONO_ARCH_IMT_REG, AMD64_R10);
+ 					}
+ 				}
+ 				item->jmp_code = code;
+ 				amd64_branch8 (code, X86_CC_NE, 0, FALSE);
+ 				/* See the comment below about R10 */
+-				amd64_mov_reg_imm (code, AMD64_R10, & (vtable->vtable [item->vtable_slot]));
++				amd64_mov_reg_imm (code, AMD64_R10, & (vtable->vtable [item->value.vtable_slot]));
+ 				amd64_jump_membase (code, AMD64_R10, 0);
+ 			} else {
+ 				/* enable the commented code to assert on wrong method */
+ #if 0
+-				if (amd64_is_imm32 (item->method))
+-					amd64_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)(gssize)item->method);
++				if (amd64_is_imm32 (item->key))
++					amd64_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)(gssize)item->key);
+ 				else {
+-					amd64_mov_reg_imm (code, AMD64_R10, item->method);
++					amd64_mov_reg_imm (code, AMD64_R10, item->key);
+ 					amd64_alu_reg_reg (code, X86_CMP, MONO_ARCH_IMT_REG, AMD64_R10);
+ 				}
+ 				item->jmp_code = code;
+ 				amd64_branch8 (code, X86_CC_NE, 0, FALSE);
+ 				/* See the comment below about R10 */
+-				amd64_mov_reg_imm (code, AMD64_R10, & (vtable->vtable [item->vtable_slot]));
++				amd64_mov_reg_imm (code, AMD64_R10, & (vtable->vtable [item->value.vtable_slot]));
+ 				amd64_jump_membase (code, AMD64_R10, 0);
+ 				amd64_patch (item->jmp_code, code);
+ 				amd64_breakpoint (code);
+@@ -6339,15 +6342,15 @@
+ 				   to be preserved for calls which
+ 				   require a runtime generic context,
+ 				   but interface calls don't. */
+-				amd64_mov_reg_imm (code, AMD64_R10, & (vtable->vtable [item->vtable_slot]));
++				amd64_mov_reg_imm (code, AMD64_R10, & (vtable->vtable [item->value.vtable_slot]));
+ 				amd64_jump_membase (code, AMD64_R10, 0);
+ #endif
+ 			}
+ 		} else {
+-			if (amd64_is_imm32 (item->method))
+-				amd64_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)(gssize)item->method);
++			if (amd64_is_imm32 (item->key))
++				amd64_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)(gssize)item->key);
+ 			else {
+-				amd64_mov_reg_imm (code, AMD64_R10, item->method);
++				amd64_mov_reg_imm (code, AMD64_R10, item->key);
+ 				amd64_alu_reg_reg (code, X86_CMP, MONO_ARCH_IMT_REG, AMD64_R10);
+ 			}
+ 			item->jmp_code = code;
+Index: mini/mini-x86.c
+===================================================================
+--- mini/mini-x86.c	(revision 114206)
++++ mini/mini-x86.c	(working copy)
+@@ -21,6 +21,7 @@
+ #include <mono/metadata/profiler-private.h>
+ #include <mono/metadata/mono-debug.h>
+ #include <mono/utils/mono-math.h>
++#include <mono/utils/mono-counters.h>
+ 
+ #include "trace.h"
+ #include "mini-x86.h"
+@@ -4467,7 +4468,8 @@
+  * LOCKING: called with the domain lock held
+  */
+ gpointer
+-mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count)
++mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count,
++	gpointer fail_tramp)
+ {
+ 	int i;
+ 	int size = 0;
+@@ -4481,10 +4483,14 @@
+ 					item->chunk_size += CMP_SIZE;
+ 				item->chunk_size += BR_SMALL_SIZE + JUMP_IMM_SIZE;
+ 			} else {
+-				item->chunk_size += JUMP_IMM_SIZE;
++				if (fail_tramp) {
++					item->chunk_size += CMP_SIZE + BR_SMALL_SIZE + JUMP_IMM_SIZE * 2;
++				} else {
++					item->chunk_size += JUMP_IMM_SIZE;
+ #if ENABLE_WRONG_METHOD_CHECK
+-				item->chunk_size += CMP_SIZE + BR_SMALL_SIZE + 1;
++					item->chunk_size += CMP_SIZE + BR_SMALL_SIZE + 1;
+ #endif
++				}
+ 			}
+ 		} else {
+ 			item->chunk_size += CMP_SIZE + BR_LARGE_SIZE;
+@@ -4492,7 +4498,10 @@
+ 		}
+ 		size += item->chunk_size;
+ 	}
+-	code = mono_code_manager_reserve (domain->code_mp, size);
++	if (fail_tramp)
++		code = mono_method_alloc_generic_virtual_thunk (domain, size);
++	else
++		code = mono_code_manager_reserve (domain->code_mp, size);
+ 	start = code;
+ 	for (i = 0; i < count; ++i) {
+ 		MonoIMTCheckItem *item = imt_entries [i];
+@@ -4500,26 +4509,39 @@
+ 		if (item->is_equals) {
+ 			if (item->check_target_idx) {
+ 				if (!item->compare_done)
+-					x86_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)item->method);
++					x86_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)item->key);
+ 				item->jmp_code = code;
+ 				x86_branch8 (code, X86_CC_NE, 0, FALSE);
+-				x86_jump_mem (code, & (vtable->vtable [item->vtable_slot]));
++				if (fail_tramp)
++					x86_jump_code (code, item->value.target_code);
++				else
++					x86_jump_mem (code, & (vtable->vtable [item->value.vtable_slot]));
+ 			} else {
+-				/* enable the commented code to assert on wrong method */
++				if (fail_tramp) {
++					x86_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)item->key);
++					item->jmp_code = code;
++					x86_branch8 (code, X86_CC_NE, 0, FALSE);
++					x86_jump_code (code, item->value.target_code);
++					x86_patch (item->jmp_code, code);
++					x86_jump_code (code, fail_tramp);
++					item->jmp_code = NULL;
++				} else {
++					/* enable the commented code to assert on wrong method */
+ #if ENABLE_WRONG_METHOD_CHECK
+-				x86_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)item->method);
+-				item->jmp_code = code;
+-				x86_branch8 (code, X86_CC_NE, 0, FALSE);
++					x86_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)item->key);
++					item->jmp_code = code;
++					x86_branch8 (code, X86_CC_NE, 0, FALSE);
+ #endif
+-				x86_jump_mem (code, & (vtable->vtable [item->vtable_slot]));
++					x86_jump_mem (code, & (vtable->vtable [item->value.vtable_slot]));
+ #if ENABLE_WRONG_METHOD_CHECK
+-				x86_patch (item->jmp_code, code);
+-				x86_breakpoint (code);
+-				item->jmp_code = NULL;
++					x86_patch (item->jmp_code, code);
++					x86_breakpoint (code);
++					item->jmp_code = NULL;
+ #endif
++				}
+ 			}
+ 		} else {
+-			x86_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)item->method);
++			x86_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32)item->key);
+ 			item->jmp_code = code;
+ 			if (x86_is_imm8 (imt_branch_distance (imt_entries, i, item->check_target_idx)))
+ 				x86_branch8 (code, X86_CC_GE, 0, FALSE);
+@@ -4536,8 +4558,9 @@
+ 			}
+ 		}
+ 	}
+-		
+-	mono_stats.imt_thunks_size += code - start;
++
++	if (!fail_tramp)
++		mono_stats.imt_thunks_size += code - start;
+ 	g_assert (code - start <= size);
+ 	return start;
+ }
+Index: mini/mini-x86.h
+===================================================================
+--- mini/mini-x86.h	(revision 114206)
++++ mini/mini-x86.h	(working copy)
+@@ -285,6 +285,7 @@
+ #define MONO_ARCH_COMMON_VTABLE_TRAMPOLINE 1
+ #define MONO_ARCH_RGCTX_REG X86_EDX
+ #define MONO_ARCH_ENABLE_NORMALIZE_OPCODES 1
++#define MONO_ARCH_HAVE_GENERALIZED_IMT_THUNK 1
+ 
+ #define MONO_ARCH_HAVE_CMOV_OPS 1
+ 
+Index: mini/mini-trampolines.c
+===================================================================
+--- mini/mini-trampolines.c	(revision 114206)
++++ mini/mini-trampolines.c	(working copy)
+@@ -106,6 +106,7 @@
+ 	gpointer *vtable_slot;
+ 	gboolean generic_shared = FALSE;
+ 	MonoMethod *declaring = NULL;
++	MonoGenericInst *generic_virtual_method_inst = NULL;
+ 	int context_used;
+ 
+ #if MONO_ARCH_COMMON_VTABLE_TRAMPOLINE
+@@ -158,7 +159,27 @@
+ 	}
+ #endif
+ 
+-	if ((context_used = mono_method_check_context_used (m))) {
++	if (m->is_generic) {
++		MonoGenericContext context = { NULL, NULL };
++		MonoMethod *declaring;
++
++		if (m->is_inflated)
++			declaring = mono_method_get_declaring_generic_method (m);
++		else
++			declaring = m;
++
++		if (m->klass->generic_class)
++			context.class_inst = m->klass->generic_class->context.class_inst;
++		else
++			g_assert (!m->klass->generic_container);
++
++		generic_virtual_method_inst = (MonoGenericInst*)mono_arch_find_imt_method ((gpointer*)regs, code);
++		context.method_inst = generic_virtual_method_inst;
++
++		m = mono_class_inflate_generic_method (declaring, &context);
++		/* FIXME: only do this if the method is sharable */
++		m = mono_marshal_get_static_rgctx_invoke (m);
++	} else if ((context_used = mono_method_check_context_used (m))) {
+ 		MonoClass *klass = NULL;
+ 		MonoMethod *actual_method = NULL;
+ 		MonoVTable *vt = NULL;
+@@ -264,6 +285,16 @@
+ 
+ 	mono_debugger_trampoline_compiled (m, addr);
+ 
++	if (generic_virtual_method_inst) {
++		vtable_slot = mono_arch_get_vcall_slot_addr (code, (gpointer*)regs);
++		g_assert (vtable_slot);
++
++		mono_method_add_generic_virtual_case (mono_domain_get (), vtable_slot,
++			generic_virtual_method_inst, addr);
++
++		return addr;
++	}
++
+ 	/* the method was jumped to */
+ 	if (!code) {
+ 		MonoDomain *domain = mono_domain_get ();
+Index: mini/mini-arm.c
+===================================================================
+--- mini/mini-arm.c	(revision 114206)
++++ mini/mini-arm.c	(working copy)
+@@ -4359,16 +4359,19 @@
+ }
+ 
+ gpointer
+-mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count)
++mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count,
++	gpointer fail_tramp)
+ {
+ 	int size, i, extra_space = 0;
+ 	arminstr_t *code, *start, *vtable_target = NULL;
+ 	size = BASE_SIZE;
+ 
++	g_assert (!fail_tramp);
++
+ 	for (i = 0; i < count; ++i) {
+ 		MonoIMTCheckItem *item = imt_entries [i];
+ 		if (item->is_equals) {
+-			g_assert (arm_is_imm12 (DISTANCE (vtable, &vtable->vtable[item->vtable_slot])));
++			g_assert (arm_is_imm12 (DISTANCE (vtable, &vtable->vtable[item->value.vtable_slot])));
+ 
+ 			if (item->check_target_idx) {
+ 				if (!item->compare_done)
+@@ -4393,7 +4396,7 @@
+ 	printf ("building IMT thunk for class %s %s entries %d code size %d code at %p end %p vtable %p\n", vtable->klass->name_space, vtable->klass->name, count, size, start, ((guint8*)start) + size, vtable);
+ 	for (i = 0; i < count; ++i) {
+ 		MonoIMTCheckItem *item = imt_entries [i];
+-		printf ("method %d (%p) %s vtable slot %p is_equals %d chunk size %d\n", i, item->method, item->method->name, &vtable->vtable [item->vtable_slot], item->is_equals, item->chunk_size);
++		printf ("method %d (%p) %s vtable slot %p is_equals %d chunk size %d\n", i, item->key, item->key->name, &vtable->vtable [item->value.vtable_slot], item->is_equals, item->chunk_size);
+ 	}
+ #endif
+ 
+@@ -4422,7 +4425,7 @@
+ 				ARM_B_COND (code, ARMCOND_NE, 0);
+ 
+ 				ARM_POP2 (code, ARMREG_R0, ARMREG_R1);
+-				ARM_LDR_IMM (code, ARMREG_PC, ARMREG_IP, DISTANCE (vtable, &vtable->vtable[item->vtable_slot]));
++				ARM_LDR_IMM (code, ARMREG_PC, ARMREG_IP, DISTANCE (vtable, &vtable->vtable[item->value.vtable_slot]));
+ 			} else {
+ 				/*Enable the commented code to assert on wrong method*/
+ #if ENABLE_WRONG_METHOD_CHECK
+@@ -4432,7 +4435,7 @@
+ 				ARM_B_COND (code, ARMCOND_NE, 1);
+ #endif
+ 				ARM_POP2 (code, ARMREG_R0, ARMREG_R1);
+-				ARM_LDR_IMM (code, ARMREG_PC, ARMREG_IP, DISTANCE (vtable, &vtable->vtable[item->vtable_slot]));
++				ARM_LDR_IMM (code, ARMREG_PC, ARMREG_IP, DISTANCE (vtable, &vtable->vtable[item->value.vtable_slot]));
+ 
+ #if ENABLE_WRONG_METHOD_CHECK
+ 				ARM_DBRK (code);
+@@ -4440,7 +4443,7 @@
+ 			}
+ 
+ 			if (imt_method)
+-				code = arm_emit_value_and_patch_ldr (code, imt_method, (guint32)item->method);
++				code = arm_emit_value_and_patch_ldr (code, imt_method, (guint32)item->key);
+ 
+ 			/*must emit after unconditional branch*/
+ 			if (vtable_target) {
+Index: mini/mini-ia64.c
+===================================================================
+--- mini/mini-ia64.c	(revision 114206)
++++ mini/mini-ia64.c	(working copy)
+@@ -4958,13 +4958,16 @@
+  * LOCKING: called with the domain lock held
+  */
+ gpointer
+-mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count)
++mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count,
++	gpointer fail_tramp)
+ {
+ 	int i;
+ 	int size = 0;
+ 	guint8 *start, *buf;
+ 	Ia64CodegenState code;
+ 
++	g_assert (!fail_tramp);
++
+ 	size = count * 256;
+ 	buf = g_malloc0 (size);
+ 	ia64_codegen_init (code, buf);
+@@ -4978,13 +4981,13 @@
+ 		if (item->is_equals) {
+ 			if (item->check_target_idx) {
+ 				if (!item->compare_done) {
+-					ia64_movl (code, GP_SCRATCH_REG, item->method);
++					ia64_movl (code, GP_SCRATCH_REG, item->key);
+ 					ia64_cmp_eq (code, 6, 7, IA64_R9, GP_SCRATCH_REG);
+ 				}
+ 				item->jmp_code = (guint8*)code.buf + code.nins;
+ 				ia64_br_cond_pred (code, 7, 0);
+ 
+-				ia64_movl (code, GP_SCRATCH_REG, &(vtable->vtable [item->vtable_slot]));
++				ia64_movl (code, GP_SCRATCH_REG, &(vtable->vtable [item->value.vtable_slot]));
+ 				ia64_ld8 (code, GP_SCRATCH_REG, GP_SCRATCH_REG);
+ 				ia64_mov_to_br (code, IA64_B6, GP_SCRATCH_REG);
+ 				ia64_br_cond_reg (code, IA64_B6);
+@@ -4993,7 +4996,7 @@
+ #if ENABLE_WRONG_METHOD_CHECK
+ 				g_assert_not_reached ();
+ #endif
+-				ia64_movl (code, GP_SCRATCH_REG, &(vtable->vtable [item->vtable_slot]));
++				ia64_movl (code, GP_SCRATCH_REG, &(vtable->vtable [item->value.vtable_slot]));
+ 				ia64_ld8 (code, GP_SCRATCH_REG, GP_SCRATCH_REG);
+ 				ia64_mov_to_br (code, IA64_B6, GP_SCRATCH_REG);
+ 				ia64_br_cond_reg (code, IA64_B6);
+@@ -5002,7 +5005,7 @@
+ #endif
+ 			}
+ 		} else {
+-			ia64_movl (code, GP_SCRATCH_REG, item->method);
++			ia64_movl (code, GP_SCRATCH_REG, item->key);
+ 			ia64_cmp_geu (code, 6, 7, IA64_R9, GP_SCRATCH_REG);
+ 			item->jmp_code = (guint8*)code.buf + code.nins;
+ 			ia64_br_cond_pred (code, 6, 0);
+Index: mini/mini-sparc.c
+===================================================================
+--- mini/mini-sparc.c	(revision 114206)
++++ mini/mini-sparc.c	(working copy)
+@@ -2576,12 +2576,15 @@
+  * LOCKING: called with the domain lock held
+  */
+ gpointer
+-mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count)
++mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count,
++	gpointer fail_tramp)
+ {
+ 	int i;
+ 	int size = 0;
+ 	guint32 *code, *start;
+ 
++	g_assert (!fail_tramp);
++
+ 	for (i = 0; i < count; ++i) {
+ 		MonoIMTCheckItem *item = imt_entries [i];
+ 		if (item->is_equals) {
+@@ -2610,13 +2613,13 @@
+ 		if (item->is_equals) {
+ 			if (item->check_target_idx) {
+ 				if (!item->compare_done) {
+-					sparc_set (code, (guint32)item->method, sparc_g5);
++					sparc_set (code, (guint32)item->key, sparc_g5);
+ 					sparc_cmp (code, MONO_ARCH_IMT_REG, sparc_g5);
+ 				}
+ 				item->jmp_code = (guint8*)code;
+ 				sparc_branch (code, 0, sparc_bne, 0);
+ 				sparc_nop (code);
+-				sparc_set (code, ((guint32)(&(vtable->vtable [item->vtable_slot]))), sparc_g5);
++				sparc_set (code, ((guint32)(&(vtable->vtable [item->value.vtable_slot]))), sparc_g5);
+ 				sparc_ld (code, sparc_g5, 0, sparc_g5);
+ 				sparc_jmpl (code, sparc_g5, sparc_g0, sparc_g0);
+ 				sparc_nop (code);
+@@ -2625,7 +2628,7 @@
+ #if ENABLE_WRONG_METHOD_CHECK
+ 				g_assert_not_reached ();
+ #endif
+-				sparc_set (code, ((guint32)(&(vtable->vtable [item->vtable_slot]))), sparc_g5);
++				sparc_set (code, ((guint32)(&(vtable->vtable [item->value.vtable_slot]))), sparc_g5);
+ 				sparc_ld (code, sparc_g5, 0, sparc_g5);
+ 				sparc_jmpl (code, sparc_g5, sparc_g0, sparc_g0);
+ 				sparc_nop (code);
+@@ -2634,7 +2637,7 @@
+ #endif
+ 			}
+ 		} else {
+-			sparc_set (code, (guint32)item->method, sparc_g5);
++			sparc_set (code, (guint32)item->key, sparc_g5);
+ 			sparc_cmp (code, MONO_ARCH_IMT_REG, sparc_g5);
+ 			item->jmp_code = (guint8*)code;
+ 			sparc_branch (code, 0, sparc_beu, 0);
+Index: mini/tramp-x86.c
+===================================================================
+--- mini/tramp-x86.c	(revision 114206)
++++ mini/tramp-x86.c	(working copy)
+@@ -94,7 +94,7 @@
+ 	} else {
+ 		printf ("Invalid trampoline sequence: %x %x %x %x %x %x %x\n", code [0], code [1], code [2], code [3],
+ 				code [4], code [5], code [6]);
+-		g_assert_not_reached ();
++		//g_assert_not_reached ();
+ 	}
+ }
+ 
+Index: mini/mini-ppc.c
+===================================================================
+--- mini/mini-ppc.c	(revision 114206)
++++ mini/mini-ppc.c	(working copy)
+@@ -4671,12 +4671,15 @@
+  * LOCKING: called with the domain lock held
+  */
+ gpointer
+-mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count)
++mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count,
++	gpointer fail_tramp)
+ {
+ 	int i;
+ 	int size = 0;
+ 	guint8 *code, *start;
+ 
++	g_assert (!fail_tramp);
++
+ 	for (i = 0; i < count; ++i) {
+ 		MonoIMTCheckItem *item = imt_entries [i];
+ 		if (item->is_equals) {
+@@ -4707,23 +4710,23 @@
+ 		if (item->is_equals) {
+ 			if (item->check_target_idx) {
+ 				if (!item->compare_done) {
+-					ppc_load (code, ppc_r0, (guint32)item->method);
++					ppc_load (code, ppc_r0, (guint32)item->key);
+ 					ppc_cmpl (code, 0, 0, MONO_ARCH_IMT_REG, ppc_r0);
+ 				}
+ 				item->jmp_code = code;
+ 				ppc_bc (code, PPC_BR_FALSE, PPC_BR_EQ, 0);
+-				ppc_lwz (code, ppc_r0, (sizeof (gpointer) * item->vtable_slot), ppc_r11);
++				ppc_lwz (code, ppc_r0, (sizeof (gpointer) * item->value.vtable_slot), ppc_r11);
+ 				ppc_mtctr (code, ppc_r0);
+ 				ppc_bcctr (code, PPC_BR_ALWAYS, 0);
+ 			} else {
+ 				/* enable the commented code to assert on wrong method */
+ #if ENABLE_WRONG_METHOD_CHECK
+-				ppc_load (code, ppc_r0, (guint32)item->method);
++				ppc_load (code, ppc_r0, (guint32)item->key);
+ 				ppc_cmpl (code, 0, 0, MONO_ARCH_IMT_REG, ppc_r0);
+ 				item->jmp_code = code;
+ 				ppc_bc (code, PPC_BR_FALSE, PPC_BR_EQ, 0);
+ #endif
+-				ppc_lwz (code, ppc_r0, (sizeof (gpointer) * item->vtable_slot), ppc_r11);
++				ppc_lwz (code, ppc_r0, (sizeof (gpointer) * item->value.vtable_slot), ppc_r11);
+ 				ppc_mtctr (code, ppc_r0);
+ 				ppc_bcctr (code, PPC_BR_ALWAYS, 0);
+ #if ENABLE_WRONG_METHOD_CHECK
+@@ -4733,7 +4736,7 @@
+ #endif
+ 			}
+ 		} else {
+-			ppc_load (code, ppc_r0, (guint32)item->method);
++			ppc_load (code, ppc_r0, (guint32)item->key);
+ 			ppc_cmpl (code, 0, 0, MONO_ARCH_IMT_REG, ppc_r0);
+ 			item->jmp_code = code;
+ 			ppc_bc (code, PPC_BR_FALSE, PPC_BR_LT, 0);

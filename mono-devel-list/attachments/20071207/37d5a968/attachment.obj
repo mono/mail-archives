@@ -1,0 +1,218 @@
+Index: mono/mono/metadata/icall-def.h
+===================================================================
+--- mono/mono/metadata/icall-def.h	(revision 90884)
++++ mono/mono/metadata/icall-def.h	(working copy)
+@@ -247,6 +247,9 @@
+ ICALL(REGINF_1, "construct_internal_region_from_lcid", ves_icall_System_Globalization_RegionInfo_construct_internal_region_from_lcid)
+ ICALL(REGINF_2, "construct_internal_region_from_name", ves_icall_System_Globalization_RegionInfo_construct_internal_region_from_name)
+ 
++ICALL_TYPE(DRVINF, "System.IO.DriveInfo", DRVINF_1)
++ICALL(DRVINF_1, "GetFSUsage", ves_icall_System_IO_DriveInfo_GetFSUsage)
++
+ ICALL_TYPE(FAMW, "System.IO.FAMWatcher", FAMW_1)
+ ICALL(FAMW_1, "InternalFAMNextEvent", ves_icall_System_IO_FAMW_InternalFAMNextEvent)
+ 
+Index: mono/mono/metadata/icall.c
+===================================================================
+--- mono/mono/metadata/icall.c	(revision 90884)
++++ mono/mono/metadata/icall.c	(working copy)
+@@ -123,6 +123,51 @@
+ 	return NULL;
+ }
+ 
++enum ves_icall_System_IO_DriveInfo_GetFSUsage_Field {
++	Icall_DRVINF_1_TOTALSIZE = 1,
++	Icall_DRVINF_1_TOTALFREE = 2,
++	Icall_DRVINF_1_AVAILFREE = 3
++};
++
++/* System.IO.DriveInfo (2.0+) */
++
++guint64
++ves_icall_System_IO_DriveInfo_GetFSUsage (MonoString *path, enum ves_icall_System_IO_DriveInfo_GetFSUsage_Field field)
++{
++	ULARGE_INTEGER retVal = { 0 };
++	BOOL ok = 0;
++	gunichar2 *unipath;
++
++	// Probably this check-or-exception logic should be replaced with assertions, since this method is only called at three points
++	MONO_CHECK_ARG_NULL (path);
++	MONO_CHECK_ARG (field, field > 0);
++	MONO_CHECK_ARG (field, field < 4);
++	
++	unipath = mono_string_to_utf16(path);
++	if (!unipath)
++		return 0;	// Probably should throw OOM, but it's a non-documented exception in this method's managed callers
++
++	switch (field) {
++	case Icall_DRVINF_1_TOTALSIZE:
++		ok = GetDiskFreeSpaceEx (unipath, NULL, &retVal, NULL);
++		break;
++	case Icall_DRVINF_1_TOTALFREE:
++		ok = GetDiskFreeSpaceEx (unipath, NULL, NULL, &retVal);
++		break;
++	case Icall_DRVINF_1_AVAILFREE:
++		ok = GetDiskFreeSpaceEx (unipath, &retVal, NULL, NULL);
++		break;
++	}
++	g_free (unipath);
++	
++	if (0 == ok) {
++		mono_raise_exception (mono_get_exception_io (NULL)); // FIXME: provide a message
++		g_assert_not_reached();
++		return 0;	// W-C4715: not all code paths return a value
++	}
++	else return (guint64)retVal.QuadPart;
++}
++
+ static MonoObject *
+ ves_icall_System_Array_GetValueImpl (MonoObject *this, guint32 pos)
+ {
+Index: mono/mono/io-layer/uglify.h
+===================================================================
+--- mono/mono/io-layer/uglify.h	(revision 90884)
++++ mono/mono/io-layer/uglify.h	(working copy)
+@@ -60,6 +60,8 @@
+ typedef WapiWSAData *LDWSADATA;
+ typedef WapiLargeInteger LARGE_INTEGER;
+ typedef WapiLargeInteger *PLARGE_INTEGER;
++typedef WapiULargeInteger ULARGE_INTEGER;
++typedef WapiULargeInteger *PULARGE_INTEGER;
+ typedef WapiSystemInfo SYSTEM_INFO;
+ typedef WapiSystemInfo *LPSYSTEM_INFO;
+ typedef WapiFloatingSaveArea FLOATING_SAVE_AREA;
+Index: mono/mono/io-layer/wapi.h
+===================================================================
+--- mono/mono/io-layer/wapi.h	(revision 90884)
++++ mono/mono/io-layer/wapi.h	(working copy)
+@@ -30,6 +30,7 @@
+ #include <mono/io-layer/threads.h>
+ #include <mono/io-layer/timefuncs.h>
+ #include <mono/io-layer/versioninfo.h>
++#include <mono/io-layer/volumes.h>
+ #include <mono/io-layer/wait.h>
+ 
+ #endif /* _WAPI_WAPI_H_ */
+Index: mono/mono/io-layer/volumes.c
+===================================================================
+--- mono/mono/io-layer/volumes.c	(revision 0)
++++ mono/mono/io-layer/volumes.c	(revision 0)
+@@ -0,0 +1,53 @@
++/*
++ * volumes.c:  Volume & filesystem management functions
++ *
++ * Author:
++ *	Javier Martin (lordhabbit@gmail.com)
++ *
++ */
++
++#include <config.h>
++#include <glib.h>
++#ifdef HAVE_SYS_STATVFS_H
++#include <sys/statvfs.h>
++#endif
++
++#include <mono/io-layer/wapi.h>
++#include <mono/utils/strenc.h>
++#include <errno.h>
++
++static const gboolean WIN32_RES_ERROR = 0;
++static const gboolean WIN32_RES_OK = 1;
++
++gboolean GetDiskFreeSpaceEx (gunichar2 *directoryName, WapiLargeInteger *availFree,
++			     WapiLargeInteger *totalSize, WapiLargeInteger *totalFree)
++{
++	struct statvfs buf;
++	gchar *dirName;
++	gint callRes;
++	
++	// Marshal UTF16 (win32) to "system external" (usually UTF8)
++	dirName = mono_unicode_to_external (directoryName);
++	if  (!dirName) {
++		SetLastError (ERROR_NOT_ENOUGH_MEMORY);
++		return WIN32_RES_ERROR;
++	}
++	
++	callRes = statvfs (dirName, &buf);
++	g_free (dirName);	// Before doing anything else
++	
++	if (0 != callRes) {
++		SetLastError (_wapi_get_win32_file_error (errno));
++		return WIN32_RES_ERROR;
++	}
++	
++	if (NULL != availFree)
++		availFree->QuadPart = buf.f_bavail * buf.f_frsize;
++	if (NULL != totalSize)
++		totalSize->QuadPart = buf.f_blocks * buf.f_frsize;
++	if (NULL != totalFree)
++		totalFree->QuadPart = buf.f_bfree * buf.f_frsize;
++	
++	return WIN32_RES_OK;
++}
++
+Index: mono/mono/io-layer/volumes.h
+===================================================================
+--- mono/mono/io-layer/volumes.h	(revision 0)
++++ mono/mono/io-layer/volumes.h	(revision 0)
+@@ -0,0 +1,15 @@
++/*
++ * volumes.h:  Volume & filesystem management functions
++ *
++ * Author:
++ *	Javier Martin (lordhabbit@gmail.com)
++ *
++ */
++
++#ifndef _WAPI_VOLUMES_H_
++#define _WAPI_VOLUMES_H_
++
++extern gboolean GetDiskFreeSpaceEx (gunichar2 *directoryName, WapiLargeInteger *availFree,
++				    WapiLargeInteger *totalSize, WapiLargeInteger *totalFree);
++
++#endif
+Index: mono/mono/io-layer/types.h
+===================================================================
+--- mono/mono/io-layer/types.h	(revision 90884)
++++ mono/mono/io-layer/types.h	(working copy)
+@@ -20,7 +20,18 @@
+ 		gint32 HighPart;
+ 	} u;
+ 	
+-	guint64 QuadPart;
++	gint64 QuadPart;
+ } WapiLargeInteger;
+ 
++typedef union 
++{
++	struct 
++	{
++		guint32 LowPart;
++		guint32 HighPart;
++	} u;
++	
++	guint64 QuadPart;
++} WapiULargeInteger;
++
+ #endif /* _WAPI_TYPES_H_ */
+Index: mono/mono/io-layer/Makefile.am
+===================================================================
+--- mono/mono/io-layer/Makefile.am	(revision 90884)
++++ mono/mono/io-layer/Makefile.am	(working copy)
+@@ -34,6 +34,7 @@
+ 	types.h		\
+ 	uglify.h	\
+ 	versioninfo.h	\
++	volumes.h	\
+ 	wait.h		\
+ 	wapi.h	
+ 
+@@ -98,6 +99,8 @@
+ 	uglify.h		\
+ 	versioninfo.c		\
+ 	versioninfo.h		\
++	volumes.c		\
++	volumes.h		\
+ 	wait.c			\
+ 	wait.h			\
+ 	wapi_glob.h		\

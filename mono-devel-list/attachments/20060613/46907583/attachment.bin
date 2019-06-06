@@ -1,0 +1,645 @@
+Index: class/corlib/System.Threading/Timer.cs
+===================================================================
+--- class/corlib/System.Threading/Timer.cs	(revision 61435)
++++ class/corlib/System.Threading/Timer.cs	(working copy)
+@@ -4,6 +4,7 @@
+ // Authors:
+ // 	Dick Porter (dick@ximian.com)
+ // 	Gonzalo Paniagua Javier (gonzalo@ximian.com)
++// 	Rafael Ferreira (raf@ophion.org)
+ //
+ // (C) 2001, 2002 Ximian, Inc.  http://www.ximian.com
+ // Copyright (C) 2004-2005 Novell, Inc (http://www.novell.com)
+@@ -29,6 +30,8 @@
+ //
+ 
+ using System.Runtime.InteropServices;
++using System.Collections;
++using System;
+ 
+ namespace System.Threading
+ {
+@@ -37,124 +40,293 @@
+ #endif
+ 	public sealed class Timer : MarshalByRefObject, IDisposable
+ 	{
+-		sealed class Runner : MarshalByRefObject
+-		{
+-			ManualResetEvent wait;
+-			AutoResetEvent start_event;
+-			TimerCallback callback;
+-			object state;
+-			int dueTime;
+-			int period;
+-			bool disposed;
+-			bool aborted;
++		/*
++		
++		Timer Scheduler
++		---------------
++		Author: Rafael Ferreira (raf@ophion.org)
++		
++		The code below implements a single thread scheduler that fires
++		events using the runtime's built-in thread pool.
+ 
+-			public Runner (TimerCallback callback, object state, AutoResetEvent start_event)
+-			{
+-				this.callback = callback;
+-				this.state = state;
+-				this.start_event = start_event;
+-				this.wait = new ManualResetEvent (false);
+-			}
++		Key Features:
++			Single thread scheduler:
++				A single thread handles firing all timer jobs thus allowing a 
++				much greater number of Timers to be defined
++			Lazy init:
++				Timer scheduler is only started after the first System.Threading.Timer is created
++			Early termination:
++				Timer scheduler thread dies if there are no more timer jobs in its Job queue
++				
++			
++		In a nutshell the scheduler works like this:
++			1 - The main scheduler thread (TimerScheduler) wakes up finds out what time it is
++			2 - The scheduler iterates over the list of timer jobs (Jobs) to find out when the next job is
++			as well as fires all timers that were scheduled to run now or in the past
++			3 - The Scheduler then calculates the mutiplier for its sleep algorithm. The multiplier
++			is basically MSEC_UNTIL_NEXT_JOB / TIME_SLICE where TIME_SLICE is the minimum amount of 
++			time the scheduler thread is allowed to sleep for
++			4 - Sleep for multiplier * TIME_SLICE
++			5 - Goto 1
+ 
+-			public int DueTime {
+-				get { return dueTime; }
+-				set { dueTime = value; }
+-			}
++		Possible improvements:
++			* Convert the big for-loop into a sorted data structure. This will speed up the time
++			it takes the scheduler to iterate over the timer jobs and lower CPU usage under insane 
++			amounts of Timers 
+ 
+-			public int Period {
+-				get { return period; }
+-				set { period = value == 0 ? Timeout.Infinite : value; }
+-			}
++		Possible issues:
++			* Overflow issues with the multiplier
++			* Race conditions with lazy-init of the scheduler thread.
+ 
+-			bool WaitForDueTime ()
+-			{
+-				if (dueTime > 0) {
+-					bool signaled;
+-					do {
+-						wait.Reset ();
+-						signaled = wait.WaitOne (dueTime, false);
+-					} while (signaled == true && !disposed && !aborted);
++		Note:
++			MONO_DEBUG_TIMER environment variable can be used
++			to turn on the scheduler's debug log
++		*/
+ 
+-					if (!signaled)
+-						callback (state);
+-
+-					if (disposed)
+-						return false;
++		class TimerScheduler {
++			private class TimerJob {
++				
++				public long NextRun;
++				public long LastRun;
++				public long Period;
++				public bool Enabled;
++				public TimerCallback Callback;
++				public readonly int ID;
++				public object State = null;
++				public TimerJob(int id) {
++					ID = id;
++					Enabled = true;
+ 				}
+-				else
+-					callback (state);
+-
+-				return true;
+ 			}
++			// this enum is used to signal the scheduler thread of the reason for the Abort() call
++			// abort() is used to signal the timer thread since Interrupt() is not implemented
++			private enum AbortSignals { TIMER_ADDED, TIMER_REMOVED, TIMER_CHANGED };
++			
++			readonly int TIME_SLICE = 10 ; // 10 msec
++			int next_id = 0;
+ 
+-			public void Abort ()
+-			{
+-				lock (this) {
+-					aborted = true;
+-					wait.Set ();
++			Thread scheduler = null;
++			static object sync_obj = new object();
++			static object sync_obj2 = new object();
++			
++			Hashtable Jobs =  new Hashtable();
++			bool scheduler_ready = false;
++			
++			static TimerScheduler _instance = null;
++
++			protected TimerScheduler() {}
++			
++			// singleton magic
++			public static TimerScheduler GetInstance() {
++				if (_instance == null) {
++					lock(sync_obj) {
++						_instance = new TimerScheduler();
++					}
+ 				}
++				return(_instance);
+ 			}
+-			
+-			public void Dispose ()
+-			{
+-				lock (this) {
+-					disposed = true;
+-					Abort ();
++
++			public int AddJob(TimerCallback cb, object state, int dueTime, int period) {
++				TimerJob tj = new TimerJob(Interlocked.Increment(ref next_id)); 
++				
++				// first run take into consideration the delay metric only
++				set_job_properties(tj,dueTime,period);
++				tj.Callback = cb;
++				tj.State = state;
++				
++				// lock job Q
++				lock(Jobs) {
++					Jobs.Add(tj.ID,tj);
+ 				}
++				lock(sync_obj2) {
++					send_scheduler_signal(AbortSignals.TIMER_ADDED);
++				}
++				
++				return(tj.ID);
++				
++				
+ 			}
++			// prorperly handles signaling the scheduler thread
++			// it will retry for 500 msec (.5 sec) if it can't properly signal scheduler
++			void send_scheduler_signal(AbortSignals signal) {
++				for (int i = 0; i < 100; i++) {
+ 
+-			public void Start ()
+-			{
+-				while (!disposed && start_event.WaitOne ()) {
+-					if (disposed)
++					// we don't start a new scheduler if the signal is to  TIMER_REMOVED
++					if (scheduler == null) {
++						log("Scheduler not currently running... new scheduler will be initiated");
++						scheduler = new Thread( new ThreadStart(SchedulerThread));
++						scheduler.IsBackground = true;
++						scheduler.Start();
+ 						return;
++						
++					} 
+ 
+-					aborted = false;
++					if (scheduler.ThreadState == ThreadState.AbortRequested || 
++					scheduler.ThreadState == ThreadState.Aborted) {
++						return;
++					}
+ 
+-					if (dueTime == Timeout.Infinite)
+-						continue;
+-
+-					if (!WaitForDueTime ())
++					if (scheduler_ready) {
++						// we batch send Abort() calls
++						// Abort is used since Thread.Interrupt is not supported.
++						scheduler.Abort(signal);
+ 						return;
++						
++					}
++					log("could not properly signal timer-scheduler, waiting...");
++					Thread.Sleep(5); 
++				}
++				
++				throw new Exception("Could not properly abort timer-scheduler thread");
++				
++			
++			}
++			void set_job_properties(TimerJob tj,int dueTime, int period) {
++				if (dueTime == Timeout.Infinite) {
++					//disables the job
++					log("disabling job " + tj.ID);
++					tj.Enabled = false;
++				}else {
++					tj.NextRun = DateTime.Now.Ticks + TimeSpan.TicksPerMillisecond * dueTime;
++					tj.Enabled = true;
++				}
++				if (period == Timeout.Infinite) {
++					log("job " + tj.ID  + " will only run once");
++					tj.Period = -1;
++				}else {
++					tj.Period = TimeSpan.TicksPerMillisecond * period;
++				}
++				log(String.Format("timer job configured, id {2} delay {0} msec period {1} msec", dueTime, period, tj.ID));
+ 
+-					if (aborted || (period == Timeout.Infinite))
+-						continue;
++			}
++			public bool RemoveJob(int id) {
++				lock (Jobs) {
++					if (!Jobs.Contains(id)) {
++						return(false);
++					}
++					Jobs.Remove(id);
++				}
++				lock (sync_obj2) {
++					send_scheduler_signal(AbortSignals.TIMER_REMOVED);
++				}
++				log(String.Format("Job {0} removed",id));
++				return(true);
++			}
+ 
+-					bool signaled = false;
+-					while (true) {
+-						if (disposed)
+-							return;
++			public bool ChangeJob(int id, int dueTime, int period) {
++			
++				// modifying the job is actually quicker (lock wise) than doing a Remove / Add combo
++				lock (Jobs) {
++					if (!Jobs.Contains(id)) {
++						return(false);
++					}
++					TimerJob tj = Jobs[id] as TimerJob;
++					set_job_properties(tj,dueTime,period);
++					log("job " + id +" changed");
++				}
++				lock (sync_obj2) {
++					send_scheduler_signal(AbortSignals.TIMER_CHANGED);
++				}
++				
++				return(true);
++			}
++			
++			public void SchedulerThread() {
++				Thread.CurrentThread.Name = "Timer-Scheduler";
++				long tick = 0;
++				long next_job = Int64.MaxValue;
++				TimerJob tj = null;
++				int multiplier = 1;
++				
++				// big scary for-loop that iterates over the jobs
++				while(Jobs.Count > 0) {
++					if (!scheduler_ready)  {
++						scheduler_ready=true;
++						log("Scheduler is ready");
++					}
+ 
+-						if (aborted)
+-							break;
++					try {
++						tick = DateTime.Now.Ticks;
++						lock (Jobs) {
++							foreach (DictionaryEntry entry in Jobs) {
++								tj = entry.Value as TimerJob;
+ 
+-						try {
+-							wait.Reset ();
+-						} catch (ObjectDisposedException) {
+-							// FIXME: There is some race condition
+-							//        here when the thread is being
+-							//        aborted on exit.
+-							return;
+-						}
++								if (tj.Enabled == false) {
++									continue;
++								}
++								if ( tj.NextRun <= tick) {
++									
++									// Firing job using runtime's thread pool
++									log("Firing job " + tj.ID);
++									ThreadPool.QueueUserWorkItem(new WaitCallback(tj.Callback),tj.State);
++									
++									if (tj.Period == - 1) {
++										// it is a run-once job, so we disable it
++										tj.Enabled = false;
++									}
++									else {
++										tj.NextRun = tick + tj.Period;
++									}
++									
++									tj.LastRun = tick;
+ 
+-						signaled = wait.WaitOne (period, false);
+-
+-						if (aborted || disposed)
+-							break;
+-
+-						if (!signaled) {
+-							callback (state);
+-						} else if (!WaitForDueTime ()) {
+-							return;
++									// we reset the next_job to the max possible value so the real next job
++									// can be figured out
++									next_job = Int64.MaxValue;
++								}
++								if ( next_job > tj.NextRun) {
++									next_job = tj.NextRun;
++								}
++							}
+ 						}
++						
++						// no other jobs are available and all jobs
++						// are disabled
++						if (next_job == Int64.MaxValue) {
++							log("no active jobs found, going into infinite sleep");
++							Thread.Sleep(Timeout.Infinite);
++						}else {
++							
++							multiplier = (int) ((next_job - tick) / TimeSpan.TicksPerMillisecond);
++							multiplier = multiplier / TIME_SLICE;
++							if (multiplier > 0 ) {
++								//TODO there are some edgy race conditions between the abort signal and telling a thread 
++								// to sleep
++								log("gong to sleep for " + multiplier + " times the time slice");
++								Thread.Sleep(multiplier * TIME_SLICE);
++							}
++						}
++						
++					} catch (ThreadAbortException ex) {
++						if (ex.ExceptionState is AbortSignals) {
++							log(String.Format("abort signal received: {0}",ex.ExceptionState));
++							switch((AbortSignals)ex.ExceptionState) {
++								default:
++									Thread.ResetAbort();
++									break;
++							}
++						}else {
++							log(ex.Message);
++							//throw(ex);
++							// we just bypass everything else
++						}
+ 					}
++						
+ 				}
++				scheduler_ready = false;
++				scheduler = null;
++				log("timer scheduelr is shutting down");
+ 			}
++
++			void log(string str) {
++				if (Environment.GetEnvironmentVariable("MONO_TIMER_DEBUG") != null)
++					Console.Error.WriteLine(String.Format("{0} TIMER SCHEDULER: {1}",DateTime.Now,str));
++			}
+ 		}
+ 
+-		Runner runner;
+-		AutoResetEvent start_event;
+-		Thread t;
++		// attributes
++		// id used to reference this job in the timer-scheduler
++		int JobID;
+ 
+ 		public Timer (TimerCallback callback, object state, int dueTime, int period)
+ 		{
+@@ -198,12 +370,8 @@
+ 
+ 		void Init (TimerCallback callback, object state, int dueTime, int period)
+ 		{
+-			start_event = new AutoResetEvent (false);
+-			runner = new Runner (callback, state, start_event);
+-			Change (dueTime, period);
+-			t = new Thread (new ThreadStart (runner.Start));
+-			t.IsBackground = true;
+-			t.Start ();
++			TimerScheduler scheduler = TimerScheduler.GetInstance();
++			JobID = scheduler.AddJob(callback,state,dueTime,period);
+ 		}
+ 
+ 		public bool Change (int dueTime, int period)
+@@ -214,14 +382,8 @@
+ 			if (period < -1)
+ 				throw new ArgumentOutOfRangeException ("period");
+ 
+-			if (runner == null)
+-				return false;
+-
+-			start_event.Reset ();
+-			runner.Abort ();
+-			runner.DueTime = dueTime;
+-			runner.Period = period;
+-			start_event.Set ();
++			TimerScheduler scheduler = TimerScheduler.GetInstance();
++			scheduler.ChangeJob(JobID,dueTime,period);
+ 			return true;
+ 		}
+ 
+@@ -255,15 +417,8 @@
+ 
+ 		public void Dispose ()
+ 		{
+-			if (t != null && t.IsAlive) {
+-				if (t != Thread.CurrentThread)
+-					t.Abort ();
+-				t = null;
+-			}
+-			if (runner != null) {
+-				runner.Dispose ();
+-				runner = null;
+-			}
++			TimerScheduler scheduler = TimerScheduler.GetInstance();
++			scheduler.RemoveJob(JobID);
+ 			GC.SuppressFinalize (this);
+ 		}
+ 
+@@ -274,14 +429,6 @@
+ 			return true;
+ 		}
+ 
+-		~Timer ()
+-		{
+-			if (t != null && t.IsAlive)
+-				t.Abort ();
+-
+-			if (runner != null)
+-				runner.Abort ();
+-		}
+ 	}
+ }
+ 
+Index: class/corlib/System.Threading/ChangeLog
+===================================================================
+--- class/corlib/System.Threading/ChangeLog	(revision 61689)
++++ class/corlib/System.Threading/ChangeLog	(working copy)
+@@ -1,3 +1,6 @@
++2006-06-13 Rafael Ferreira <raf@ophion.org>
++	* Timer.cs: Changed timer logic to use a single scheduler thread
++
+ 2006-05-05  Sebastien Pouliot  <sebastien@ximian.com>
+ 
+ 	* ExecutionContext.cs: Don't capture the compressed stack unless the 
+Index: class/corlib/Test/System.Threading/TimerTest.cs
+===================================================================
+--- class/corlib/Test/System.Threading/TimerTest.cs	(revision 61435)
++++ class/corlib/Test/System.Threading/TimerTest.cs	(working copy)
+@@ -23,110 +23,96 @@
+ 	// -- Ben
+ 	//
+ 	public class TimerTest : Assertion {
++		// this bucket is used to avoid non-theadlocal issues
++		class Bucket {
++			public int count;
++		}
++		
+ 		[Test]
+-		[Category ("NotWorking")]
+ 		public void TestDueTime ()
+ 		{
+-			counter = 0;
+-			Timer t = new Timer (new TimerCallback (Callback), null, 200, Timeout.Infinite);
++			Bucket bucket = new Bucket();
++			Timer t = new Timer (new TimerCallback (Callback), bucket, 200, Timeout.Infinite);
+ 			Thread.Sleep (50);
+-			AssertEquals ("t0", 0, counter);
++			AssertEquals ("t0", 0, bucket.count);
+ 			Thread.Sleep (200);
+-			AssertEquals ("t1", 1, counter);
++			AssertEquals ("t1", 1, bucket.count);
+ 			Thread.Sleep (500);
+-			AssertEquals ("t2", 1, counter);
+-			
++			AssertEquals ("t2", 1, bucket.count);
+ 			t.Change (10, 10);
+-			Thread.Sleep (500);
+-			Assert ("t3", counter > 20);
++			Thread.Sleep (1000);
++			Assert ("t3", bucket.count > 20);
+ 			t.Dispose ();
+ 		}
+ 
+ 		[Test]
+-		[Category ("NotWorking")]
+ 		public void TestChange ()
+ 		{
+-			counter = 0;
+-			Timer t = new Timer (new TimerCallback (Callback), null, 1, 1);
++			Bucket bucket = new Bucket();
++			Timer t = new Timer (new TimerCallback (Callback), bucket, 1, 1);
+ 			Thread.Sleep (500);
+-			int c = counter;
++			int c = bucket.count;
+ 			Assert ("t1", c > 20);
+ 			t.Change (100, 100);
+ 			Thread.Sleep (500);
+-			Assert ("t2", counter <= c + 6);
++			Assert ("t2", bucket.count <= c + 6);
+ 			t.Dispose ();
+ 		}
+ 
+ 		[Test]
+-		[Category ("NotWorking")]
+ 		public void TestZeroDueTime () {
+-			counter = 0;
++			Bucket bucket = new Bucket();
+ 
+-			Timer t = new Timer (new TimerCallback (Callback), null, 0, Timeout.Infinite);
++			Timer t = new Timer (new TimerCallback (Callback), bucket, 0, Timeout.Infinite);
+ 			Thread.Sleep (100);
+-			AssertEquals (1, counter);
++			AssertEquals (1, bucket.count);
+ 			t.Change (0, Timeout.Infinite);
+ 			Thread.Sleep (100);
+-			AssertEquals (2, counter);
++			AssertEquals (2, bucket.count);
+ 			t.Dispose ();
+ 		}
+-
+ 		[Test]
+-		[Category ("NotWorking")]
+ 		public void TestDispose ()
+-		{
+-			counter = 0;
+-			Timer t = new Timer (new TimerCallback (CallbackTestDispose), null, 10, 10);
++		{	
++			Bucket bucket = new Bucket();
++			Timer t = new Timer (new TimerCallback (Callback), bucket, 10, 10);
+ 			Thread.Sleep (200);
+ 			t.Dispose ();
+ 			Thread.Sleep (20);
+-			int c = counter;
+-			Assert (counter > 5);
++			int c = bucket.count;
++			Assert (bucket.count > 5);
+ 			Thread.Sleep (200);
+-			AssertEquals (c, counter);
++			AssertEquals (c, bucket.count);
+ 		}
+ 
+ 		[Test] // bug #78208
+ 		public void TestDispose2 ()
+ 		{
+-			Timer t = new Timer (new TimerCallback (CallbackTestDispose), null, 10, 10);
++			Timer t = new Timer (new TimerCallback (Callback), null, 10, 10);
+ 			t.Dispose ();
+ 			t.Dispose ();
+ 		}
+-		
++	
+ 		[Test]
+-		[Category ("NotWorking")]
++		[Category("NotWorking")]
+ 		public void TestDisposeOnCallback () {
+-			counter = 0;
+-			t1 = new Timer (new TimerCallback (CallbackTestDisposeOnCallback), null, 0, 10);
++		
++			Timer t1 = null;
++			t1 = new Timer (new TimerCallback (CallbackTestDisposeOnCallback), t1, 0, 10);
+ 			Thread.Sleep (200);
+-			AssertNull (t1);
++			AssertNull(t1);
+ 			
+-			counter = 2;
+-			t1 = new Timer (new TimerCallback (CallbackTestDisposeOnCallback), null, 50, 0);
+-			Thread.Sleep (200);
+-			AssertNull (t1);
+ 		}
+-		
++
+ 		private void CallbackTestDisposeOnCallback (object foo)
+ 		{
+-			if (++counter == 3) {
+-				t1.Dispose ();
+-				t1 = null;
+-			}
++			((Timer)foo).Dispose();
+ 		}
+ 
+-		private void CallbackTestDispose (object foo)
+-		{
+-			counter++;
+-		}
+-
+ 		private void Callback (object foo)
+ 		{
+-			counter++;
++			Bucket b = foo as Bucket;
++			b.count++;
+ 		}
+-
+-		Timer t1;
+-		int counter;
+ 	}
+ }
+Index: class/corlib/Test/System.Threading/ChangeLog
+===================================================================
+--- class/corlib/Test/System.Threading/ChangeLog	(revision 61435)
++++ class/corlib/Test/System.Threading/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-06-13 Rafael Ferreira <raf@ophion.org>
++	* TimerTests.cs: Changed tests to use a counter object. Fixed tests with 
++	category NotWorking - Only NotWorking left is TestDisposeOnCallback
++
+ 2006-04-30  Gert Driesen  <drieseng@users.sourceforge.net>
+ 
+ 	* TimerTest.cs: Added test for bug #78208. Marked individual tests

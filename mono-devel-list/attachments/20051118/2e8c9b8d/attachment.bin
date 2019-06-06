@@ -1,0 +1,5022 @@
+Index: mono/mono/mini/mini-ops.h
+===================================================================
+--- mono/mono/mini/mini-ops.h	(revision 53232)
++++ mono/mono/mini/mini-ops.h	(working copy)
+@@ -5,6 +5,7 @@
+ MINI_OP(OP_OBJADDR,	"objaddr")
+ MINI_OP(OP_VTADDR,	"vtaddr")
+ MINI_OP(OP_PHI,		"phi")
++MINI_OP(OP_SSA_LOCAL,	"ssa_local")
+ MINI_OP(OP_RENAME,	"rename")
+ MINI_OP(OP_COMPARE,	"compare")
+ MINI_OP(OP_COMPARE_IMM,	"compare_imm")
+Index: mono/mono/mini/mini.c
+===================================================================
+--- mono/mono/mini/mini.c	(revision 53232)
++++ mono/mono/mini/mini.c	(working copy)
+@@ -63,6 +63,7 @@
+ #include "jit-icalls.c"
+ 
+ #include "aliasing.h"
++#include "hssa.h"
+ 
+ /* 
+  * this is used to determine when some branch optimizations are possible: we exclude FP compares
+@@ -654,7 +655,11 @@
+ 		(dest)->inst_left = (sp) [0];	\
+ 		(dest)->inst_right = (sp) [1];	\
+ 		(dest)->type = STACK_MP;	\
+-		(dest)->klass = (k);	\
++		if ((k) == mono_defaults.object_class) {	\
++			(dest)->klass = (dest)->inst_left->klass->element_class;	\
++		} else {	\
++			(dest)->klass = (k);	\
++		}	\
+ 		(cfg)->flags |= MONO_CFG_HAS_LDELEMA; \
+ 	} while (0)
+ 
+@@ -1138,6 +1143,7 @@
+ 	case MONO_TYPE_SZARRAY:
+ 	case MONO_TYPE_ARRAY:    
+ 		inst->type = STACK_OBJ;
++		inst->klass = klass;
+ 		return;
+ 	case MONO_TYPE_I8:
+ 	case MONO_TYPE_U8:
+@@ -1635,7 +1641,17 @@
+ 	case STACK_PTR: return &mono_defaults.int_class->byval_arg;
+ 	case STACK_R8: return &mono_defaults.double_class->byval_arg;
+ 	case STACK_MP: return &mono_defaults.int_class->byval_arg;
++	//FIXMEHSSA: Check why this breaks inlining
++#if 0
++	case STACK_OBJ:
++		if (ins->klass != NULL) {
++			return &ins->klass->byval_arg;
++		} else {
++			return &mono_defaults.object_class->byval_arg;
++		}
++#else
+ 	case STACK_OBJ: return &mono_defaults.object_class->byval_arg;
++#endif
+ 	case STACK_VTYPE: return &ins->klass->byval_arg;
+ 	default:
+ 		g_error ("stack type %d to montype not handled\n", ins->type);
+@@ -2545,6 +2561,7 @@
+ {
+ 	MonoInst *iargs [2];
+ 	void *alloc_ftn;
++	int result;
+ 
+ 	if (cfg->opt & MONO_OPT_SHARED) {
+ 		NEW_DOMAINCONST (cfg, iargs [0]);
+@@ -2566,7 +2583,13 @@
+ 			NEW_VTABLECONST (cfg, iargs [0], vtable);
+ 	}
+ 
+-	return mono_emit_jit_icall (cfg, bblock, alloc_ftn, iargs, ip);
++	result = mono_emit_jit_icall (cfg, bblock, alloc_ftn, iargs, ip);
++	g_assert (bblock->last_ins->opcode == CEE_STIND_REF);
++	g_assert (bblock->last_ins->inst_i0->opcode == OP_LOCAL);
++	g_assert (bblock->last_ins->inst_i1->opcode == CEE_CALL);
++	bblock->last_ins->inst_i0->klass = klass;
++	bblock->last_ins->inst_i1->klass = klass;
++	return result;
+ }
+ 	
+ static MonoInst *
+@@ -2581,6 +2604,8 @@
+ 	MONO_INST_NEW (cfg, add, OP_PADD);
+ 	add->inst_left = dest;
+ 	add->inst_right = vtoffset;
++	//FIXMEHSSA: this *seems* OK...
++	add->type = STACK_MP;
+ 	add->cil_code = ip;
+ 	add->klass = klass;
+ 	MONO_INST_NEW (cfg, vstore, CEE_STIND_I);
+@@ -4479,6 +4504,13 @@
+ 			ins->inst_i0 = *sp;
+ 			*sp++ = ins;
+ 			ins->type = ldind_type [*ip - CEE_LDIND_I1];
++			/* FIXMEHSSA This 'if' probably is not needed */
++			if ((ins->opcode == CEE_LDIND_I) && ((ins->inst_i0->opcode == OP_LOCAL) || (ins->inst_i0->opcode == OP_ARG))) {
++				ins->klass = ins->inst_i0->klass;
++			}
++			if ((ins->type == STACK_OBJ) && (ins->inst_i0->klass != NULL)) {
++				ins->klass = ins->inst_i0->klass;
++			}
+ 			ins->flags |= ins_flag;
+ 			ins_flag = 0;
+ 			++ip;
+@@ -4860,6 +4892,12 @@
+ 				NEW_PCONST (cfg, *sp, NULL); 
+ 				/* now call the string ctor */
+ 				temp = mono_emit_method_call_spilled (cfg, bblock, cmethod, fsig, sp, ip, NULL);
++				
++				g_assert (bblock->last_ins->opcode == CEE_STIND_REF);
++				g_assert (bblock->last_ins->inst_i0->opcode == OP_LOCAL);
++				g_assert (bblock->last_ins->inst_i1->opcode == CEE_CALL);
++				bblock->last_ins->inst_i0->klass = mono_defaults.string_class;
++				bblock->last_ins->inst_i1->klass = mono_defaults.string_class;
+ 			} else {
+ 				MonoInst* callvirt_this_arg = NULL;
+ 				
+@@ -5388,6 +5426,14 @@
+ 						NEW_SFLDACONST (cfg, ins, field);
+ 					else
+ 						NEW_PCONST (cfg, ins, addr);
++					
++					/* FIXMEHSSA: this if was never true, check why*/
++					//if (ins->type == STACK_OBJ) {
++					//	printf ("    --- Inst has klass %s: ", (ins->klass->name)!=NULL?(ins->klass->name):"<NULL>");
++					//	mono_print_tree_nl (ins);
++					//}
++					
++					
+ 					ins->cil_code = ip;
+ 				} else {
+ 					/* 
+@@ -5578,6 +5624,7 @@
+ 			ins->inst_newa_class = klass;
+ 			ins->inst_newa_len = *sp;
+ 			ins->type = STACK_OBJ;
++			ins->klass = mono_array_class_get (klass, 1);
+ 			ip += 5;
+ 			*sp++ = ins;
+ 			/* 
+@@ -5681,6 +5728,9 @@
+ 			ins->inst_left = load;
+ 			*sp++ = ins;
+ 			ins->type = ldind_type [ins->opcode - CEE_LDIND_I1];
++			if (ins->type == STACK_OBJ) {
++				ins->klass = load->klass;
++			}
+ 			++ip;
+ 			break;
+ 		}
+@@ -8222,6 +8272,7 @@
+ 	for (bbn = cfg->bb_entry; bbn->next_bb && bbn->next_bb != bb; bbn = bbn->next_bb)
+ 		;
+ 	if (bbn->next_bb) {
++		/* TODO: Finish off bug 75738 here! */
+ 		bbn->next_bb = bb->next_bb;
+ 	}
+ 
+@@ -8486,6 +8537,8 @@
+ 		cfg->ret->opcode = OP_RETARG;
+ 		cfg->ret->inst_vtype = sig->ret;
+ 		cfg->ret->klass = mono_class_from_mono_type (sig->ret);
++		//FIXMEHSSA: This *seems* ok...
++		cfg->ret->type = STACK_MP;
+ 	}
+ 	if (cfg->verbose_level > 2)
+ 		g_print ("creating vars\n");
+@@ -9227,7 +9280,7 @@
+ 	if (cfg->opt & MONO_OPT_BRANCH)
+ 		optimize_branches (cfg);
+ 
+-	if (cfg->opt & MONO_OPT_SSAPRE) {
++	if (cfg->opt & (MONO_OPT_SSAPRE|MONO_OPT_HSSA)) {
+ 		remove_critical_edges (cfg);
+ 	}
+ 
+@@ -9312,7 +9365,7 @@
+ 			//mono_local_cprop (cfg);
+ 		}
+ 		
+-		if (cfg->opt & MONO_OPT_DEADCE) {
++		if ((cfg->opt & MONO_OPT_DEADCE) && ! (cfg->opt & MONO_OPT_HSSA)) {
+ 			mono_ssa_deadce (cfg);
+ 			deadce_has_run = TRUE;
+ 		}
+@@ -9326,6 +9379,25 @@
+ 			optimize_branches (cfg);
+ 	}
+ 
++	if ((cfg->opt & MONO_OPT_HSSA) && (! header->num_clauses) && !cfg->disable_ssa) {
++//	if ((cfg->opt & MONO_OPT_HSSA) && (! header->num_clauses)) {
++		mono_build_hssa (cfg);
++		
++		if (cfg->hssa != NULL) {
++			if ((cfg->opt & MONO_OPT_DEADCE) && ! deadce_has_run) {
++				mono_hssa_deadce (cfg->hssa);
++				deadce_has_run = TRUE;
++			}
++			
++			mono_destroy_hssa (cfg);
++		}
++	}
++	if (cfg->verbose_level > 4) {
++		printf ("After HSSA removal:\n");
++		mono_print_code (cfg);
++		printf ("After HSSA removal end\n");
++	}
++	
+ 	/* after SSA removal */
+ 	if (parts == 3)
+ 		return cfg;
+Index: mono/mono/mini/mini.h
+===================================================================
+--- mono/mono/mini/mini.h	(revision 53232)
++++ mono/mono/mini/mini.h	(working copy)
+@@ -236,6 +236,8 @@
+ 	BB_EXCEPTION_HANDLER  = 1 << 4
+ };
+ 
++struct MonoHssaMonoInstInfo;
++
+ struct MonoInst {
+ 	union {
+ 		union {
+@@ -262,6 +264,9 @@
+ 	
+ 	/* used by the register allocator */
+ 	gint32 dreg, sreg1, sreg2, unused;
++	union {
++		struct MonoHssaMonoInstInfo *hssa;
++	} info;
+ 	
+ 	MonoInst *next;
+ 	MonoClass *klass;
+@@ -499,9 +504,12 @@
+ 	MONO_OPT_ABCREM   = 1 << 18,
+ 	MONO_OPT_SSAPRE   = 1 << 19,
+ 	MONO_OPT_EXCEPTION= 1 << 20,
+-	MONO_OPT_SSA      = 1 << 21
++	MONO_OPT_SSA      = 1 << 21,
++	MONO_OPT_HSSA     = 1 << 22
+ };
+ 
++#define MONO_OPT_SSA_OPTIONS (MONO_OPT_ABCREM|MONO_OPT_SSAPRE)
++
+ /* Bit-fields in the MonoBasicBlock.region */
+ #define MONO_REGION_TRY       0
+ #define MONO_REGION_FINALLY  16
+@@ -547,6 +555,7 @@
+ 	MonoInst        *got_var; /* Global Offset Table variable */
+ 	
+ 	struct MonoAliasingInformation *aliasing_info;
++	struct MonoHssaCfgData *hssa;
+ 
+ 	/* A hashtable of region ID-> SP var mappings */
+ 	/* An SP var is a place to store the stack pointer (used by handlers)*/
+Index: mono/mono/mini/driver.c
+===================================================================
+--- mono/mono/mini/driver.c	(revision 53232)
++++ mono/mono/mini/driver.c	(working copy)
+@@ -88,7 +88,8 @@
+ 	{"abcrem",     "Array bound checks removal"},	
+ 	{"ssapre",     "SSA based Partial Redundancy Elimination"},
+ 	{"exception",  "Optimize exception catch blocks"},
+-	{"ssa",        "Build and use SSA form"}
++	{"ssa",        "Use plain SSA form"},
++	{"hssa",       "Use Hashed SSA form"}
+ };
+ 
+ #define DEFAULT_OPTIMIZATIONS (	\
+@@ -100,7 +101,7 @@
+ 	MONO_OPT_LOOP |  \
+ 	MONO_OPT_AOT)
+ 
+-#define EXCLUDED_FROM_ALL (MONO_OPT_SHARED | MONO_OPT_PRECOMP)
++#define EXCLUDED_FROM_ALL (MONO_OPT_SHARED | MONO_OPT_PRECOMP | MONO_OPT_HSSA)
+ 
+ static guint32
+ parse_optimizations (const char* p)
+@@ -242,6 +243,7 @@
+        MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE | MONO_OPT_LOOP | MONO_OPT_INLINE | MONO_OPT_INTRINS | MONO_OPT_EXCEPTION | MONO_OPT_ABCREM | MONO_OPT_SSAPRE,
+        MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE | MONO_OPT_LOOP | MONO_OPT_INLINE | MONO_OPT_INTRINS | MONO_OPT_ABCREM,
+        MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE | MONO_OPT_LOOP | MONO_OPT_INLINE | MONO_OPT_INTRINS | MONO_OPT_SSAPRE,
++       MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE | MONO_OPT_LOOP | MONO_OPT_INLINE | MONO_OPT_INTRINS | MONO_OPT_HSSA,
+        MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE | MONO_OPT_LOOP | MONO_OPT_INLINE | MONO_OPT_INTRINS | MONO_OPT_ABCREM | MONO_OPT_SHARED
+ };
+ 
+Index: mono/mono/mini/hssa.c
+===================================================================
+--- mono/mono/mini/hssa.c	(revision 0)
++++ mono/mono/mini/hssa.c	(revision 0)
+@@ -0,0 +1,4279 @@
++/*
++ * hssa.c: HSSA
++ *
++ * Author:
++ *   Massimiliano Mantione (massi@ximian.com)
++ *
++ * (C) 2005 Novell, Inc.  http://www.novell.com
++ */
++#include <string.h>
++#include <stdio.h>
++
++#include <mono/metadata/debug-helpers.h>
++#include <mono/metadata/mempool.h>
++#include <mono/metadata/opcodes.h>
++
++#include "hssa.h"
++
++extern guint8 mono_burg_arity [];
++
++#define DEBUG_HSSA 1
++#define MONO_APPLY_HSSA_TO_SINGLE_METHOD 0
++
++#define TRACE_HSSA (hssa->cfg->verbose_level > 2)
++#define DUMP_HSSA (hssa->cfg->verbose_level > 4)
++#define FOLLOW_HSSA (hssa->cfg->verbose_level > 5)
++
++#define OBJECT_ALIASING_CLASS (&(hssa->object_aliasing_class))
++#define NO_VALUE ((MonoHssaValue*)&(hssa->no_value))
++#define NO_VALUE_OCCURRENCE (&(hssa->no_value_occurrence))
++#define WHOLE_LOCATION (-1)
++
++#define INST_ALIASING_CLASS(i) ((i)->info.hssa->data.aliasing_class)
++#define INST_VALUE(i) ((i)->info.hssa->data.value)
++#define INST_PREVIOUS(i) ((i)->info.hssa->link.previous)
++#define INST_FATHER(i) ((i)->info.hssa->link.father)
++#define INST_LOCAL_USE(i) ((i)->info.hssa->use.local)
++#define INST_HEAP_USE(i) ((i)->info.hssa->use.heap)
++#define INST_IS_LOCAL_USE(i) ((i)->info.hssa->is_local_read)
++#define INST_IS_HEAP_USE(i) ((i)->info.hssa->is_heap_read)
++#define INST_HAS_SIDE_EFFECTS(i) ((i)->info.hssa->has_side_effects)
++#define INST_IS_LOCAL_ADDRESS(i) ((i)->info.hssa->is_local_address)
++#define INST_IS_HEAP_ADDRESS(i) ((i)->info.hssa->is_heap_address)
++#define INST_IS_LEFT_OPERAND(i) ((i)->info.hssa->is_left_operand)
++#define INST_IS_RIGHT_OPERAND(i) ((i)->info.hssa->is_right_operand)
++#define INST_IS_LOCAL_IMMEDIATE(i) ((i)->info.hssa->is_local_immediate)
++
++#define CHECK_HEAP_STATE_LENGTH(__hssa,__bb) do {\
++		int __i = 0;\
++		MonoHssaHeapAddress *__ca = (__hssa)->addresses_with_known_value;\
++		MonoHssaHeapAddress *__slow_ca = __ca;\
++		while (__ca != NULL) {\
++			if (__i % 2 != 0) {\
++				__slow_ca = __slow_ca->data.next_address_with_known_value;\
++			}\
++			__ca = __ca->data.next_address_with_known_value;\
++			__i++;\
++			if (__ca == __slow_ca) {\
++				gboolean __collision_happened = FALSE;\
++				printf ("\nERROR: heap state contains cycles... examined %d addresses, bb->final_heap_state_length is %d\n", __i, (__bb)->final_heap_state_length);\
++				__ca = (__hssa)->addresses_with_known_value;\
++				while (__ca != NULL) {\
++					printf ("address ");\
++					print_value_briefly (__ca->base.value);\
++					printf ("\n");\
++					if (__ca == __slow_ca) {\
++						if (__collision_happened) {\
++							printf ("Collision found\n");\
++							g_assert_not_reached ();\
++						} else {\
++							__collision_happened = TRUE;\
++						}\
++					}\
++					__ca = __ca->data.next_address_with_known_value;\
++				}\
++				printf ("Collision not found\n");\
++				g_assert_not_reached ();\
++			}\
++		}\
++		if (__i != (__bb)->final_heap_state_length) {\
++			printf ("\nERROR: heap state contains %d addresses, but bb->final_heap_state_length is %d\n", __i, (__bb)->final_heap_state_length);\
++			g_assert_not_reached ();\
++		}\
++	} while (0);
++
++#define SET_HEAP_ADDRESS_USED(__a) do {\
++		if (((__a)->data.next_used_heap_address == NULL) && (hssa->last_used_heap_address != (__a))) {\
++			(__a)->data.next_used_heap_address = hssa->used_heap_addresses;\
++			hssa->used_heap_addresses = (__a);\
++			if (hssa->last_used_heap_address == NULL) {\
++				hssa->last_used_heap_address = (__a);\
++			}\
++		}\
++	} while (0);
++
++
++#define MONO_HSSA_LOCAL_ADDRESS_STATE_MASK 0xc0000000
++#define MONO_HSSA_LOCAL_ADDRESS_STATE_DATA_MASK 0x3fffffff
++typedef enum {
++	MONO_HSSA_LOCAL_ADDRESS_STATE_NONE = 0,
++	MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_IMMEDIATE = 0x40000000,
++	MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS = 0x80000000,
++	MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS_PLUS_OFFSET = 0xc0000000
++} MonoHssaLocalAddressState;
++
++static void
++print_local_address_state (MonoHssaLocalAddressState state) {
++	printf ("\"");
++	switch (state & MONO_HSSA_LOCAL_ADDRESS_STATE_MASK) {
++	case MONO_HSSA_LOCAL_ADDRESS_STATE_NONE :
++		printf ("NONE");
++		break;
++	case MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_IMMEDIATE :
++		printf ("IMMEDIATE");
++		break;
++	case MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS :
++		printf ("ADDRESS");
++		break;
++	case MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS_PLUS_OFFSET :
++		printf ("ADDRESS_PLUS_OFFSET");
++		break;
++	default :
++		printf ("INVALID(%X)", state & MONO_HSSA_LOCAL_ADDRESS_STATE_MASK);
++	}
++	printf ("[%d]\"", state & MONO_HSSA_LOCAL_ADDRESS_STATE_DATA_MASK);
++}
++
++const static char *mono_stack_type_names[] = {
++	"INV",
++	"I4",
++	"I8",
++	"PTR",
++	"R8",
++	"MP",
++	"OBJ",
++	"VTYPE"
++};
++
++static void
++print_mono_inst (MonoInst *inst) {
++	if (inst == NULL) {
++		printf ("[NULL]");
++		return;
++	}
++	
++	if (inst->type < STACK_MAX) {
++		printf ("[%s]", mono_stack_type_names [inst->type]);
++	} else {
++		printf ("[BAD%d]", inst->type);
++	}
++	printf (mono_inst_name (inst->opcode));
++	
++	switch (inst->opcode) {
++	case OP_ICONST:
++		printf ("[%d]", (int)inst->inst_c0);
++		break;
++	case OP_I8CONST:
++		printf ("[%lld]", (long long)inst->inst_l);
++		break;
++	case OP_R8CONST:
++		printf ("[%f]", *(double*)inst->inst_p0);
++		break;
++	case OP_R4CONST:
++		printf ("[%f]", *(float*)inst->inst_p0);
++		break;
++	case OP_ARG:
++	case OP_LOCAL:
++		printf ("[%d]", (int)inst->inst_c0);
++		break;
++	case OP_REGOFFSET:
++		if (inst->inst_offset < 0)
++			printf ("[-0x%x(%s)]", (int)(-inst->inst_offset), mono_arch_regname (inst->inst_basereg));
++		else
++			printf ("[0x%x(%s)]", (int)(inst->inst_offset), mono_arch_regname (inst->inst_basereg));
++		break;
++	case OP_REGVAR:
++		printf ("[%s]", mono_arch_regname (inst->dreg));
++		break;
++	case CEE_NEWARR:
++		printf ("[%s]",  inst->inst_newa_class->name);
++		break;
++	case OP_OUTARG:
++	case OP_OUTARG_REG:
++	case OP_OUTARG_IMM:
++	case OP_OUTARG_R4:
++	case OP_OUTARG_R8:
++	case OP_OUTARG_VT:
++		printf ("[OUT]");
++		break;
++	case CEE_CALL:
++	case CEE_CALLVIRT:
++	case OP_FCALL:
++	case OP_FCALLVIRT:
++	case OP_LCALL:
++	case OP_LCALLVIRT:
++	case OP_VCALL:
++	case OP_VCALLVIRT:
++	case OP_VOIDCALL:
++	case OP_VOIDCALLVIRT: {
++		MonoCallInst *call = (MonoCallInst*)inst;
++		if (call->method)
++			printf ("[%s]", call->method->name);
++		else if (call->fptr) {
++			MonoJitICallInfo *info = mono_find_jit_icall_by_addr (call->fptr);
++			if (info)
++				printf ("[%s]", info->name);
++		}
++		printf ("[ARGS:%d]", call->signature->param_count);
++		break;
++	}
++	case OP_PHI: {
++		int i;
++		printf ("[%d (", (int)inst->inst_c0);
++		for (i = 0; i < inst->inst_phi_args [0]; i++) {
++			if (i)
++				printf (", ");
++			printf ("%d", inst->inst_phi_args [i + 1]);
++		}
++		printf (")]");
++		break;
++	}
++	case OP_LOAD_MEMBASE:
++	case OP_LOADI4_MEMBASE:
++	case OP_LOADU4_MEMBASE:
++	case OP_LOADU1_MEMBASE:
++	case OP_LOADI1_MEMBASE:
++	case OP_LOADU2_MEMBASE:
++	case OP_LOADI2_MEMBASE:
++		printf ("[%s] <- [%s + 0x%x]", mono_arch_regname (inst->dreg), mono_arch_regname (inst->inst_basereg), (int)inst->inst_offset);
++		break;
++	case CEE_BR:
++	case OP_CALL_HANDLER:
++		printf ("[B%d]", inst->inst_target_bb->block_num);
++		break;
++	case CEE_BNE_UN:
++	case CEE_BEQ:
++	case CEE_BLT:
++	case CEE_BLT_UN:
++	case CEE_BGT:
++	case CEE_BGT_UN:
++	case CEE_BGE:
++	case CEE_BGE_UN:
++	case CEE_BLE:
++	case CEE_BLE_UN:
++		printf ("[B%dB%d]", inst->inst_true_bb->block_num, inst->inst_false_bb->block_num);
++		break;
++	case OP_DUMMY_USE:
++		printf ("[%d]", (int)inst->inst_i0->inst_i0->inst_c0);
++		break;
++	case OP_DUMMY_STORE:
++		printf ("[%d]", (int)inst->inst_i0->inst_c0);
++		break;
++	case OP_SSA_LOCAL: {
++		MonoHssaLocalVariableDefinition *definition = HSSA_DEFINITION (inst);
++		printf ("[%d,%d]", definition->ssa_variable->index, definition->ssa_version);
++		break;
++	}
++	default:
++		break;
++	}
++}
++
++static void
++print_mono_inst_tree (MonoInst *inst) {
++	print_mono_inst (inst);
++	
++	if (inst == NULL) return;
++	
++	if (mono_burg_arity [inst->opcode] > 0) {
++		printf (" (");
++		print_mono_inst_tree (inst->inst_left);
++		if (mono_burg_arity [inst->opcode] > 1) {
++			printf (", ");
++			print_mono_inst_tree (inst->inst_right);
++		}
++		printf (")");
++	}
++}
++
++#define GBOOLEAN_TO_STRING(b) ((b)?"TRUE":"FALSE")
++
++#define CHECK_IF_VALUE_IS_NOTHING(__v, __s, __inst) do {	\
++	if ((__v)->base.type == MONO_HSSA_VALUE_NONE) {	\
++		printf ("ERROR!!! Value ");	\
++		print_value_briefly ((__v));	\
++		printf (" IS NO_VALUE (");	\
++		printf (__s);	\
++		printf (") ");	\
++		print_mono_inst_tree (__inst);\
++		printf ("\n");	\
++		g_assert_not_reached ();\
++	}	\
++} while (0)
++
++static void
++print_local_variable_definition (MonoHssaLocalVariableDefinition *definition, gboolean print_uses);
++
++static void
++print_local_variable_state_in_bb (MonoHssaLocalVariableStateInBB *state, guint32 variable_index) {
++	printf ("Last definition for variable %d (has phi: %s, has definitions: %s):\n  ", variable_index, GBOOLEAN_TO_STRING (state->has_phi), GBOOLEAN_TO_STRING (state->has_definition));
++	if (state->current_definition != NULL) {
++		print_local_variable_definition (state->current_definition, FALSE);
++	} else {
++		printf ("[NULL]");
++	}
++	printf ("\n");
++}
++
++static void
++print_bb_id (MonoHssaBB *bb) {
++	printf ("BB%d[DT%d]", bb->bb->block_num, bb->dt_index);
++}
++
++static const char*
++value_type_name (MonoHssaValueType type) {
++	switch (type) {
++	case MONO_HSSA_VALUE_NONE : return "VALUE_NONE";
++	case MONO_HSSA_VALUE_PRIMITIVE : return "VALUE_PRIMITIVE";
++	case MONO_HSSA_VALUE_COMPUTED : return "VALUE_COMPUTED";
++	case MONO_HSSA_VALUE_PHI : return "VALUE_PHI";
++	case MONO_HSSA_VALUE_INTEGER_CONSTANT : return "VALUE_INTEGER_CONSTANT";
++	case MONO_HSSA_VALUE_LONG_COSTANT : return "VALUE_LONG_COSTANT";
++	case MONO_HSSA_VALUE_FLOAT_COSTANT : return "VALUE_FLOAT_COSTANT";
++	case MONO_HSSA_VALUE_DOUBLE_COSTANT : return "VALUE_DOUBLE_COSTANT";
++	case MONO_HSSA_VALUE_LOCAL : return "VALUE_LOCAL";
++	default : return "[VALUE INVALID]";
++	}
++}
++
++static void
++print_value_briefly (struct MonoHssaValue *value);
++static void
++print_value_occurrence (struct MonoHssaValueOccurrence *occurrence);
++
++static void
++print_heap_address_value_use (MonoHssaHeapAddressValueUse *use) {
++	printf ("Use at location \"");
++	print_mono_inst_tree (use->use);
++	printf ("\"");
++}
++
++static void
++print_heap_address_value_uses (MonoHssaHeapAddressValueUse *use) {
++	printf ("Uses:\n");
++	while (use != NULL) {
++		printf ("  ");
++		print_heap_address_value_use (use);
++		printf ("\n");
++		use = use->next;
++	}
++}
++
++
++static void
++print_heap_address_value_definition (MonoHssaHeapAddressValueDefinition *definition, gboolean print_uses) {
++	printf ("Address: ");
++	print_value_briefly (definition->address->base.value);
++	printf ("\nreceives value ");
++	print_value_briefly (definition->value);
++	printf ("\naffecting %d bytes, killed by chi: %s, used by mu: %s\n at instruction ",definition->affected_bytes, GBOOLEAN_TO_STRING (definition->is_killed_by_chi), GBOOLEAN_TO_STRING (definition->is_used_by_mu));
++	print_mono_inst_tree (definition->definition);
++	printf ("\n");
++	if (print_uses) {
++		print_heap_address_value_uses (definition->uses);
++	}
++}
++
++static void
++print_heap_address (MonoHssaHeapAddress *address, gboolean print_values, gboolean print_value_uses) {
++	printf ("[HEAP ADDRESS] Base address: ");
++	print_value_briefly (address->data.base_address);
++	printf (", offset: ");
++	if (address->data.offset != NULL) {
++		print_value_briefly (address->data.offset);
++	} else {
++		printf ("NULL");
++	}
++	if (print_values) {
++		MonoHssaHeapAddressValueDefinition *current_definition;
++		printf (", associated values:\n");
++		for (current_definition = address->data.definitions; current_definition != NULL; current_definition = current_definition->next) {
++			print_heap_address_value_definition (current_definition, print_value_uses);
++		}
++	}
++}
++
++static void
++print_local_address (MonoHssaLocalAddress *address) {
++	printf ("[LOCAL ADDRESS] Base variable: %d, offset: ", address->data.base_variable->index);
++	if (address->data.offset != NULL) {
++		print_value_briefly (address->data.offset);
++	} else {
++		printf ("NULL");
++	}
++}
++
++static void
++print_address (MonoHssaAddress *address) {
++	switch (address->base.type) {
++		case MONO_HSSA_ADDRESS_HEAP :
++			print_heap_address ((MonoHssaHeapAddress*)address, FALSE, FALSE);
++			break;
++		case MONO_HSSA_ADDRESS_LOCAL :
++			print_local_address ((MonoHssaLocalAddress*)address);
++			break;
++		default :
++			g_assert_not_reached ();
++	}
++}
++
++static void
++print_heap_state (MonoHssaCfgData *hssa, const char *message) {
++	MonoHssaHeapAddress *current_address_with_known_value = hssa->addresses_with_known_value;
++	printf ("Heap state %s start\n", message);
++	while (current_address_with_known_value != NULL) {
++		g_assert (current_address_with_known_value->base.type == MONO_HSSA_ADDRESS_HEAP);
++		print_heap_address (current_address_with_known_value, TRUE, TRUE);
++		current_address_with_known_value = current_address_with_known_value->data.next_address_with_known_value;
++	}
++	printf ("Heap state %s end\n", message);
++}
++
++static void
++print_used_heap_addresses (MonoHssaCfgData *hssa) {
++	MonoHssaHeapAddress *current_address = hssa->used_heap_addresses;
++	printf ("Used heap addressea start\n");
++	while (current_address != NULL) {
++		g_assert (current_address->base.type == MONO_HSSA_ADDRESS_HEAP);
++		print_heap_address (current_address, TRUE, TRUE);
++		current_address = current_address->data.next_used_heap_address;
++	}
++	printf ("Used heap addressea end\n");
++}
++
++static void
++print_base_value (MonoHssaBaseValue *base) {
++	printf ("type %s, value number %d", value_type_name (base->type), base->value_number);
++}
++
++static void
++print_primitive_value (MonoHssaPrimitiveValueData *data) {
++	printf ("PRIMITIVE id %d, at location ", data->value_id);
++	print_mono_inst_tree (data->location);
++}
++
++static void
++print_integer_value (MonoHssaConstantValueData *data) {
++	printf ("INT %d", data->value.integer_constant);
++}
++
++static void
++print_long_value (MonoHssaConstantValueData *data) {
++	printf ("LONG %lld", (gint64) *(data->value.long_constant));
++}
++
++static void
++print_float_value (MonoHssaConstantValueData *data) {
++	printf ("FLOAT %f", *(data->value.float_constant));
++}
++
++static void
++print_double_value (MonoHssaConstantValueData *data) {
++	printf ("DOUBLE %f", *(data->value.double_constant));
++}
++
++
++static void
++print_computed_value (MonoHssaComputedValueData *data) {
++	printf ("OPERATION %s (VN %d, VN %d)", mono_inst_name (data->opcode), data->left_operand->base.value_number, data->right_operand->base.value_number);
++}
++
++static void
++print_phi_value (MonoHssaPhiValueData *data) {
++	int i = 0;
++	printf ("PHI AT ");
++	print_bb_id (data->join_point);
++	printf (" (");
++	while (i < data->number_of_alternatives) {
++		printf ("<");
++		print_bb_id (data->join_point->in_bb [i]);
++		printf (">");
++		print_base_value (&(data->alternatives [i]->base));
++		i++;
++		if (i < data->number_of_alternatives) {
++			printf (", ");
++		}
++	}
++	printf (")");
++}
++
++static void
++print_local_value (MonoHssaLocalValueData *data) {
++	printf ("LOCAL %d", data->variable_index);
++}
++
++static void
++print_value_briefly (MonoHssaValue *value) {
++	printf ("\"[VN%d] ", value->base.value_number);
++	switch (value->base.type) {
++	case MONO_HSSA_VALUE_NONE :
++		printf ("NONE");
++		break;
++	case MONO_HSSA_VALUE_PRIMITIVE :
++		print_primitive_value (&(value->data.primitive));
++		break;
++	case MONO_HSSA_VALUE_COMPUTED :
++		print_computed_value (&(value->data.computed));
++		break;
++	case MONO_HSSA_VALUE_PHI :
++		print_phi_value (&(value->data.phi));
++		break;
++	case MONO_HSSA_VALUE_INTEGER_CONSTANT :
++		print_integer_value (&(value->data.constant));
++		break;
++	case MONO_HSSA_VALUE_LONG_COSTANT :
++		print_long_value (&(value->data.constant));
++		break;
++	case MONO_HSSA_VALUE_FLOAT_COSTANT :
++		print_float_value (&(value->data.constant));
++		break;
++	case MONO_HSSA_VALUE_DOUBLE_COSTANT :
++		print_double_value (&(value->data.constant));
++		break;
++	case MONO_HSSA_VALUE_LOCAL :
++		print_local_value (&(value->data.local));
++		break;
++	default :
++		printf ("INVALID %d", value->base.type);
++		g_assert_not_reached ();
++	}
++	if (value->base.address.generic != NULL) {
++		switch (value->base.address.generic->base.type) {
++		case MONO_HSSA_ADDRESS_HEAP :
++			printf (" [HEAP ADDRESS]");
++			break;
++		case MONO_HSSA_ADDRESS_LOCAL :
++			printf (" [LOCAL ADDRESS]");
++			break;
++		default :
++			printf (" [UNEXPECTED %d]", value->base.address.generic->base.type);
++			g_assert_not_reached ();
++		}
++	}
++	printf ("\"");
++}
++
++
++static void
++print_value_occurrence (MonoHssaValueOccurrence *occurrence) {
++	printf ("occurrence at ");
++	print_mono_inst_tree (occurrence->occurrence);
++}
++
++static void
++print_local_variable_use (MonoHssaLocalVariableUse *use) {
++	printf ("use of variable %d (version %d) at ", use->definition->ssa_variable->index, use->definition->ssa_version);
++	print_mono_inst_tree (use->use);
++}
++
++static void
++print_local_variable_uses (MonoHssaLocalVariableUse *use) {
++	printf ("Uses:\n");
++	while (use != NULL) {
++		printf ("  ");
++		print_local_variable_use (use);
++		printf ("\n");
++		use = use->next;
++	}
++}
++
++static void
++print_local_variable_definition (MonoHssaLocalVariableDefinition *definition, gboolean print_uses) {
++	printf ("Definition of version %d for variable %d, storing ", definition->ssa_version, definition->ssa_variable->index);
++	print_value_briefly (definition->value);
++	if (print_uses) {
++		printf ("\n");
++		print_local_variable_uses (definition->uses);
++	}
++}
++
++static void
++print_local_variable (MonoHssaLocalVariable *variable, gboolean print_definitions, gboolean print_uses) {
++	printf ("Variable %d", variable->index);
++	if (print_definitions) {
++		MonoHssaLocalVariableDefinition *current_definition = variable->definitions;
++		printf ("\n");
++		while (current_definition != NULL) {
++			print_local_variable_definition (current_definition, print_uses);
++			current_definition = current_definition->next;
++		}
++	}
++}
++
++static void
++print_bb_data (MonoHssaCfgData *hssa, MonoHssaBB *bb, gboolean print_code, gboolean print_definitions, gboolean print_uses) {
++	int i;
++	
++	printf ("Block data for ");
++	print_bb_id (bb);
++	printf (": dt_children = %d, dt_level = %d, idominator ", bb->dt_children, bb->dt_level);
++	if (bb->idominator != NULL) {
++		print_bb_id (bb->idominator);
++	} else {
++		printf ("NONE");
++	}
++	printf ("\n");
++	
++	printf ("IN BBs {");
++	i = 0;
++	while (i < bb->in_count) {
++		print_bb_id (bb->in_bb [i]);
++		i++;
++		if (i < bb->in_count) {
++			printf (", ");
++		}
++	}
++	printf ("}\n");
++	printf ("OUT BBs {");
++	i = 0;
++	while (i < bb->out_count) {
++		print_bb_id (bb->out_bb [i]);
++		i++;
++		if (i < bb->out_count) {
++			printf (", ");
++		}
++	}
++	printf ("}\n");
++	printf ("J BBs {");
++	i = 0;
++	while (i < bb->j_edges_count) {
++		print_bb_id (bb->j_edges [i]);
++		i++;
++		if (i < bb->j_edges_count) {
++			printf (", ");
++		}
++	}
++	printf ("}\n");
++	
++	if (print_code) {
++		MonoInst *inst;
++		
++		printf ("Code start:\n");
++		for (inst = bb->bb->code; inst != NULL; inst = inst->next) {
++			print_mono_inst_tree (inst);
++			printf ("\n");
++		}
++		printf ("Code end.\n");
++	}
++	
++	if (print_definitions) {
++		printf ("Local variables:\n");
++		for (i = 0; i < hssa->number_of_local_variables; i++) {
++			print_local_variable_state_in_bb (&(bb->local_variables_state [i]), i);
++		}
++		printf ("Heap at beginning:\n");
++		for (i = 0; i < bb->initial_heap_state_length; i++) {
++			print_heap_address_value_definition (bb->initial_heap_state [i], print_uses);
++		}
++		printf ("Heap at end:\n");
++		for (i = 0; i < bb->initial_heap_state_length; i++) {
++			print_heap_address_value_definition (bb->initial_heap_state [i], print_uses);
++		}
++		printf ("Block data end.\n");
++	}
++}
++
++static void
++print_definition_flags (MonoHssaCfgData *hssa, gboolean print_definitions, gboolean print_phis) {
++	int i;
++	int j;
++	printf ("Flag summary start:\n");
++	for (i = 0; i < hssa->number_of_bblocks; i++) {
++		MonoHssaBB *bb = &(hssa->bblocks [i]);
++		
++		print_bb_id (bb);
++		printf (", idominator ");
++		if (bb->idominator != NULL) {
++			print_bb_id (bb->idominator);
++		} else {
++			printf ("NULL");
++		}
++		printf (", IN { ");
++		for (j = 0; j < bb->in_count; j++) {
++			print_bb_id (bb->in_bb [j]);
++			printf (" ");
++		}
++		printf ("}, OUT { ");
++		for (j = 0; j < bb->out_count; j++) {
++			print_bb_id (bb->out_bb [j]);
++			printf (" ");
++		}
++		printf ("}, J { ");
++		for (j = 0; j < bb->j_edges_count; j++) {
++			print_bb_id (bb->j_edges [j]);
++			printf (" ");
++		}
++		printf ("}\n");
++		if (print_definitions) {
++			printf ("Definitions: { ");
++			for (j = 0; j < hssa->number_of_local_variables; j++) {
++				if (bb->local_variables_state [j].has_definition) {
++					printf ("%d ", j);
++				}
++			}
++			printf ("}\n");
++		}
++		if (print_phis) {
++			printf ("Phi insertions: { ");
++			for (j = 0; j < hssa->number_of_local_variables; j++) {
++				if (bb->local_variables_state [j].has_phi) {
++					printf ("%d ", j);
++				}
++			}
++			printf ("}\n");
++		}
++	}
++	printf ("Flag summary end.\n");
++}
++
++static void
++print_hssa_data (MonoHssaCfgData *hssa) {
++	int i;
++	
++	printf ("HSSA CFG information start:\n");
++	
++	printf ("Local variables:\n");
++	for (i = 0; i < hssa->number_of_local_variables; i++) {
++		print_local_variable (hssa->local_variables [i], TRUE, TRUE);
++	}
++	
++	print_used_heap_addresses (hssa);
++	
++	printf ("HSSA CFG information end.\n");
++}
++
++#define APPEND_LIST_ELEMENT(_base,_field,_element) do {\
++	if ((_base)->last_##_field != NULL) {\
++		(_base)->last_##_field->next = (_element);\
++	} else {\
++		(_base)->_field##s = (_element);\
++	}\
++	(_base)->last_##_field = (_element);\
++} while (0)
++#define INSERT_LIST_ELEMENT(_base,_field,_element) do {\
++	if ((_base)->_field != NULL) {\
++		(_base)->_field->previous = (_element);\
++	}\
++	(_element)->next = (_base)->_field;\
++	(_element)->previous = NULL;\
++	(_base)->_field = (_element);\
++} while (0)
++#define UNLINK_LIST_ELEMENT(_element,_base_field,_element_field) do {\
++	if ((_element)->next != NULL) {\
++		(_element)->next->previous = (_element)->previous;\
++	}\
++	if ((_element)->previous != NULL) {\
++		(_element)->previous->next = (_element)->next;\
++	} else {\
++		(_element)->_base_field->_element_field = (_element)->next;\
++	}\
++	(_element)->next = NULL;\
++	(_element)->previous = NULL;\
++} while (0)
++#define UNLINK_LIST_ELEMENT_FROM_BASE(_element,_base) do {\
++	if ((_element)->next != NULL) {\
++		(_element)->next->previous = (_element)->previous;\
++	}\
++	if ((_element)->previous != NULL) {\
++		(_element)->previous->next = (_element)->next;\
++	} else {\
++		(_base) = (_element)->next;\
++	}\
++	(_element)->next = NULL;\
++	(_element)->previous = NULL;\
++} while (0)
++
++
++#define NEW_ALIASING_CLASS(_hssa,_ac,_klass) do {	\
++	_ac = mono_mempool_alloc0 (_hssa->mempool, sizeof (MonoHssaTypeBasedAliasingClass));	\
++	_ac->klass = _klass;	\
++	_ac->class_id = _hssa->number_of_aliasing_classes;	\
++	_hssa->number_of_aliasing_classes++;	\
++	_ac->class_aliasing_classes = 0;	\
++	_ac->interface_aliasing_classes = 0;	\
++} while (0)
++#define NEW_ALIASING_CLASS_LIST_ELEMENT(_hssa,_le,_ac) do {\
++	MonoHssaTypeBasedAliasingClasses *_nle = mono_mempool_alloc0 (_hssa->mempool, sizeof (MonoHssaTypeBasedAliasingClasses));\
++	_nle->aliasing_class = _ac;\
++	_nle->next = _le;\
++	_le = _nle;\
++} while (0)
++
++#define TRACE_FOACAC 0
++static MonoHssaTypeBasedAliasingClass*
++find_or_add_class_aliasing_class (MonoHssaCfgData *hssa, MonoClass *klass) {
++	/* start from the root of the tree: object */
++	MonoHssaTypeBasedAliasingClass *ac = &(hssa->object_aliasing_class);
++	MonoHssaTypeBasedAliasingClass *first_sibling = ac;
++	MonoHssaTypeBasedAliasingClass *last_sibling = NULL;
++#if TRACE_FOACAC
++	printf ("\n<FOACAC> *** Starting from klass %s\n", klass->name);
++#endif
++	
++	while (ac != NULL) {
++#if TRACE_FOACAC
++		printf ("<FOACAC> Looking at AC %s\n", ac->klass->name);
++#endif
++		if (ac->klass != klass) {
++			if (mono_class_is_assignable_from (ac->klass, klass)) {
++				/* "ac->klass" is an ancestor of "klass" */
++				if (ac->first_child != NULL) {
++#if TRACE_FOACAC
++					printf ("<FOACAC> Moving to 1st child\n");
++#endif
++					/* work on "ac->klass"'s children */
++					ac = ac->first_child;
++					first_sibling = ac;
++					last_sibling = NULL;
++				} else {
++					/* "ac->klass" had no children, we are the new one */
++					MonoHssaTypeBasedAliasingClass *new_ac;
++#if TRACE_FOACAC
++					printf ("<FOACAC> No children create new AC\n");
++#endif
++					NEW_ALIASING_CLASS (hssa, new_ac, klass);
++					ac->first_child = new_ac;
++					new_ac->father = ac;
++					return new_ac;
++				}
++			} else if (mono_class_is_assignable_from (klass, ac->klass)) {
++				/* "klass" is an ancestor of "ac->klass" */
++				MonoHssaTypeBasedAliasingClass *next_sibling = ac->siblings;
++				MonoHssaTypeBasedAliasingClass *new_ac;
++#if TRACE_FOACAC
++				printf ("<FOACAC> We are a superclass, new AC\n");
++#endif
++				NEW_ALIASING_CLASS (hssa, new_ac, klass);
++				ac->father->first_child = new_ac;
++				new_ac->father = ac->father;
++				ac->father = new_ac;
++				new_ac->first_child = ac;
++				ac->siblings = NULL;
++				/* take any previous sibling with us */
++				if (last_sibling != NULL) {
++					last_sibling->siblings = NULL;
++					new_ac->siblings = first_sibling;
++#if TRACE_FOACAC
++					printf ("<FOACAC> Taking nodes from %s to %s as siblings\n", first_sibling->klass->name, last_sibling->klass->name);
++#endif
++				}
++				/* start from next sibling */
++				ac = next_sibling;
++				/* redistribute any remaining sibling between us and the child */
++				while (ac != NULL) {
++					next_sibling = ac->siblings;
++					if (mono_class_is_assignable_from (klass, ac->klass)) {
++						/* this sibling was our child, too */
++#if TRACE_FOACAC
++						printf ("<FOACAC> Taking node %s as child\n", ac->klass->name);
++#endif
++						ac->father = new_ac;
++						ac->siblings = new_ac->first_child->siblings;
++						new_ac->first_child->siblings = ac;
++					} else {
++						/* keep this sibling with us */
++#if TRACE_FOACAC
++						printf ("<FOACAC> Taking node %s as sibling\n", ac->klass->name);
++#endif
++						ac->siblings = new_ac->siblings;
++						new_ac->siblings = ac;
++					}
++					ac = next_sibling;
++				}
++				return new_ac;
++			} else {
++				/* no relationship, they must be siblings */
++				if (ac->siblings != NULL) {
++					/* there are more siblings to check: go on */
++					last_sibling = ac;
++					ac = ac->siblings;
++				} else {
++					/* no more siblings, we are the new one */
++					MonoHssaTypeBasedAliasingClass *new_ac;
++#if TRACE_FOACAC
++					printf ("<FOACAC> No more siblings, new AC\n");
++#endif
++					NEW_ALIASING_CLASS (hssa, new_ac, klass);
++					new_ac->father = ac->father;
++					ac->siblings = new_ac;
++					return new_ac;
++				}
++			}
++		} else {
++#if TRACE_FOACAC
++			printf ("<FOACAC> AC found\n");
++#endif
++			return ac;
++		}
++	}
++	g_assert_not_reached ();
++	return NULL;
++}
++#undef TRACE_FOACAC
++
++static MonoHssaTypeBasedAliasingClass*
++find_or_add_interface_aliasing_class (MonoHssaCfgData *hssa, MonoClass *klass) {
++	MonoHssaTypeBasedAliasingClass *ac;
++	MonoHssaTypeBasedAliasingClass *new_ac;
++	
++	/* check if we already have this interface  */
++	for (ac = hssa->interface_aliasing_classes; ac != NULL; ac = ac->siblings) {
++		if (ac->klass == klass) {
++			return ac;
++		}
++	}
++	
++	/* make a new one, and put it into the list */
++	NEW_ALIASING_CLASS (hssa, new_ac, klass);
++	new_ac->siblings = hssa->interface_aliasing_classes;
++	hssa->interface_aliasing_classes = new_ac;
++	
++	/* connect it to the old ones */
++	for (ac = new_ac->siblings; ac != NULL; ac = ac->siblings) {
++		if (mono_class_is_assignable_from (ac->klass, klass)) {
++			/* "ac->klass" is an ancestor of "klass" */
++			
++			
++		} else if (mono_class_is_assignable_from (klass, ac->klass)) {
++			/* "klass" is an ancestor of "ac->klass" */
++			
++		}
++	}
++	
++	return new_ac;
++}
++
++static MonoHssaTypeBasedAliasingClass*
++find_or_add_aliasing_class (MonoHssaCfgData *hssa, MonoClass *klass) {
++	if (klass != NULL) {
++		if (MONO_CLASS_IS_INTERFACE (klass)) {
++			return find_or_add_interface_aliasing_class (hssa, klass);
++		} else {
++			return find_or_add_class_aliasing_class (hssa, klass);
++		}
++	} else {
++		return OBJECT_ALIASING_CLASS;
++	}
++}
++
++#define OP_IS_OUTARG(op) (((op)==OP_OUTARG)||((op)==OP_OUTARG_REG)||((op)==OP_OUTARG_IMM)||((op)==OP_OUTARG_R4)||((op)==OP_OUTARG_R8)||((op)==OP_OUTARG_VT))
++#define OP_IS_CALL(op) (((op)==CEE_CALLI)||((op)==CEE_CALL)||((op)==CEE_CALLVIRT)||(((op)>=OP_VOIDCALL)&&((op)<=OP_CALL_MEMBASE)))
++#define OP_IS_STORE(op) (((op)==CEE_STIND_REF)||((op)==CEE_STIND_I1)||((op)==CEE_STIND_I2)||((op)==CEE_STIND_I4)||((op)==CEE_STIND_I8)||((op)==CEE_STIND_R4)||((op)==CEE_STIND_R8)||((op)==CEE_STIND_I))
++#define OP_IS_LOAD(op) (((op)==CEE_LDIND_REF)||((op)==CEE_LDIND_I1)||((op)==CEE_LDIND_I2)||((op)==CEE_LDIND_I4)||((op)==CEE_LDIND_U1)||((op)==CEE_LDIND_U2)||((op)==CEE_LDIND_U4)||((op)==CEE_LDIND_I8)||((op)==CEE_LDIND_R4)||((op)==CEE_LDIND_R8)||((op)==CEE_LDIND_I))
++
++#define DEBUG_HSSA_ALIASING_COMPUTATION 0
++static MonoHssaLocalAddressState
++compute_aliasing_classes_on_inst (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst) {
++	MonoClass *klass = NULL;
++	MonoHssaLocalAddressState left_state = MONO_HSSA_LOCAL_ADDRESS_STATE_NONE;
++	MonoHssaLocalAddressState right_state = MONO_HSSA_LOCAL_ADDRESS_STATE_NONE;
++	MonoHssaTypeBasedAliasingClass *ac;
++	
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++	print_mono_inst (inst);
++#endif
++	if (inst->type == STACK_OBJ) {
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++		printf (" [OBJECT:");
++#endif
++		if (inst->klass != NULL) {
++			klass = inst->klass;
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++			printf ("\"%s\"", inst->klass->name);
++			if (MONO_CLASS_IS_INTERFACE (klass)) {
++				printf ("(I)");
++			}
++		} else {
++			printf ("UNKNOWN");
++#endif
++		}
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++		printf ("]");
++#endif
++	}
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++	printf (" ");
++#endif
++	
++	if (mono_burg_arity [inst->opcode] > 0) {
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++		printf (" (");
++#endif
++		left_state = compute_aliasing_classes_on_inst (hssa, bb, inst->inst_i0);
++		if (mono_burg_arity [inst->opcode] > 1) {
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++			printf (", ");
++#endif
++			right_state = compute_aliasing_classes_on_inst (hssa, bb, inst->inst_i1);
++		}
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++		printf (")");
++#endif
++	}
++	
++	ac = find_or_add_aliasing_class (hssa, klass);
++	
++	if (inst->info.hssa == NULL) {
++		inst->info.hssa = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaMonoInstInfo));
++		INST_ALIASING_CLASS (inst) = ac;
++		if ((inst->opcode == OP_LOCAL) || (inst->opcode == OP_ARG)) {
++			INST_IS_LOCAL_IMMEDIATE (inst) = TRUE;
++		}
++	} else if ((inst->opcode != OP_LOCAL) && (inst->opcode != OP_ARG) &&
++			(inst->opcode != OP_ICONST) && (inst->opcode != OP_I8CONST) &&
++			(inst->opcode != OP_R4CONST) && (inst->opcode != OP_R8CONST) &&
++			(inst->opcode != OP_RETARG)) {
++		printf ("Info field not NULL in ");
++		print_mono_inst_tree (inst);
++		printf ("\n");
++		g_assert_not_reached ();
++		return 0;
++	}
++	
++	switch (inst->opcode) {
++	case OP_LOCAL :
++	case OP_ARG :
++#if (DEBUG_HSSA)
++		printf ("Introducing immediate, state is ");
++		print_local_address_state (MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_IMMEDIATE | inst->inst_c0);
++		printf (" at ");
++		print_bb_id (bb);
++		printf (", ");
++		print_mono_inst_tree (inst);
++		printf ("\n");
++#endif
++		return MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_IMMEDIATE | inst->inst_c0;
++	case OP_LDADDR :
++#if (DEBUG_HSSA)
++		printf ("Introducing address, state is ");
++		print_local_address_state (MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_IMMEDIATE | inst->inst_c0);
++		printf (" at ");
++		print_bb_id (bb);
++		printf (", ");
++		print_mono_inst_tree (inst);
++		printf ("\n");
++#endif
++		return (left_state & MONO_HSSA_LOCAL_ADDRESS_STATE_DATA_MASK) | MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS;
++	/* Write operations */
++	case CEE_STIND_REF :
++	case CEE_STIND_I1 :
++	case CEE_STIND_I2 :
++	case CEE_STIND_I4 :
++	case CEE_STIND_I8 :
++	case CEE_STIND_R4 :
++	case CEE_STIND_R8 :
++	case CEE_STIND_I :
++	/* Trigger memory write and read */
++	case OP_MEMCPY :
++	/* Trigger memory write */
++	case OP_MEMSET :
++		if (left_state != MONO_HSSA_LOCAL_ADDRESS_STATE_NONE) {
++			MonoHssaLocalAddressState right_state_kind = right_state & MONO_HSSA_LOCAL_ADDRESS_STATE_MASK;
++			gint32 defined_variable = left_state & MONO_HSSA_LOCAL_ADDRESS_STATE_DATA_MASK;
++			
++#if (DEBUG_HSSA)
++			printf ("Detected definition of variable %d at ", defined_variable);
++			print_bb_id (bb);
++			printf (", ");
++			print_mono_inst_tree (inst);
++			printf ("\n");
++#endif
++			bb->local_variables_state [defined_variable].has_definition = TRUE;
++			
++			if ((right_state_kind == MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS) ||
++			(right_state_kind == MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS_PLUS_OFFSET)) {
++				hssa->method_stores_local_addresses = TRUE;
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++				printf (" [ADDRESS STORED]");
++#endif
++			}
++		}
++#if (DEBUG_HSSA)
++		else {
++			printf ("Assignment discarded, state is ");
++			print_local_address_state (left_state);
++			printf (" at ");
++			print_bb_id (bb);
++			printf (", ");
++			print_mono_inst_tree (inst);
++			printf ("\n");
++		}
++#endif
++		return MONO_HSSA_LOCAL_ADDRESS_STATE_NONE;
++	/* Dummy write operation */
++	case OP_DUMMY_STORE : {
++		gint32 defined_variable = inst->inst_i0->inst_c0;
++		bb->local_variables_state [defined_variable].has_definition = TRUE;
++#if (DEBUG_HSSA)
++			printf ("Detected definition of variable %d at ", defined_variable);
++			print_bb_id (bb);
++			printf (", ");
++			print_mono_inst_tree (inst);
++			printf ("\n");
++#endif
++		return MONO_HSSA_LOCAL_ADDRESS_STATE_NONE;
++	}
++	/* Method call */
++	case OP_VOIDCALL :
++	case OP_VOIDCALLVIRT :
++	case OP_VOIDCALL_REG :
++	case OP_VOIDCALL_MEMBASE :
++	case OP_FCALL :
++	case OP_FCALLVIRT :
++	case OP_FCALL_REG :
++	case OP_FCALL_MEMBASE :
++	case OP_LCALL :
++	case OP_LCALLVIRT :
++	case OP_LCALL_REG :
++	case OP_LCALL_MEMBASE :
++	case OP_VCALL :
++	case OP_VCALLVIRT :
++	case OP_VCALL_REG :
++	case OP_VCALL_MEMBASE :
++	case OP_CALL_REG :
++	case OP_CALL_MEMBASE :
++	case CEE_CALL :
++	case CEE_CALLI :
++	case CEE_CALLVIRT :
++	//case CEE_MONO_ICALL :
++	/* Arguments (can pass addresses to the following call) */
++	case OP_OUTARG :
++	case OP_OUTARG_REG :
++	case OP_OUTARG_FREG :
++	case OP_OUTARG_IMM :
++	case OP_OUTARG_R4 :
++	case OP_OUTARG_R8 :
++	case OP_OUTARG_VT :
++	case OP_INARG_VT :
++		if (left_state != MONO_HSSA_LOCAL_ADDRESS_STATE_NONE) {
++			gint32 defined_variable = left_state & MONO_HSSA_LOCAL_ADDRESS_STATE_DATA_MASK;
++			bb->local_variables_state [defined_variable].has_definition = TRUE;
++#if (DEBUG_HSSA)
++			printf ("Detected definition of variable %d at ", defined_variable);
++			print_bb_id (bb);
++			printf (", ");
++			print_mono_inst_tree (inst);
++			printf ("\n");
++#endif
++		}
++#if (DEBUG_HSSA)
++		else {
++			printf ("Assignment discarded, state is ");
++			print_local_address_state (left_state);
++			printf (" at ");
++			print_bb_id (bb);
++			printf (", ");
++			print_mono_inst_tree (inst);
++			printf ("\n");
++		}
++#endif
++		return MONO_HSSA_LOCAL_ADDRESS_STATE_NONE;
++	/* Read operations */
++	case CEE_LDIND_I1 :
++	case CEE_LDIND_U1 :
++	case CEE_LDIND_I2 :
++	case CEE_LDIND_U2 :
++	case CEE_LDIND_I4 :
++	case CEE_LDIND_U4 :
++	case CEE_LDIND_I8 :
++	case CEE_LDIND_I :
++	case CEE_LDIND_R4 :
++	case CEE_LDIND_R8 :
++	case CEE_LDIND_REF :
++	/* Dummy read operation */
++	case OP_DUMMY_USE :
++		return MONO_HSSA_LOCAL_ADDRESS_STATE_NONE;
++	case CEE_MONO_OBJADDR :
++	case CEE_MONO_LDPTR :
++	case CEE_MONO_VTADDR :
++	case CEE_MONO_NEWOBJ :
++	case CEE_MONO_RETOBJ :
++	case CEE_MONO_LDNATIVEOBJ :
++	case CEE_MONO_CISINST :
++	case CEE_MONO_CCASTCLASS :
++	case CEE_MONO_SAVE_LMF :
++	case CEE_MONO_RESTORE_LMF :
++	case CEE_MONO_CLASSCONST :
++	case CEE_MONO_NOT_TAKEN :
++	/* In practice, is this the address of the last parameter? */
++	case CEE_ARGLIST :
++	case OP_ARGLIST :
++	/* Unknown */
++	case OP_LOAD :
++	case OP_STORE :
++	/* Cannot happen */
++	case OP_PHI :
++	case OP_SSA_LOCAL :
++	case OP_REGVAR :
++	case OP_REG :
++	case OP_REGOFFSET :
++	case OP_LABEL :
++	case OP_STORE_MEMBASE_IMM :
++	case OP_STORE_MEMBASE_REG :
++	case OP_STOREI1_MEMBASE_IMM :
++	case OP_STOREI1_MEMBASE_REG :
++	case OP_STOREI2_MEMBASE_IMM :
++	case OP_STOREI2_MEMBASE_REG :
++	case OP_STOREI4_MEMBASE_IMM :
++	case OP_STOREI4_MEMBASE_REG :
++	case OP_STOREI8_MEMBASE_IMM :
++	case OP_STOREI8_MEMBASE_REG :
++	case OP_STORER4_MEMBASE_REG :
++	case OP_STORER8_MEMBASE_REG :
++	case OP_LOAD_MEMBASE :
++	case OP_LOADI1_MEMBASE :
++	case OP_LOADU1_MEMBASE :
++	case OP_LOADI2_MEMBASE :
++	case OP_LOADU2_MEMBASE :
++	case OP_LOADI4_MEMBASE :
++	case OP_LOADU4_MEMBASE :
++	case OP_LOADI8_MEMBASE :
++	case OP_LOADR4_MEMBASE :
++	case OP_LOADR8_MEMBASE :
++	case OP_LOADR8_SPILL_MEMBASE :
++	case OP_LOADU4_MEM :
++	case OP_MOVE :
++	case OP_FMOVE :
++	case OP_ADD_IMM :
++	case OP_SUB_IMM :
++	case OP_MUL_IMM :
++	case OP_DIV_IMM :
++	case OP_DIV_UN_IMM :
++	case OP_REM_IMM :
++	case OP_REM_UN_IMM :
++	case OP_AND_IMM :
++	case OP_OR_IMM :
++	case OP_XOR_IMM :
++	case OP_SHL_IMM :
++	case OP_SHR_IMM :
++	case OP_SHR_UN_IMM :
++	case OP_COND_EXC_EQ :
++	case OP_COND_EXC_GE :
++	case OP_COND_EXC_GT :
++	case OP_COND_EXC_LE :
++	case OP_COND_EXC_LT :
++	case OP_COND_EXC_NE_UN :
++	case OP_COND_EXC_GE_UN :
++	case OP_COND_EXC_GT_UN :
++	case OP_COND_EXC_LE_UN :
++	case OP_COND_EXC_LT_UN :
++	case OP_COND_EXC_OV :
++	case OP_COND_EXC_NO :
++	case OP_COND_EXC_C :
++	case OP_COND_EXC_NC :
++	case OP_IADC_IMM :
++	case OP_ISBB_IMM :
++	case OP_LSHR_IMM :
++	case OP_LSHR_UN_IMM :
++	case OP_LSHL_IMM :
++	case OP_LADD_IMM :
++	case OP_LSUB_IMM :
++	case OP_LMUL_IMM :
++	case OP_IADD_IMM :
++	case OP_ISUB_IMM :
++	case OP_IMUL_IMM :
++	case OP_IDIV_IMM :
++	case OP_IDIV_UN_IMM :
++	case OP_IREM_IMM :
++	case OP_IREM_UN_IMM :
++	case OP_IAND_IMM :
++	case OP_IOR_IMM :
++	case OP_IXOR_IMM :
++	case OP_ISHL_IMM :
++	case OP_ISHR_IMM :
++	case OP_ISHR_UN_IMM :
++	case OP_COND_EXC_IOV :
++	case OP_COND_EXC_IC :
++	case OP_FCEQ_MEMBASE :
++	case OP_FCGT_MEMBASE :
++	case OP_FCGT_UN_MEMBASE :
++	case OP_FCLT_MEMBASE :
++	case OP_FCLT_UN_MEMBASE :
++	case OP_ADC :
++	case OP_ADC_IMM :
++	case OP_SBB :
++	case OP_SBB_IMM :
++	case OP_ADDCC :
++	case OP_ADDCC_IMM :
++	case OP_SUBCC :
++	case OP_SUBCC_IMM :
++	case OP_BR_REG :
++	case OP_SEXT_I1 :
++	case OP_SEXT_I2 :
++	case OP_CNE :
++	case OP_ADD_OVF_CARRY :
++	case OP_SUB_OVF_CARRY :
++	case OP_ADD_OVF_UN_CARRY :
++	case OP_SUB_OVF_UN_CARRY :
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++		printf (" [UNEXPECTED OPCODE]");
++#endif
++		return MONO_HSSA_LOCAL_ADDRESS_STATE_NONE;
++	default :
++		if (inst->type != STACK_MP) {
++			return MONO_HSSA_LOCAL_ADDRESS_STATE_NONE;
++		} else {
++			gint32 local = -1;
++			int number_of_involved_locals = 0;
++			
++			if ((left_state & MONO_HSSA_LOCAL_ADDRESS_STATE_MASK) == MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS) {
++				local = left_state & MONO_HSSA_LOCAL_ADDRESS_STATE_DATA_MASK;
++				number_of_involved_locals ++;
++			}
++			if ((right_state & MONO_HSSA_LOCAL_ADDRESS_STATE_MASK) == MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS) {
++				local = right_state & MONO_HSSA_LOCAL_ADDRESS_STATE_DATA_MASK;
++				number_of_involved_locals ++;
++			}
++			
++			if (number_of_involved_locals != 1) {
++				return MONO_HSSA_LOCAL_ADDRESS_STATE_NONE;
++			} else {
++				return MONO_HSSA_LOCAL_ADDRESS_STATE_LOCAL_ADDRESS_PLUS_OFFSET | local;
++			}
++		}
++	}
++}
++
++/*
++ * current_tree_depth is the number of tree nodes above ac.
++ * Returns the number of tree nodes below on the subtree (including ac).
++ */
++static int
++connect_class_aliasing_class (MonoHssaCfgData *hssa, MonoHssaTypeBasedAliasingClass *ac, int current_tree_depth) {
++	MonoHssaTypeBasedAliasingClass *child;
++	int child_aliases = 0;
++	
++	for (child = ac->first_child; child != NULL; child = child->siblings) {
++		child_aliases += connect_class_aliasing_class (hssa, child, current_tree_depth + 1);
++	}
++	
++	ac->interface_aliasing_classes = 0;
++	if (ac != OBJECT_ALIASING_CLASS) {
++		MonoHssaTypeBasedAliasingClass *interfaces;
++		
++		ac->class_aliasing_classes = current_tree_depth + child_aliases;
++		
++		for (interfaces = hssa->interface_aliasing_classes; interfaces != NULL; interfaces = interfaces->siblings) {
++			if (mono_class_is_assignable_from (interfaces->klass, ac->klass)) {
++				ac->interface_aliasing_classes ++;
++			}
++		}
++		
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++		printf ("STATISTICS CLASS_AC C=%d I=%d \"%s\"\n", ac->class_aliasing_classes, ac->interface_aliasing_classes, ac->klass->name);
++#endif
++		
++	}
++	
++	return child_aliases + 1;
++}
++
++static void
++connect_aliasing_classes (MonoHssaCfgData *hssa) {
++	MonoHssaTypeBasedAliasingClass *interfaces;
++	MonoHssaTypeBasedAliasingClass *inner_interfaces;
++	int t;
++	char *name = mono_method_full_name (hssa->cfg->method, TRUE);
++	
++	t = connect_class_aliasing_class (hssa, OBJECT_ALIASING_CLASS, -1);
++	
++	for (interfaces = hssa->interface_aliasing_classes; interfaces != NULL; interfaces = interfaces->siblings) {
++		for (inner_interfaces = interfaces->siblings; inner_interfaces != NULL; inner_interfaces = inner_interfaces->siblings) {
++			if (mono_class_is_assignable_from (interfaces->klass, inner_interfaces->klass) || mono_class_is_assignable_from (inner_interfaces->klass, interfaces->klass)) {
++				interfaces->interface_aliasing_classes ++;
++				inner_interfaces->interface_aliasing_classes ++;
++			}
++		}
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++		printf ("STATISTICS INTERFACE_AC C=%d I=%d \"%s\"\n", interfaces->class_aliasing_classes, interfaces->interface_aliasing_classes, interfaces->klass->name);
++#endif
++	}
++	
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++	printf ("STATISTICS METHOD T=%d C=%d I=%d \"%s\"\n", hssa->number_of_aliasing_classes, t, hssa->number_of_aliasing_classes - t, name);
++#endif
++	g_free (name);
++}
++
++/* Returns the size of the current subtree */
++static int visit_dominator_subtree (MonoHssaCfgData *hssa, MonoBasicBlock* cfg_bb, int dt_index, int dt_level, MonoHssaBB *bb) {
++	GList *current_dominated_bb = g_list_first (cfg_bb->dominated);
++	int last_used_dt_index = dt_index;
++	MonoHssaBB *last_used_slot = bb;
++	int number_of_children = 0;
++	
++	bb->bb = cfg_bb;
++	bb->dt_index = dt_index;
++	bb->dt_level = dt_level;
++	bb->index_in_predecessors_out_blocks = -1;
++	bb->index_in_successors_in_blocks = -1;
++	hssa->bblocks_in_cfg_order [cfg_bb->dfn] = bb;
++	
++	while (current_dominated_bb != NULL ) {
++		int children = visit_dominator_subtree (hssa, (MonoBasicBlock*) (current_dominated_bb->data), last_used_dt_index + 1, dt_level + 1, last_used_slot + 1);
++		
++		number_of_children += children;
++		
++		current_dominated_bb = g_list_next (current_dominated_bb);
++		last_used_slot += children;
++		last_used_dt_index += children;
++	}
++	
++	bb->dt_children = number_of_children;
++	return number_of_children + 1;
++}
++
++static void initialize_bb_array (MonoHssaCfgData *hssa) {
++	int i;
++	
++	hssa->number_of_bblocks = hssa->cfg->num_bblocks;
++	
++	hssa->bblocks = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaBB) * hssa->number_of_bblocks);
++	hssa->bblocks_in_cfg_order = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaBB*) * hssa->number_of_bblocks);
++	
++	if (DUMP_HSSA) {
++		printf ("Visiting dominator subtree...\n");
++	}
++	visit_dominator_subtree (hssa, hssa->cfg->bblocks [0], 0, 0, hssa->bblocks);
++	if (DUMP_HSSA) {
++		printf ("Scanning BB array...\n");
++	}
++	
++	for (i = 0; i < hssa->number_of_bblocks; i++) {
++		MonoHssaBB *bb = &(hssa->bblocks [i]);
++		
++		/* Initialize all "generic" bb fields here... */
++		bb->in_count = bb->bb->in_count;
++		switch (bb->in_count) {
++		case 0:
++			bb->in_bb = NULL;
++			break;
++		case 1:
++			bb->in_bb = mono_mempool_alloc (hssa->mempool, sizeof (MonoHssaBB*));
++			bb->in_bb [0] = hssa->bblocks_in_cfg_order [bb->bb->in_bb [0]->dfn];
++			break;
++		default: {
++			int i;
++			
++			bb->in_bb = mono_mempool_alloc (hssa->mempool, sizeof (MonoHssaBB*) * bb->in_count);
++			for (i = 0; i < bb->in_count; i++) {
++				MonoHssaBB *in_bb = hssa->bblocks_in_cfg_order [bb->bb->in_bb [i]->dfn];
++				in_bb->index_in_successors_in_blocks = i;
++				bb->in_bb [i] = in_bb;
++			}
++		}
++		}
++		bb->out_count = bb->bb->out_count;
++		switch (bb->out_count) {
++		case 0:
++			bb->out_bb = NULL;
++			break;
++		case 1:
++			bb->out_bb = mono_mempool_alloc (hssa->mempool, sizeof (MonoHssaBB*));
++			bb->out_bb [0] = hssa->bblocks_in_cfg_order [bb->bb->out_bb [0]->dfn];
++			break;
++		default: {
++			int i;
++			
++			bb->out_bb = mono_mempool_alloc (hssa->mempool, sizeof (MonoHssaBB*) * bb->out_count);
++			for (i = 0; i < bb->out_count; i++) {
++				MonoHssaBB *out_bb = hssa->bblocks_in_cfg_order [bb->bb->out_bb [i]->dfn];
++				out_bb->index_in_predecessors_out_blocks = i;
++				bb->out_bb [i] = out_bb;
++			}
++		}
++		}
++		if (bb->bb->idom != NULL) {
++			bb->idominator = hssa->bblocks_in_cfg_order [bb->bb->idom->dfn];
++		} else {
++			bb->idominator = NULL;
++		}
++		bb->local_variables_state = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaLocalVariableStateInBB) * hssa->local_variables_capaciy);
++	}
++}
++
++static void initialize_local_variables_array (MonoHssaCfgData *hssa) {
++	MonoHssaLocalVariable *buffer;
++	int i;
++	
++	hssa->number_of_local_variables = hssa->cfg->num_varinfo;
++	// FIXME: hssa->local_variables_capaciy = hssa->cfg->varinfo_count;
++	hssa->local_variables_capaciy = hssa->cfg->num_varinfo;
++	buffer = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaLocalVariable) * hssa->local_variables_capaciy);
++	hssa->local_variables = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaLocalVariable*) * hssa->local_variables_capaciy);
++	for (i = 0; i < hssa->number_of_local_variables; i++) {
++		MonoHssaLocalVariable *variable = & (buffer [i]);
++		hssa->local_variables [i] = variable;
++		variable->index = i;
++		
++		/* Initialize all "generic" variable fields here... */
++		variable->inst = hssa->cfg->varinfo [i];
++		variable->local_value.base.type = MONO_HSSA_VALUE_LOCAL;
++		variable->local_value.base.value_number = 0;
++		variable->local_value.data.variable_index = i;
++		if (variable->inst->info.hssa == NULL) {
++			variable->inst->info.hssa = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaMonoInstInfo));
++			INST_IS_LOCAL_IMMEDIATE (variable->inst) = TRUE;
++		}		
++	}
++}
++
++
++static void
++initialize_aliasing_classes (MonoHssaCfgData *hssa) {
++	hssa->object_aliasing_class.klass = mono_defaults.object_class;
++	hssa->object_aliasing_class.father = NULL;
++	hssa->object_aliasing_class.siblings = NULL;
++	hssa->object_aliasing_class.first_child = NULL;
++	hssa->object_aliasing_class.interfaces = NULL;
++	hssa->object_aliasing_class.implementors = NULL;
++	hssa->interface_aliasing_classes = NULL;
++	
++	hssa->number_of_aliasing_classes = 0;
++	
++	char *name = mono_method_full_name (hssa->cfg->method, TRUE);
++	int i;
++	MonoHssaBB *bb;
++	int dt_depth = 0;
++	
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++	printf ("ALIASING DATA START (METHOD %s)\n", name);
++	for (i = 0; i < hssa->cfg->num_varinfo; i++) {
++		MonoInst *inst = hssa->cfg->varinfo [i];
++		
++		printf ("    %s[%d]", mono_inst_name (inst->opcode), inst->inst_c0);
++		if (inst->klass != NULL) {
++			printf (" [KLASS:");
++			printf ("\"%s\"", inst->klass->name);
++			if (MONO_CLASS_IS_INTERFACE (inst->klass)) {
++				printf ("(I)]");
++			}
++		}
++		printf ("]\n");
++	}
++#endif
++	for (i = 0, bb = hssa->bblocks; i < hssa->number_of_bblocks; i++, bb++) {
++		MonoInst *inst;
++		for (inst = bb->bb->code; inst != NULL; inst = inst->next) {
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++			printf (" ");
++#endif
++			compute_aliasing_classes_on_inst (hssa, bb, inst);
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++			printf ("\n");
++#endif
++		}
++		
++		/* Compute DT depth */
++		if (bb->dt_level > dt_depth) {
++			dt_depth = bb->dt_level;
++		}
++		
++		/* Initialize J edges */
++		switch (bb->out_count) {
++		case 0:
++			bb->j_edges = NULL;
++			bb->j_edges_count = 0;
++			break;
++		case 1: {
++			MonoHssaBB* out_bb = bb->out_bb [0];
++			
++			if (! MONO_HSSA_STRICTLY_DOMINATES (bb, out_bb)) {
++				bb->j_edges = mono_mempool_alloc (hssa->mempool, sizeof (MonoHssaBB*));
++				bb->j_edges [0] = out_bb;
++				bb->j_edges_count = 1;
++			} else {
++				bb->j_edges = NULL;
++				bb->j_edges_count = 0;
++			}
++			break;
++		}
++		default: {
++			int out_bb_index;
++			int j_edges_count = 0;
++			
++			bb->j_edges = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaBB*) * bb->out_count);
++			for (out_bb_index = 0; out_bb_index < bb->out_count; out_bb_index++) {
++				MonoHssaBB *out_bb = bb->out_bb [out_bb_index];
++				
++				if (! MONO_HSSA_STRICTLY_DOMINATES (bb, out_bb)) {
++					bb->j_edges [j_edges_count] = out_bb;
++					j_edges_count ++;
++				}
++			}
++			bb->j_edges_count = j_edges_count;
++		}
++		}
++	}
++	hssa->dt_depth = dt_depth + 1;
++	hssa->phi_computation_bank = mono_mempool_alloc (hssa->mempool, sizeof (MonoHssaBB*) * hssa->dt_depth);
++#if (DEBUG_HSSA_ALIASING_COMPUTATION)
++	printf ("ALIASING DATA END (METHOD %s)\n", name);
++#endif
++	
++	connect_aliasing_classes (hssa);
++	
++	g_free (name);
++}
++#undef DEBUG_HSSA_ALIASING_COMPUTATION
++
++#define DEBUG_PHI_PLACEMENT 0
++static void
++place_phis_for_local_variable (MonoHssaCfgData *hssa, gint32 variable_index) {
++	int i;
++	int current_level;
++	MonoHssaBB *bb;
++	
++	/* Clear bank */
++	memset (hssa->phi_computation_bank, 0, hssa->dt_depth * sizeof (MonoHssaBB*));	
++	
++#if (DEBUG_PHI_PLACEMENT)
++	printf ("Placing phi definitions for local variable %d\n", variable_index);
++#endif
++	/* Fill bank */
++	for (i = 0, bb = hssa->bblocks; i < hssa->number_of_bblocks; i++, bb++) {
++		bb->processed_in_phi_computation = FALSE;
++		if (bb->local_variables_state [variable_index].has_definition) {
++			bb->next_bb_in_phi_computation = hssa->phi_computation_bank [bb->dt_level];
++			hssa->phi_computation_bank [bb->dt_level] = bb;
++#if (DEBUG_PHI_PLACEMENT)
++			printf ("Adding ");
++			print_bb_id (bb);
++			printf ("to bank at level %d\n", bb->dt_level);
++#endif
++		}
++	}
++	
++	/* Start at top of bank */
++	current_level = hssa->dt_depth - 1;
++	
++	/* Get first node */
++	bb = hssa->phi_computation_bank [current_level];
++	while ((bb == NULL) && (current_level > 0)) {
++		current_level--;
++		bb = hssa->phi_computation_bank [current_level];
++	}
++	while (bb != NULL) {
++		int index_in_dominator_subtree = 0;
++		MonoHssaBB *dominated_bb = bb;
++		
++#if (DEBUG_PHI_PLACEMENT)
++		printf ("Processing level %d, getting ", current_level);
++		print_bb_id (bb);
++		printf (" from bank at level %d with %d children\n", bb->dt_level, bb->dt_children);
++#endif
++		/* Take node off the bank */
++		hssa->phi_computation_bank [current_level] = bb->next_bb_in_phi_computation;
++		
++		/* Process Node node */
++		//bb->processed_in_phi_computation = TRUE;
++		/* Traverse dominator subtree */
++		while (index_in_dominator_subtree <= bb->dt_children) {
++			if (! dominated_bb->processed_in_phi_computation) {
++				int j;
++				
++#if (DEBUG_PHI_PLACEMENT)
++				printf ("  At subtree index %d, working on ", index_in_dominator_subtree);
++				print_bb_id (dominated_bb);
++				printf (" with %d j edges\n", dominated_bb->j_edges_count);
++#endif
++				
++				/* Mark node as processed */
++				dominated_bb->processed_in_phi_computation = TRUE;
++				
++				/* Traverse all J edges */
++				for (j = 0; j < dominated_bb->j_edges_count; j++) {
++					MonoHssaBB *j_edge_target = dominated_bb->j_edges [j];
++#if (DEBUG_PHI_PLACEMENT)
++				printf ("    Considering j edge with target ");
++				print_bb_id (j_edge_target);
++				printf (" of level %d: ", j_edge_target->dt_level);
++#endif
++					if (j_edge_target->dt_level <= bb->dt_level) {
++						if (! j_edge_target->local_variables_state [variable_index].has_phi) {
++							j_edge_target->local_variables_state [variable_index].has_phi = TRUE;
++							if (! j_edge_target->local_variables_state [variable_index].has_definition) {
++								/* Add node to bank */
++								j_edge_target->next_bb_in_phi_computation = hssa->phi_computation_bank [j_edge_target->dt_level];
++								hssa->phi_computation_bank [j_edge_target->dt_level] = j_edge_target;
++#if (DEBUG_PHI_PLACEMENT)
++								printf ("phi placed (node added to bank)\n");
++#endif
++							}
++#if (DEBUG_PHI_PLACEMENT)
++							else {
++								printf ("phi placed (node not added to bank because already contains a definition)\n");
++							}
++#endif
++						}
++#if (DEBUG_PHI_PLACEMENT)
++						else {
++							printf ("refused because already contains a phi\n");
++						}
++#endif
++					}
++#if (DEBUG_PHI_PLACEMENT)
++					else {
++						printf ("refused because of level\n");
++					}
++#endif
++				}
++			}
++#if (DEBUG_PHI_PLACEMENT)
++			else {
++				printf ("  At subtree index %d, skipping ", index_in_dominator_subtree);
++				print_bb_id (dominated_bb);
++				printf (" because already processed\n");
++			}
++#endif
++			
++			index_in_dominator_subtree ++;
++			dominated_bb ++;
++		}
++		
++		/* Get next node */
++		bb = hssa->phi_computation_bank [current_level];
++		while ((bb == NULL) && (current_level > 0)) {
++			current_level--;
++			bb = hssa->phi_computation_bank [current_level];
++		}
++	}
++	
++#if (DEBUG_PHI_PLACEMENT)
++	printf ("Placed phi definitions for local variable %d\n", variable_index);
++#endif
++}
++#undef DEBUG_PHI_PLACEMENT
++
++static void
++place_phis_for_local_variables (MonoHssaCfgData *hssa) {
++	int i;
++	
++	if (FOLLOW_HSSA) {
++		print_definition_flags (hssa, TRUE, FALSE);
++	}
++	for (i = 0; i < hssa->number_of_local_variables; i++) {
++		place_phis_for_local_variable (hssa, i);
++	}
++	if (FOLLOW_HSSA) {
++		print_definition_flags (hssa, FALSE, TRUE);
++	}
++}
++
++static MonoHssaLocalVariableDefinition*
++lookup_definition_in_value_stacks (MonoHssaBB *bb, gint32 variable) {
++	return bb->local_variables_state [variable].current_definition;
++}
++
++static MonoHssaLocalVariableUse*
++create_variable_use (MonoHssaCfgData *hssa, MonoHssaLocalVariableDefinition *definition, MonoInst *inst) {
++	MonoHssaLocalVariableUse *use = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaLocalVariableUse));
++	use->definition = definition;
++	use->use = inst;
++	return use;
++}
++
++static MonoHssaLocalVariableUse*
++add_variable_use_to_definition (MonoHssaCfgData *hssa, MonoHssaLocalVariableDefinition *definition, MonoInst *inst) {
++	MonoHssaLocalVariableUse *use = create_variable_use (hssa, definition, inst);
++	INSERT_LIST_ELEMENT (definition, uses, use);
++	return use;
++}
++
++static MonoHssaValueOccurrence*
++allocate_value_occurrence (MonoHssaCfgData *hssa, MonoInst *inst) {
++	MonoHssaValueOccurrence *occurrence = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaValueOccurrence));
++	occurrence->occurrence = inst;
++	return occurrence;
++}
++
++static MonoHssaValue*
++create_new_primitive_value (MonoHssaCfgData *hssa, MonoInst *inst) {
++	MonoHssaValue *value = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaPrimitiveValue));
++	value->base.type = MONO_HSSA_VALUE_PRIMITIVE;
++	value->base.value_number = hssa->next_available_value_number;
++	hssa->next_available_value_number++;
++	value->data.primitive.value_id = hssa->next_available_primitive_value_id;
++	hssa->next_available_primitive_value_id++;
++	value->data.primitive.location = inst;
++	return value;
++}
++
++static MonoHssaLocalAddress*
++create_new_local_address (MonoHssaCfgData *hssa, guint32 variable_index, MonoHssaValue *value, MonoHssaValue *offset) {
++	MonoHssaLocalAddress *address = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaLocalAddress));
++	address->base.type = MONO_HSSA_ADDRESS_LOCAL;
++	address->base.value = value;
++#if (DEBUG_HSSA)
++	g_assert (value->base.type != MONO_HSSA_VALUE_LOCAL);
++#endif
++	address->data.base_variable = hssa->local_variables [variable_index];
++	address->data.offset = offset;
++	return address;
++}
++
++#if 0
++static MonoHssaLocalAddress*
++create_new_local_address_from_previous_address (MonoHssaCfgData *hssa, MonoHssaValue *previous_address, MonoHssaValue *new_offset) {
++	MonoHssaLocalAddress *address = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaLocalAddress));
++	address->base.type = MONO_HSSA_ADDRESS_LOCAL;
++	address->base.value = value;
++#if (DEBUG_HSSA)
++	g_assert (value->base.type != MONO_HSSA_VALUE_LOCAL);
++#endif
++	address->data.base_variable = hssa->local_variables [variable_index];
++	address->data.offset = offset;
++	return address;
++}
++
++static MonoHssaAddress*
++clone_local_address (MonoHssaCfgData *hssa, MonoHssaValueExtensionLocalAddress *previous_address) {
++	MonoHssaValueExtensionLocalAddress *address = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaValueExtensionLocalAddress));
++	address->base.type = MONO_HSSA_VALUE_EXTENSION_LOCAL_ADDRESS;
++	address->data.base_variable = previous_address->data.base_variable;
++	address->data.offset = previous_address->data.offset;
++	return (MonoHssaValueExtension*) address;
++}
++#endif
++
++static MonoHssaHeapAddress*
++create_new_heap_address (MonoHssaCfgData *hssa, SetOfAliasingClasses aliasing_classes, MonoHssaValue *value, MonoHssaValue *base_address, MonoHssaValue *offset) {
++	MonoHssaHeapAddress *address = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaHeapAddress));
++	address->base.type = MONO_HSSA_ADDRESS_HEAP;
++	address->base.value = value;
++#if (DEBUG_HSSA)
++	g_assert (value->base.type != MONO_HSSA_VALUE_LOCAL);
++#endif
++	address->data.aliasing_classes = aliasing_classes;
++	address->data.base_address = base_address;
++	address->data.offset = offset;
++	return address;
++}
++
++#if 0
++static MonoHssaValueExtension*
++create_new_heap_address_from_previous_address (MonoHssaCfgData *hssa, MonoHssaValueExtensionHeapAddress *previous_address, MonoHssaValue *new_offset) {
++	MonoHssaValueExtensionHeapAddress *address = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaValueExtensionHeapAddress));
++	address->base.type = MONO_HSSA_VALUE_EXTENSION_HEAP_ADDRESS;
++	address->data.aliasing_classes = previous_address->data.aliasing_classes;
++	address->data.base_address = previous_address->data.base_address;
++	address->data.offset = new_offset;
++	return (MonoHssaValueExtension*) address;
++}
++
++static MonoHssaValueExtension*
++clone_heap_address (MonoHssaCfgData *hssa, MonoHssaValueExtensionHeapAddress *previous_address) {
++	MonoHssaValueExtensionHeapAddress *address = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaValueExtensionHeapAddress));
++	address->base.type = MONO_HSSA_VALUE_EXTENSION_HEAP_ADDRESS;
++	address->data.aliasing_classes = previous_address->data.aliasing_classes;
++	address->data.base_address = previous_address->data.base_address;
++	address->data.offset = previous_address->data.offset;
++	return (MonoHssaValueExtension*) address;
++}
++#endif
++
++static MonoHssaHeapAddress*
++create_new_heap_address_pointing_to_object (MonoHssaCfgData *hssa, SetOfAliasingClasses aliasing_classes, MonoHssaValue *base_address) {
++	return create_new_heap_address (hssa, aliasing_classes, base_address, base_address, hssa->zero);
++}
++
++static MonoHssaHeapAddress*
++create_new_heap_address_for_simple_managed_pointer (MonoHssaCfgData *hssa, MonoHssaValue *base_address) {
++	return create_new_heap_address (hssa, MONO_HSSA_ALL_ALIASING_CLASSES, base_address, base_address, NULL);
++}
++
++static MonoHssaHeapAddress*
++create_new_heap_address_for_inst (MonoHssaCfgData *hssa, MonoHssaValue *base_address, MonoInst *inst) {
++	if (inst->type == STACK_OBJ) {
++		return create_new_heap_address_pointing_to_object (hssa, MONO_HSSA_ALL_ALIASING_CLASSES, base_address);
++	} else if ((inst->type == STACK_MP) || (inst->type == STACK_PTR)) {
++		return create_new_heap_address_for_simple_managed_pointer (hssa, base_address);
++	} else {
++		return NULL;
++	}
++}
++
++static MonoHssaValue*
++create_new_primitive_value_as_address_according_to_inst (MonoHssaCfgData *hssa, MonoInst *inst) {
++	MonoHssaValue *value = create_new_primitive_value (hssa, inst);
++	value->base.address.heap = create_new_heap_address_for_inst (hssa, value, inst);
++	return value;
++}
++
++
++static MonoHssaAddress*
++create_address_from_operands (MonoHssaCfgData *hssa, MonoHssaAddress *left_address, MonoHssaAddress *right_address, MonoHssaValue *value, MonoInst *inst) {
++	MonoHssaAddress *base_address;
++	
++	if (left_address != NULL) {
++		base_address = left_address;
++#if (DEBUG_HSSA)
++		printf ("(taking left address, ");
++#endif
++	} else if (right_address != NULL) {
++		base_address = right_address;
++#if (DEBUG_HSSA)
++		printf ("(taking right address, ");
++#endif
++	} else if ((inst->opcode == CEE_CONV_I) || (inst->opcode == CEE_CONV_U) ||
++			(inst->opcode == CEE_CONV_OVF_I) || (inst->opcode == CEE_CONV_OVF_U) ||
++			(inst->opcode == CEE_CONV_OVF_I_UN) || (inst->opcode == CEE_CONV_OVF_U_UN) ||
++			(inst->opcode == OP_LCONV_TO_I) || (inst->opcode == OP_LCONV_TO_U) ||
++			(inst->opcode == OP_LCONV_TO_OVF_I) || (inst->opcode == OP_LCONV_TO_OVF_U) ||
++			(inst->opcode == OP_LCONV_TO_OVF_I_UN) || (inst->opcode == OP_LCONV_TO_OVF_U_UN) ||
++			(inst->opcode == OP_FCONV_TO_OVF_I) || (inst->opcode == OP_FCONV_TO_OVF_U) ||
++			(inst->opcode == OP_FCONV_TO_OVF_I_UN) || (inst->opcode == OP_FCONV_TO_OVF_U_UN) ||
++			(inst->opcode == OP_TLS_GET)) {
++#if (DEBUG_HSSA)
++		printf ("(converting value to address)");
++#endif
++		return (MonoHssaAddress*) create_new_heap_address_for_simple_managed_pointer (hssa, value);
++	} else if (inst->opcode == CEE_LDLEN) {
++		printf ("(result is not an address)");
++		return NULL;
++	} else {
++		printf ("\nAddress required, but not provided for value ");
++		print_value_briefly (value);
++		printf ("\n");
++		g_assert_not_reached ();
++		base_address = NULL;
++	}
++	
++	if (base_address->base.type == MONO_HSSA_ADDRESS_LOCAL) {
++#if (DEBUG_HSSA)
++		printf (" producing a local address)");
++#endif
++		return (MonoHssaAddress*) create_new_local_address (hssa, base_address->data.local_address.base_variable->index, value, hssa->zero);
++	} else if (base_address->base.type == MONO_HSSA_ADDRESS_HEAP) {
++		if (inst->type == STACK_OBJ) {
++#if (DEBUG_HSSA)
++			printf (" producing an object address)");
++#endif
++			return (MonoHssaAddress*) create_new_heap_address_pointing_to_object (hssa, MONO_HSSA_ALL_ALIASING_CLASSES, value);
++		} else {
++#if (DEBUG_HSSA)
++			printf (" producing a generic heap address)");
++#endif
++			return (MonoHssaAddress*) create_new_heap_address_for_simple_managed_pointer (hssa, value);
++		}
++	} else {
++		g_assert_not_reached ();
++		return NULL;
++	}
++}
++
++static guint
++constant_value_key (gconstpointer key) {
++	MonoHssaValue *value = (MonoHssaValue*) key;
++	
++	switch (value->base.type) {
++	case MONO_HSSA_VALUE_INTEGER_CONSTANT: return (guint) value->data.constant.value.integer_constant;
++	case MONO_HSSA_VALUE_LONG_COSTANT: return (guint) *value->data.constant.value.long_constant;
++	case MONO_HSSA_VALUE_FLOAT_COSTANT: return (guint) *value->data.constant.value.float_constant;
++	case MONO_HSSA_VALUE_DOUBLE_COSTANT: return (guint) *value->data.constant.value.double_constant;
++	default:
++		g_assert_not_reached ();
++		return 0;
++	}
++}
++
++static gboolean
++constant_value_equal (gconstpointer a, gconstpointer b) {
++	MonoHssaValue *v1 = (MonoHssaValue*) a;
++	MonoHssaValue *v2 = (MonoHssaValue*) b;
++	
++	if (v1->base.type == v2->base.type) {
++		switch (v1->base.type) {
++		case MONO_HSSA_VALUE_INTEGER_CONSTANT: return (v1->data.constant.value.integer_constant == v2->data.constant.value.integer_constant);
++		case MONO_HSSA_VALUE_LONG_COSTANT: return (*v1->data.constant.value.long_constant == *v2->data.constant.value.long_constant);
++		case MONO_HSSA_VALUE_FLOAT_COSTANT: return (*v1->data.constant.value.float_constant == *v2->data.constant.value.float_constant);
++		case MONO_HSSA_VALUE_DOUBLE_COSTANT: return (*v1->data.constant.value.double_constant == *v2->data.constant.value.double_constant);
++		default:
++			g_assert_not_reached ();
++			return FALSE;
++		}
++	} else {
++		return FALSE;
++	}
++}
++
++static MonoHssaValue*
++get_integer_constant_value (MonoHssaCfgData *hssa, MonoInst *inst) {
++	MonoHssaValue sample;
++	MonoHssaValue *result;
++	
++	sample.base.type = MONO_HSSA_VALUE_INTEGER_CONSTANT;
++	sample.data.constant.value.integer_constant = inst->inst_c0;
++	
++	result = g_hash_table_lookup (hssa->constant_values, &sample);
++	if (result == NULL) {
++		result = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaConstantValue));
++		result->base.type = MONO_HSSA_VALUE_INTEGER_CONSTANT;
++		result->base.value_number = hssa->next_available_value_number;
++		hssa->next_available_value_number++;
++		result->data.constant.value.integer_constant = inst->inst_c0;
++		result->base.address.heap = create_new_heap_address_for_inst (hssa, result, inst);
++		g_hash_table_insert (hssa->constant_values, result, result);
++	}
++	
++	return result;
++}
++
++static MonoHssaValue*
++get_long_constant_value (MonoHssaCfgData *hssa, MonoInst *inst) {
++	MonoHssaValue sample;
++	MonoHssaValue *result;
++	
++	sample.base.type = MONO_HSSA_VALUE_LONG_COSTANT;
++	sample.data.constant.value.long_constant = &(inst->inst_l);
++	
++	result = g_hash_table_lookup (hssa->constant_values, &sample);
++	if (result == NULL) {
++		result = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaConstantValue));
++		result->base.type = MONO_HSSA_VALUE_LONG_COSTANT;
++		result->base.value_number = hssa->next_available_value_number;
++		hssa->next_available_value_number++;
++		result->data.constant.value.long_constant = &(inst->inst_l);
++		result->base.address.heap = create_new_heap_address_for_inst (hssa, result, inst);
++		g_hash_table_insert (hssa->constant_values, result, result);
++	}
++	
++	return result;
++}
++
++static MonoHssaValue*
++get_float_constant_value (MonoHssaCfgData *hssa, float* value) {
++	MonoHssaValue sample;
++	MonoHssaValue *result;
++	
++	sample.base.type = MONO_HSSA_VALUE_FLOAT_COSTANT;
++	sample.data.constant.value.float_constant = value;
++	
++	result = g_hash_table_lookup (hssa->constant_values, &sample);
++	if (result == NULL) {
++		result = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaConstantValue));
++		result->base.type = MONO_HSSA_VALUE_FLOAT_COSTANT;
++		result->base.value_number = hssa->next_available_value_number;
++		hssa->next_available_value_number++;
++		result->data.constant.value.float_constant = value;
++		g_hash_table_insert (hssa->constant_values, result, result);
++	}
++	
++	return result;
++}
++static MonoHssaValue*
++get_double_constant_value (MonoHssaCfgData *hssa, double* value) {
++	MonoHssaValue sample;
++	MonoHssaValue *result;
++	
++	sample.base.type = MONO_HSSA_VALUE_DOUBLE_COSTANT;
++	sample.data.constant.value.double_constant = value;
++	
++	result = g_hash_table_lookup (hssa->constant_values, &sample);
++	if (result == NULL) {
++		result = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaConstantValue));
++		result->base.type = MONO_HSSA_VALUE_DOUBLE_COSTANT;
++		result->base.value_number = hssa->next_available_value_number;
++		hssa->next_available_value_number++;
++		result->data.constant.value.double_constant = value;
++		g_hash_table_insert (hssa->constant_values, result, result);
++	}
++	
++	return result;
++}
++
++
++
++static guint
++computed_value_key (gconstpointer key) {
++	MonoHssaValue *value = (MonoHssaValue*) key;
++	
++	if (value->base.type == MONO_HSSA_VALUE_COMPUTED) {
++		return value->data.computed.opcode |
++				((value->data.computed.left_operand->base.value_number & 0xff) << 24) |
++				((value->data.computed.right_operand->base.value_number & 0xff) << 16);
++	} else {
++		g_assert_not_reached ();
++		return 0;
++	}
++}
++
++static gboolean
++computed_value_equal (gconstpointer a, gconstpointer b) {
++	MonoHssaValue *v1 = (MonoHssaValue*) a;
++	MonoHssaValue *v2 = (MonoHssaValue*) b;
++	
++	if ((v1->base.type == MONO_HSSA_VALUE_COMPUTED && (v2->base.type == MONO_HSSA_VALUE_COMPUTED))) {
++		return (v1->data.computed.opcode == v2->data.computed.opcode) &&
++				(v1->data.computed.left_operand->base.value_number == v2->data.computed.left_operand->base.value_number) &&
++				(v1->data.computed.right_operand->base.value_number == v2->data.computed.right_operand->base.value_number);
++	} else {
++		g_assert_not_reached ();
++		return FALSE;
++	}
++}
++
++static MonoHssaValue*
++get_computed_value (MonoHssaCfgData *hssa, guint16 opcode, MonoHssaValue *left_operand, MonoHssaValue *right_operand, MonoInst *inst) {
++	MonoHssaValue sample;
++	MonoHssaValue *result;
++	
++	sample.base.type = MONO_HSSA_VALUE_COMPUTED;
++	sample.data.computed.opcode = opcode;
++	sample.data.computed.left_operand = left_operand;
++	sample.data.computed.right_operand = right_operand;
++	
++	result = g_hash_table_lookup (hssa->computed_values, &sample);
++	if (result == NULL) {
++		result = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaComputedValue));
++		result->base.type = MONO_HSSA_VALUE_COMPUTED;
++		result->base.value_number = hssa->next_available_value_number;
++		hssa->next_available_value_number++;
++		result->data.computed.opcode = opcode;
++		result->data.computed.left_operand = left_operand;
++		result->data.computed.right_operand = right_operand;
++		if ((inst->type == STACK_PTR) || (inst->type == STACK_MP) || (inst->type == STACK_OBJ)) {
++			result->base.address.generic = create_address_from_operands (hssa, left_operand->base.address.generic, right_operand->base.address.generic, result, inst);
++		}
++		g_hash_table_insert (hssa->computed_values, result, result);
++	}
++	
++	return result;
++}
++
++static MonoHssaValue*
++create_new_empty_phi_value (MonoHssaCfgData *hssa, MonoHssaBB *bb) {
++	MonoHssaValue *value = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaPhiValue));
++	value->base.type = MONO_HSSA_VALUE_PHI;
++	value->base.value_number = hssa->next_available_value_number;
++	hssa->next_available_value_number++;
++	value->data.phi.number_of_alternatives = 0;
++	value->data.phi.alternatives = NULL;
++	value->data.phi.join_point = bb;
++	return value;
++}
++
++
++
++static void
++fill_local_phi_value (MonoHssaCfgData *hssa, MonoHssaValue *value, gint32 variable_index) {
++	MonoHssaBB *bb = value->data.phi.join_point;
++	MonoHssaValue **alternatives;
++	int i;
++	
++	value->data.phi.number_of_alternatives = bb->in_count;
++	alternatives = mono_mempool_alloc0 (hssa->mempool, bb->in_count * sizeof (MonoHssaValue*));
++	value->data.phi.alternatives = alternatives;
++	
++	for (i = 0; i < bb->in_count; i++) {
++		MonoHssaBB *in_bb = bb->in_bb [i];
++		MonoHssaLocalVariableDefinition *definition = lookup_definition_in_value_stacks (in_bb, variable_index);
++		
++		if (definition != NULL) {
++			alternatives [i] = definition->value;
++		} else {
++			//printf ("Error: variable %d undefined in phi (", variable_index);
++			//print_bb_id (bb);
++			//printf (")\n");
++			alternatives [i] = NO_VALUE;
++			//g_assert_not_reached ();
++		}
++	}
++}
++
++static void
++fill_heap_phi_value (MonoHssaCfgData *hssa, MonoHssaValue *value, MonoHssaHeapAddressValueDefinition *definition) {
++	MonoHssaBB *bb = value->data.phi.join_point;
++	MonoHssaValue **alternatives;
++	int i;
++	
++	value->data.phi.number_of_alternatives = bb->in_count;
++	alternatives = mono_mempool_alloc0 (hssa->mempool, bb->in_count * sizeof (MonoHssaValue*));
++	value->data.phi.alternatives = alternatives;
++	
++	for (i = 0; i < bb->in_count; i++) {
++		MonoHssaHeapAddressValueUse *use = definition->phi_arguments_uses [i];
++		
++		if (use != NULL) {
++			alternatives [i] = use->definition->value;
++		} else {
++			/* FIXME: convert phi to input value */
++			alternatives [i] = NO_VALUE;
++		}
++	}
++}
++
++
++
++static MonoHssaLocalVariableDefinition*
++create_new_ssa_definition (MonoHssaCfgData *hssa, guint32 variable, MonoHssaValue *value, MonoHssaBB *bb, MonoInst *inst) {
++	MonoHssaLocalVariable *local_variable = hssa->local_variables [variable];
++	MonoHssaLocalVariableDefinition *definition = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaLocalVariableDefinition));
++	MonoHssaLocalVariableStateInBB *state = &(bb->local_variables_state [variable]);
++	
++	definition->ssa_variable_inst = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoInst));
++	definition->ssa_variable_inst->opcode = OP_SSA_LOCAL;
++	definition->ssa_variable_inst->data.op [0].p = definition;
++	definition->ssa_variable_inst->info.hssa = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaMonoInstInfo));
++	INST_IS_LOCAL_IMMEDIATE (definition->ssa_variable_inst) = TRUE;
++	definition->value = value;
++	definition->definition = inst;
++	definition->ssa_variable = local_variable;
++	definition->ssa_version = local_variable->next_available_ssa_version;
++	local_variable->next_available_ssa_version ++;
++	
++	INSERT_LIST_ELEMENT (local_variable, definitions, definition);
++	state->current_definition = definition;
++	
++	return definition;
++}
++
++static gboolean
++addresses_might_alias (MonoHssaValue *address_value1, MonoHssaValue *address_value2, int bytes) {
++	return TRUE;
++#if 0
++	MonoHssaValueExtension extension1 = address_value1->extensions;
++	MonoHssaValueExtension extension2 = address_value2->extensions;
++	
++	g_assert ((extension1 != NULL) && (extension2 != NULL));
++	
++	if () {
++	} else if () {
++	} else {
++		return FALSE;
++	}
++	
++	if (address1->aliasing_classes && address2->aliasing_classes) {
++		MonoHssaValue *offset1 = address1->offset;
++		MonoHssaValue *offset2 = address2->offset;
++		
++		if ((offset1 != NULL) && (offset2 != NULL)) {
++			if ((offset1->base.type == MONO_HSSA_VALUE_INTEGER_CONSTANT) && (offset2->base.type == MONO_HSSA_VALUE_INTEGER_CONSTANT)) {
++				int constant1 = offset1->data.constant.value.integer_constant;
++				int constant2 = offset2->data.constant.value.integer_constant;
++				
++				if ((constant1 - constant2 <= bytes) || (constant2 - constant1 <= bytes)) {
++					return TRUE;
++				} else {
++					return FALSE;
++				}
++			} else {
++				return TRUE;
++			}
++		} else {
++			return TRUE;
++		}
++	} else {
++		return FALSE;
++	}
++#endif
++}
++
++
++static MonoHssaValue*
++do_local_read (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, gint32 variable) {
++	MonoHssaLocalVariableDefinition *definition = lookup_definition_in_value_stacks (bb, variable);
++	if (definition != NULL) {
++		INST_LOCAL_USE (inst) = add_variable_use_to_definition (hssa, definition, inst);
++		INST_IS_LOCAL_USE (inst) = TRUE;
++		INST_VALUE (inst) = definition->value;
++		return definition->value;
++	} else {
++		g_assert_not_reached ();
++		return NO_VALUE;
++	}
++}
++
++static MonoHssaValue*
++handle_local_read (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, gint32 variable) {
++	return do_local_read (hssa, bb, inst, variable);
++}
++
++static MonoHssaValue*
++handle_local_read_through_address (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, MonoHssaValue *address) {
++	g_assert ((address->base.address.generic != NULL) && (address->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL));
++	return do_local_read (hssa, bb, inst, address->base.address.local->data.base_variable->index);
++}
++
++static void
++handle_local_dummy_read_through_address (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, MonoHssaValue *address) {
++	guint32 variable_index;
++	MonoHssaLocalVariableDefinition *definition;
++	
++	g_assert ((address->base.address.generic != NULL) && (address->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL));
++	variable_index = address->base.address.local->data.base_variable->index;
++	definition = lookup_definition_in_value_stacks (bb, variable_index);
++	if (definition != NULL) {
++		INST_LOCAL_USE (inst) = add_variable_use_to_definition (hssa, definition, inst);
++		INST_IS_LOCAL_USE (inst) = TRUE;
++		INST_VALUE (inst) = definition->value;
++	}
++}
++
++static MonoHssaLocalVariableDefinition*
++do_local_write (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, gint32 variable, MonoHssaValue *value) {
++	if (value == NULL) {
++		/* FIXME: what if the value had to be an address? */
++		value = create_new_primitive_value (hssa, inst);
++	}
++	return create_new_ssa_definition (hssa, variable, value, bb, inst);
++}
++
++static MonoHssaLocalVariableDefinition*
++handle_local_write (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, gint32 variable, MonoHssaValue *value) {
++	return do_local_write (hssa, bb, inst, variable, value);
++}
++
++static MonoHssaLocalVariableDefinition*
++handle_local_write_through_address (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, MonoHssaValue *address, MonoHssaValue *value) {
++	g_assert ((address->base.address.generic != NULL) && (address->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL));
++	return do_local_write (hssa, bb, inst, address->base.address.local->data.base_variable->index, value);
++}
++
++
++static MonoHssaValue*
++handle_heap_read (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, MonoHssaValue *address, int bytes) {
++	MonoHssaHeapAddress *current_address;
++	MonoHssaHeapAddressValueUse *use;
++	MonoHssaHeapAddressValueDefinition *definition = NULL;
++	gboolean address_has_a_known_value = FALSE;
++	
++#if (DEBUG_HSSA)
++	print_heap_state (hssa, "before heap read");
++	CHECK_HEAP_STATE_LENGTH (hssa, bb);
++#endif
++	
++	g_assert ((address->base.address.generic != NULL) && (address->base.address.generic->base.type == MONO_HSSA_ADDRESS_HEAP));
++	for (current_address = hssa->addresses_with_known_value; current_address != NULL; current_address = current_address->data.next_address_with_known_value) {
++		MonoHssaHeapAddressValueDefinition *current_definition = current_address->data.current_definition;
++		
++		if (current_definition == NULL) {
++			printf ("\nAddress ");
++			print_value_briefly (current_address->base.value);
++			printf (" has no current definition\n");
++			g_assert_not_reached ();
++		}
++		
++		if (current_address == address->base.address.heap) {
++#if (DEBUG_HSSA)
++			if (current_address->base.value != address) {
++				printf ("\n'current_address->base.value' is ");
++				print_value_briefly (current_address->base.value);
++				printf ("\n'address' is ");
++				print_value_briefly (address);
++				printf ("\n but the address is ");
++				print_address ((MonoHssaAddress*) current_address);
++				g_assert_not_reached ();
++			}
++#endif
++			address_has_a_known_value = TRUE;
++			if (current_definition->affected_bytes == bytes) {
++				definition = current_definition;
++			} else {
++				current_definition->is_used_by_mu = TRUE;
++			}
++		} else if (addresses_might_alias (current_address->base.value, address, bytes)) {
++			current_definition->is_used_by_mu = TRUE;
++		}
++	}
++	
++	if (definition == NULL) {
++		definition = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaHeapAddressValueDefinition));
++		definition->value = create_new_primitive_value_as_address_according_to_inst (hssa, inst);
++		definition->address = address->base.address.heap;
++		definition->definition = inst;
++		definition->affected_bytes = bytes;
++		
++		address->base.address.heap->data.current_definition = definition;
++		INSERT_LIST_ELEMENT (&(address->base.address.heap->data), definitions, definition);
++	}
++#if (DEBUG_HSSA)
++	CHECK_HEAP_STATE_LENGTH (hssa, bb);
++#endif
++	if (! address_has_a_known_value) {
++		address->base.address.heap->data.next_address_with_known_value = hssa->addresses_with_known_value;
++		hssa->addresses_with_known_value = address->base.address.heap;
++		bb->final_heap_state_length ++;
++		SET_HEAP_ADDRESS_USED (address->base.address.heap);
++#if (DEBUG_HSSA)
++		CHECK_HEAP_STATE_LENGTH (hssa, bb);
++#endif
++	}
++	
++	use = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaHeapAddressValueUse));
++	use->definition = definition;
++	use->use = inst;
++	INSERT_LIST_ELEMENT (definition, uses, use);
++	INST_HEAP_USE (inst) = use;
++	INST_IS_HEAP_USE (inst) = TRUE;
++	
++#if (DEBUG_HSSA)
++	print_heap_state (hssa, "after heap read");
++	CHECK_HEAP_STATE_LENGTH (hssa, bb);
++#endif
++	return definition->value;
++}
++
++static void
++handle_heap_write (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, MonoHssaValue *address, int bytes, MonoHssaValue *value) {
++	MonoHssaHeapAddress *previous_address;
++	MonoHssaHeapAddress *current_address;
++	MonoHssaHeapAddress *next_address;
++	MonoHssaHeapAddressValueDefinition *definition;
++	gboolean address_has_a_known_value = FALSE;
++	
++#if (DEBUG_HSSA)
++	print_heap_state (hssa, "before heap write");
++	CHECK_HEAP_STATE_LENGTH (hssa, bb);
++#endif
++	
++	g_assert ((address->base.address.generic != NULL) && (address->base.address.generic->base.type == MONO_HSSA_ADDRESS_HEAP));
++	for (previous_address = NULL, current_address = hssa->addresses_with_known_value; current_address != NULL; current_address = next_address) {
++		MonoHssaHeapAddressValueDefinition *current_definition = current_address->data.current_definition;
++		
++		next_address = current_address->data.next_address_with_known_value;
++		if (current_address->base.value == address) {
++			if (value == NULL) {
++				/* Address was the same, but the write was "generic" */
++				goto HANDLE_ALIAS;
++			}
++			
++			if (current_definition->affected_bytes != bytes) {
++				/* Address was the same, but memory region size was not... */
++				goto HANDLE_ALIAS;
++			}
++			
++			address_has_a_known_value = TRUE;
++			previous_address = current_address;
++		} else {
++			if (addresses_might_alias (current_definition->address->base.value, address, bytes)) {
++HANDLE_ALIAS:
++				current_definition->is_killed_by_chi = TRUE;
++				// FIXME: With the current setup, eliminating the address from the
++				// "known" list will make us lose the chance to "keep it live"!
++				current_definition->is_used_by_mu = TRUE;
++				current_address->data.next_address_with_known_value = NULL;
++				current_address->data.current_definition = NULL;
++				if (previous_address != NULL) {
++					previous_address->data.next_address_with_known_value = next_address;
++				} else {
++					hssa->addresses_with_known_value = next_address;
++				}
++				bb->final_heap_state_length --;
++			} else {
++				previous_address = current_address;
++			}
++		}
++	}
++	
++	if (value != NULL) {
++		if (address_has_a_known_value == FALSE) {
++			address->base.address.heap->data.next_address_with_known_value = hssa->addresses_with_known_value;
++			hssa->addresses_with_known_value = address->base.address.heap;
++			bb->final_heap_state_length ++;
++			SET_HEAP_ADDRESS_USED (address->base.address.heap);
++		}
++		
++		definition = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaHeapAddressValueDefinition));
++		definition->value = value;
++		definition->address = address->base.address.heap;
++		definition->definition = inst;
++		definition->affected_bytes = bytes;
++		INSERT_LIST_ELEMENT (&(address->base.address.heap->data), definitions, definition);
++		address->base.address.heap->data.current_definition = definition;
++	}
++	
++#if (DEBUG_HSSA)
++	print_heap_state (hssa, "after heap write");
++	CHECK_HEAP_STATE_LENGTH (hssa, bb);
++#endif
++}
++
++static void
++touch_the_whole_heap (MonoHssaCfgData *hssa, MonoHssaBB *bb) {
++	MonoHssaHeapAddress *current_address;
++	
++#if (DEBUG_HSSA)
++	print_heap_state (hssa, "before becoming empty");
++#endif
++	for (current_address = hssa->addresses_with_known_value; current_address != NULL; current_address = current_address->data.next_address_with_known_value) {
++		MonoHssaHeapAddressValueDefinition *current_definition = current_address->data.current_definition;
++		current_definition->is_used_by_mu = TRUE;
++		current_definition->is_killed_by_chi = TRUE;
++		current_address->data.current_definition = NULL;
++	}
++	
++	hssa->addresses_with_known_value = NULL;
++	bb->final_heap_state_length = 0;
++}
++
++static void
++record_local_address_passed_as_call_parameter (MonoHssaCfgData *hssa, MonoHssaLocalAddress *address) {
++	MonoHssaLocalAddresses *node;
++	
++	if (hssa->nodes_for_local_addresses_passed_as_parameters != NULL) {
++		node = hssa->nodes_for_local_addresses_passed_as_parameters;
++		hssa->nodes_for_local_addresses_passed_as_parameters = node->next;
++	} else {
++		node = mono_mempool_alloc (hssa->mempool, sizeof (MonoHssaLocalAddresses));
++	}
++	
++	node->address = address;
++	node->next = hssa->local_addresses_passed_as_parameters;
++	hssa->local_addresses_passed_as_parameters = node;
++}
++
++static void
++handle_local_addresses_passed_as_call_parameters (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst) {
++	MonoHssaLocalAddresses *current_node = hssa->local_addresses_passed_as_parameters;
++	
++	while (current_node != NULL) {
++		handle_local_dummy_read_through_address (hssa, bb, inst, current_node->address->base.value);
++		handle_local_write_through_address (hssa, bb, inst, current_node->address->base.value, NULL);
++		if (current_node->next != NULL) {
++			current_node = current_node->next;
++		} else {
++			current_node->next = hssa->nodes_for_local_addresses_passed_as_parameters;
++			hssa->nodes_for_local_addresses_passed_as_parameters = hssa->local_addresses_passed_as_parameters;
++			hssa->local_addresses_passed_as_parameters = NULL;
++			break;
++		}
++	}
++}
++
++static MonoHssaHeapAddress*
++create_heap_address_from_mono_type (MonoHssaCfgData *hssa, MonoType *type, MonoHssaValue *address_value) {
++	if (type->byref) {
++		return create_new_heap_address_for_simple_managed_pointer (hssa, address_value);
++	}
++
++handle_enum:
++	switch (type->type) {
++	case MONO_TYPE_I:
++	case MONO_TYPE_U:
++	case MONO_TYPE_PTR:
++	case MONO_TYPE_FNPTR:
++		return create_new_heap_address_for_simple_managed_pointer (hssa, address_value);
++	case MONO_TYPE_CLASS:
++	case MONO_TYPE_STRING:
++	case MONO_TYPE_OBJECT:
++	case MONO_TYPE_SZARRAY:
++	case MONO_TYPE_ARRAY:    
++		//FIXME: klass = mono_class_from_mono_type (type);
++		return create_new_heap_address_for_simple_managed_pointer (hssa, address_value);
++	case MONO_TYPE_VALUETYPE:
++		if (type->data.klass->enumtype) {
++			type = type->data.klass->enum_basetype;
++			goto handle_enum;
++		} else {
++			return NULL;
++		}
++	case MONO_TYPE_GENERICINST:
++		type = &type->data.generic_class->container_class->byval_arg;
++		goto handle_enum;
++	case MONO_TYPE_VOID:
++	case MONO_TYPE_I1:
++	case MONO_TYPE_U1:
++	case MONO_TYPE_BOOLEAN:
++	case MONO_TYPE_I2:
++	case MONO_TYPE_U2:
++	case MONO_TYPE_CHAR:
++	case MONO_TYPE_I4:
++	case MONO_TYPE_U4:
++	case MONO_TYPE_TYPEDBYREF:
++	case MONO_TYPE_I8:
++	case MONO_TYPE_U8:
++	case MONO_TYPE_R4:
++	case MONO_TYPE_R8:
++		return NULL;
++	default:
++		g_error ("unknown type 0x%02x in eval stack type", type->type);
++		return NULL;
++	}
++}
++
++/* Create "implicit" definitions for method arguments, putting them in the entry bb */
++static void
++create_arguments_definitions (MonoHssaCfgData *hssa) {
++	int i;
++	
++	for (i = 0; i < hssa->number_of_local_variables && hssa->local_variables [i]->inst->opcode == OP_ARG; i++) {
++		MonoHssaValue *value = create_new_primitive_value (hssa, hssa->local_variables [i]->inst);
++		value->base.address.heap = create_heap_address_from_mono_type (hssa, hssa->local_variables [i]->inst->inst_vtype, value);
++		create_new_ssa_definition (hssa, i, value, hssa->bblocks, NULL);
++		hssa->bblocks->local_variables_state [i].has_definition = TRUE;
++		if (FOLLOW_HSSA) {
++			printf ("Creating definition for argument %d, got value ", i);
++			print_value_briefly (value);
++			printf ("\n");
++		}
++	}
++}
++
++static MonoHssaValue*
++build_definitions_for_inst (MonoHssaCfgData *hssa, MonoHssaBB *bb, MonoInst *inst, gboolean value_is_used) {
++	MonoHssaValue *left_operand;
++	MonoHssaValue *right_operand;
++	MonoHssaValue *value;
++	int bytes;
++	gboolean operands_are_used;
++	
++	if (FOLLOW_HSSA) {
++		printf ("Entering into inst ");
++		print_mono_inst (inst);
++		printf ("\n");
++	}
++	
++	if ((inst->opcode == OP_DUMMY_USE) || (inst->opcode == OP_DUMMY_STORE) || (inst->opcode == CEE_POP)) {
++		if (FOLLOW_HSSA) {
++			printf ("[dummy operation discards operands]\n");
++		}
++		operands_are_used = FALSE;
++	} else {
++		operands_are_used = TRUE;
++	}
++	
++	if (mono_burg_arity [inst->opcode] > 0) {
++		left_operand = build_definitions_for_inst (hssa, bb, inst->inst_left, operands_are_used);
++		if (operands_are_used) {
++			CHECK_IF_VALUE_IS_NOTHING (left_operand, "left_operand", inst);
++			if (left_operand->base.type == MONO_HSSA_VALUE_LOCAL) {
++				MonoHssaLocalVariableDefinition *definition = bb->local_variables_state [left_operand->data.local.variable_index].current_definition;
++				if (definition != NULL) {
++					inst->inst_left = definition->ssa_variable_inst;
++				}
++			}
++		}
++		if (! INST_IS_LOCAL_IMMEDIATE (inst->inst_left)) {
++			INST_IS_LEFT_OPERAND (inst->inst_left) = TRUE;
++			if (INST_HAS_SIDE_EFFECTS (inst->inst_left)) {
++				INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++			}
++		}
++		if (mono_burg_arity [inst->opcode] > 1) {
++			right_operand = build_definitions_for_inst (hssa, bb, inst->inst_right, operands_are_used);
++			if (operands_are_used) {
++				CHECK_IF_VALUE_IS_NOTHING (right_operand, "right_operand", inst);
++				if (right_operand->base.type == MONO_HSSA_VALUE_LOCAL) {
++					MonoHssaLocalVariableDefinition *definition = bb->local_variables_state [right_operand->data.local.variable_index].current_definition;
++					g_assert (definition != NULL);
++					inst->inst_right = definition->ssa_variable_inst;
++				}
++			}
++			if (! INST_IS_LOCAL_IMMEDIATE (inst->inst_right)) {
++				INST_IS_RIGHT_OPERAND (inst->inst_right) = TRUE;
++				if (INST_HAS_SIDE_EFFECTS (inst->inst_right)) {
++					INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++				}
++			}
++		} else {
++			right_operand = NO_VALUE;
++		}
++	} else {
++		left_operand = NO_VALUE;
++		right_operand = NO_VALUE;
++	}
++
++	if (FOLLOW_HSSA) {
++		printf ("Working on inst ");
++		print_mono_inst (inst);
++		printf (", left operand: ");
++		if (operands_are_used) {
++			print_value_briefly (left_operand);
++		} else {
++			printf ("[dummy operand discarded]");
++		}
++		printf (", right operand: ");
++		if (operands_are_used) {
++			print_value_briefly (right_operand);
++		} else {
++			printf ("[dummy operand discarded]");
++		}
++		printf ("\n");
++	}
++	
++	if (! operands_are_used) {
++		if (FOLLOW_HSSA) {
++			printf ("[dummy operation discarded]\n");
++		}
++		return NO_VALUE;
++	}
++	
++	switch (inst->opcode) {
++	
++	/* Constants */
++	case OP_ICONST :
++		value = get_integer_constant_value (hssa, inst);
++		INST_VALUE (inst) = value;
++		break;
++	case OP_I8CONST :
++		value = get_long_constant_value (hssa, inst);
++		INST_VALUE (inst) = value;
++		break;
++	case OP_R4CONST :
++		value = get_float_constant_value (hssa, (float*)inst->inst_p0);
++		INST_VALUE (inst) = value;
++		break;
++	case OP_R8CONST :
++		value = get_double_constant_value (hssa, (double*)inst->inst_p0);
++		INST_VALUE (inst) = value;
++		break;
++	
++	/* Local identifier */
++	case OP_LOCAL :
++	case OP_ARG :
++		value = (MonoHssaValue*) &(hssa->local_variables [inst->inst_c0]->local_value);
++		break;
++	
++	/* Address of local */
++	case CEE_LDOBJ :
++	case OP_LDADDR :
++		if (left_operand->base.type == MONO_HSSA_VALUE_LOCAL) {
++			guint32 variable_index = left_operand->data.local.variable_index;
++			
++			if (hssa->local_variables [variable_index]->address == NULL) {
++				hssa->local_variables [variable_index]->address = create_new_primitive_value (hssa, inst);
++				hssa->local_variables [variable_index]->address->base.address.local =  create_new_local_address (hssa, variable_index, hssa->local_variables [variable_index]->address, hssa->zero);
++			}
++			value = hssa->local_variables [variable_index]->address;
++			INST_VALUE (inst) = value;
++			INST_IS_LOCAL_ADDRESS (inst) = TRUE;
++		} else {
++			if ((inst->opcode == CEE_LDOBJ) && (inst->type != STACK_MP)) {
++				if (left_operand->base.address.generic == NULL) {
++					left_operand->base.address.heap = create_new_heap_address_for_simple_managed_pointer (hssa, left_operand);
++					value = create_new_primitive_value (hssa, inst);
++				} else {
++					/* It looks weird, but CEE_LDOBJ is a noop in this case! */
++					value = left_operand;
++				}
++				INST_VALUE (inst) = value;
++			} else {
++				g_assert_not_reached ();
++				value = NULL;
++			}
++		}
++		break;
++	
++	/* Read operations */
++	case CEE_LDIND_I1 :
++	case CEE_LDIND_U1 :
++		bytes = 1;
++		goto HANDLE_READ_OPERATIONS;
++	case CEE_LDIND_I2 :
++	case CEE_LDIND_U2 :
++		bytes = 2;
++		goto HANDLE_READ_OPERATIONS;
++	case CEE_LDIND_I4 :
++	case CEE_LDIND_U4 :
++	case CEE_LDIND_R4 :
++		bytes = 4;
++		goto HANDLE_READ_OPERATIONS;
++	case CEE_LDIND_I8 :
++	case CEE_LDIND_R8 :
++		bytes = 8;
++		goto HANDLE_READ_OPERATIONS;
++	case CEE_LDIND_I :
++	case CEE_LDIND_REF :
++		bytes = sizeof (gpointer);
++		goto HANDLE_READ_OPERATIONS;
++	/* Dummy read operation */
++	case OP_DUMMY_USE :
++		bytes = WHOLE_LOCATION;
++HANDLE_READ_OPERATIONS:
++		if (left_operand->base.type == MONO_HSSA_VALUE_LOCAL) {
++			value = handle_local_read (hssa, bb, inst, left_operand->data.local.variable_index);
++		} else if (left_operand->base.address.generic != NULL) {
++			if (left_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL) {
++				value = handle_local_read_through_address (hssa, bb, inst, left_operand);
++			} else if (left_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_HEAP) {
++				value = handle_heap_read (hssa, bb, inst, left_operand, bytes);
++			} else {
++				g_assert_not_reached ();
++				value = NULL;
++			}
++		} else {
++			//FIXME!!!
++			if (left_operand->base.type & MONO_HSSA_VALUE_CONSTANT) {
++				left_operand->base.address.heap = create_new_heap_address_for_simple_managed_pointer (hssa, left_operand);
++				value = handle_heap_read (hssa, bb, inst, left_operand, bytes);
++			} else {
++				g_assert_not_reached ();
++				value = NULL;
++			}
++		}
++		if (value->base.address.generic == NULL) {
++			// FIXME We assume that if we are reading a pointer from somewhere,
++			// for sure it points to the heap and not to a local valiable...
++			value->base.address.heap = create_new_heap_address_for_inst (hssa, value, inst);
++		}
++		break;
++	
++	/* Write operations */
++	case CEE_STIND_I1 :
++		bytes = 1;
++		goto HANDLE_WRITE_OPERATIONS;
++	case CEE_STIND_I2 :
++		bytes = 2;
++		goto HANDLE_WRITE_OPERATIONS;
++	case CEE_STIND_I4 :
++	case CEE_STIND_R4 :
++		bytes = 4;
++		goto HANDLE_WRITE_OPERATIONS;
++	case CEE_STIND_I8 :
++	case CEE_STIND_R8 :
++		bytes = 8;
++		goto HANDLE_WRITE_OPERATIONS;
++	case CEE_STIND_I :
++	case CEE_STIND_REF :
++		bytes = sizeof (gpointer);
++HANDLE_WRITE_OPERATIONS:
++		if (left_operand->base.type == MONO_HSSA_VALUE_LOCAL) {
++			MonoHssaLocalVariableDefinition *definition = handle_local_write (hssa, bb, inst, left_operand->data.local.variable_index, right_operand);
++			inst->inst_left = definition->ssa_variable_inst;
++		} else if (left_operand->base.address.generic != NULL) {
++			if (left_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL) {
++				handle_local_write_through_address (hssa, bb, inst, left_operand, right_operand);
++				INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++			} else if (left_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_HEAP) {
++				handle_heap_write (hssa, bb, inst, left_operand, bytes, right_operand);
++			} else {
++				g_assert_not_reached ();
++			}
++		} else {
++			//FIXME!!!
++			if (left_operand->base.type & MONO_HSSA_VALUE_CONSTANT) {
++				left_operand->base.address.heap = create_new_heap_address_for_simple_managed_pointer (hssa, left_operand);
++				handle_heap_write (hssa, bb, inst, left_operand, bytes, right_operand);
++			} else {
++				g_assert_not_reached ();
++			}
++		}
++		value = NULL;
++		break;
++	/* Dummy write operation */
++	case OP_DUMMY_STORE : {
++		gint32 defined_variable = inst->inst_i0->inst_c0;
++		MonoHssaLocalVariableDefinition *definition = handle_local_write (hssa, bb, inst, defined_variable, NULL);
++		INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++		//FIXME!!! if OP_DUMMY_STORE really has zero arity we are toasted removing this...
++		//inst->inst_left = definition->ssa_variable_inst;
++		value = NULL;
++		break;
++	}
++		
++	/* Trigger memory write and read */
++	/* (handle the read, then fall through to the write in the next dase) */
++	case OP_MEMCPY :
++		/* This case handles the "read", and follows through for the "write" */
++		if (right_operand->base.type == MONO_HSSA_VALUE_LOCAL) {
++			value = handle_local_read (hssa, bb, inst, right_operand->data.local.variable_index);
++		} else if (right_operand->base.address.generic != NULL) {
++			if (right_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL) {
++				value = handle_local_read_through_address (hssa, bb, inst, right_operand);
++			} else if (right_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_HEAP) {
++				value = handle_heap_read (hssa, bb, inst, right_operand, WHOLE_LOCATION);
++			} else {
++				g_assert_not_reached ();
++				value = NULL;
++			}
++		} else {
++			//FIXME!!!
++			if (right_operand->base.type & MONO_HSSA_VALUE_CONSTANT) {
++				right_operand->base.address.heap = create_new_heap_address_for_simple_managed_pointer (hssa, left_operand);
++				value = handle_heap_read (hssa, bb, inst, right_operand, WHOLE_LOCATION);
++			} else {
++				g_assert_not_reached ();
++				value = NULL;
++			}
++		}
++		/* Trick next case making it use our result as right_operand */
++		right_operand = value;
++		/* "break" not needed, fall through is intentional */
++	/* Trigger memory write */
++	case OP_MEMSET :
++		if (right_operand == NO_VALUE) {
++			/* Compensate the fact that in a OP_MEMSET right_operand is NULL */
++			right_operand = NULL;
++		}
++		if (left_operand->base.type == MONO_HSSA_VALUE_LOCAL) {
++			MonoHssaLocalVariableDefinition *definition = handle_local_write (hssa, bb, inst, left_operand->data.local.variable_index, right_operand);
++			INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++			inst->inst_left = definition->ssa_variable_inst;
++		} else if (left_operand->base.address.generic != NULL) {
++			if (left_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL) {
++				handle_local_write_through_address (hssa, bb, inst, left_operand, right_operand);
++				INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++			} else if (left_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_HEAP) {
++				handle_heap_write (hssa, bb, inst, left_operand, WHOLE_LOCATION, right_operand);
++			} else {
++				g_assert_not_reached ();
++			}
++		} else {
++			//FIXME!!!
++			if (left_operand->base.type & MONO_HSSA_VALUE_CONSTANT) {
++				left_operand->base.address.heap = create_new_heap_address_for_simple_managed_pointer (hssa, left_operand);
++				handle_heap_write (hssa, bb, inst, left_operand, WHOLE_LOCATION, right_operand);
++			} else {
++				g_assert_not_reached ();
++			}
++		}
++		value = NULL;
++		break;
++	
++	/* Proper expressions */
++	case OP_COMPARE :
++	case OP_COMPARE_IMM :
++	case OP_FCOMPARE :
++	case OP_LCOMPARE :
++	case OP_ICOMPARE :
++	case OP_ICOMPARE_IMM :
++	case OP_ARRAY_RANK :
++	case OP_LADD :
++	case OP_LSUB :
++	case OP_LMUL :
++	case OP_LDIV :
++	case OP_LDIV_UN :
++	case OP_LREM :
++	case OP_LREM_UN :
++	case OP_LAND :
++	case OP_LOR :
++	case OP_LXOR :
++	case OP_LSHL :
++	case OP_LSHR :
++	case OP_LSHR_UN :
++	case OP_LNEG :
++	case OP_LNOT :
++	case OP_LCONV_TO_I1 :
++	case OP_LCONV_TO_I2 :
++	case OP_LCONV_TO_I4 :
++	case OP_LCONV_TO_I8 :
++	case OP_LCONV_TO_R4 :
++	case OP_LCONV_TO_R8 :
++	case OP_LCONV_TO_U4 :
++	case OP_LCONV_TO_U8 :
++	case OP_LCONV_TO_U2 :
++	case OP_LCONV_TO_U1 :
++	case OP_LCONV_TO_I :
++	case OP_LCONV_TO_OVF_I :
++	case OP_LCONV_TO_OVF_U :
++	case OP_LADD_OVF :
++	case OP_LADD_OVF_UN :
++	case OP_LMUL_OVF :
++	case OP_LMUL_OVF_UN :
++	case OP_LSUB_OVF :
++	case OP_LSUB_OVF_UN :
++	case OP_LCONV_TO_OVF_I1_UN :
++	case OP_LCONV_TO_OVF_I2_UN :
++	case OP_LCONV_TO_OVF_I4_UN :
++	case OP_LCONV_TO_OVF_I8_UN :
++	case OP_LCONV_TO_OVF_U1_UN :
++	case OP_LCONV_TO_OVF_U2_UN :
++	case OP_LCONV_TO_OVF_U4_UN :
++	case OP_LCONV_TO_OVF_U8_UN :
++	case OP_LCONV_TO_OVF_I_UN :
++	case OP_LCONV_TO_OVF_U_UN :
++	case OP_LCONV_TO_OVF_I1 :
++	case OP_LCONV_TO_OVF_U1 :
++	case OP_LCONV_TO_OVF_I2 :
++	case OP_LCONV_TO_OVF_U2 :
++	case OP_LCONV_TO_OVF_I4 :
++	case OP_LCONV_TO_OVF_U4 :
++	case OP_LCONV_TO_OVF_I8 :
++	case OP_LCONV_TO_OVF_U8 :
++	case OP_LCEQ :
++	case OP_LCGT :
++	case OP_LCGT_UN :
++	case OP_LCLT :
++	case OP_LCLT_UN :
++	case OP_LCONV_TO_R_UN :
++	case OP_LCONV_TO_U :
++	case OP_IADD :
++	case OP_ISUB :
++	case OP_IMUL :
++	case OP_IMUL_OVF :
++	case OP_IMUL_OVF_UN :
++	case OP_IDIV :
++	case OP_IDIV_UN :
++	case OP_IREM :
++	case OP_IREM_UN :
++	case OP_IAND :
++	case OP_IOR :
++	case OP_IXOR :
++	case OP_ISHL :
++	case OP_ISHR :
++	case OP_ISHR_UN :
++	case OP_IADC :
++	case OP_ISBB :
++	case OP_IADDCC :
++	case OP_ISUBCC :
++	case OP_INEG :
++	case OP_INOT :
++	case OP_ICEQ :
++	case OP_ICGT :
++	case OP_ICGT_UN :
++	case OP_ICLT :
++	case OP_ICLT_UN :
++	case OP_LONG_SHRUN_32 :
++	case OP_FADD :
++	case OP_FSUB :
++	case OP_FMUL :
++	case OP_FDIV :
++	case OP_FDIV_UN :
++	case OP_FREM :
++	case OP_FREM_UN :
++	case OP_FNEG :
++	case OP_FNOT :
++	case OP_FCONV_TO_I1 :
++	case OP_FCONV_TO_I2 :
++	case OP_FCONV_TO_I4 :
++	case OP_FCONV_TO_I8 :
++	case OP_FCONV_TO_R4 :
++	case OP_FCONV_TO_R8 :
++	case OP_FCONV_TO_U4 :
++	case OP_FCONV_TO_U8 :
++	case OP_FCONV_TO_U2 :
++	case OP_FCONV_TO_U1 :
++	case OP_FCONV_TO_I :
++	case OP_FCONV_TO_OVF_I :
++	case OP_FCONV_TO_OVF_U :
++	case OP_FADD_OVF :
++	case OP_FADD_OVF_UN :
++	case OP_FMUL_OVF :
++	case OP_FMUL_OVF_UN :
++	case OP_FSUB_OVF :
++	case OP_FSUB_OVF_UN :
++	case OP_FCONV_TO_OVF_I1_UN :
++	case OP_FCONV_TO_OVF_I2_UN :
++	case OP_FCONV_TO_OVF_I4_UN :
++	case OP_FCONV_TO_OVF_I8_UN :
++	case OP_FCONV_TO_OVF_U1_UN :
++	case OP_FCONV_TO_OVF_U2_UN :
++	case OP_FCONV_TO_OVF_U4_UN :
++	case OP_FCONV_TO_OVF_U8_UN :
++	case OP_FCONV_TO_OVF_I_UN :
++	case OP_FCONV_TO_OVF_U_UN :
++	case OP_FCONV_TO_OVF_I1 :
++	case OP_FCONV_TO_OVF_U1 :
++	case OP_FCONV_TO_OVF_I2 :
++	case OP_FCONV_TO_OVF_U2 :
++	case OP_FCONV_TO_OVF_I4 :
++	case OP_FCONV_TO_OVF_U4 :
++	case OP_FCONV_TO_OVF_I8 :
++	case OP_FCONV_TO_OVF_U8 :
++	case OP_FCEQ :
++	case OP_FCGT :
++	case OP_FCGT_UN :
++	case OP_FCLT :
++	case OP_FCLT_UN :
++	case OP_FCONV_TO_U :
++	case OP_BIGMUL :
++	case OP_BIGMUL_UN :
++	case OP_SIN :
++	case OP_COS :
++	case OP_ABS :
++	case OP_TAN :
++	case OP_ATAN :
++	case OP_SQRT :
++	case OP_GETCHR :
++	case OP_STRLEN :
++	case OP_GETTYPE :
++	case OP_GETHASHCODE :
++	case OP_LDELEMA2D :
++	
++	case CEE_ADD :
++	case CEE_SUB :
++	case CEE_MUL :
++	case CEE_DIV :
++	case CEE_DIV_UN :
++	case CEE_REM :
++	case CEE_REM_UN :
++	case CEE_AND :
++	case CEE_OR :
++	case CEE_XOR :
++	case CEE_SHL :
++	case CEE_SHR :
++	case CEE_SHR_UN :
++	case CEE_NEG :
++	case CEE_NOT :
++	case CEE_CONV_I1 :
++	case CEE_CONV_I2 :
++	case CEE_CONV_I4 :
++	case CEE_CONV_I8 :
++	case CEE_CONV_R4 :
++	case CEE_CONV_R8 :
++	case CEE_CONV_U4 :
++	case CEE_CONV_U8 :
++	
++	case CEE_CONV_OVF_I1_UN :
++	case CEE_CONV_OVF_I2_UN :
++	case CEE_CONV_OVF_I4_UN :
++	case CEE_CONV_OVF_I8_UN :
++	case CEE_CONV_OVF_U1_UN :
++	case CEE_CONV_OVF_U2_UN :
++	case CEE_CONV_OVF_U4_UN :
++	case CEE_CONV_OVF_U8_UN :
++	case CEE_CONV_OVF_I_UN :
++	case CEE_CONV_OVF_U_UN :
++	case CEE_LDLEN :
++	
++	case CEE_LDELEMA :
++	
++	case CEE_CASTCLASS :
++	case CEE_ISINST :
++	
++	case CEE_CONV_R_UN :
++	
++	case CEE_CONV_OVF_I1 :
++	case CEE_CONV_OVF_U1 :
++	case CEE_CONV_OVF_I2 :
++	case CEE_CONV_OVF_U2 :
++	case CEE_CONV_OVF_I4 :
++	case CEE_CONV_OVF_U4 :
++	case CEE_CONV_OVF_I8 :
++	case CEE_CONV_OVF_U8 :
++	case CEE_CKFINITE :
++	
++	case CEE_CONV_U2 :
++	case CEE_CONV_U1 :
++	case CEE_CONV_I :
++	case CEE_CONV_OVF_I :
++	case CEE_CONV_OVF_U :
++	case CEE_ADD_OVF :
++	case CEE_ADD_OVF_UN :
++	case CEE_MUL_OVF :
++	case CEE_MUL_OVF_UN :
++	case CEE_SUB_OVF :
++	case CEE_SUB_OVF_UN :
++	case CEE_CONV_U :
++	
++	case OP_GROUP ://expr
++	case OP_TLS_GET ://expr
++	case OP_CISINST ://expr
++	case OP_CCASTCLASS ://expr
++	
++	case OP_CEQ ://custom!!!
++	
++	//case CEE_CEQ :
++	//case CEE_CGT :
++	//case CEE_CGT_UN :
++	//case CEE_CLT :
++	//case CEE_CLT_UN :
++		value = get_computed_value (hssa, inst->opcode, left_operand, right_operand, inst);
++		INST_VALUE (inst) = value;
++		break;
++	
++	/* Arguments (can pass addresses to the following call) */
++	case OP_OUTARG :
++	case OP_OUTARG_REG :
++	case OP_OUTARG_FREG :
++	case OP_OUTARG_IMM :
++	case OP_OUTARG_R4 :
++	case OP_OUTARG_R8 :
++	case OP_OUTARG_VT :
++	case OP_INARG_VT :
++		if ((left_operand->base.address.generic != NULL) && (left_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL)) {
++			record_local_address_passed_as_call_parameter (hssa, left_operand->base.address.local);
++		}
++		value = NULL;
++		INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++		break;
++	
++	/* Method call */
++	case OP_VOIDCALL :
++	case OP_VOIDCALLVIRT :
++	case OP_VOIDCALL_REG :
++	case OP_VOIDCALL_MEMBASE :
++	case OP_FCALL :
++	case OP_FCALLVIRT :
++	case OP_FCALL_REG :
++	case OP_FCALL_MEMBASE :
++	case OP_LCALL :
++	case OP_LCALLVIRT :
++	case OP_LCALL_REG :
++	case OP_LCALL_MEMBASE :
++	case OP_VCALL :
++	case OP_VCALLVIRT :
++	case OP_VCALL_REG :
++	case OP_VCALL_MEMBASE :
++	case OP_CALL_REG :
++	case OP_CALL_MEMBASE :
++	case CEE_CALL :
++	case CEE_CALLI :
++	case CEE_CALLVIRT :
++		if ((left_operand->base.address.generic != NULL) && (left_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL)) {
++			handle_local_dummy_read_through_address (hssa, bb, inst, left_operand);
++			handle_local_write_through_address (hssa, bb, inst, left_operand, NULL);
++		}
++		if ((right_operand->base.address.generic != NULL) && (right_operand->base.address.generic->base.type == MONO_HSSA_ADDRESS_LOCAL)) {
++			handle_local_dummy_read_through_address (hssa, bb, inst, right_operand);
++			handle_local_write_through_address (hssa, bb, inst, right_operand, NULL);
++		}
++		touch_the_whole_heap (hssa, bb);
++		handle_local_addresses_passed_as_call_parameters (hssa, bb, inst);
++		if (value_is_used) {
++			value = create_new_primitive_value_as_address_according_to_inst (hssa, inst);
++			INST_VALUE (inst) = value;
++		} else {
++			value = NULL;
++		}
++		INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++		break;
++		
++	/* Create new primitive value */
++	case OP_NEWOBJ :
++	case CEE_NEWOBJ :
++	case CEE_BOX :
++	case CEE_NEWARR :
++	//case CEE_LOCALLOC :
++	/* Is this a special location set by the following opcodes? */
++	case OP_RETARG :
++	case OP_SETRET :
++	case OP_SETFRET :
++	case OP_SETLRET :
++	/* Ignore them (at least until we take exceptions into account) */
++	case OP_CHECK_THIS :
++	case OP_TRAP :
++	case OP_THROW_OR_NULL :
++	case OP_RETHROW :
++	case OP_CHECK_ARRAY_TYPE :
++	case OP_CALL_HANDLER :
++	case OP_START_HANDLER :
++	case OP_ENDFILTER :
++	case CEE_BREAK :
++	case OP_NOT_REACHED :
++	case CEE_THROW :
++	case CEE_ENDFINALLY :
++	case CEE_LEAVE :
++	case CEE_LEAVE_S :
++	//case CEE_ENDFILTER :
++	//case CEE_RETHROW :
++	/* Need help on these */
++	case OP_VTADDR :
++	case OP_RENAME :
++	/* For now produce primitive value or ignore, but we should handle these */
++	case OP_REFANYTYPE :
++	case OP_AOTCONST :
++	case OP_PATCH_INFO :
++	case OP_GOT_ENTRY :
++	case OP_UNBOXCAST :
++	case OP_LOAD_GOTADDR :
++	
++	case OP_SAVE_LMF :
++	case OP_RESTORE_LMF :
++
++	case CEE_REFANYVAL :
++	case CEE_MKREFANY :
++	case CEE_LDTOKEN :
++	
++	case CEE_UNBOX :
++	case OP_OBJADDR ://noop?
++		if (value_is_used) {
++#if 1
++			value = create_new_primitive_value_as_address_according_to_inst (hssa, inst);
++#else
++			if (mono_burg_arity [inst->opcode] == 0) {
++				value = create_new_primitive_value_as_address_according_to_inst (hssa, inst);
++			} else {
++				value = create_new_primitive_value (hssa, inst);
++				value->base.address.generic = create_address_from_operands (hssa, left_operand->base.address.generic, right_operand->base.address.generic, value, inst);
++			}
++#endif
++			INST_VALUE (inst) = value;
++		} else {
++			value = NULL;
++		}
++		INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++		break;
++	
++	/* Ignore... */
++	case CEE_NOP :
++	case CEE_RET :
++	
++	/* Branches should be used only by SCCP, and ignored otherwise */
++	case OP_LBEQ :
++	case OP_LBNE_UN :
++	case OP_LBLT :
++	case OP_LBLT_UN :
++	case OP_LBGT :
++	case OP_LBGT_UN :
++	case OP_LBGE :
++	case OP_LBGE_UN :
++	case OP_LBLE :
++	case OP_LBLE_UN :
++	case OP_IBEQ :
++	case OP_IBNE_UN :
++	case OP_IBLT :
++	case OP_IBLT_UN :
++	case OP_IBGT :
++	case OP_IBGT_UN :
++	case OP_IBGE :
++	case OP_IBGE_UN :
++	case OP_IBLE :
++	case OP_IBLE_UN :
++	case OP_FBEQ :
++	case OP_FBNE_UN :
++	case OP_FBLT :
++	case OP_FBLT_UN :
++	case OP_FBGT :
++	case OP_FBGT_UN :
++	case OP_FBGE :
++	case OP_FBGE_UN :
++	case OP_FBLE :
++	case OP_FBLE_UN :
++	case CEE_JMP :
++	case CEE_BR_S :
++	case CEE_BRFALSE_S :
++	case CEE_BRTRUE_S :
++	case CEE_BEQ_S :
++	case CEE_BGE_S :
++	case CEE_BGT_S :
++	case CEE_BLE_S :
++	case CEE_BLT_S :
++	case CEE_BNE_UN_S :
++	case CEE_BGE_UN_S :
++	case CEE_BGT_UN_S :
++	case CEE_BLE_UN_S :
++	case CEE_BLT_UN_S :
++	case CEE_BR :
++	case CEE_BRFALSE :
++	case CEE_BRTRUE :
++	case CEE_BEQ :
++	case CEE_BGE :
++	case CEE_BGT :
++	case CEE_BLE :
++	case CEE_BLT :
++	case CEE_BNE_UN :
++	case CEE_BGE_UN :
++	case CEE_BGT_UN :
++	case CEE_BLE_UN :
++	case CEE_BLT_UN :
++	case CEE_SWITCH :
++	
++	case CEE_POP :
++		value = NULL;
++		INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++		break;
++	
++	
++	/* For now we don't accept these... */
++	//case CEE_MONO_ICALL :
++	//case CEE_MONO_OBJADDR :
++	//case CEE_MONO_LDPTR :
++	//case CEE_MONO_VTADDR :
++	//case CEE_MONO_NEWOBJ :
++	//case CEE_MONO_RETOBJ :
++	//case CEE_MONO_LDNATIVEOBJ :
++	//case CEE_MONO_CISINST :
++	//case CEE_MONO_CCASTCLASS :
++	//case CEE_MONO_SAVE_LMF :
++	//case CEE_MONO_RESTORE_LMF :
++	//case CEE_MONO_CLASSCONST :
++	//case CEE_MONO_NOT_TAKEN :
++	case OP_SETREG : //ll
++	case OP_SETREGIMM : //ll
++	case OP_SETFREG : //ll
++	case CEE_UNBOX_ANY ://no
++	/* In practice, is this the address of the last parameter? */
++	//case CEE_ARGLIST :
++	case OP_ARGLIST :
++	/* Unknown */
++	case OP_LOAD :
++	case OP_STORE :
++	
++	
++	/* Cannot happen */
++	case OP_PHI :
++	case OP_SSA_LOCAL :
++	case OP_REGVAR :
++	case OP_REG :
++	case OP_REGOFFSET :
++	case OP_LABEL :
++	case OP_STORE_MEMBASE_IMM :
++	case OP_STORE_MEMBASE_REG :
++	case OP_STOREI1_MEMBASE_IMM :
++	case OP_STOREI1_MEMBASE_REG :
++	case OP_STOREI2_MEMBASE_IMM :
++	case OP_STOREI2_MEMBASE_REG :
++	case OP_STOREI4_MEMBASE_IMM :
++	case OP_STOREI4_MEMBASE_REG :
++	case OP_STOREI8_MEMBASE_IMM :
++	case OP_STOREI8_MEMBASE_REG :
++	case OP_STORER4_MEMBASE_REG :
++	case OP_STORER8_MEMBASE_REG :
++	case OP_LOAD_MEMBASE :
++	case OP_LOADI1_MEMBASE :
++	case OP_LOADU1_MEMBASE :
++	case OP_LOADI2_MEMBASE :
++	case OP_LOADU2_MEMBASE :
++	case OP_LOADI4_MEMBASE :
++	case OP_LOADU4_MEMBASE :
++	case OP_LOADI8_MEMBASE :
++	case OP_LOADR4_MEMBASE :
++	case OP_LOADR8_MEMBASE :
++	case OP_LOADR8_SPILL_MEMBASE :
++	case OP_LOADU4_MEM :
++	case OP_MOVE :
++	case OP_FMOVE :
++	case OP_ADD_IMM :
++	case OP_SUB_IMM :
++	case OP_MUL_IMM :
++	case OP_DIV_IMM :
++	case OP_DIV_UN_IMM :
++	case OP_REM_IMM :
++	case OP_REM_UN_IMM :
++	case OP_AND_IMM :
++	case OP_OR_IMM :
++	case OP_XOR_IMM :
++	case OP_SHL_IMM :
++	case OP_SHR_IMM :
++	case OP_SHR_UN_IMM :
++	case OP_COND_EXC_EQ :
++	case OP_COND_EXC_GE :
++	case OP_COND_EXC_GT :
++	case OP_COND_EXC_LE :
++	case OP_COND_EXC_LT :
++	case OP_COND_EXC_NE_UN :
++	case OP_COND_EXC_GE_UN :
++	case OP_COND_EXC_GT_UN :
++	case OP_COND_EXC_LE_UN :
++	case OP_COND_EXC_LT_UN :
++	case OP_COND_EXC_OV :
++	case OP_COND_EXC_NO :
++	case OP_COND_EXC_C :
++	case OP_COND_EXC_NC :
++	case OP_IADC_IMM :
++	case OP_ISBB_IMM :
++	case OP_LSHR_IMM :
++	case OP_LSHR_UN_IMM :
++	case OP_LSHL_IMM :
++	case OP_LADD_IMM :
++	case OP_LSUB_IMM :
++	case OP_LMUL_IMM :
++	case OP_IADD_IMM :
++	case OP_ISUB_IMM :
++	case OP_IMUL_IMM :
++	case OP_IDIV_IMM :
++	case OP_IDIV_UN_IMM :
++	case OP_IREM_IMM :
++	case OP_IREM_UN_IMM :
++	case OP_IAND_IMM :
++	case OP_IOR_IMM :
++	case OP_IXOR_IMM :
++	case OP_ISHL_IMM :
++	case OP_ISHR_IMM :
++	case OP_ISHR_UN_IMM :
++	case OP_COND_EXC_IOV :
++	case OP_COND_EXC_IC :
++	case OP_FCEQ_MEMBASE :
++	case OP_FCGT_MEMBASE :
++	case OP_FCGT_UN_MEMBASE :
++	case OP_FCLT_MEMBASE :
++	case OP_FCLT_UN_MEMBASE :
++	case OP_ADC :
++	case OP_ADC_IMM :
++	case OP_SBB :
++	case OP_SBB_IMM :
++	case OP_ADDCC :
++	case OP_ADDCC_IMM :
++	case OP_SUBCC :
++	case OP_SUBCC_IMM :
++	case OP_BR_REG :
++	case OP_SEXT_I1 :
++	case OP_SEXT_I2 :
++	case OP_CNE :
++	case OP_ADD_OVF_CARRY :
++	case OP_SUB_OVF_CARRY :
++	case OP_ADD_OVF_UN_CARRY :
++	case OP_SUB_OVF_UN_CARRY :
++	case CEE_LDARG_0 :
++	case CEE_LDARG_1 :
++	case CEE_LDARG_2 :
++	case CEE_LDARG_3 :
++	case CEE_LDLOC_0 :
++	case CEE_LDLOC_1 :
++	case CEE_LDLOC_2 :
++	case CEE_LDLOC_3 :
++	case CEE_STLOC_0 :
++	case CEE_STLOC_1 :
++	case CEE_STLOC_2 :
++	case CEE_STLOC_3 :
++	case CEE_LDARG_S :
++	case CEE_LDARGA_S :
++	case CEE_STARG_S :
++	case CEE_LDLOC_S :
++	case CEE_LDLOCA_S :
++	case CEE_STLOC_S :
++	case CEE_LDNULL :
++	case CEE_LDC_I4_M1 :
++	case CEE_LDC_I4_0 :
++	case CEE_LDC_I4_1 :
++	case CEE_LDC_I4_2 :
++	case CEE_LDC_I4_3 :
++	case CEE_LDC_I4_4 :
++	case CEE_LDC_I4_5 :
++	case CEE_LDC_I4_6 :
++	case CEE_LDC_I4_7 :
++	case CEE_LDC_I4_8 :
++	case CEE_LDC_I4_S :
++	case CEE_LDC_I4 :
++	case CEE_LDC_I8 :
++	case CEE_LDC_R4 :
++	case CEE_LDC_R8 :
++	case CEE_UNUSED99 :
++	case CEE_DUP :
++	case CEE_CPOBJ :
++	case CEE_LDSTR :
++	case CEE_LDFLD :
++	case CEE_LDFLDA :
++	case CEE_STFLD :
++	case CEE_LDSFLD :
++	case CEE_LDSFLDA :
++	case CEE_STSFLD :
++	case CEE_STOBJ :
++	case CEE_LDELEM_I1 :
++	case CEE_LDELEM_U1 :
++	case CEE_LDELEM_I2 :
++	case CEE_LDELEM_U2 :
++	case CEE_LDELEM_I4 :
++	case CEE_LDELEM_U4 :
++	case CEE_LDELEM_I8 :
++	case CEE_LDELEM_I :
++	case CEE_LDELEM_R4 :
++	case CEE_LDELEM_R8 :
++	case CEE_LDELEM_REF :
++	case CEE_STELEM_I :
++	case CEE_STELEM_I1 :
++	case CEE_STELEM_I2 :
++	case CEE_STELEM_I4 :
++	case CEE_STELEM_I8 :
++	case CEE_STELEM_R4 :
++	case CEE_STELEM_R8 :
++	case CEE_STELEM_REF :
++	case CEE_LDELEM_ANY :
++	case CEE_STELEM_ANY :
++	case CEE_UNUSED5 :
++	case CEE_UNUSED6 :
++	case CEE_UNUSED7 :
++	case CEE_UNUSED8 :
++	case CEE_UNUSED9 :
++	case CEE_UNUSED10 :
++	case CEE_UNUSED11 :
++	case CEE_UNUSED12 :
++	case CEE_UNUSED13 :
++	case CEE_UNUSED14 :
++	case CEE_UNUSED15 :
++	case CEE_UNUSED16 :
++	case CEE_UNUSED17 :
++	case CEE_UNUSED50 :
++	case CEE_UNUSED18 :
++	case CEE_UNUSED19 :
++	case CEE_UNUSED20 :
++	case CEE_UNUSED21 :
++	case CEE_UNUSED22 :
++	case CEE_UNUSED23 :
++	case CEE_UNUSED24 :
++	case CEE_UNUSED25 :
++	case CEE_UNUSED59 :
++	case CEE_UNUSED60 :
++	case CEE_UNUSED61 :
++	case CEE_UNUSED62 :
++	case CEE_UNUSED63 :
++	case CEE_UNUSED64 :
++	case CEE_UNUSED65 :
++	case CEE_UNUSED66 :
++	case CEE_UNUSED67 :
++	case CEE_UNUSED26 :
++	case CEE_UNUSED27 :
++	case CEE_UNUSED28 :
++	case CEE_UNUSED29 :
++	case CEE_UNUSED30 :
++	case CEE_UNUSED31 :
++	case CEE_UNUSED32 :
++	case CEE_UNUSED33 :
++	case CEE_UNUSED34 :
++	case CEE_UNUSED35 :
++	case CEE_UNUSED36 :
++	case CEE_UNUSED37 :
++	case CEE_UNUSED38 :
++	case CEE_UNUSED39 :
++	case CEE_UNUSED40 :
++	case CEE_UNUSED41 :
++	case CEE_UNUSED42 :
++	case CEE_UNUSED43 :
++	case CEE_UNUSED44 :
++	case CEE_UNUSED45 :
++	case CEE_UNUSED46 :
++	case CEE_UNUSED47 :
++	case CEE_UNUSED48 :
++	case CEE_PREFIX7 :
++	case CEE_PREFIX6 :
++	case CEE_PREFIX5 :
++	case CEE_PREFIX4 :
++	case CEE_PREFIX3 :
++	case CEE_PREFIX2 :
++	case CEE_PREFIX1 :
++	case CEE_PREFIXREF :
++	case CEE_UNUSED58 :
++	case CEE_UNUSED1 :
++	
++	//case CEE_LDFTN :
++	//case CEE_LDVIRTFTN :
++	//case CEE_UNUSED56 :
++	//case CEE_LDARG :
++	//case CEE_LDARGA :
++	//case CEE_STARG :
++	//case CEE_LDLOC :
++	//case CEE_LDLOCA :
++	//case CEE_STLOC :
++	//case CEE_UNUSED57 :
++	//case CEE_UNUSED53 :
++	//case CEE_UNUSED54 :
++	//case CEE_UNUSED55 :
++	//case CEE_UNUSED70 :
++	//case CEE_ILLEGAL :
++	
++	//case CEE_UNALIGNED_ :
++	//case CEE_VOLATILE_ :
++	//case CEE_TAIL_ :
++	//case CEE_INITOBJ :
++	//case CEE_CONSTRAINED_ :
++	//case CEE_CPBLK :
++	//case CEE_INITBLK :
++	//case CEE_NO_ :
++	//case CEE_UNUSED :
++	//case CEE_SIZEOF :
++	//case CEE_REFANYTYPE :
++	//case CEE_READONLY_ :
++	//case CEE_ENDMAC :
++	default :
++#if 1
++		if (value_is_used) {
++			value = create_new_primitive_value_as_address_according_to_inst (hssa, inst);
++			INST_VALUE (inst) = value;
++		} else {
++			value = NULL;
++		}
++		INST_HAS_SIDE_EFFECTS (inst) = TRUE;
++		break;
++#else
++		printf ("\nOpcode \"%s\"(%d) not allowed in HSSA construction, inst is ", mono_inst_name (inst->opcode), inst->opcode);
++		print_mono_inst_tree (inst);
++		printf ("\n");
++		g_assert_not_reached ();
++		value = NULL;
++		result = NULL;
++		break;
++#endif
++	}
++	
++	if (value_is_used) {
++		if (value == NULL) {
++			printf ("\nOpcode \"%s\"(%d) is not producing a value, inst is ", mono_inst_name (inst->opcode), inst->opcode);
++			print_mono_inst_tree (inst);
++			printf ("\n");
++			g_assert_not_reached ();
++		}
++		/* FIXME: so we make sure we have an address when needed, but is this safe? */
++		//if (value->base.address.generic == NULL) {
++		//	value->base.address.heap = create_new_heap_address_for_inst (hssa, value, inst);
++		//}
++	}
++	
++	if (FOLLOW_HSSA) {
++		printf ("Ending inst ");
++		print_mono_inst (inst);
++		printf (" value (used is %s) is: ", GBOOLEAN_TO_STRING (value_is_used));
++		if (value != NULL) {
++			print_value_briefly (value);
++		} else {
++			printf ("NULL");
++		}
++		printf ("\n");
++	}
++	
++	return value;
++}
++
++
++static void
++build_definitions_for_bb (MonoHssaCfgData *hssa, MonoHssaBB *bb) {
++	MonoInst *inst;
++	int i;
++	
++	if (FOLLOW_HSSA) {
++		printf ("Building definitions in ");
++		print_bb_id (bb);
++		printf ("\n");
++	}
++	
++	if (bb->idominator != NULL) {
++		MonoHssaBB *idominator = bb->idominator;
++		
++		for (i = 0; i < hssa->number_of_local_variables; i++) {
++			MonoHssaLocalVariableStateInBB *state = & (bb->local_variables_state [i]);
++			
++			if (state->has_phi) {
++				MonoHssaValue *phi_value = create_new_empty_phi_value (hssa, bb);
++				MonoHssaLocalVariableDefinitions *list = mono_mempool_alloc (hssa->mempool, sizeof (MonoHssaLocalVariableDefinitions));
++				list->definition = create_new_ssa_definition (hssa, i, phi_value, bb, NULL);
++				list->next = bb->local_phi_definitions;
++				bb->local_phi_definitions = list;
++			} else {
++				MonoHssaLocalVariableStateInBB *previous_state = &(idominator->local_variables_state [i]);
++				state->current_definition = previous_state->current_definition;
++			}
++		}
++		
++		if (idominator->final_heap_state_length > 0) {
++			MonoHssaHeapAddress *next_address_with_known_value;
++			
++			bb->initial_heap_state_length = idominator->final_heap_state_length;
++			bb->initial_heap_state = mono_mempool_alloc0 (hssa->mempool, idominator->final_heap_state_length * sizeof (MonoHssaHeapAddress*));
++			
++			if (bb->in_count > 1) {
++				for (i = 0; i < idominator->final_heap_state_length; i++) {
++					MonoHssaHeapAddressValueDefinition *previous_definition = idominator->final_heap_state [i];
++					MonoHssaHeapAddress *address = previous_definition->address;
++					MonoHssaHeapAddressValueDefinition *definition = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaHeapAddressValueDefinition));
++					MonoHssaHeapAddressValueDefinitions *list = mono_mempool_alloc (hssa->mempool, sizeof (MonoHssaHeapAddressValueDefinitions));
++					definition->value = create_new_empty_phi_value (hssa, bb);
++					definition->address = address;
++					definition->affected_bytes = previous_definition->affected_bytes;
++					definition->definition = NULL;
++					list->definition = definition;
++					list->next = bb->heap_phi_definitions;
++					bb->heap_phi_definitions = list;
++					INSERT_LIST_ELEMENT (&(address->data), definitions, definition);
++					address->data.current_definition = definition;
++					bb->initial_heap_state [i] = definition;
++				}
++			} else {
++				for (i = 0; i < idominator->final_heap_state_length; i++) {
++					bb->initial_heap_state [i] = idominator->final_heap_state [i];
++				}
++			}
++			
++			next_address_with_known_value = NULL;
++			for (i = 0; i < bb->initial_heap_state_length; i++) {
++				MonoHssaHeapAddressValueDefinition *current_definition = bb->initial_heap_state [i];
++				MonoHssaHeapAddress *current_address_with_known_value = current_definition->address;
++				current_address_with_known_value->data.next_address_with_known_value = next_address_with_known_value;
++				current_address_with_known_value->data.current_definition = current_definition;
++				next_address_with_known_value = current_address_with_known_value;
++			}
++			hssa->addresses_with_known_value = next_address_with_known_value;
++		} else {
++			hssa->addresses_with_known_value = NULL;
++			bb->initial_heap_state_length = 0;
++			bb->initial_heap_state = NULL;
++		}
++	} else {
++		hssa->addresses_with_known_value = NULL;
++		bb->initial_heap_state_length = 0;
++		bb->initial_heap_state = NULL;
++	}
++	bb->final_heap_state_length = bb->initial_heap_state_length;
++	
++#if (DEBUG_HSSA)
++	CHECK_HEAP_STATE_LENGTH (hssa, bb);
++#endif
++	
++	for (inst = bb->bb->code; inst != NULL; inst = inst->next) {
++		build_definitions_for_inst (hssa, bb, inst, FALSE);
++	}
++	
++#if (DEBUG_HSSA)
++	CHECK_HEAP_STATE_LENGTH (hssa, bb);
++#endif
++	
++	if (bb->final_heap_state_length > 0) {
++		MonoHssaHeapAddress *address_with_known_value;
++		gboolean heap_is_dead = (bb->out_count == 0) || (bb->j_edges_count != 0);
++		
++		bb->final_heap_state = mono_mempool_alloc0 (hssa->mempool, bb->final_heap_state_length * sizeof (MonoHssaHeapAddress*));
++		
++		address_with_known_value = hssa->addresses_with_known_value;
++		for (i = 0; i < bb->final_heap_state_length; i++) {
++			MonoHssaHeapAddressValueDefinition *current_definition = address_with_known_value->data.current_definition;
++			/* Mark as used if may be phi argument or if this is the exit BB */
++			if (heap_is_dead) {
++				current_definition->is_used_by_mu = TRUE;
++			}
++			bb->final_heap_state [i] = current_definition;
++			address_with_known_value = address_with_known_value->data.next_address_with_known_value;
++		}
++	} else {
++		bb->final_heap_state = NULL;
++	}
++	
++	bb->processed = TRUE;
++	
++	if (FOLLOW_HSSA) {
++		print_bb_data (hssa, bb, FALSE, TRUE, TRUE);
++	}
++}
++
++static void
++link_phi_uses_for_bb (MonoHssaCfgData *hssa, MonoHssaBB *bb) {
++	MonoHssaLocalVariableDefinitions *local_list;
++	MonoHssaHeapAddressValueDefinitions *heap_list;
++	
++	for (local_list = bb->local_phi_definitions; local_list != NULL; local_list = local_list->next) {
++		MonoHssaLocalVariableDefinition *definition = local_list->definition;
++		int in_bb_index;
++		
++		definition->phi_arguments_uses = mono_mempool_alloc (hssa->mempool, bb->in_count * sizeof (MonoHssaLocalVariableUse*));
++		
++		for (in_bb_index = 0; in_bb_index < bb->in_count; in_bb_index++) {
++			MonoHssaBB *in_bb = bb->in_bb [in_bb_index];
++			MonoHssaLocalVariableDefinition *in_definition = lookup_definition_in_value_stacks (in_bb, definition->ssa_variable->index);
++			
++			if (in_definition != NULL) {
++				definition->phi_arguments_uses [in_bb_index] = add_variable_use_to_definition (hssa, in_definition, NULL);
++			} else {
++				definition->phi_arguments_uses [in_bb_index] = NULL;
++			}
++		}
++	}
++	
++	for (heap_list = bb->heap_phi_definitions; heap_list != NULL; heap_list = heap_list->next) {
++		MonoHssaHeapAddressValueDefinition *definition = heap_list->definition;
++		int in_bb_index;
++		
++		definition->phi_arguments_uses = mono_mempool_alloc (hssa->mempool, bb->in_count * sizeof (MonoHssaHeapAddressValueUse*));
++		
++		for (in_bb_index = 0; in_bb_index < bb->in_count; in_bb_index++) {
++			MonoHssaBB *in_bb = bb->in_bb [in_bb_index];
++			MonoHssaHeapAddressValueDefinition *in_definition = NULL;
++			int in_definition_index;
++			
++			for (in_definition_index = 0; in_definition_index < in_bb->final_heap_state_length; in_definition_index ++) {
++				MonoHssaHeapAddressValueDefinition *current_in_definition = in_bb->final_heap_state [in_definition_index];
++				
++				if ((current_in_definition->address == definition->address) &&
++						(current_in_definition->affected_bytes == definition->affected_bytes)) {
++					in_definition = current_in_definition;
++				}
++			}
++			
++			if (in_definition != NULL) {
++				MonoHssaHeapAddressValueUse *use = mono_mempool_alloc0 (hssa->mempool, sizeof (MonoHssaHeapAddressValueUse));
++				use->definition = in_definition;
++				use->use = NULL;
++				INSERT_LIST_ELEMENT (in_definition, uses, use);
++				definition->phi_arguments_uses [in_bb_index] = use;
++			} else {
++				definition->phi_arguments_uses [in_bb_index] = NULL;
++			}
++		}
++	}
++}
++
++
++
++static void
++fill_phi_values_for_bb (MonoHssaCfgData *hssa, MonoHssaBB *bb) {
++	MonoHssaLocalVariableDefinitions *local_list;
++	MonoHssaHeapAddressValueDefinitions *heap_list;
++	
++	for (local_list = bb->local_phi_definitions; local_list != NULL; local_list = local_list->next) {
++		MonoHssaLocalVariableDefinition *definition = local_list->definition;
++		MonoHssaValue *value = definition->value;
++		fill_local_phi_value (hssa, value, definition->ssa_variable->index);
++		/* FIXME: check if this is still a phi */
++	}
++	
++	for (heap_list = bb->heap_phi_definitions; heap_list != NULL; heap_list = heap_list->next) {
++		MonoHssaHeapAddressValueDefinition *definition = heap_list->definition;
++		MonoHssaValue *value = definition->value;
++		fill_heap_phi_value (hssa, value, definition);
++		/* FIXME: check if this is still a phi */
++	}
++}
++
++
++
++
++static void
++build_definitions (MonoHssaCfgData *hssa) {
++	int i;
++	MonoHssaBB *bb;
++	
++	for (i = 0, bb = hssa->bblocks; i < hssa->number_of_bblocks; i++, bb++) {
++		build_definitions_for_bb (hssa, bb);
++	}
++	
++	for (i = 0, bb = hssa->bblocks; i < hssa->number_of_bblocks; i++, bb++) {
++		link_phi_uses_for_bb (hssa, bb);
++	}
++	
++	for (i = 0, bb = hssa->bblocks; i < hssa->number_of_bblocks; i++, bb++) {
++		fill_phi_values_for_bb (hssa, bb);
++	}
++}
++
++static gboolean
++deadce_is_local_variable_definition_dead (MonoHssaLocalVariableDefinition *definition) {
++	if ((definition->uses == NULL) && (! (definition->ssa_variable->inst->flags & MONO_INST_VOLATILE))) {
++		if (definition->definition != NULL) {
++			return ! INST_HAS_SIDE_EFFECTS (definition->definition);
++		} else {
++			return definition->value->base.type == MONO_HSSA_VALUE_PHI;
++		}
++	} else {
++		return FALSE;
++	}
++}
++
++static gboolean
++deadce_is_heap_value_definition_dead (MonoHssaHeapAddressValueDefinition *definition) {
++	return ((definition->uses == NULL) && (! definition->is_used_by_mu) &&
++			((definition->definition == NULL) || (! INST_HAS_SIDE_EFFECTS (definition->definition))));
++}
++
++
++static void
++deadce_build_worklists (MonoHssaCfgData *hssa) {
++	int variable_index;
++	MonoHssaHeapAddress *current_heap_address;
++	
++	hssa->deadce_local_worklist = NULL;
++	hssa->deadce_heap_worklist = NULL;
++	
++	hssa->deadce_total_local_stores = 0;
++	hssa->deadce_dead_local_stores = 0;
++	hssa->deadce_total_heap_stores = 0;
++	hssa->deadce_dead_heap_stores = 0;
++	
++	for (variable_index = 0; variable_index < hssa->number_of_local_variables; variable_index++) {
++		MonoHssaLocalVariable *current_local_variable = hssa->local_variables [variable_index];
++		MonoHssaLocalVariableDefinition *current_local_definition = current_local_variable->definitions;
++		
++		while (current_local_definition != NULL) {
++			MonoHssaLocalVariableDefinition *next = current_local_definition->next;
++			
++			hssa->deadce_total_local_stores++;
++			//if (current_local_definition->definition) printf ("HSSA DEADCE TOTAL LOCAL\n");
++			
++			if (deadce_is_local_variable_definition_dead (current_local_definition)) {
++				UNLINK_LIST_ELEMENT (current_local_definition, ssa_variable, definitions);
++				INSERT_LIST_ELEMENT (hssa, deadce_local_worklist, current_local_definition);
++			}
++			current_local_definition = next;
++		}
++	}
++	
++	current_heap_address = hssa->used_heap_addresses;
++	while (current_heap_address != NULL) {
++		MonoHssaHeapAddressValueDefinition *current_heap_definition = current_heap_address->data.definitions;
++		
++		while (current_heap_definition != NULL) {
++			MonoHssaHeapAddressValueDefinition *next = current_heap_definition->next;
++			
++			hssa->deadce_total_heap_stores++;
++			//if (current_heap_definition->definition) printf ("HSSA DEADCE TOTAL HEAP\n");
++			
++			if (deadce_is_heap_value_definition_dead (current_heap_definition)) {
++				UNLINK_LIST_ELEMENT (current_heap_definition, address, data.definitions);
++				INSERT_LIST_ELEMENT (hssa, deadce_heap_worklist, current_heap_definition);
++			}
++			current_heap_definition = next;
++		}
++		current_heap_address = current_heap_address->data.next_used_heap_address;
++	}
++}
++
++static void
++deadce_handle_inst_nullification (MonoHssaCfgData *hssa, MonoInst *inst) {
++	if (mono_burg_arity [inst->opcode] > 0) {
++		deadce_handle_inst_nullification (hssa, inst->inst_left);
++		if (mono_burg_arity [inst->opcode] > 1) {
++			deadce_handle_inst_nullification (hssa, inst->inst_right);
++		}
++	}
++	
++	if (INST_IS_LOCAL_USE (inst)) {
++		MonoHssaLocalVariableUse *use = INST_LOCAL_USE (inst);
++		UNLINK_LIST_ELEMENT (use, definition, uses);
++		if (deadce_is_local_variable_definition_dead (use->definition)) {
++			UNLINK_LIST_ELEMENT (use->definition, ssa_variable, definitions);
++			INSERT_LIST_ELEMENT (hssa, deadce_local_worklist, use->definition);
++		}
++	} else if (INST_IS_HEAP_USE (inst)) {
++		MonoHssaHeapAddressValueUse *use = INST_HEAP_USE (inst);
++		UNLINK_LIST_ELEMENT (use, definition, uses);
++		if (deadce_is_heap_value_definition_dead (use->definition)) {
++			UNLINK_LIST_ELEMENT (use->definition, address, data.definitions);
++			INSERT_LIST_ELEMENT (hssa, deadce_heap_worklist, use->definition);
++		}
++	}
++}
++
++static void
++deadce_process_worklists (MonoHssaCfgData *hssa) {
++	while ((hssa->deadce_local_worklist != NULL) || (hssa->deadce_heap_worklist != NULL)) {
++		if (hssa->deadce_local_worklist != NULL) {
++			MonoHssaLocalVariableDefinition *definition = hssa->deadce_local_worklist;
++			UNLINK_LIST_ELEMENT_FROM_BASE (definition, hssa->deadce_local_worklist);
++			
++			hssa->deadce_dead_local_stores++;
++			if (definition->definition) printf ("HSSA DEADCE DEAD LOCAL\n");
++			
++			if (definition->definition != NULL) {
++				deadce_handle_inst_nullification (hssa, definition->definition);
++				definition->definition->opcode = CEE_NOP;
++				definition->definition->ssa_op = MONO_SSA_NOP;
++				INST_IS_LOCAL_USE (definition->definition) = FALSE;
++				INST_IS_HEAP_USE (definition->definition) = FALSE;
++			} else if (definition->value->base.type == MONO_HSSA_VALUE_PHI) {
++				int i;
++				for (i = 0; i < definition->value->data.phi.join_point->in_count; i++) {
++					MonoHssaLocalVariableUse *in_use = definition->phi_arguments_uses [i];
++					if (in_use != NULL) {
++						MonoHssaLocalVariableDefinition *in_definition = in_use->definition;
++						
++						UNLINK_LIST_ELEMENT (in_use, definition, uses);
++						definition->phi_arguments_uses [i] = NULL;
++						
++						if (deadce_is_local_variable_definition_dead (in_definition)) {
++							UNLINK_LIST_ELEMENT (in_definition, ssa_variable, definitions);
++							INSERT_LIST_ELEMENT (hssa, deadce_local_worklist, in_definition);
++						}
++					}
++				}
++			} else {
++				g_assert_not_reached ();
++			}
++		}
++		if (hssa->deadce_heap_worklist != NULL) {
++			MonoHssaHeapAddressValueDefinition *definition = hssa->deadce_heap_worklist;
++			UNLINK_LIST_ELEMENT_FROM_BASE (definition, hssa->deadce_heap_worklist);
++			
++			hssa->deadce_dead_heap_stores++;
++			//if (definition->definition) printf ("HSSA DEADCE DEAD HEAP\n");
++			
++			if (definition->definition != NULL) {
++				deadce_handle_inst_nullification (hssa, definition->definition);
++				definition->definition->opcode = CEE_NOP;
++				definition->definition->ssa_op = MONO_SSA_NOP;
++				INST_IS_LOCAL_USE (definition->definition) = FALSE;
++				INST_IS_HEAP_USE (definition->definition) = FALSE;
++			} else if (definition->value->base.type == MONO_HSSA_VALUE_PHI) {
++				int i;
++				for (i = 0; i < definition->value->data.phi.join_point->in_count; i++) {
++					MonoHssaHeapAddressValueUse *in_use = definition->phi_arguments_uses [i];
++					if (in_use != NULL) {
++						MonoHssaHeapAddressValueDefinition *in_definition = in_use->definition;
++						
++						UNLINK_LIST_ELEMENT (in_use, definition, uses);
++						definition->phi_arguments_uses [i] = NULL;
++						
++						if (deadce_is_heap_value_definition_dead (in_definition)) {
++							UNLINK_LIST_ELEMENT (in_definition, address, data.definitions);
++							INSERT_LIST_ELEMENT (hssa, deadce_heap_worklist, in_definition);
++						}
++					}
++				}
++			} else {
++				g_assert_not_reached ();
++			}
++		}
++	}
++}
++
++void mono_hssa_deadce (MonoHssaCfgData *hssa) {
++	if (DUMP_HSSA) {
++		printf ("Before DEADCE:\n");
++		print_hssa_data (hssa);
++	}
++	deadce_build_worklists (hssa);
++	deadce_process_worklists (hssa);
++	
++	if (TRACE_HSSA) {
++		printf ("HSSA DEADCE local: (total %d, dead %d)\n",
++				hssa->deadce_total_local_stores, hssa->deadce_dead_local_stores);
++		printf ("HSSA DEADCE heap: (total %d, dead %d)\n",
++				hssa->deadce_total_heap_stores, hssa->deadce_dead_heap_stores);
++	}
++	
++	if (DUMP_HSSA) {
++		int i;
++		printf ("After DEADCE:\n");
++		print_hssa_data (hssa);
++		printf ("Code dump start:\n");
++		for (i = 0; i < hssa->number_of_bblocks; i++) {
++			print_bb_data (hssa, &(hssa->bblocks [i]), TRUE, FALSE, FALSE);
++		}
++		printf ("Code dump end.\n");
++	}
++}
++
++
++#if (MONO_APPLY_HSSA_TO_SINGLE_METHOD)
++static char*
++mono_hssa_method_name = NULL;
++static gboolean check_hssa_method_name (MonoCompile *cfg) {
++	gboolean result;
++	if (mono_hssa_method_name == NULL) {
++		mono_hssa_method_name = getenv ("MONO_HSSA_METHOD_NAME");
++	}
++	if (mono_hssa_method_name != NULL) {
++		char *method_name = mono_method_full_name (cfg->method, TRUE);
++		if (strstr (method_name, mono_hssa_method_name) != NULL) {
++			result = TRUE;
++		} else {
++			result = FALSE;
++		}
++		g_free (method_name);
++	} else {
++		result = TRUE;
++	}
++	return result;
++}
++#endif
++
++static void
++free_hssa_resources (MonoHssaCfgData *hssa) {
++	g_hash_table_destroy (hssa->constant_values);
++	g_hash_table_destroy (hssa->computed_values);
++	mono_mempool_destroy (hssa->mempool);
++}
++
++void
++mono_build_hssa (MonoCompile *cfg) {
++	MonoMemPool *pool = mono_mempool_new ();
++	MonoHssaCfgData *hssa = mono_mempool_alloc0 (pool, sizeof (MonoHssaCfgData));
++	MonoInst zero_inst;
++	
++#if (MONO_APPLY_HSSA_TO_SINGLE_METHOD)
++	if (! check_hssa_method_name (cfg)) return;
++#endif
++	
++#if (DEBUG_HSSA)
++	int verbose_level = cfg->verbose_level;
++	cfg->verbose_level = 7;
++#endif
++	
++	cfg->hssa = hssa;
++	hssa->mempool = pool;
++	hssa->cfg = cfg;
++	hssa->next_available_value_number = 1;
++	hssa->next_available_primitive_value_id = 1;
++	hssa->no_value.type = MONO_HSSA_VALUE_NONE;
++	hssa->no_value.value_number = 0;
++	hssa->no_value.address.generic = NULL;
++	hssa->method_stores_local_addresses = FALSE;
++	
++	if (cfg->verbose_level > 0) {
++		hssa->method_name = mono_method_full_name (hssa->cfg->method, TRUE);
++	} else {
++		hssa->method_name = (char*) "METHOD-NAME-UNAVAILABLE";
++	}
++	
++	if (TRACE_HSSA) {
++		printf ("Building HSSA for method %s...\n", hssa->method_name);
++	}
++	
++	mono_compile_dominator_info (cfg, MONO_COMP_DOM | MONO_COMP_IDOM);
++	
++	hssa->constant_values = g_hash_table_new (constant_value_key, constant_value_equal);
++	hssa->computed_values = g_hash_table_new (computed_value_key, computed_value_equal);
++	
++	memset (&zero_inst, 0, sizeof (MonoInst));
++	zero_inst.opcode = OP_ICONST;
++	zero_inst.inst_c0 = 0;
++	zero_inst.type = STACK_MP;
++	hssa->zero = get_integer_constant_value (hssa, &zero_inst);
++	
++	if (DUMP_HSSA) {
++		printf ("Initializing local variables array...\n");
++	}
++	initialize_local_variables_array (hssa);
++	if (DUMP_HSSA) {
++		printf ("Initializing BB array...\n");
++	}
++	initialize_bb_array (hssa);
++	
++	if (DUMP_HSSA) {
++		int i;
++		printf ("Code dump start:\n");
++		for (i = 0; i < hssa->number_of_bblocks; i++) {
++			print_bb_data (hssa, &(hssa->bblocks [i]), TRUE, FALSE, FALSE);
++		}
++		printf ("Code dump end.\n");
++	}
++	
++	initialize_aliasing_classes (hssa);
++	
++	if (hssa->method_stores_local_addresses == FALSE) {
++		create_arguments_definitions (hssa);
++		place_phis_for_local_variables (hssa);
++		build_definitions (hssa);
++		
++		if (DUMP_HSSA) {
++			int i;
++			printf ("Code dump start (after mono_hssa_deadce):\n");
++			for (i = 0; i < hssa->number_of_bblocks; i++) {
++				print_bb_data (hssa, &(hssa->bblocks [i]), TRUE, FALSE, FALSE);
++			}
++			printf ("Code dump end (after mono_hssa_deadce).\n");
++		}
++		
++		if (DUMP_HSSA) {
++			print_hssa_data (hssa);
++		}
++		
++		if (TRACE_HSSA) {
++			printf ("Built HSSA for method %s...\n", hssa->method_name);
++		}
++		if (cfg->verbose_level > 0) {
++			g_free (hssa->method_name);
++		}
++	} else {
++		if (TRACE_HSSA) {
++			printf ("Gave up building HSSA for method %s...\n", hssa->method_name);
++		}
++		
++		if (cfg->verbose_level > 0) {
++			g_free (hssa->method_name);
++		}
++		free_hssa_resources (hssa);
++		cfg->hssa = NULL;
++	}
++	
++	
++#if (DEBUG_HSSA)
++	cfg->verbose_level = verbose_level;
++#endif
++}
++
++static void
++destroy_hssa_on_inst (MonoInst *inst) {
++	if (mono_burg_arity [inst->opcode] > 0) {
++		if (inst->inst_left->opcode == OP_SSA_LOCAL) {
++			MonoHssaLocalVariableDefinition *definition = HSSA_DEFINITION (inst->inst_left);
++			inst->inst_left = definition->ssa_variable->inst;
++		} else {
++			destroy_hssa_on_inst (inst->inst_left);
++		}
++		if (mono_burg_arity [inst->opcode] > 1) {
++			if (inst->inst_right->opcode == OP_SSA_LOCAL) {
++				MonoHssaLocalVariableDefinition *definition = HSSA_DEFINITION (inst->inst_right);
++				inst->inst_right = definition->ssa_variable->inst;
++			} else {
++				destroy_hssa_on_inst (inst->inst_right);
++			}
++		}
++	}
++}
++
++void
++mono_destroy_hssa (MonoCompile *cfg) {
++	MonoHssaCfgData *hssa = cfg->hssa;
++	MonoHssaBB *bb;
++	int i;
++	
++	g_assert (hssa != NULL);
++	
++	for (i = 0, bb = hssa->bblocks; i < hssa->number_of_bblocks; i++, bb++) {
++		MonoInst *inst;
++		
++		for (inst = bb->bb->code; inst != NULL; inst = inst->next) {
++			destroy_hssa_on_inst (inst);
++		}
++	}
++	
++	free_hssa_resources (hssa);
++	cfg->hssa = NULL;	
++}
+Index: mono/mono/mini/hssa.h
+===================================================================
+--- mono/mono/mini/hssa.h	(revision 0)
++++ mono/mono/mini/hssa.h	(revision 0)
+@@ -0,0 +1,428 @@
++/*
++ * hssa.h: HSSA
++ *
++ * Author:
++ *   Massimiliano Mantione (massi@ximian.com)
++ *
++ * (C) 2005 Novell, Inc.  http://www.novell.com
++ */
++
++#ifndef __MONO_HSSA_H__
++#define __MONO_HSSA_H__
++
++#include "mini.h"
++
++
++struct MonoHssaLocalVariableDefinitions;
++struct MonoHssaBB;
++struct MonoHssaBaseAddress;
++struct MonoHssaHeapAddressValueUse;
++struct MonoHssaHeapAddressValueDefinition;
++struct MonoHssaHeapAddressData;
++struct MonoHssaHeapAddress;
++struct MonoHssaLocalAddressData;
++struct MonoHssaLocalAddress;
++struct MonoHssaValue;
++struct MonoHssaPrimitiveValue;
++struct MonoHssaConstantValue;
++struct MonoHssaComputedValue;
++struct MonoHssaPhiValue;
++struct MonoHssaLocalValue;
++struct MonoHssaValueOccurrence;
++struct MonoHssaLocalVariableUse;
++struct MonoHssaLocalVariableDefinition;
++struct MonoHssaLocalVariable;
++struct MonoHssaTypeBasedAliasingClasses;
++struct MonoHssaTypeBasedAliasingClass;
++struct MonoHssaCfgData;
++
++typedef guint32 SetOfAliasingClasses;
++#define MONO_HSSA_ALL_ALIASING_CLASSES (0xffffffff)
++
++typedef struct MonoHssaLocalVariableStateInBB {
++	struct MonoHssaLocalVariableDefinition *current_definition;
++	gboolean has_definition;
++	gboolean has_phi;
++} MonoHssaLocalVariableStateInBB;
++
++typedef struct MonoHssaLocalVariableDefinitions {
++	struct MonoHssaLocalVariableDefinition *definition;
++	struct MonoHssaLocalVariableDefinitions *next;
++} MonoHssaLocalVariableDefinitions;
++
++typedef struct MonoHssaHeapAddressValueDefinitions {
++	struct MonoHssaHeapAddressValueDefinition *definition;
++	struct MonoHssaHeapAddressValueDefinitions *next;
++} MonoHssaHeapAddressValueDefinitions;
++
++
++#define MONO_HSSA_DOMINATES(_dominator,_dominated) (((_dominator)->dt_index<=(_dominated)->dt_index)&&((_dominated)->dt_index<=((_dominator)->dt_index+(_dominator)->dt_children)))
++#define MONO_HSSA_STRICTLY_DOMINATES(_dominator,_dominated) (((_dominator)->dt_index<(_dominated)->dt_index)&&((_dominated)->dt_index<=((_dominator)->dt_index+(_dominator)->dt_children)))
++
++typedef struct MonoHssaBB {
++	MonoBasicBlock *bb;
++	int dt_index;
++	int dt_children;
++	int dt_level;
++	gint16 out_count, in_count;
++	struct MonoHssaBB **in_bb;
++	struct MonoHssaBB **out_bb;
++	gint16 index_in_predecessors_out_blocks;
++	gint16 index_in_successors_in_blocks;
++	struct MonoHssaBB *next_bb_in_phi_computation;
++	struct MonoHssaBB **j_edges;
++	gint16 j_edges_count;
++	gboolean processed_in_phi_computation;
++	gboolean processed;
++	
++	MonoHssaLocalVariableStateInBB *local_variables_state;
++	struct MonoHssaLocalVariableDefinitions *local_phi_definitions;
++	struct MonoHssaHeapAddressValueDefinitions *heap_phi_definitions;
++	struct MonoHssaHeapAddressValueDefinition **initial_heap_state;
++	int initial_heap_state_length;
++	struct MonoHssaHeapAddressValueDefinition **final_heap_state;
++	int final_heap_state_length;
++	
++	struct MonoHssaBB *idominator;
++} MonoHssaBB;
++
++
++#if 0
++typedef enum {
++	STACK_INV,
++	STACK_I4,
++	STACK_I8,
++	STACK_PTR,
++	STACK_R8,
++	STACK_MP,
++	STACK_OBJ,
++	STACK_VTYPE,
++	STACK_MAX
++} MonoStackType;
++#endif
++
++/*
++ * All the different kind of values we can have.
++ */
++typedef enum {
++	MONO_HSSA_VALUE_NONE = 0,
++	MONO_HSSA_VALUE_PRIMITIVE = 1,
++	MONO_HSSA_VALUE_COMPUTED = 2,
++	MONO_HSSA_VALUE_PHI = 3,
++	MONO_HSSA_VALUE_INTEGER_CONSTANT = 4,
++	MONO_HSSA_VALUE_LONG_COSTANT = 8,
++	MONO_HSSA_VALUE_FLOAT_COSTANT = 12,
++	MONO_HSSA_VALUE_DOUBLE_COSTANT = 16,
++	MONO_HSSA_VALUE_LOCAL = 32,
++	MONO_HSSA_VALUE_CONSTANT = (MONO_HSSA_VALUE_INTEGER_CONSTANT|MONO_HSSA_VALUE_LONG_COSTANT|MONO_HSSA_VALUE_FLOAT_COSTANT|MONO_HSSA_VALUE_DOUBLE_COSTANT)
++} MonoHssaValueType;
++
++/*
++ * All the different kind of addresses we can have.
++ */
++typedef enum {
++	MONO_HSSA_ADDRESS_NONE = 0,
++	MONO_HSSA_ADDRESS_HEAP = 1,
++	MONO_HSSA_ADDRESS_LOCAL = 2,
++} MonoHssaAddressType;
++
++typedef struct MonoHssaBaseAddress {
++	MonoHssaAddressType type;
++	struct MonoHssaValue *value;
++} MonoHssaBaseAddress;
++
++
++typedef struct MonoHssaHeapAddressValueUse {
++	struct MonoHssaHeapAddressValueDefinition *definition;
++	MonoInst *use;
++	struct MonoHssaHeapAddressValueUse *previous;
++	struct MonoHssaHeapAddressValueUse *next;
++} MonoHssaHeapAddressValueUse;
++
++typedef struct MonoHssaHeapAddressValueDefinition {
++	struct MonoHssaValue *value;
++	struct MonoHssaHeapAddress *address;
++	MonoInst *definition;
++	guint16 affected_bytes;
++	gboolean is_used_by_mu;
++	gboolean is_killed_by_chi;
++	
++	struct MonoHssaHeapAddressValueUse *uses;
++	struct MonoHssaHeapAddressValueUse **phi_arguments_uses;
++	
++	struct MonoHssaHeapAddressValueDefinition *previous;
++	struct MonoHssaHeapAddressValueDefinition *next;
++} MonoHssaHeapAddressValueDefinition;
++
++
++typedef struct MonoHssaHeapAddressData {
++	SetOfAliasingClasses aliasing_classes;
++	struct MonoHssaValue *base_address;
++	struct MonoHssaValue *offset;
++	
++	struct MonoHssaHeapAddressValueDefinition *definitions;
++	
++	struct MonoHssaHeapAddressValueDefinition *current_definition;
++	struct MonoHssaHeapAddress *next_address_with_known_value;
++	struct MonoHssaHeapAddress *next_used_heap_address;
++} MonoHssaHeapAddressData;
++
++typedef struct MonoHssaHeapAddress {
++	MonoHssaBaseAddress base;
++	MonoHssaHeapAddressData data;
++} MonoHssaHeapAddress;
++
++
++
++typedef struct MonoHssaLocalAddressData {
++	struct MonoHssaLocalVariable *base_variable;
++	struct MonoHssaValue *offset;
++} MonoHssaLocalAddressData;
++
++typedef struct MonoHssaLocalAddress {
++	MonoHssaBaseAddress base;
++	MonoHssaLocalAddressData data;
++} MonoHssaLocalAddress;
++
++
++typedef struct MonoHssaAddress {
++	MonoHssaBaseAddress base;
++	union {
++		MonoHssaHeapAddressData heap_address;
++		MonoHssaLocalAddressData local_address;
++	} data;
++} MonoHssaAddress;
++
++typedef struct MonoHssaLocalAddresses {
++	struct MonoHssaLocalAddress *address;
++	struct MonoHssaLocalAddresses *next;
++} MonoHssaLocalAddresses;
++
++typedef struct MonoHssaBaseValue {
++	MonoHssaValueType type;
++	guint32 value_number;
++	union {
++		MonoHssaAddress *generic;
++		MonoHssaLocalAddress *local;
++		MonoHssaHeapAddress *heap;
++	} address;
++} MonoHssaBaseValue;
++
++
++typedef struct MonoHssaPrimitiveValueData {
++	guint32 value_id;
++	MonoInst *location;
++} MonoHssaPrimitiveValueData;
++
++typedef struct MonoHssaPrimitiveValue {
++	MonoHssaBaseValue base;
++	MonoHssaPrimitiveValueData data;
++} MonoHssaPrimitiveValue;
++
++typedef struct MonoHssaConstantValueData {
++	union {
++		int integer_constant;
++		gint64* long_constant;
++		float* float_constant;
++		double* double_constant;
++	} value;
++} MonoHssaConstantValueData;
++
++typedef struct MonoHssaConstantValue {
++	MonoHssaBaseValue base;
++	MonoHssaConstantValueData data;
++} MonoHssaConstantValue;
++
++typedef struct MonoHssaComputedValueData {
++	guint16 opcode;
++	struct MonoHssaValue *left_operand;
++	struct MonoHssaValue *right_operand;
++} MonoHssaComputedValueData;
++
++typedef struct MonoHssaComputedValue {
++	MonoHssaBaseValue base;
++	MonoHssaComputedValueData data;
++} MonoHssaComputedValue;
++
++typedef struct MonoHssaPhiValueData {
++	int number_of_alternatives;
++	struct MonoHssaValue **alternatives;
++	struct MonoHssaBB *join_point;
++} MonoHssaPhiValueData;
++
++typedef struct MonoHssaPhiValue {
++	MonoHssaBaseValue base;
++	MonoHssaPhiValueData data;
++} MonoHssaPhiValue;
++
++typedef struct MonoHssaLocalValueData {
++	guint variable_index;
++} MonoHssaLocalValueData;
++
++typedef struct MonoHssaLocalValue {
++	MonoHssaBaseValue base;
++	MonoHssaLocalValueData data;
++} MonoHssaLocalValue;
++
++typedef struct MonoHssaValue {
++	MonoHssaBaseValue base;
++	union {
++		MonoHssaPrimitiveValueData primitive;
++		MonoHssaConstantValueData constant;
++		MonoHssaComputedValueData computed;
++		MonoHssaPhiValueData phi;
++		MonoHssaLocalValueData local;
++	} data;
++} MonoHssaValue;
++
++
++typedef struct MonoHssaMonoInstInfo {
++	union {
++		struct MonoHssaTypeBasedAliasingClass *aliasing_class;
++		MonoHssaValue *value;
++	} data;
++	union {
++		MonoInst *previous;
++		MonoInst *father;
++	} link;
++	union {
++		struct MonoHssaLocalVariableUse *local;
++		struct MonoHssaHeapAddressValueUse *heap;
++	} use;
++	gboolean is_local_read      : 1;
++	gboolean is_heap_read       : 1;
++	gboolean has_side_effects   : 1;
++	gboolean is_local_address   : 1;
++	gboolean is_heap_address    : 1;
++	gboolean is_left_operand    : 1;
++	gboolean is_right_operand   : 1;
++	gboolean is_local_immediate : 1;
++} MonoHssaMonoInstInfo;
++
++
++typedef struct MonoHssaValueOccurrence {
++	MonoInst *occurrence;
++	struct MonoHssaValueOccurrence *next;
++} MonoHssaValueOccurrence;
++
++
++typedef struct MonoHssaLocalVariableUse {
++	struct MonoHssaLocalVariableDefinition *definition;
++	struct MonoInst *use;
++	struct MonoHssaLocalVariableUse *previous;
++	struct MonoHssaLocalVariableUse *next;
++} MonoHssaLocalVariableUse;
++
++typedef struct MonoHssaLocalVariableDefinition {
++	MonoInst *ssa_variable_inst;
++	struct MonoHssaLocalVariable *ssa_variable;
++	guint ssa_version;
++	
++	MonoHssaValue *value;
++	MonoInst *definition;
++	
++	struct MonoHssaLocalVariableUse *uses;
++	struct MonoHssaLocalVariableUse **phi_arguments_uses;
++	
++	struct MonoHssaLocalVariableDefinition *previous;
++	struct MonoHssaLocalVariableDefinition *next;
++} MonoHssaLocalVariableDefinition;
++
++
++
++#define HSSA_DEFINITION(_v) ((MonoHssaLocalVariableDefinition*)(_v->data.op[0].p))
++
++typedef struct MonoHssaLocalVariable {
++	guint index;
++	guint next_available_ssa_version;
++	MonoInst *inst;
++	MonoHssaLocalValue local_value;
++	
++	struct MonoHssaValue *address;
++	struct MonoHssaLocalVariableDefinition *definitions;
++} MonoHssaLocalVariable;
++
++
++typedef struct MonoHssaTypeBasedAliasingClasses {
++	struct MonoHssaTypeBasedAliasingClass *aliasing_class;
++	struct MonoHssaTypeBasedAliasingClasses *next;
++} MonoHssaTypeBasedAliasingClasses;
++
++typedef struct MonoHssaTypeBasedAliasingClass {
++	MonoClass *klass;
++	
++	int class_id;
++	SetOfAliasingClasses aliasing_classes;
++	
++	int class_aliasing_classes;
++	int interface_aliasing_classes;
++	
++	struct MonoHssaTypeBasedAliasingClass *father;
++	struct MonoHssaTypeBasedAliasingClass *siblings;
++	struct MonoHssaTypeBasedAliasingClass *first_child;
++	struct MonoHssaTypeBasedAliasingClasses *interfaces;
++	struct MonoHssaTypeBasedAliasingClasses *implementors;
++} MonoHssaTypeBasedAliasingClass;
++
++
++typedef struct MonoHssaCfgData {
++	/* The MonoCompile to which these data are relaed. */
++	MonoCompile *cfg;
++	
++	/* The full name of the compiled method */
++	char *method_name;
++	
++	/* The pool from where everything is allocated (including this struct). */
++	MonoMemPool *mempool;
++	
++	/* A pool used only *constructing* these data (it is then destroyed). */
++	/* MonoMemPool *construction_pool; */
++	
++	int number_of_bblocks;
++	MonoHssaBB *bblocks;
++	MonoHssaBB **bblocks_in_cfg_order;
++	
++	int number_of_local_variables;
++	int local_variables_capaciy;
++	MonoHssaLocalVariable **local_variables;
++	
++	MonoHssaTypeBasedAliasingClass object_aliasing_class;
++	MonoHssaTypeBasedAliasingClass* interface_aliasing_classes;
++	int number_of_aliasing_classes;
++	gboolean method_stores_local_addresses;
++	
++	int next_available_value_number;
++	int next_available_primitive_value_id;
++	
++	MonoHssaBaseValue no_value;
++	MonoHssaValue *zero;
++	GHashTable *constant_values;
++	GHashTable *computed_values;
++	
++	int dt_depth;
++	MonoHssaBB **phi_computation_bank;
++	
++	MonoHssaHeapAddress *addresses_with_known_value;
++	
++	MonoHssaHeapAddress *used_heap_addresses;
++	MonoHssaHeapAddress *last_used_heap_address;
++	
++	MonoHssaLocalAddresses *local_addresses_passed_as_parameters;
++	MonoHssaLocalAddresses *nodes_for_local_addresses_passed_as_parameters;
++	
++	MonoHssaLocalVariableDefinition *deadce_local_worklist;
++	MonoHssaHeapAddressValueDefinition *deadce_heap_worklist;
++	int deadce_total_local_stores;
++	int deadce_dead_local_stores;
++	int deadce_total_heap_stores;
++	int deadce_dead_heap_stores;
++} MonoHssaCfgData;
++
++void
++mono_build_hssa (MonoCompile *cfg);
++void
++mono_destroy_hssa (MonoCompile *cfg);
++void
++mono_hssa_deadce (MonoHssaCfgData *hssa);
++
++#endif /* __MONO_HSSA_H__ */
+Index: mono/mono/mini/Makefile.am
+===================================================================
+--- mono/mono/mini/Makefile.am	(revision 53232)
++++ mono/mono/mini/Makefile.am	(working copy)
+@@ -182,6 +182,8 @@
+ 	ssa.c		\
+ 	abcremoval.c	\
+ 	abcremoval.h	\
++	hssa.c	\
++	hssa.h	\
+ 	ssapre.c	\
+ 	ssapre.h	\
+ 	aliasing.c	\

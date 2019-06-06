@@ -1,0 +1,161 @@
+? t
+Index: inssel-x86.brg
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/inssel-x86.brg,v
+retrieving revision 1.17
+diff -u -r1.17 inssel-x86.brg
+--- inssel-x86.brg	17 Feb 2004 17:15:14 -0000	1.17
++++ inssel-x86.brg	1 Apr 2004 19:06:30 -0000
+@@ -1,3 +1,39 @@
++#define MONO_EMIT_NEW_X86_COMPARE_MEMBASE_REG(cfg,basereg,offset,operand) do { \
++		MonoInst *inst; \
++		inst = mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoInst));	\
++		inst->opcode = OP_X86_COMPARE_MEMBASE_REG; \
++		inst->inst_basereg = basereg; \
++		inst->inst_offset = offset; \
++		inst->sreg2 = operand; \
++		mono_bblock_add_inst (cfg->cbb, inst); \
++	} while (0)
++
++#define MONO_EMIT_NEW_X86_COMPARE_MEMBASE_IMM(cfg,basereg,offset,operand) do { \
++		MonoInst *inst; \
++		inst = mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoInst));	\
++		inst->opcode = OP_X86_COMPARE_MEMBASE_IMM; \
++		inst->inst_basereg = basereg; \
++		inst->inst_offset = offset; \
++		inst->inst_imm = operand; \
++		mono_bblock_add_inst (cfg->cbb, inst); \
++	} while (0)
++
++/* override the arch independant versions with fast x86 versions */
++
++#undef MONO_EMIT_BOUNDS_CHECK
++#undef MONO_EMIT_BOUNDS_CHECK_IMM
++
++#define MONO_EMIT_BOUNDS_CHECK(cfg, array_reg, array_type, array_length_field, index_reg) do { \
++		MONO_EMIT_NEW_X86_COMPARE_MEMBASE_REG (cfg, array_reg, G_STRUCT_OFFSET (array_type, array_length_field), index_reg); \
++		MONO_EMIT_NEW_COND_EXC (cfg, LE_UN, "IndexOutOfRangeException"); \
++	} while (0)
++
++#define MONO_EMIT_BOUNDS_CHECK_IMM(cfg, array_reg, array_type, array_length_field, index_imm) do { \
++		MONO_EMIT_NEW_X86_COMPARE_MEMBASE_IMM (cfg, array_reg, G_STRUCT_OFFSET (array_type, array_length_field), index_imm); \
++		MONO_EMIT_NEW_COND_EXC (cfg, LE_UN, "IndexOutOfRangeException"); \
++	} while (0)
++
++
+ %%
+ 
+ #
+@@ -349,13 +385,9 @@
+ }
+ 
+ reg: CEE_LDELEMA (reg, reg) "15" {
+-	int length_reg = mono_regstate_next_int (s->rs);
+ 	guint32 size = mono_class_array_element_size (tree->klass);
+ 	
+-	MONO_EMIT_NEW_LOAD_MEMBASE_OP (s, OP_LOADI4_MEMBASE, length_reg, 
+-				       state->left->reg1, G_STRUCT_OFFSET (MonoArray, max_length));
+-	MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, length_reg, state->right->reg1);
+-	MONO_EMIT_NEW_COND_EXC (s, LE_UN, "IndexOutOfRangeException");
++	MONO_EMIT_BOUNDS_CHECK (s, state->left->reg1, MonoArray, max_length, state->right->reg1);
+ 
+ 	if (size == 1 || size == 2 || size == 4 || size == 8) {
+ 		static const int fast_log2 [] = { 1, 0, 1, -1, 2, -1, -1, -1, 3 };
+Index: inssel.brg
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/inssel.brg,v
+retrieving revision 1.36
+diff -u -r1.36 inssel.brg
+--- inssel.brg	26 Mar 2004 15:24:16 -0000	1.36
++++ inssel.brg	1 Apr 2004 19:06:31 -0000
+@@ -245,6 +245,20 @@
+ 		(inst)->opcode = OP_LABEL;	\
+ 	} while (0)
+ 
++#define MONO_EMIT_BOUNDS_CHECK(cfg, array_reg, array_type, array_length_field, index_reg) do { \
++		int _length_reg = mono_regstate_next_int (cfg->rs); \
++		MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, _length_reg, array_reg, G_STRUCT_OFFSET (array_type, array_length_field)); \
++		MONO_EMIT_NEW_BIALU (cfg, OP_COMPARE, -1, _length_reg, index_reg); \
++		MONO_EMIT_NEW_COND_EXC (cfg, LE_UN, "IndexOutOfRangeException"); \
++	} while (0)
++
++#define MONO_EMIT_BOUNDS_CHECK_IMM(cfg, array_reg, array_type, array_length_field, index_imm) do { \
++		int _length_reg = mono_regstate_next_int (cfg->rs); \
++		MONO_EMIT_NEW_LOAD_MEMBASE_OP (cfg, OP_LOADI4_MEMBASE, _length_reg, array_reg, G_STRUCT_OFFSET (array_type, array_length_field)); \
++		MONO_EMIT_NEW_BIALU_IMM (cfg, OP_COMPARE_IMM, -1, _length_reg, index_imm); \
++		MONO_EMIT_NEW_COND_EXC (cfg, LE_UN, "IndexOutOfRangeException"); \
++	} while (0)
++
+ /* we need to kludge state because monoburg puts this stuff before the definition of MBState */
+ void mini_emit_virtual_call (MonoCompile *s, void *state, MonoInst *tree, int novirt_op, int virtop);
+ void mini_emit_isninst_cast (MonoCompile *s, int klass_reg, MonoClass *klass, MonoInst *false_target, MonoInst *true_target);
+@@ -1691,15 +1705,10 @@
+ # string support
+ #
+ reg: OP_GETCHR (reg, reg) {
+-	int length_reg = mono_regstate_next_int (s->rs);
+ 	int mult_reg = mono_regstate_next_int (s->rs);
+ 	int add_reg = mono_regstate_next_int (s->rs);
+ 	
+-	MONO_EMIT_NEW_LOAD_MEMBASE_OP (s, OP_LOADI4_MEMBASE, length_reg, 
+-				       state->left->reg1, G_STRUCT_OFFSET (MonoString, length));
+-	MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, length_reg, state->right->reg1);
+-	MONO_EMIT_NEW_COND_EXC (s, LE_UN, "IndexOutOfRangeException");
+-
++	MONO_EMIT_BOUNDS_CHECK (s, state->left->reg1, MonoString, length, state->right->reg1);
+ 	MONO_EMIT_NEW_BIALU_IMM (s, OP_SHL_IMM, mult_reg, state->right->reg1, 1);
+ 	MONO_EMIT_NEW_BIALU (s, CEE_ADD, add_reg, mult_reg, state->left->reg1);
+ 	MONO_EMIT_LOAD_MEMBASE_OP (s, tree, OP_LOADU2_MEMBASE, state->reg1, 
+@@ -1707,14 +1716,9 @@
+ }
+ 
+ reg: OP_GETCHR (reg, OP_ICONST) {
+-	int length_reg = mono_regstate_next_int (s->rs);
+-	int ind;
++	int ind = 2 * state->right->tree->inst_c0 + G_STRUCT_OFFSET (MonoString, chars);
+ 
+-	MONO_EMIT_NEW_LOAD_MEMBASE (s, length_reg, state->left->reg1, G_STRUCT_OFFSET (MonoString, length));
+-	MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, length_reg, state->right->tree->inst_c0);
+-	MONO_EMIT_NEW_COND_EXC (s, LE_UN, "IndexOutOfRangeException");
+-       
+-	ind = 2 * state->right->tree->inst_c0 + G_STRUCT_OFFSET (MonoString, chars);
++	MONO_EMIT_BOUNDS_CHECK_IMM (s, state->left->reg1, MonoString, length, state->right->tree->inst_c0);
+ 	MONO_EMIT_LOAD_MEMBASE_OP (s, tree, OP_LOADU2_MEMBASE, state->reg1, state->left->reg1, ind);
+ }
+ 
+@@ -1765,31 +1769,20 @@
+ }
+ 
+ reg: CEE_LDELEMA (reg, OP_ICONST) "15" {
+-	int length_reg = mono_regstate_next_int (s->rs);
+ 	guint32 size = mono_class_array_element_size (tree->klass);
+-	int ind;
+ 
+-	MONO_EMIT_NEW_LOAD_MEMBASE_OP (s, OP_LOADI4_MEMBASE, length_reg, 
+-				       state->left->reg1, G_STRUCT_OFFSET (MonoArray, max_length));
+-	MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, length_reg, state->right->tree->inst_c0);
+-	MONO_EMIT_NEW_COND_EXC (s, LE_UN, "IndexOutOfRangeException");
+-       
+-	ind = size * state->right->tree->inst_c0 + G_STRUCT_OFFSET (MonoArray, vector);
+-	
++	int ind = size * state->right->tree->inst_c0 + G_STRUCT_OFFSET (MonoArray, vector);
++
++	MONO_EMIT_BOUNDS_CHECK_IMM (s, state->left->reg1, MonoArray, max_length, state->right->tree->inst_c0);
+ 	MONO_EMIT_NEW_BIALU_IMM (s, OP_ADD_IMM, state->reg1, state->left->reg1, ind);
+ }
+ 
+ reg: CEE_LDELEMA (reg, reg) "20" {
+-	int length_reg = mono_regstate_next_int (s->rs);
+ 	int mult_reg = mono_regstate_next_int (s->rs);
+ 	int add_reg = mono_regstate_next_int (s->rs);
+ 	guint32 size = mono_class_array_element_size (tree->klass);
+-	
+-	MONO_EMIT_NEW_LOAD_MEMBASE_OP (s, OP_LOADI4_MEMBASE, length_reg, 
+-				       state->left->reg1, G_STRUCT_OFFSET (MonoArray, max_length));
+-	MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, length_reg, state->right->reg1);
+-	MONO_EMIT_NEW_COND_EXC (s, LE_UN, "IndexOutOfRangeException");
+ 
++	MONO_EMIT_BOUNDS_CHECK (s, state->left->reg1, MonoArray, max_length, state->right->reg1);
+ 	MONO_EMIT_NEW_BIALU_IMM (s, OP_MUL_IMM, mult_reg, state->right->reg1, size);
+ 	MONO_EMIT_NEW_BIALU (s, CEE_ADD, add_reg, mult_reg, state->left->reg1);
+ 	MONO_EMIT_NEW_BIALU_IMM (s, OP_ADD_IMM, state->reg1, add_reg, G_STRUCT_OFFSET (MonoArray, vector));

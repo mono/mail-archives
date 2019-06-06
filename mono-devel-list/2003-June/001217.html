@@ -1,0 +1,462 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Sorting in XPath
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Sorting%20in%20XPath&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001230.html">
+   <LINK REL="Next"  HREF="001218.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Sorting in XPath</H1>
+    <B>Ben Maurer</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Sorting%20in%20XPath&In-Reply-To="
+       TITLE="[Mono-devel-list] Sorting in XPath">bmaurer at users.sourceforge.net
+       </A><BR>
+    <I>Mon Jun 23 20:14:59 EDT 2003</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001230.html">[Mono-devel-list] xsp listen 80
+</A></li>
+        <LI>Next message: <A HREF="001218.html">[Mono-devel-list] new ThreadPool implementation
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1217">[ date ]</a>
+              <a href="thread.html#1217">[ thread ]</a>
+              <a href="subject.html#1217">[ subject ]</a>
+              <a href="author.html#1217">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello all,
+
+I have implemented sorting in XPath. I am attaching the patch that adds
+support for the AddSort (...) methods. It also contains NUnit tests.
+
+I would appreciate a review for this patch.
+
+-- Ben 
+-------------- next part --------------
+? Test/System.Xml.XPath/tmp
+Index: System.Xml.XPath/ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/class/System.XML/System.Xml.XPath/ChangeLog,v
+retrieving revision 1.34
+diff -u -r1.34 ChangeLog
+--- System.Xml.XPath/ChangeLog	28 Apr 2003 21:00:33 -0000	1.34
++++ System.Xml.XPath/ChangeLog	24 Jun 2003 00:23:17 -0000
+@@ -1,3 +1,7 @@
++2003-06-23  Ben Maurer &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">bmaurer at users.sourceforge.net</A>&gt;
++	
++	* Expression.cs: Added support for sorts.
++
+ 2003-04-28  Piers Haken  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">piersh at friskit.com</A>&gt;
+ 
+ 	* Parser.jay, Tokenizer.cs: more compliant lexical parsing of ambiguous tokens
+Index: System.Xml.XPath/Expression.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.XML/System.Xml.XPath/Expression.cs,v
+retrieving revision 1.10
+diff -u -r1.10 Expression.cs
+--- System.Xml.XPath/Expression.cs	7 Apr 2003 10:55:13 -0000	1.10
++++ System.Xml.XPath/Expression.cs	24 Jun 2003 00:23:17 -0000
+@@ -9,9 +9,11 @@
+ using System;
+ using System.IO;
+ using System.Collections;
++using System.Globalization;
+ using System.Xml;
+ using System.Xml.XPath;
+ using System.Xml.Xsl;
++using Mono.Xml.XPath;
+ 
+ namespace System.Xml.XPath
+ {
+@@ -46,17 +48,40 @@
+ 		internal XmlNamespaceManager NamespaceManager { get { return _nsm; } }
+ 		public override String Expression { get { return _expr.ToString (); }}
+ 		public override XPathResultType ReturnType { get { return _expr.ReturnType; }}
+-		[MonoTODO]
+-		public override void AddSort (Object obj, IComparer cmp)
++		
++		public override void AddSort (object query, IComparer cmp)
+ 		{
+-			throw new NotImplementedException ();
++			Expression e = ExpFromObj (query);
++			if (!(this._expr is ExprSort))
++				this._expr = new ExprSort (this._expr);
++			
++			((ExprSort)this._expr).AddSort (e, cmp);
++		
+ 		}
+-		[MonoTODO]
+-		public override void AddSort(object obj, XmlSortOrder sortOrder, XmlCaseOrder caseOrder, string str, XmlDataType type)
++		
++		public override void AddSort(object query, XmlSortOrder sortOrder, XmlCaseOrder caseOrder, string lang, XmlDataType type)
+ 		{
+-			throw new NotImplementedException ();
++			Expression e = ExpFromObj (query);
++			if (!(this._expr is ExprSort))
++				this._expr = new ExprSort (this._expr);
++			
++			((ExprSort)this._expr).AddSort (e, sortOrder, caseOrder, lang, type);
+ 		}
++		
++		static Expression ExpFromObj (object query)
++		{
++			if (query is CompiledExpression) return ((CompiledExpression)query)._expr;
++			if (query is String) return Compile ((string)query);
+ 
++			throw new XPathException (&quot;Invalid query object&quot;);
++		}
++		static Expression Compile (string xpath)
++		{
++			Tokenizer tokenizer = new Tokenizer (xpath);
++			XPathParser parser = new XPathParser ();
++			return (Expression)parser.yyparseSafe (tokenizer);
++		}
++		
+ 		public object Evaluate (BaseIterator iter)
+ 		{
+ 			try
+@@ -1054,6 +1079,212 @@
+ 				}
+ 			}
+ 			return func.Invoke (context, rgArgs, iter.Current);
++		}
++	}
++	
++	internal class ExprSort : NodeSet
++	{
++		Expression exp;
++		
++		ArrayList sortExpressions;
++		ArrayList comparers;
++			
++		public ExprSort (Expression exp) {
++			this.exp = exp;
++			sortExpressions = new ArrayList ();
++			comparers = new ArrayList ();
++		}
++			
++		public void AddSort (Expression query, IComparer cmp)
++		{
++			if (query.ReturnType == XPathResultType.NodeSet)
++				query = new ExprFunctionCall (&quot;string&quot;, new FunctionArguments (query, null));
++				
++			sortExpressions.Add (query);
++			comparers.Add (cmp);
++		}
++		
++		public void AddSort (Expression query, XmlSortOrder sortOrder, XmlCaseOrder caseOrder, string lang, XmlDataType type)
++		{
++			CultureInfo cinfo;
++			
++			if (lang == null || lang == String.Empty)
++				cinfo = System.Threading.Thread.CurrentThread.CurrentCulture;
++			else
++				cinfo = new CultureInfo(lang);
++			
++			AddSort (query, new XPathComparer (sortOrder, caseOrder, cinfo, type));
++		}
++			
++		public override String ToString () { return &quot;sort &quot; + exp.ToString ();}
++		public override object Evaluate (BaseIterator iter)
++		{
++			BaseIterator baseItr = exp.EvaluateNodeSet (iter);
++			int numSorts = sortExpressions.Count;
++			SortedList results = new SortedList (new MultiSortComparer (comparers));
++			
++			while (baseItr.MoveNext ()) {
++
++				MultiSortKey key = new MultiSortKey (numSorts);
++
++				for (int i = 0; i &lt; numSorts; i++) {
++					Expression e = (Expression)sortExpressions [i];
++					key.Parts [i] = e.Evaluate (baseItr);
++				}
++				
++				results.Add (key, baseItr.Current.Clone ());
++			}
++			
++			return new SortIterator (iter, results);
++		}
++		
++		
++		class SortIterator : BaseIterator
++		{
++			SortedList nodes;
++			int pos = -1;
++	
++			public SortIterator (BaseIterator iter, SortedList nodes) : base (iter)
++			{
++				this.nodes = nodes;
++			}
++	
++			private SortIterator (SortIterator other) : base (other)
++			{
++				this.nodes = (SortedList) other.nodes.Clone ();
++				pos = other.pos;
++			}
++			public override XPathNodeIterator Clone () { return new SortIterator (this); }
++	
++			public override bool MoveNext ()
++			{
++				return ++pos &lt; nodes.Count;
++			}
++			public override XPathNavigator Current
++			{
++				get {
++					return (XPathNavigator) nodes.GetByIndex (pos);
++				}
++			}
++			
++			public override int CurrentPosition { get { return pos; }}
++		}
++		
++		class XPathComparer : IComparer {
++			
++			private XmlSortOrder sortOrder;
++			private XmlCaseOrder caseOrder;
++			private CultureInfo cinfo;
++			private XmlDataType dataType;
++	
++			internal XPathComparer (XmlSortOrder sortOrder, XmlCaseOrder caseOrder, CultureInfo cinfo, XmlDataType dataType)
++			{
++				this.sortOrder = sortOrder;
++				this.caseOrder = caseOrder;
++				this.cinfo = cinfo;
++				// Is this right?
++				if (dataType != XmlDataType.Text &amp;&amp; dataType != XmlDataType.Number)
++					throw new ArgumentException (&quot;dataType&quot;);
++				this.dataType = dataType;
++			}
++			
++			public int Compare (object x, object y)
++			{
++				int sortMul = (sortOrder == XmlSortOrder.Ascending) ? -1 : 1;
++				switch (dataType) {
++					case XmlDataType.Text:
++						string strX = x.ToString ();
++						string strY = y.ToString ();
++						int result = String.Compare (strX, strY, true, cinfo);
++						if (result != 0 || caseOrder == XmlCaseOrder.None)
++							return (sortMul * result);
++	
++						// so, they are equal in case
++						int caseMul = (caseOrder == XmlCaseOrder.LowerFirst) ? 1 : -1;
++						return sortMul * caseMul * String.Compare (strX, strY, false, cinfo);
++	
++					case XmlDataType.Number:
++						double dblX = ToDouble (x);
++						double dblY = ToDouble (y);
++	
++						// Easy
++						if (dblX &gt;  dblY) return  sortMul;
++						if (dblY &lt;  dblX) return -sortMul;
++						if (dblX == dblY) return 0;
++						
++						
++						if (Double.IsNaN (dblX)) {
++							if (Double.IsNaN (dblY)) {
++								return 0;
++							}
++							// NaN &gt; anything
++							return -sortMul;
++						}
++						// NaN &gt; anything
++						return sortMul;
++				}
++				throw new Exception ();
++				
++			}
++			static double ToDouble (object o)
++			{
++				switch (Type.GetTypeCode(o.GetType ())) {
++				case TypeCode.String :
++					try {
++						string str = ((string)o).Trim ();
++						return Double.Parse(str, NumberStyles.AllowLeadingSign|NumberStyles.AllowDecimalPoint, NumberFormatInfo.InvariantInfo);
++					} catch {}
++					return Double.NaN;
++				case TypeCode.Double :
++					return (double)o;
++				case TypeCode.Boolean :
++					return (bool)o ? 1.0 : 0.0;
++				default :
++						return Convert.ToDouble (o, NumberFormatInfo.InvariantInfo); 
++				}
++			}
++
++		}
++		
++		class MultiSortComparer : IComparer {
++			ArrayList cmpArray;
++	
++			internal MultiSortComparer (ArrayList cmpArray)
++			{
++				this.cmpArray = cmpArray;
++			}
++	
++			int IComparer.Compare (object x, object y)
++			{			
++				return Compare ((MultiSortKey)x, (MultiSortKey)y);
++			}
++	
++			public int Compare (MultiSortKey x, MultiSortKey y)
++			{
++				int i = 0;
++				
++				foreach (IComparer cmp in cmpArray) {
++					
++					int result = cmp.Compare (x.Parts [i], y.Parts [i]);
++					if (result != 0) return result;
++					i++;
++				}
++	
++				// Preserve document order
++				return 1;
++			}
++		}
++		
++		class MultiSortKey {
++			
++			object [] parts;
++	
++			public MultiSortKey (int n)
++			{
++				parts = new object [n];
++			}
++		
++			public object [] Parts { get { return parts; } }
+ 		}
+ 	}
+ }
+Index: Test/System.Xml.XPath/ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/class/System.XML/Test/System.Xml.XPath/ChangeLog,v
+retrieving revision 1.4
+diff -u -r1.4 ChangeLog
+--- Test/System.Xml.XPath/ChangeLog	1 Jun 2003 05:58:05 -0000	1.4
++++ Test/System.Xml.XPath/ChangeLog	24 Jun 2003 00:23:17 -0000
+@@ -1,3 +1,7 @@
++2003-06-23  Ben Maurer &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">bmaurer at users.sourceforge.net</A>&gt;
++
++	* XPathNavigatorTests.cs: Added tests for sorting.
++
+ 2003-06-01  Atsushi Enomoto &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">ginga at kit.hi-ho.ne.jp</A>&gt;
+ 
+ 	* XPathNavigatorTests.cs : added DocumentWithProcessingInstruction().
+Index: Test/System.Xml.XPath/XPathNavigatorTests.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.XML/Test/System.Xml.XPath/XPathNavigatorTests.cs,v
+retrieving revision 1.4
+diff -u -r1.4 XPathNavigatorTests.cs
+--- Test/System.Xml.XPath/XPathNavigatorTests.cs	1 Jun 2003 05:58:05 -0000	1.4
++++ Test/System.Xml.XPath/XPathNavigatorTests.cs	24 Jun 2003 00:23:17 -0000
+@@ -204,5 +204,80 @@
+ 			XPathNodeIterator iter = navigator.SelectChildren (XPathNodeType.Element);
+ 			AssertEquals (0, iter.Count);
+ 		}
++		[Test]
++		public void TestSort ()
++		{
++			// This is from MSDN
++			document.LoadXml (@&quot;
++&lt;?xml version='1.0'?&gt;
++&lt;bookstore xmlns:bk='urn:samples'&gt;
++  &lt;book genre='novel' publicationdate='1997' bk:ISBN='1-861001-57-8' id='1'&gt;
++    &lt;title&gt;Pride And Prejudice&lt;/title&gt;
++    &lt;author&gt;
++      &lt;first-name&gt;Jane&lt;/first-name&gt;
++      &lt;last-name&gt;Austen&lt;/last-name&gt;
++    &lt;/author&gt;
++    &lt;price&gt;24.95&lt;/price&gt;
++  &lt;/book&gt;
++  &lt;book genre='novel' publicationdate='1992' bk:ISBN='1-861002-30-1' id='2'&gt;
++    &lt;title&gt;The Handmaid's Tale&lt;/title&gt;
++    &lt;author&gt;
++      &lt;first-name&gt;Margaret&lt;/first-name&gt;
++      &lt;last-name&gt;Atwood&lt;/last-name&gt;
++    &lt;/author&gt;
++    &lt;price&gt;29.95&lt;/price&gt;
++  &lt;/book&gt;
++  &lt;book genre='novel' publicationdate='1991' bk:ISBN='1-861001-57-6' id='3'&gt;
++    &lt;title&gt;Emma&lt;/title&gt;
++    &lt;author&gt;
++      &lt;first-name&gt;jane&lt;/first-name&gt;
++      &lt;last-name&gt;Austen&lt;/last-name&gt;
++    &lt;/author&gt;
++    &lt;price&gt;19.95&lt;/price&gt;
++  &lt;/book&gt;
++  &lt;book genre='novel' publicationdate='1982' bk:ISBN='1-861001-45-3' id='4'&gt;
++    &lt;title&gt;Sense and Sensibility&lt;/title&gt;
++    &lt;author&gt;
++      &lt;first-name&gt;Jane&lt;/first-name&gt;
++      &lt;last-name&gt;Austen&lt;/last-name&gt;
++    &lt;/author&gt;
++    &lt;price&gt;19.95&lt;/price&gt;
++  &lt;/book&gt;
++&lt;/bookstore&gt;
++			&quot;);
++			navigator = document.CreateNavigator ();
++			
++			XPathExpression expr; 
++			XPathNodeIterator iterator;
++			
++			expr = navigator.Compile (&quot;descendant::book[author/last-name='Austen']&quot;);
++			expr.AddSort (&quot;price&quot;, XmlSortOrder.Ascending, XmlCaseOrder.None, &quot;&quot;, XmlDataType.Number);
++			AssertItrVals (&quot;a&quot;, navigator.Select(expr), 3, 4, 1);
++			
++			expr = navigator.Compile (&quot;descendant::book[author/last-name='Austen']&quot;);
++			expr.AddSort (&quot;price&quot;, XmlSortOrder.Descending, XmlCaseOrder.None, &quot;&quot;, XmlDataType.Number);
++			AssertItrVals (&quot;b&quot;, navigator.Select(expr), 1, 3, 4);
++			
++			expr = navigator.Compile (&quot;descendant::book[author/last-name='Austen']&quot;);
++			expr.AddSort (&quot;title&quot;, XmlSortOrder.Descending, XmlCaseOrder.None, &quot;&quot;, XmlDataType.Text);
++			AssertItrVals (&quot;c&quot;, navigator.Select(expr), 3, 1, 4);
++			
++			expr = navigator.Compile (&quot;descendant::book[author/last-name='Austen']&quot;);
++			expr.AddSort (&quot;title&quot;, XmlSortOrder.Ascending, XmlCaseOrder.None, &quot;&quot;, XmlDataType.Text);
++			AssertItrVals (&quot;d&quot;, navigator.Select(expr), 4, 1, 3);
++			
++						
++			expr = navigator.Compile (&quot;descendant::book[author/last-name='Austen']&quot;);
++			expr.AddSort (&quot;author/first-name&quot;, XmlSortOrder.Ascending, XmlCaseOrder.LowerFirst, &quot;&quot;, XmlDataType.Text);
++			AssertItrVals (&quot;e&quot;, navigator.Select(expr), 1, 4, 3);
++		}
++		
++		static void AssertItrVals (string s, XPathNodeIterator itr, params int [] v) {
++			for (int i = 0; i &lt; v.Length; i++) {
++				AssertEquals (s, true, itr.MoveNext ());
++				AssertEquals (s, v [i], int.Parse(itr.Current.GetAttribute (&quot;id&quot;, &quot;&quot;)));
++			}
++			AssertEquals (s, false, itr.MoveNext ());
++		}
+ 	}
+ }
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001230.html">[Mono-devel-list] xsp listen 80
+</A></li>
+	<LI>Next message: <A HREF="001218.html">[Mono-devel-list] new ThreadPool implementation
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1217">[ date ]</a>
+              <a href="thread.html#1217">[ thread ]</a>
+              <a href="subject.html#1217">[ subject ]</a>
+              <a href="author.html#1217">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,232 @@
+Index: System.ServiceModel.Dispatcher/ChannelDispatcher.cs
+===================================================================
+--- System.ServiceModel.Dispatcher/ChannelDispatcher.cs	(revision 154044)
++++ System.ServiceModel.Dispatcher/ChannelDispatcher.cs	(working copy)
+@@ -130,7 +130,7 @@
+ 			endpoints = new EndpointDispatcherCollection (this);
+ 		}
+ 
+-		internal void InitializeServiceEndpoint (Type serviceType, ServiceEndpoint se)
++		internal EndpointDispatcher InitializeServiceEndpoint (Type serviceType, ServiceEndpoint se)
+ 		{
+ 			this.MessageVersion = se.Binding.MessageVersion;
+ 			if (this.MessageVersion == null)
+@@ -140,6 +140,7 @@
+ 			EndpointDispatcher ed = new EndpointDispatcher (se.Address, se.Contract.Name, se.Contract.Namespace);
+ 			this.Endpoints.Add (ed);
+ 			ed.InitializeServiceEndpoint (false, serviceType, se);
++			return ed;
+ 		}
+ 
+ 		public string BindingName {
+@@ -264,7 +265,7 @@
+ 			AsyncCallback callback, object state)
+ 		{
+ 			if (open_delegate == null)
+-				open_delegate = new Action<TimeSpan> (OnClose);
++				open_delegate = new Action<TimeSpan> (OnOpen);		
+ 			return open_delegate.BeginInvoke (timeout, callback, state);
+ 		}
+ 
+@@ -450,7 +451,7 @@
+ 					LoopCore ();
+ 				} catch (Exception ex) {
+ 					// FIXME: log it
+-					Console.WriteLine ("ChannelDispatcher caught an exception inside dispatcher loop, which is likely thrown by the channel listener {0}", owner.Listener);
++					Console.WriteLine ("ListenerLoopManager caught an exception inside dispatcher loop, which is likely thrown by the channel listener {0}", owner.Listener);
+ 					Console.WriteLine (ex);
+ 				} finally {
+ 					if (stop_handle != null)
+@@ -486,26 +487,29 @@
+ 
+ 			void ChannelAccepted (IChannel ch)
+ 			{
+-			try {
+-				if (ch == null) // could happen when it was aborted
+-					return;
+-				if (!loop) {
+-					var dis = ch as IDisposable;
+-					if (dis != null)
+-						dis.Dispose ();
+-					return;
+-				}
++				try {
++					if (ch == null) // could happen when it was aborted
++						return;
++					if (!loop) {
++						var dis = ch as IDisposable;
++						if (dis != null)
++							dis.Dispose ();
++						return;
++					}
+ 
+-				channels.Add (ch);
++				lock ( channels )	
++					channels.Add (ch);
+ 				ch.Opened += delegate {
+ 					ch.Faulted += delegate {
+-						if (channels.Contains (ch))
+-							channels.Remove (ch);
++						lock ( channels )	
++							if (channels.Contains (ch))
++								channels.Remove (ch);
+ 						throttle_wait_handle.Set (); // release loop wait lock.
+ 						};
+ 					ch.Closed += delegate {
+-						if (channels.Contains (ch))
+-							channels.Remove (ch);
++						lock ( channels )	 
++							if (channels.Contains (ch))
++								channels.Remove (ch);
+ 						throttle_wait_handle.Set (); // release loop wait lock.
+ 						};
+ 					};
+@@ -567,7 +571,7 @@
+ 
+ 					MessageVersion version = rc.RequestMessage.Version;
+ 					FaultCode fc = new FaultCode ("DestinationUnreachable", version.Addressing.Namespace);
+-					Message res = Message.CreateMessage (version, fc, "error occured", rc.RequestMessage.Headers.Action);
++					Message res = Message.CreateMessage (version, fc, ex.Message, rc.RequestMessage.Headers.Action);
+ 					rc.Reply (res);
+ 				} catch (Exception e) {
+ 					// FIXME: log it
+Index: System.ServiceModel/ServiceHostBase.cs
+===================================================================
+--- System.ServiceModel/ServiceHostBase.cs	(revision 154044)
++++ System.ServiceModel/ServiceHostBase.cs	(working copy)
+@@ -300,7 +300,7 @@
+ 				//base addresses
+ 				HostElement host = service.Host;
+ 				foreach (BaseAddressElement baseAddress in host.BaseAddresses) {
+-					AddBaseAddress (new Uri (baseAddress.BaseAddress));
++					base_addresses.Add (new Uri (baseAddress.BaseAddress));
+ 				}
+ 
+ 				// behaviors
+@@ -375,18 +375,18 @@
+ 			//Build all ChannelDispatchers, one dispatcher per user configured EndPoint.
+ 			//We must keep thet ServiceEndpoints as a seperate collection, since the user
+ 			//can change the collection in the description during the behaviors events.
+-			Dictionary<ServiceEndpoint, ChannelDispatcher> endPointToDispatcher = new Dictionary<ServiceEndpoint,ChannelDispatcher>();
+ 			ServiceEndpoint[] endPoints = new ServiceEndpoint[Description.Endpoints.Count];
+ 			Description.Endpoints.CopyTo (endPoints, 0);
++			var builder = new DispatcherBuilder ();
+ 			foreach (ServiceEndpoint se in endPoints) {
+ 
+ 				var commonParams = new BindingParameterCollection ();
+ 				foreach (IServiceBehavior b in Description.Behaviors)
+ 					b.AddBindingParameters (Description, this, Description.Endpoints, commonParams);
+ 
+-				var channel = new DispatcherBuilder ().BuildChannelDispatcher (Description.ServiceType, se, commonParams);
+-				ChannelDispatchers.Add (channel);
+-				endPointToDispatcher[se] = channel;
++				var channel = builder.BuildChannelDispatcher (Description.ServiceType, se, commonParams);
++				if ( !ChannelDispatchers.Contains(channel) )
++					ChannelDispatchers.Add (channel);
+ 			}
+ 
+ 			//After the ChannelDispatchers are created, and attached to the service host
+@@ -394,9 +394,7 @@
+ 			foreach (IServiceBehavior b in Description.Behaviors)
+ 				b.ApplyDispatchBehavior (Description, this);
+ 
+-			foreach(KeyValuePair<ServiceEndpoint, ChannelDispatcher> val in endPointToDispatcher)
+-				foreach (var ed in val.Value.Endpoints)
+-					ApplyDispatchBehavior (ed, val.Key);			
++			builder.ApplyDispatchBehaviors();
+ 		}
+ 
+ 		private void ValidateDescription ()
+@@ -410,19 +408,6 @@
+ 				throw new InvalidOperationException ("The ServiceHost must have at least one application endpoint (that does not include metadata exchange contract) defined by either configuration, behaviors or call to AddServiceEndpoint methods.");
+ 		}
+ 
+-		private void ApplyDispatchBehavior (EndpointDispatcher ed, ServiceEndpoint endPoint)
+-		{
+-			foreach (IContractBehavior b in endPoint.Contract.Behaviors)
+-				b.ApplyDispatchBehavior (endPoint.Contract, endPoint, ed.DispatchRuntime);
+-			foreach (IEndpointBehavior b in endPoint.Behaviors)
+-				b.ApplyDispatchBehavior (endPoint, ed);
+-			foreach (OperationDescription operation in endPoint.Contract.Operations) {
+-				foreach (IOperationBehavior b in operation.Behaviors)
+-					b.ApplyDispatchBehavior (operation, ed.DispatchRuntime.Operations [operation.Name]);
+-			}
+-
+-		}
+-
+ 		[MonoTODO]
+ 		protected void LoadConfigurationSection (ServiceElement element)
+ 		{
+@@ -596,20 +581,67 @@
+ 		*/
+ 	}
+ 
++	/// <summary>
++	///  Builds ChannelDispatchers as appropriate to service the service endpoints. 
++	/// </summary>
++	/// <remarks>Will re-use ChannelDispatchers when two endpoint uris are the same</remarks>
+ 	partial class DispatcherBuilder
+ 	{
++		List<ChannelDispatcher> built_dispatchers = new List<ChannelDispatcher>();
++		Dictionary<ServiceEndpoint, EndpointDispatcher> ep_to_dispatcher_ep = new Dictionary<ServiceEndpoint, EndpointDispatcher>();
++		
+ 		internal ChannelDispatcher BuildChannelDispatcher (Type serviceType, ServiceEndpoint se, BindingParameterCollection commonParams)
+ 		{
+ 			//Let all behaviors add their binding parameters
+ 			AddBindingParameters (commonParams, se);
+-			//User the binding parameters to build the channel listener and Dispatcher
+-			IChannelListener lf = BuildListener (se, commonParams);
+-			ChannelDispatcher cd = new ChannelDispatcher (
+-				lf, se.Binding.Name);
+-			cd.InitializeServiceEndpoint (serviceType, se);
++			
++			// See if there's an existing channel that matches this endpoint
++			ChannelDispatcher cd = FindExistingDispatcher(se);
++			EndpointDispatcher ep;
++			if ( cd != null ) {
++				ep = cd.InitializeServiceEndpoint (serviceType, se);
++			}
++			else {
++				//User the binding parameters to build the channel listener and Dispatcher
++				IChannelListener lf = BuildListener (se, commonParams);
++				cd = new ChannelDispatcher (
++					lf, se.Binding.Name);
++				ep = cd.InitializeServiceEndpoint (serviceType, se);
++				built_dispatchers.Add(cd);
++			}
++			ep_to_dispatcher_ep[se] = ep;
+ 			return cd;
+ 		}
++		
++		private ChannelDispatcher FindExistingDispatcher(ServiceEndpoint se)
++		{
++			Func<ChannelDispatcher, bool> dispatcher_selector = (ChannelDispatcher cd) => 
++			{
++				return (cd.Listener.Uri.Equals(se.ListenUri)) && cd.MessageVersion.Equals(se.Binding.MessageVersion);
++			};
++			
++			return built_dispatchers.FirstOrDefault (dispatcher_selector);
++		}
+ 
++		internal void ApplyDispatchBehaviors()
++		{
++			foreach(KeyValuePair<ServiceEndpoint, EndpointDispatcher> val in ep_to_dispatcher_ep)
++					ApplyDispatchBehavior (val.Value, val.Key);
++		}
++		
++		private void ApplyDispatchBehavior (EndpointDispatcher ed, ServiceEndpoint endPoint)
++		{
++			foreach (IContractBehavior b in endPoint.Contract.Behaviors)
++				b.ApplyDispatchBehavior (endPoint.Contract, endPoint, ed.DispatchRuntime);
++			foreach (IEndpointBehavior b in endPoint.Behaviors)
++				b.ApplyDispatchBehavior (endPoint, ed);
++			foreach (OperationDescription operation in endPoint.Contract.Operations) {
++				foreach (IOperationBehavior b in operation.Behaviors)
++					b.ApplyDispatchBehavior (operation, ed.DispatchRuntime.Operations [operation.Name]);
++			}
++
++		}
++
+ 		private void AddBindingParameters (BindingParameterCollection commonParams, ServiceEndpoint endPoint) {
+ 
+ 			commonParams.Add (ChannelProtectionRequirements.CreateFromContract (endPoint.Contract));

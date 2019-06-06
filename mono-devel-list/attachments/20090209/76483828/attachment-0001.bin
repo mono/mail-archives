@@ -1,0 +1,200 @@
+Index: appdomain.c
+===================================================================
+--- appdomain.c	(revision 126331)
++++ appdomain.c	(working copy)
+@@ -302,6 +302,8 @@
+ 	/* This ends up calling any pending pending (for at most 2 seconds) */
+ 	mono_gc_cleanup ();
+ 
++	mono_thread_wait_last_threads ();
++
+ 	mono_thread_cleanup ();
+ 
+ #ifndef DISABLE_SOCKETS
+Index: threads.c
+===================================================================
+--- threads.c	(revision 126331)
++++ threads.c	(working copy)
+@@ -2393,6 +2393,12 @@
+ 	thread->manage_callback = func;
+ }
+ 
++void
++mono_thread_set_shutdown_callback (MonoThread *thread, MonoThreadShutdownCallback func)
++{
++	thread->shutdown_callback = func;
++}
++
+ void mono_threads_install_notify_pending_exc (MonoThreadNotifyPendingExcFunc func)
+ {
+ 	mono_thread_notify_pending_exc_fn = func;
+@@ -2570,6 +2576,9 @@
+ 	if (wait->num >= MAXIMUM_WAIT_OBJECTS)
+ 		return FALSE;
+ 
++	if (thread->shutdown_callback && !thread->shutdown_callback (thread, ShutdownRegular))
++		return FALSE;
++
+ 	/* The finalizer thread is not a background thread */
+ 	if (thread->tid != self && (thread->state & ThreadState_Background) != 0) {
+ 	
+@@ -2729,6 +2738,76 @@
+ 	g_free (wait);
+ }
+ 
++static void
++build_last_stage_wait_list (gpointer key, gpointer value, gpointer user)
++{
++	struct wait_data *wait=(struct wait_data *)user;
++	gsize self = GetCurrentThreadId ();
++	MonoThread *thread = (MonoThread *) value;
++	HANDLE handle;
++
++	if (wait->num >= MAXIMUM_WAIT_OBJECTS)
++		return;
++
++	if ((thread->state & ThreadState_Suspended) != 0 || 
++		(thread->state & ThreadState_Stopped) != 0)
++		return;
++
++	if (thread->tid != self) {
++		/*only threads with shutdown_callback might have survived so far.*/
++		if (thread->shutdown_callback)
++			g_assert (thread->shutdown_callback (thread, ShutdownLastOpportunity));
++
++		handle = OpenThread (THREAD_ALL_ACCESS, TRUE, thread->tid);
++		if (handle == NULL)
++			return;
++
++		wait->handles[wait->num]=thread->handle;
++		wait->threads[wait->num]=thread;
++		wait->num++;
++
++		THREAD_DEBUG (g_print ("%s: Last chance abort id: %x\n", __func__, (gsize)thread->tid));
++		mono_thread_stop (thread);
++	}
++}
++
++void
++mono_thread_wait_last_threads (void)
++{
++	struct wait_data *wait = g_new0 (struct wait_data, 1);
++
++	/* join each thread that's still running */
++	THREAD_DEBUG (g_message ("%s: Joining threads after GC finalization...", __func__));
++
++	do {
++		mono_threads_lock ();
++		THREAD_DEBUG (g_message ("%s: There are %d threads to join", __func__, mono_g_hash_table_size (threads));
++			mono_g_hash_table_foreach (threads, print_tids, NULL));
++
++		wait->num = 0;
++		mono_g_hash_table_foreach (threads, build_last_stage_wait_list, wait);
++
++		mono_threads_unlock ();
++
++		THREAD_DEBUG (g_message ("%s: wait->num is now %d", __func__, wait->num));
++
++		if(wait->num > 0)
++			wait_for_tids (wait, INFINITE);
++		THREAD_DEBUG (g_message ("%s: I have %d threads after waiting.", __func__, wait->num));
++	} while(wait->num > 0);
++
++	/* 
++	 * give the subthreads a chance to really quit (this is mainly needed
++	 * to get correct user and system times from getrusage/wait/time(1)).
++	 * This could be removed if we avoid pthread_detach() and use pthread_join().
++	 */
++#ifndef PLATFORM_WIN32
++	sched_yield ();
++#endif
++
++	g_free (wait);
++}
++
+ static void terminate_thread (gpointer key, gpointer value, gpointer user)
+ {
+ 	MonoThread *thread=(MonoThread *)value;
+@@ -2768,6 +2847,9 @@
+ 		(thread->state & ThreadState_Stopped) != 0)
+ 		return;
+ 
++	if (thread->shutdown_callback && !thread->shutdown_callback (thread, ShutdownRegular))
++		return;
++
+ 	if (wait->num<MAXIMUM_WAIT_OBJECTS) {
+ 		handle = OpenThread (THREAD_ALL_ACCESS, TRUE, thread->tid);
+ 		if (handle == NULL)
+Index: threads.h
+===================================================================
+--- threads.h	(revision 126331)
++++ threads.h	(working copy)
+@@ -19,9 +19,34 @@
+ 
+ typedef void (*MonoThreadCleanupFunc) (MonoThread* thread);
+ 
++typedef enum {
++	ShutdownRegular = 1, /*Once regular shutdown has begun*/
++	ShutdownLastOpportunity  = 99 /*After the finalizer thread has finished*/
++} MonoShutdownSequence;
++
+ /* This callback should return TRUE if the runtime must wait for the thread, FALSE otherwise */
+ typedef gboolean (*MonoThreadManageCallback) (MonoThread* thread);
+ 
++/*
++This callback allows to interact with the shutdown sequence and make sure the thread is shutdown at
++the right time.
++
++It will be called during many parts of the shutdown sequence to give it oportunity to finish properly.
++
++This callback might be called multiple times for a given part of shutdown sequence so the callee must control
++this by itself. 
++
++It should return TRUE if the runtime must wait for the thread during a given part of the shutdown sequence.
++
++The runtime expects that once this callback returns TRUE the thread will begin to shutdown.
++
++Despite this callback allows to bypass a given part of the shutdown sequence it must not ignore ShutdownLastOpportunity
++and failing to do so will cause an assertion on the runtime.
++FIXME: there is no possible good behavior for this last part. All options are bad: either assert, wait forever, or 
++ignore the thread.
++*/
++typedef gboolean (*MonoThreadShutdownCallback) (MonoThread* thread, MonoShutdownSequence);
++
+ extern int  mono_thread_get_abort_signal (void);
+ 
+ extern void mono_thread_init (MonoThreadStartCB start_cb,
+@@ -54,6 +79,7 @@
+ 
+ void     mono_threads_install_cleanup   (MonoThreadCleanupFunc func);
+ void     mono_thread_set_manage_callback (MonoThread *thread, MonoThreadManageCallback func);
++void     mono_thread_set_shutdown_callback (MonoThread *thread, MonoThreadShutdownCallback func);
+ 
+ extern void mono_threads_set_default_stacksize (guint32 stacksize);
+ extern guint32 mono_threads_get_default_stacksize (void);
+Index: object-internals.h
+===================================================================
+--- object-internals.h	(revision 126331)
++++ object-internals.h	(working copy)
+@@ -304,7 +304,7 @@
+ 	 * These fields are used to avoid having to increment corlib versions
+ 	 * when a new field is added to the unmanaged MonoThread structure.
+ 	 */
+-	gpointer unused2;
++	MonoThreadShutdownCallback shutdown_callback;
+ 	gpointer unused3;
+ 	gpointer unused4;
+ 	gpointer unused5;
+Index: threads-types.h
+===================================================================
+--- threads-types.h	(revision 126331)
++++ threads-types.h	(working copy)
+@@ -163,6 +163,8 @@
+ 
+ void mono_threads_install_notify_pending_exc (MonoThreadNotifyPendingExcFunc func) MONO_INTERNAL;
+ 
++void mono_thread_wait_last_threads (void) MONO_INTERNAL;
++
+ #define mono_hazard_pointer_set(hp,i,v)	\
+ 	do { g_assert ((i) == 0 || (i) == 1); \
+ 		(hp)->hazard_pointers [(i)] = (v); \

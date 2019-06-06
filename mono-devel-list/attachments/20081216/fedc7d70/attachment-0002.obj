@@ -1,0 +1,422 @@
+Index: class/Mono.Posix/Mono.Unix.Native/Stdlib.cs
+===================================================================
+--- class/Mono.Posix/Mono.Unix.Native/Stdlib.cs	(revision 121281)
++++ class/Mono.Posix/Mono.Unix.Native/Stdlib.cs	(working copy)
+@@ -504,6 +504,16 @@
+ 
+ 		public static int SetSignalAction (Signum signal, SignalAction action)
+ 		{
++			return SetSignalAction(NativeConvert.FromSignum (signal), action);
++		}
++
++		public static int SetSignalAction (RealTimeSignum rts, SignalAction action)
++		{
++			return SetSignalAction(NativeConvert.FromRealTimeSignum (rts), action);
++		}
++		
++		private static int SetSignalAction (int signum, SignalAction action)
++		{
+ 			IntPtr handler = IntPtr.Zero;
+ 			switch (action) {
+ 				case SignalAction.Default:
+@@ -518,7 +528,7 @@
+ 				default:
+ 					throw new ArgumentException ("Invalid action value.", "action");
+ 			}
+-			IntPtr r = sys_signal (NativeConvert.FromSignum (signal), handler);
++			IntPtr r = sys_signal (signum, handler);
+ 			if (r == _SIG_ERR)
+ 				return -1;
+ 			return 0;
+@@ -530,10 +540,14 @@
+ 		[CLSCompliant (false)]
+ 		public static int raise (Signum sig)
+ 		{
+-			int _sig = NativeConvert.FromSignum (sig);
+-			return sys_raise (_sig);
++			return sys_raise(NativeConvert.FromSignum(sig));
+ 		}
+ 
++		public static int raise (RealTimeSignum rts)
++		{
++			return sys_raise(NativeConvert.FromRealTimeSignum(rts));
++		}
++
+ 		//
+ 		// <stdio.h> -- COMPLETE except for :
+ 		//    - the scanf(3) family .
+Index: class/Mono.Posix/Mono.Unix.Native/NativeConvert.cs
+===================================================================
+--- class/Mono.Posix/Mono.Unix.Native/NativeConvert.cs	(revision 121281)
++++ class/Mono.Posix/Mono.Unix.Native/NativeConvert.cs	(working copy)
+@@ -18,6 +18,24 @@
+ 		// Non-generated exports
+ 		//
+ 
++	        [DllImport (LIB, EntryPoint="Mono_Posix_FromRealTimeSignum")]
++		private static extern int FromRealTimeSignum (Int32 offset, out Int32 rval);
++
++		// convert a realtime signal to os signal
++		public static int FromRealTimeSignum(RealTimeSignum sig)
++		{
++			int sigNum;
++			if (FromRealTimeSignum(sig.Offset, out sigNum) == -1)
++				ThrowArgumentException(sig.Offset);
++			return sigNum;
++		}
++
++		// convert an offset to an rt signum
++		public static RealTimeSignum ToRealTimeSignum(int offset)
++		{
++			return new RealTimeSignum(offset);
++		}
++
+ 		// convert from octal representation.
+ 		public static FilePermissions FromOctalPermissionString (string value)
+ 		{
+Index: class/Mono.Posix/Test/Mono.Unix/UnixSignalTest.cs
+===================================================================
+--- class/Mono.Posix/Test/Mono.Unix/UnixSignalTest.cs	(revision 121281)
++++ class/Mono.Posix/Test/Mono.Unix/UnixSignalTest.cs	(working copy)
+@@ -3,11 +3,13 @@
+ //
+ // Authors:
+ //	Jonathan Pryor  <jonpryor@vt.edu>
++//	Tim Jenks	<tim.jenks@realtimeworlds.com>
+ //
+ // (C) 2008 Jonathan Pryor
+ //
+ 
+ using NUnit.Framework;
++using NUnit.Framework.SyntaxHelpers;
+ using System;
+ using System.Text;
+ using System.Threading;
+@@ -18,31 +20,171 @@
+ 
+ 	[TestFixture]
+ 	public class UnixSignalTest {
++
+ 		[Test]
+-		public void TestRaise ()
++		public void TestRealTimeCstor()
+ 		{
+-			Thread t1 = new Thread (delegate () {
+-					using (UnixSignal a = new UnixSignal (Signum.SIGINT)) {
++			RealTimeSignum rts = new RealTimeSignum(0);
++			using (UnixSignal s = new UnixSignal(rts))
++			{
++				Assert.That(s.IsRealTimeSignal);
++				Assert.That(s.RealTimeSignum, Is.EqualTo(rts));
++			}
++		}
++
++		[Test]
++		[ExpectedException(typeof(ArgumentOutOfRangeException))]
++		public void TestRealTimeOutOfRange()
++		{
++			RealTimeSignum rts = new RealTimeSignum(int.MaxValue);
++		}
++
++		// helper method to create a thread waiting on a UnixSignal
++		private Thread WaitSignal(UnixSignal signal, int timeout)
++		{
++			Thread t1 = new Thread(delegate() {
+ 						DateTime start = DateTime.Now;
+-						bool r = a.WaitOne (5000, false);
++						bool r = signal.WaitOne (timeout, false);
+ 						DateTime end = DateTime.Now;
+-						Assert.AreEqual (a.Count, 1);
++						Assert.AreEqual (signal.Count, 1);
+ 						Assert.AreEqual (r, true);
+-						if ((end - start) > new TimeSpan (0, 0, 5))
++						if ((end - start) > new TimeSpan (0, 0, timeout/1000))
+ 							throw new InvalidOperationException ("Signal slept too long");
+-					}
+-			});
+-			Thread t2 = new Thread (delegate () {
+-					Thread.Sleep (1000);
+-					Stdlib.raise (Signum.SIGINT);
+-			});
+-			t1.Start ();
+-			t2.Start ();
+-			t1.Join ();
+-			t2.Join ();
++					});
++			return t1;
+ 		}
+ 
+ 		[Test]
++		[ExpectedException(typeof(ArgumentOutOfRangeException))]
++		public void TestRealTimeSignumNegativeOffset()
++		{
++			RealTimeSignum rts1 = new RealTimeSignum(-1);
++		}
++
++		[Test]
++		public void TestRTSignalEquality()
++		{
++			RealTimeSignum rts1 = new RealTimeSignum(0);
++			RealTimeSignum rts2 = new RealTimeSignum(0);
++			Assert.That(rts1 == rts2, Is.True);
++			Assert.That(rts1 != rts2, Is.False);
++		}
++
++		[Test]
++		public void TestRTSignalInequality()
++		{
++			RealTimeSignum rts1 = new RealTimeSignum(0);
++			RealTimeSignum rts2 = new RealTimeSignum(1);
++			Assert.That(rts1 == rts2, Is.False);
++			Assert.That(rts1 != rts2, Is.True);
++		}
++
++		[Test]
++		public void TestRTSignalGetHashCodeEquality()
++		{
++			RealTimeSignum rts1 = new RealTimeSignum(0);
++			RealTimeSignum rts2 = new RealTimeSignum(0);
++			Assert.That(rts1.GetHashCode(), Is.EqualTo(rts2.GetHashCode()));
++		}
++
++		[Test]
++		public void TestRTSignalGetHashCodeInequality()
++		{
++			RealTimeSignum rts1 = new RealTimeSignum(0);
++			RealTimeSignum rts2 = new RealTimeSignum(1);
++			Assert.That(rts1.GetHashCode(), Is.Not.EqualTo(rts2.GetHashCode()));
++		}
++
++		[Test]
++		public void TestIsRTSignalPropertyForRTSignum()
++		{
++			UnixSignal signal1 = new UnixSignal(new RealTimeSignum(0));
++			Assert.That(signal1.IsRealTimeSignal, Is.True);
++		}
++
++		[Test]
++		public void TestIsRTSignalPropertyForSignum()
++		{
++			UnixSignal signal1 = new UnixSignal(Signum.SIGSEGV);
++			Assert.That(signal1.IsRealTimeSignal, Is.False);
++		}
++
++		[Test]
++		public void TestSignumProperty()
++		{
++			UnixSignal signal1 = new UnixSignal(Signum.SIGSEGV);
++			Assert.That(signal1.Signum, Is.EqualTo(Signum.SIGSEGV));
++		}
++	
++		[Test]
++		[ExpectedException]
++		public void TestSignumPropertyThrows()
++		{
++			UnixSignal signal1 = new UnixSignal(new RealTimeSignum(0));
++			Signum s = signal1.Signum;
++		}
++
++		[Test]
++		public void TestRealTimeSignumProperty()
++		{
++			RealTimeSignum rts = new RealTimeSignum(0);
++			UnixSignal signal1 = new UnixSignal(rts);
++			Assert.That(signal1.RealTimeSignum, Is.EqualTo(rts));
++		}
++	
++		[Test]
++		[ExpectedException]
++		public void TestRealTimePropertyThrows()
++		{
++			UnixSignal signal1 = new UnixSignal(Signum.SIGSEGV);
++			RealTimeSignum s = signal1.RealTimeSignum;
++		}
++
++		[Test]
++		public void TestRaiseRTMINSignal()
++		{
++			RealTimeSignum rts = new RealTimeSignum(0);
++			Thread t1 = WaitSignal(new UnixSignal(rts), 5000);
++			Thread t2 = new Thread(delegate() {
++					Thread.Sleep(1000);
++					Stdlib.raise(rts);
++					});
++			t1.Start();
++			t2.Start();
++			t1.Join();
++			t2.Join();			
++		}
++
++		[Test]
++		public void TestRaiseRTMINPlusOneSignal()
++		{
++			RealTimeSignum rts = new RealTimeSignum(1);
++			Thread t1 = WaitSignal(new UnixSignal(rts), 5000);
++			Thread t2 = new Thread(delegate() {
++					Thread.Sleep(1000);
++					Stdlib.raise(rts);
++					});
++			t1.Start();
++			t2.Start();
++			t1.Join();
++			t2.Join();		
++		}
++
++		[Test]
++		public void TestRaise ()
++		{
++			Thread t1 = WaitSignal(new UnixSignal(Signum.SIGINT), 5000);
++			Thread t2 = new Thread(delegate() {
++					Thread.Sleep(1000);
++					Stdlib.raise(Signum.SIGINT);
++					});
++			t1.Start();
++			t2.Start();
++			t1.Join();
++			t2.Join();		
++		}
++
++		[Test]
+ 		public void TestRaiseAny ()
+ 		{
+ 			Thread t1 = new Thread (delegate () {
+Index: class/Mono.Posix/Mono.Unix/UnixSignal.cs
+===================================================================
+--- class/Mono.Posix/Mono.Unix/UnixSignal.cs	(revision 121281)
++++ class/Mono.Posix/Mono.Unix/UnixSignal.cs	(working copy)
+@@ -3,6 +3,7 @@
+ //
+ // Authors:
+ //   Jonathan Pryor (jpryor@novell.com)
++//   Tim Jenks (tim.jenks@realtimeworlds.com)
+ //
+ // (C) 2008 Novell, Inc.
+ //
+@@ -33,28 +34,106 @@
+ using Mono.Unix.Native;
+ 
+ namespace Mono.Unix {
++
++	public struct RealTimeSignum
++#if NET_2_0
++                : IEquatable <RealTimeSignum>
++#endif
++	{
++		private int rt_offset;
++		public static readonly RealTimeSignum MinValue = new RealTimeSignum(0);
++		public static readonly RealTimeSignum MaxValue = new RealTimeSignum(UnixSignal.GetSIGRTMAX() - UnixSignal.GetSIGRTMIN() - 1);
++	
++		public RealTimeSignum(int offset)
++		{
++			if (offset < 0)
++				throw new ArgumentOutOfRangeException("Offset cannot be negative");
++			if (offset > (UnixSignal.GetSIGRTMAX()-UnixSignal.GetSIGRTMIN()-1))
++				throw new ArgumentOutOfRangeException("Offset greater than maximum supported SIGRT");
++			rt_offset = offset;
++		}
++
++		public override int GetHashCode()
++		{
++			return rt_offset.GetHashCode();
++		}
++
++		public override bool Equals (object obj)
++		{
++			if ((obj == null) || (obj.GetType () != GetType ()))
++				return false;
++			RealTimeSignum value = (RealTimeSignum) obj;
++			return Offset == value.Offset;
++		}
++
++		public bool Equals (RealTimeSignum value)
++		{
++		return Offset == value.Offset;
++		}
++
++		public static bool operator== (RealTimeSignum lhs, RealTimeSignum rhs)
++		{
++			return lhs.Equals (rhs);
++		}
++
++		public static bool operator!= (RealTimeSignum lhs, RealTimeSignum rhs)
++		{
++			return !lhs.Equals (rhs);
++		}
++
++		public int Offset { 
++			get { return rt_offset; }
++		}
++	}
++
+ 	public class UnixSignal : WaitHandle {
+-		private Signum signum;
++		private int signum;
+ 		private IntPtr signal_info;
+ 
+ 		public UnixSignal (Signum signum)
+ 		{
+-			this.signum = signum;
+-			// ensure signum is a valid signal
+-			int _signum = NativeConvert.FromSignum (signum);
+-			this.signal_info = install (_signum);
++			this.signum = NativeConvert.FromSignum (signum);
++			this.signal_info = install (this.signum);
+ 			if (this.signal_info == IntPtr.Zero) {
+ 				throw new ArgumentException ("Unable to handle signal", "signum");
+ 			}
+ 		}
+ 
++		public UnixSignal (RealTimeSignum rtsig)
++		{
++			signum = NativeConvert.FromRealTimeSignum(rtsig);
++                        this.signal_info = install (this.signum);
++			if (this.signal_info == IntPtr.Zero) {
++                                throw new ArgumentException ("Unable to handle signal", "signum");
++                        }
++		}
++
+ 		public Signum Signum {
+ 			get {
++				if (IsRealTimeSignal)
++					throw new InvalidOperationException("This signal is a RealTimeSignum");
+ 				AssertValid ();
+-				return signum; 
++				return NativeConvert.ToSignum(signum); 
+ 			}
+ 		}
+ 
++		public RealTimeSignum RealTimeSignum {
++			get {
++				if (!IsRealTimeSignal)
++					throw new InvalidOperationException("This signal is not a RealTimeSignum");
++				return NativeConvert.ToRealTimeSignum(signum-GetSIGRTMIN());
++			}
++		}
++
++		public bool IsRealTimeSignal {
++			get {
++				int sigrtmin = GetSIGRTMIN();
++				if (sigrtmin == -1)
++					return false;
++				return signum >= sigrtmin;
++			}
++		}
++
+ 		[DllImport (Stdlib.MPH, CallingConvention=CallingConvention.Cdecl,
+ 				EntryPoint="Mono_Unix_UnixSignal_install")]
+ 		private static extern IntPtr install (int signum);
+@@ -67,6 +146,14 @@
+ 				EntryPoint="Mono_Unix_UnixSignal_WaitAny")]
+ 		private static extern int WaitAny (IntPtr[] infos, int count, int timeout);
+ 
++		[DllImport (Stdlib.MPH, CallingConvention=CallingConvention.Cdecl,
++                                EntryPoint="Mono_Posix_SIGRTMIN")]
++		internal static extern int GetSIGRTMIN();
++
++		[DllImport (Stdlib.MPH, CallingConvention=CallingConvention.Cdecl,
++                                EntryPoint="Mono_Posix_SIGRTMAX")]
++		internal static extern int GetSIGRTMAX();
++
+ 		private void AssertValid ()
+ 		{
+ 			if (signal_info == IntPtr.Zero)

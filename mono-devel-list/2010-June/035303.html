@@ -1,0 +1,4229 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Proposed Patch - Google Native Client
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Proposed%20Patch%20-%20Google%20Native%20Client&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035286.html">
+   <LINK REL="Next"  HREF="035309.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Proposed Patch - Google Native Client</H1>
+    <B>Elijah Taylor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Proposed%20Patch%20-%20Google%20Native%20Client&In-Reply-To="
+       TITLE="[Mono-dev] Proposed Patch - Google Native Client">elijahtaylor at google.com
+       </A><BR>
+    <I>Tue Jun 22 13:29:12 EDT 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="035286.html">[Mono-dev] Problem with CA sending certified emails
+</A></li>
+        <LI>Next message: <A HREF="035309.html">[Mono-dev] Proposed Patch - Google Native Client
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35303">[ date ]</a>
+              <a href="thread.html#35303">[ thread ]</a>
+              <a href="subject.html#35303">[ subject ]</a>
+              <a href="author.html#35303">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Greetings Mono Developers,
+
+Attached is a patch to support 32-bit x86 code generation for Google Native
+Client (<A HREF="http://code.google.com/p/nativeclient/">http://code.google.com/p/nativeclient/</A>).  I encourage you to browse
+our project for more information if you're curious.  I apologize for the
+large diff, let me try to explain the highlights to make it easier to
+digest.
+
+There is a code generation component (define: __native_client_codegen__)
+which affects the Mono bytecode -&gt; native code generation for x86-32.  There
+are a set of alignment restrictions, illegal instructions, and replacement
+instructions we use for Native Client to ensure proper control-flow
+sandboxing.  Please see
+<A HREF="http://nativeclient.googlecode.com/svn/data/docs_tarball/nacl/googleclient/native_client/documentation/nacl_paper.pdffor">http://nativeclient.googlecode.com/svn/data/docs_tarball/nacl/googleclient/native_client/documentation/nacl_paper.pdffor</A>
+more details.
+
+There is also a runtime component (define: __native_client__) which modifies
+or disables some functionality to be compatible with the Native Client
+runtime.
+
+We also had to modify some code that doesn't fall under either of the above
+defines.  Most of these changes revolved around type safety.  The modified
+version of gcc we use to compile Native Client modules is more strict about
+types, and it caught what look like legitimate issues with the Mono
+codebase.  The largest issue in terms of number of errors was the use of
+mono_bool and gboolean interchangeably between declaration and definition of
+many functions.  gboolean is defined as an &quot;int&quot; but mono_bool is defined as
+int32_t.  Other type issues are listed directly below.  Feedback is
+appreciated on these changes because of our unfamiliarity with this code,
+but I modified these in the way that seemed most &quot;right&quot; at the time.
+
+mono/metadata/decimal.h:47 mono_decimal2string int -&gt; gint32
+mono/metadata/filewatcher.h:28 gboolean -&gt; int
+mono/metadata/filewatcher.c:158 int32 -&gt; gint32
+mono/metadata/threads-type.h:64 int -&gt; gint32
+
+mono/mini/mini.h:1546  gboolean sort_end -&gt; int sort_type
+mono/mini/mini.h:1733  gboolean fp -&gt; int bank
+
+The last bit of modification is to genmdesc and the Makefiles in general.
+We added a new flag to genmdesc called &quot;nacl&quot; which overrides the given max
+length of an instruction.  Native Client code tends to be larger because of
+some of the instruction requirements we have, so some of the instructions in
+cpu-x86.md had to be modified.  This is all tied to a new configure flag
+called &quot;--enable-nacl-codegen&quot;, which enables the codegen define, and sets
+up calls to genmdesc with a --nacl flag.  It also modifies the mono-wrapper
+script so one aspect of our code generation rules (masking jump targets to
+32-byte boundaries) is turned off while compiling and testing mono from the
+Makefiles, which is required when testing outside of the Native Client
+environment.  We're also including a standalone check &quot;fsacheck&quot; which tests
+mono code generation as full AOT and a the library linked into a fully
+static executable.
+
+
+I look forward to your comments, questions, and suggestions.
+
+
+-Elijah Taylor
+Google Native Client Team
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20100622/cb0f40c6/attachment-0001.html">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20100622/cb0f40c6/attachment-0001.html</A> 
+-------------- next part --------------
+Index: eglib/src/eglib-config.h.in
+===================================================================
+--- eglib/src/eglib-config.h.in	(revision 159271)
++++ eglib/src/eglib-config.h.in	(working copy)
+@@ -29,4 +29,12 @@
+ #define G_HAVE_ISO_VARARGS
+ #endif
+ 
++#if defined (__native_client__)
++#define sem_trywait(x) sem_wait(x)
++#define sem_timedwait(x,y) sem_wait(x)
++#define getdtablesize() (32768)
++#undef G_BREAKPOINT
++#define G_BREAKPOINT()
+ #endif
++
++#endif
+Index: eglib/src/gmodule-unix.c
+===================================================================
+--- eglib/src/gmodule-unix.c	(revision 159271)
++++ eglib/src/gmodule-unix.c	(working copy)
+@@ -31,6 +31,42 @@
+ #include &lt;glib.h&gt;
+ #include &lt;gmodule.h&gt;
+ 
++#if defined(__native_client__)
++GModule *
++g_module_open (const gchar *file, GModuleFlags flags)
++{
++	printf(&quot;dlopen() not supported on Native Client.\n&quot;);
++	return NULL;
++}
++
++
++gboolean
++g_module_symbol (GModule *module, const gchar *symbol_name, gpointer *symbol)
++{
++	return FALSE;
++}
++
++
++const gchar*
++g_module_error(void)
++{
++	return &quot;dlopen not supported on Native Client.&quot;;
++}
++
++gboolean
++g_module_close (GModule *module)
++{
++	return FALSE;
++}
++
++gchar*
++g_module_build_path (const gchar *directory, const gchar *module_name)
++{
++	return NULL;
++}
++
++#else
++
+ #ifdef G_OS_UNIX
+ #include &lt;dlfcn.h&gt;
+ 
+@@ -286,3 +322,5 @@
+ 	return g_strdup_printf (&quot;%s%s&quot; LIBSUFFIX, lib_prefix, module_name); 
+ }
+ 
++#endif /* __native_client__ */
++
+Index: eglib/src/glib.h
+===================================================================
+--- eglib/src/glib.h	(revision 159271)
++++ eglib/src/glib.h	(working copy)
+@@ -43,7 +43,7 @@
+ /*
+  * Basic data types
+  */
+-typedef int            gboolean;
++typedef int32_t        gboolean;
+ typedef int            gint;
+ typedef unsigned int   guint;
+ typedef short          gshort;
+Index: runtime/mono-wrapper.in
+===================================================================
+--- runtime/mono-wrapper.in	(revision 159271)
++++ runtime/mono-wrapper.in	(working copy)
+@@ -3,5 +3,6 @@
+ MONO_CFG_DIR='@mono_cfg_dir@'
+ PATH=&quot;$r/runtime/_tmpinst/bin:$PATH&quot;
+ MONO_SHARED_DIR=$r/runtime
++export MONO_NACL_ALIGN_MASK_OFF=@MONO_NACL_ALIGN_MASK_OFF@
+ export MONO_CFG_DIR MONO_SHARED_DIR PATH
+ exec &quot;$r/libtool&quot; --mode=execute &quot;$r/@mono_runtime@&quot; --config &quot;@mono_cfg_dir@/mono/config&quot; &quot;$@&quot;
+Index: mono/metadata/filewatcher.h
+===================================================================
+--- mono/metadata/filewatcher.h	(revision 159271)
++++ mono/metadata/filewatcher.h	(working copy)
+@@ -25,7 +25,7 @@
+ 
+ G_BEGIN_DECLS
+ 
+-gboolean ves_icall_System_IO_FSW_SupportsFSW (void) MONO_INTERNAL;
++gint ves_icall_System_IO_FSW_SupportsFSW (void) MONO_INTERNAL;
+ 
+ gboolean ves_icall_System_IO_FAMW_InternalFAMNextEvent (gpointer conn,
+ 							MonoString **filename,
+Index: mono/metadata/assembly.c
+===================================================================
+--- mono/metadata/assembly.c	(revision 159271)
++++ mono/metadata/assembly.c	(working copy)
+@@ -120,6 +120,26 @@
+ static GList *loaded_assemblies = NULL;
+ static MonoAssembly *corlib;
+ 
++#if defined(__native_client__)
++
++/* On Native Client, allow mscorlib to be loaded from memory  */
++/* instead of loaded off disk.  If these are not set, default */
++/* mscorlib loading will take place                           */
++
++/* NOTE: If mscorlib data is passed to mono in this way then */
++/* it needs to remain allocated during the use of mono.      */
++
++static void *corlibData = NULL;
++static size_t corlibSize = 0;
++
++void mono_set_corlib_data(void *data, size_t size)
++{
++  corlibData = data;
++  corlibSize = size;
++}
++
++#endif
++
+ /* This protects loaded_assemblies and image-&gt;references */
+ #define mono_assemblies_lock() EnterCriticalSection (&amp;assemblies_mutex)
+ #define mono_assemblies_unlock() LeaveCriticalSection (&amp;assemblies_mutex)
+@@ -2508,7 +2528,6 @@
+ 	return result;
+ }
+ 
+-
+ MonoAssembly*
+ mono_assembly_load_corlib (const MonoRuntimeInfo *runtime, MonoImageOpenStatus *status)
+ {
+@@ -2518,6 +2537,22 @@
+ 		/* g_print (&quot;corlib already loaded\n&quot;); */
+ 		return corlib;
+ 	}
++
++#if defined(__native_client__)
++	if (corlibData != NULL &amp;&amp; corlibSize != 0) {
++		int status = 0;
++		/* First &quot;FALSE&quot; instructs mono not to make a copy. */
++		/* Second &quot;FALSE&quot; says this is not just a ref.      */
++		MonoImage* image = mono_image_open_from_data_full (corlibData, corlibSize, FALSE, &amp;status, FALSE);
++		if (image == NULL || status != 0)
++			g_print(&quot;mono_image_open_from_data_full failed: %d\n&quot;, status);
++		corlib = mono_assembly_load_from_full (image, &quot;mscorlib&quot;, &amp;status, FALSE);
++		if (corlib == NULL || status != 0)
++			g_print (&quot;mono_assembly_load_from_full failed: %d\n&quot;, status);
++		if (corlib)
++			return corlib;
++	}
++#endif
+ 	
+ 	if (assemblies_path) {
+ 		corlib = load_in_path (&quot;mscorlib.dll&quot;, (const char**)assemblies_path, status, FALSE);
+Index: mono/metadata/console-unix.c
+===================================================================
+--- mono/metadata/console-unix.c	(revision 159271)
++++ mono/metadata/console-unix.c	(working copy)
+@@ -6,6 +6,9 @@
+  *
+  * Copyright (C) 2005-2009 Novell, Inc. (<A HREF="http://www.novell.com">http://www.novell.com</A>)
+  */
++#if defined(__native_client__)
++#include &quot;console-null.c&quot;
++#else
+ 
+ #include &lt;config.h&gt;
+ #include &lt;glib.h&gt;
+@@ -485,3 +488,5 @@
+ 
+ 	return TRUE;
+ }
++#endif /* #if defined(__native_client__) */
++
+Index: mono/metadata/decimal.h
+===================================================================
+--- mono/metadata/decimal.h	(revision 159271)
++++ mono/metadata/decimal.h	(working copy)
+@@ -44,6 +44,6 @@
+ gint32 mono_decimalSetExponent(/*[In, Out]*/decimal_repr* pA, gint32 texp) MONO_INTERNAL;
+ 
+ gint32 mono_string2decimal(/*[Out]*/decimal_repr* pA, /*[In]*/MonoString* s, gint32 decrDecimal, gint32 sign) MONO_INTERNAL;
+-gint32 mono_decimal2string(/*[In]*/decimal_repr* pA, int digits, int decimals,
++gint32 mono_decimal2string(/*[In]*/decimal_repr* pA, gint32 digits, gint32 decimals,
+ 			 /*[Out]*/MonoArray* pArray, gint32 bufSize, gint32* pDecPos, gint32* pSign) MONO_INTERNAL;
+ 
+Index: mono/metadata/Makefile.am
+===================================================================
+--- mono/metadata/Makefile.am	(revision 159271)
++++ mono/metadata/Makefile.am	(working copy)
+@@ -134,6 +134,7 @@
+ 	mono-wsq.h		\
+ 	monitor.c		\
+ 	monitor.h		\
++	nacl-stub.c		\
+ 	normalization-tables.h	\
+ 	null-gc.c		\
+ 	number-formatter.h	\
+Index: mono/metadata/process.c
+===================================================================
+--- mono/metadata/process.c	(revision 159271)
++++ mono/metadata/process.c	(working copy)
+@@ -29,7 +29,6 @@
+ #define LOGDEBUG(...)  
+ /* define LOGDEBUG(...) g_message(__VA_ARGS__)  */
+ 
+-
+ HANDLE ves_icall_System_Diagnostics_Process_GetProcess_internal (guint32 pid)
+ {
+ 	HANDLE handle;
+Index: mono/metadata/threads-types.h
+===================================================================
+--- mono/metadata/threads-types.h	(revision 159271)
++++ mono/metadata/threads-types.h	(working copy)
+@@ -61,7 +61,7 @@
+ void ves_icall_System_Threading_Thread_ConstructInternalThread (MonoThread *this) MONO_INTERNAL;
+ HANDLE ves_icall_System_Threading_Thread_Thread_internal(MonoThread *this_obj, MonoObject *start) MONO_INTERNAL;
+ void ves_icall_System_Threading_InternalThread_Thread_free_internal(MonoInternalThread *this_obj, HANDLE thread) MONO_INTERNAL;
+-void ves_icall_System_Threading_Thread_Sleep_internal(int ms) MONO_INTERNAL;
++void ves_icall_System_Threading_Thread_Sleep_internal(gint32 ms) MONO_INTERNAL;
+ gboolean ves_icall_System_Threading_Thread_Join_internal(MonoInternalThread *this_obj, int ms, HANDLE thread) MONO_INTERNAL;
+ gint32 ves_icall_System_Threading_Thread_GetDomainID (void) MONO_INTERNAL;
+ MonoString* ves_icall_System_Threading_Thread_GetName_internal (MonoInternalThread *this_obj) MONO_INTERNAL;
+Index: mono/metadata/rand.c
+===================================================================
+--- mono/metadata/rand.c	(revision 159271)
++++ mono/metadata/rand.c	(working copy)
+@@ -26,6 +26,17 @@
+ #include &lt;mono/metadata/rand.h&gt;
+ #include &lt;mono/metadata/exception.h&gt;
+ 
++#if defined(__native_client__)
++#include &lt;errno.h&gt;
++
++static void
++get_entropy_from_server (const char *path, guchar *buf, int len)
++{
++    return;
++}
++
++#else /* defined(__native_client__) */
++
+ #if !defined(HOST_WIN32)
+ #include &lt;sys/socket.h&gt;
+ #include &lt;sys/un.h&gt;
+@@ -96,6 +107,7 @@
+     close (file);
+ }
+ #endif
++#endif /* __native_client__ */
+ 
+ #if defined (HOST_WIN32)
+ 
+Index: mono/metadata/nacl-stub.c
+===================================================================
+--- mono/metadata/nacl-stub.c	(revision 0)
++++ mono/metadata/nacl-stub.c	(revision 0)
+@@ -0,0 +1,16 @@
++
++#if defined(__native_client__)
++
++#ifdef HAVE_CONFIG_H
++#include &lt;config.h&gt;
++#endif
++#include &lt;eglib/src/glib.h&gt;
++#include &lt;errno.h&gt;
++#include &lt;sys/types.h&gt;
++
++struct group *getgrnam(const char *name) { return NULL; }
++struct group *getgrgid(gid_t gid) { errno=EIO; return NULL; }
++int fsync(int fd) { errno=EINVAL; return -1; }
++dev_t makedev(guint32 maj, guint32 min) { return (maj)*256+(min); }
++
++#endif
+Index: mono/metadata/filewatcher.c
+===================================================================
+--- mono/metadata/filewatcher.c	(revision 159271)
++++ mono/metadata/filewatcher.c	(working copy)
+@@ -155,7 +155,7 @@
+ 	return -1;
+ }
+ 
+-int ves_icall_System_IO_InotifyWatcher_RemoveWatch (int fd, int watch_descriptor)
++int ves_icall_System_IO_InotifyWatcher_RemoveWatch (int fd, gint32 watch_descriptor)
+ {
+ 	return -1;
+ }
+Index: mono/metadata/socket-io.c
+===================================================================
+--- mono/metadata/socket-io.c	(revision 159271)
++++ mono/metadata/socket-io.c	(working copy)
+@@ -11,6 +11,8 @@
+ 
+ #include &lt;config.h&gt;
+ 
++#if !defined(__native_client__)
++
+ #include &lt;glib.h&gt;
+ #include &lt;string.h&gt;
+ #include &lt;stdlib.h&gt;
+@@ -3075,3 +3077,5 @@
+ 	WSACleanup();
+ }
+ 
++
++#endif /* #if !defined(__native_client__) */
+Index: mono/io-layer/sockets.c
+===================================================================
+--- mono/io-layer/sockets.c	(revision 159271)
++++ mono/io-layer/sockets.c	(working copy)
+@@ -7,6 +7,8 @@
+  * (C) 2002 Ximian, Inc.
+  */
+ 
++#if !defined(__native_client__)
++
+ #include &lt;config.h&gt;
+ #include &lt;glib.h&gt;
+ #include &lt;pthread.h&gt;
+@@ -1581,3 +1583,5 @@
+ 	*sent = ret;
+ 	return 0;
+ }
++
++#endif /* if !defined(__native_client__) */
+Index: mono/io-layer/locking.c
+===================================================================
+--- mono/io-layer/locking.c	(revision 159271)
++++ mono/io-layer/locking.c	(working copy)
+@@ -23,6 +23,11 @@
+ gboolean
+ _wapi_lock_file_region (int fd, off_t offset, off_t length)
+ {
++#if defined(__native_client__)
++	printf(&quot;WARNING: locking.c: _wapi_lock_file_region(): fcntl() not available on Native Client!\n&quot;);
++	// behave as below -- locks are not available
++	return(TRUE);
++#else
+ 	struct flock lock_data;
+ 	int ret;
+ 
+@@ -58,11 +63,16 @@
+ 	}
+ 
+ 	return(TRUE);
++#endif /* __native_client__ */
+ }
+ 
+ gboolean
+ _wapi_unlock_file_region (int fd, off_t offset, off_t length)
+ {
++#if defined(__native_client__)
++	printf(&quot;WARNING: locking.c: _wapi_unlock_file_region(): fcntl() not available on Native Client!\n&quot;);
++	return (TRUE);
++#else
+ 	struct flock lock_data;
+ 	int ret;
+ 
+@@ -98,6 +108,7 @@
+ 	}
+ 
+ 	return(TRUE);
++#endif /* __native_client__ */
+ }
+ 
+ gboolean
+Index: mono/mini/method-to-ir.c
+===================================================================
+--- mono/mini/method-to-ir.c	(revision 159271)
++++ mono/mini/method-to-ir.c	(working copy)
+@@ -5386,6 +5386,7 @@
+ 		cfg-&gt;bb_exit = end_bblock;
+ 		end_bblock-&gt;cil_code = NULL;
+ 		end_bblock-&gt;cil_length = 0;
++		end_bblock-&gt;flags |= BB_INDIRECT_JUMP_TARGET;
+ 		g_assert (cfg-&gt;num_bblocks == 2);
+ 
+ 		arg_array = cfg-&gt;args;
+@@ -6990,11 +6991,13 @@
+ 			target = ip + n * sizeof (guint32);
+ 
+ 			GET_BBLOCK (cfg, default_bblock, target);
++			default_bblock-&gt;flags |= BB_INDIRECT_JUMP_TARGET;
+ 
+ 			targets = mono_mempool_alloc (cfg-&gt;mempool, sizeof (MonoBasicBlock*) * n);
+ 			for (i = 0; i &lt; n; ++i) {
+ 				GET_BBLOCK (cfg, tblock, target + (gint32)read32(ip));
+ 				targets [i] = tblock;
++				targets [i]-&gt;flags |= BB_INDIRECT_JUMP_TARGET;
+ 				ip += 4;
+ 			}
+ 
+Index: mono/mini/mini.c
+===================================================================
+--- mono/mini/mini.c	(revision 159271)
++++ mono/mini/mini.c	(working copy)
+@@ -78,6 +78,11 @@
+ MonoMethodSignature *helper_sig_monitor_enter_exit_trampoline = NULL;
+ MonoMethodSignature *helper_sig_monitor_enter_exit_trampoline_llvm = NULL;
+ 
++#ifdef __native_client_codegen__
++/* Default alignment for Native Client is 32-byte. */
++guint8 nacl_align_byte = 0xe0;
++#endif
++
+ static guint32 default_opt = 0;
+ static gboolean default_opt_set = FALSE;
+ 
+@@ -3333,7 +3338,14 @@
+ 	}
+ 
+ 	memcpy (code, cfg-&gt;native_code, cfg-&gt;code_len);
++#ifdef __native_client_codegen__
++	if (cfg-&gt;native_code_alloc) {
++		g_free (cfg-&gt;native_code_alloc);
++		cfg-&gt;native_code_alloc = 0;
++	}
++#else
+ 	g_free (cfg-&gt;native_code);
++#endif
+ 	cfg-&gt;native_code = code;
+ 	code = cfg-&gt;native_code + cfg-&gt;code_len;
+   
+@@ -5681,7 +5693,7 @@
+ 
+ 	MONO_PROBE_VES_INIT_BEGIN ();
+ 
+-#ifdef __linux__
++#if defined(__linux__) &amp;&amp; !defined(__native_client__)
+ 	if (access (&quot;/proc/self/maps&quot;, F_OK) != 0) {
+ 		g_print (&quot;Mono requires /proc to be mounted.\n&quot;);
+ 		exit (1);
+Index: mono/mini/mini.h
+===================================================================
+--- mono/mini/mini.h	(revision 159271)
++++ mono/mini/mini.h	(working copy)
+@@ -563,11 +563,13 @@
+ 
+ /* BBlock flags */
+ enum {
+-	BB_VISITED            = 1 &lt;&lt; 0,
+-	BB_REACHABLE          = 1 &lt;&lt; 1,
+-	BB_EXCEPTION_DEAD_OBJ = 1 &lt;&lt; 2,
+-	BB_EXCEPTION_UNSAFE   = 1 &lt;&lt; 3,
+-	BB_EXCEPTION_HANDLER  = 1 &lt;&lt; 4
++	BB_VISITED              = 1 &lt;&lt; 0,
++	BB_REACHABLE            = 1 &lt;&lt; 1,
++	BB_EXCEPTION_DEAD_OBJ   = 1 &lt;&lt; 2,
++	BB_EXCEPTION_UNSAFE     = 1 &lt;&lt; 3,
++	BB_EXCEPTION_HANDLER    = 1 &lt;&lt; 4,
++	/* for Native Client, mark the blocks that can be jumped to indirectly */
++	BB_INDIRECT_JUMP_TARGET = 1 &lt;&lt; 5 
+ };
+ 
+ typedef struct MonoMemcpyArgs {
+@@ -1059,6 +1061,11 @@
+ 	MonoGenericSharingContext *generic_sharing_context;
+ 
+ 	unsigned char   *cil_start;
++#ifdef __native_client_codegen__
++	/* this alloc is not aligned, native_code */
++	/* is the 32-byte aligned version of this */
++	unsigned char   *native_code_alloc;
++#endif
+ 	unsigned char   *native_code;
+ 	guint            code_size;
+ 	guint            code_len;
+@@ -1542,7 +1549,7 @@
+ MonoInst* mono_get_jit_tls_intrinsic        (MonoCompile *cfg) MONO_INTERNAL;
+ MonoInst* mono_get_domain_intrinsic         (MonoCompile* cfg) MONO_INTERNAL;
+ MonoInst* mono_get_thread_intrinsic         (MonoCompile* cfg) MONO_INTERNAL;
+-GList    *mono_varlist_insert_sorted        (MonoCompile *cfg, GList *list, MonoMethodVar *mv, gboolean sort_end) MONO_INTERNAL;
++GList    *mono_varlist_insert_sorted        (MonoCompile *cfg, GList *list, MonoMethodVar *mv, int sort_type) MONO_INTERNAL;
+ GList    *mono_varlist_sort                 (MonoCompile *cfg, GList *list, int sort_type) MONO_INTERNAL;
+ void      mono_analyze_liveness             (MonoCompile *cfg) MONO_INTERNAL;
+ void      mono_linear_scan                  (MonoCompile *cfg, GList *vars, GList *regs, regmask_t *used_mask) MONO_INTERNAL;
+@@ -1729,7 +1736,7 @@
+ void     *mono_arch_instrument_epilog           (MonoCompile *cfg, void *func, void *p, gboolean enable_arguments) MONO_INTERNAL;
+ void     *mono_arch_instrument_epilog_full     (MonoCompile *cfg, void *func, void *p, gboolean enable_arguments, gboolean preserve_argument_registers) MONO_INTERNAL;
+ void      mono_codegen                          (MonoCompile *cfg) MONO_INTERNAL;
+-void      mono_call_inst_add_outarg_reg         (MonoCompile *cfg, MonoCallInst *call, int vreg, int hreg, gboolean fp) MONO_INTERNAL;
++void      mono_call_inst_add_outarg_reg         (MonoCompile *cfg, MonoCallInst *call, int vreg, int hreg, int bank) MONO_INTERNAL;
+ const char *mono_arch_regname                   (int reg) MONO_INTERNAL;
+ const char *mono_arch_fregname                  (int reg) MONO_INTERNAL;
+ void      mono_arch_exceptions_init             (void) MONO_INTERNAL;
+Index: mono/mini/cpu-x86.md
+===================================================================
+--- mono/mini/cpu-x86.md	(revision 159271)
++++ mono/mini/cpu-x86.md	(working copy)
+@@ -63,12 +63,12 @@
+ # See the code in mini-x86.c for more details on how the specifiers are used.
+ #
+ break: len:1
+-jmp: len:32
++jmp: len:32 clob:c
+ call: dest:a clob:c len:17
+ br: len:5
+ seq_point: len:16
+ 
+-int_beq: len:6 nacl:28
++int_beq: len:6
+ int_bge: len:6
+ int_bgt: len:6
+ int_ble: len:6
+@@ -117,8 +117,8 @@
+ throw: src1:i len:13
+ rethrow: src1:i len:13
+ start_handler: len:16
+-endfinally: len:16
+-endfilter: src1:a len:16
++endfinally: len:16 nacl:21
++endfilter: src1:a len:16 nacl:21
+ 
+ ckfinite: dest:f src1:f len:32
+ ceq: dest:y len:6
+@@ -134,18 +134,18 @@
+ checkthis: src1:b len:3
+ voidcall: len:17 clob:c
+ voidcall_reg: src1:i len:11 clob:c
+-voidcall_membase: src1:b len:16 clob:c
++voidcall_membase: src1:b len:16 nacl:17 clob:c
+ fcall: dest:f len:17 clob:c
+ fcall_reg: dest:f src1:i len:11 clob:c
+-fcall_membase: dest:f src1:b len:16 clob:c
++fcall_membase: dest:f src1:b len:16 nacl:17 clob:c
+ lcall: dest:l len:17 clob:c
+ lcall_reg: dest:l src1:i len:11 clob:c
+-lcall_membase: dest:l src1:b len:16 clob:c
++lcall_membase: dest:l src1:b len:16 nacl:17 clob:c
+ vcall: len:17 clob:c
+ vcall_reg: src1:i len:11 clob:c
+-vcall_membase: src1:b len:16 clob:c
+-call_reg: dest:a src1:i len:11 clob:c
+-call_membase: dest:a src1:b len:16 clob:c
++vcall_membase: src1:b len:16 nacl:17 clob:c
++call_reg: dest:a src1:i len:11 nacl:14 clob:c
++call_membase: dest:a src1:b len:16 nacl:18 clob:c
+ iconst: dest:i len:5
+ r4const: dest:f len:15
+ r8const: dest:f len:16
+@@ -284,7 +284,7 @@
+ adc_imm: dest:i src1:i len:6 clob:1
+ sbb: dest:i src1:i src2:i len:2 clob:1
+ sbb_imm: dest:i src1:i len:6 clob:1
+-br_reg: src1:i len:2
++br_reg: src1:i len:2 nacl:5
+ sin: dest:f src1:f len:6
+ cos: dest:f src1:f len:6
+ abs: dest:f src1:f len:2
+@@ -386,7 +386,7 @@
+ 
+ vcall2: len:17 clob:c
+ vcall2_reg: src1:i len:11 clob:c
+-vcall2_membase: src1:b len:16 clob:c
++vcall2_membase: src1:b len:16 nacl:17 clob:c
+ 
+ localloc_imm: dest:i len:120
+ 
+Index: mono/mini/genmdesc.pl
+===================================================================
+--- mono/mini/genmdesc.pl	(revision 159271)
++++ mono/mini/genmdesc.pl	(working copy)
+@@ -13,8 +13,10 @@
+ sub INST_SRC3  () {return 3;}
+ sub INST_LEN   () {return 4;}
+ sub INST_CLOB  () {return 5;}
++# making INST_NACL the same as INST_MAX is not a mistake,
++# INST_NACL writes over INST_LEN, it's not its own field
+ sub INST_NACL  () {return 6;}
+-sub INST_MAX   () {return 7;}
++sub INST_MAX   () {return 6;}
+ 
+ # this must include all the #defines used in mini-ops.h
+ my @defines = qw (__i386__ __x86_64__ __ppc__ __powerpc__ __ppc64__ __arm__ 
+@@ -23,6 +25,8 @@
+ my %template_table =();
+ my @opcodes = ();
+ 
++my $nacl = 0;
++
+ sub parse_file
+ {
+ 	my ($define, $file) = @_;
+@@ -167,14 +171,15 @@
+ 	my $res = &quot;&quot;;
+ 	my $n = 0;
+ 	for (my $i = 0; $i &lt; @vals; ++$i) {
++		next if $i == INST_NACL;
+ 		if (defined $vals [$i]) {
+ 			if ($i == INST_LEN) {
+ 			        $n = $vals [$i];
+-			        if (defined $vals [INST_NACL]){
+-				    $n += $vals [INST_NACL];
++			        if ((defined $vals [INST_NACL]) and $nacl == 1){
++				    $n = $vals [INST_NACL];
+ 			        }
+ 				$res .= sprintf (&quot;\\x%x\&quot; \&quot;&quot;, + $n);
+-			} if ($i != INST_NACL) {
++			} else {
+ 				if ($vals [$i] =~ /^[a-zA-Z0-9]$/) {
+ 					$res .= $vals [$i];
+ 				} else {
+@@ -201,6 +206,8 @@
+ 	$idx = 1;
+ 
+ 	for ($i = 0; $i &lt; @opcodes; ++$i) {
++		next if $i == INST_NACL;
++
+ 		my $name = $opcodes [$i]-&gt;[1];
+ 		my $desc = $table {$name};
+ 		my $spec = $desc-&gt;{&quot;spec&quot;};
+@@ -221,12 +228,17 @@
+ }
+ 
+ sub usage {
+-	die &quot;genmdesc.pl arch srcdir output name desc [desc2 ...]\n&quot;;
++	die &quot;genmdesc.pl arch srcdir [--nacl] output name desc [desc2 ...]\n&quot;;
+ }
+ 
+ my $arch = shift || usage ();
+ my $srcdir = shift || usage ();
+ my $output = shift || usage ();
++if ($output eq &quot;--nacl&quot;)
++{
++  $nacl = 1;  
++  $output = shift || usage();
++}
+ my $name = shift || usage ();
+ usage () unless @ARGV;
+ my @files = @ARGV;
+Index: mono/mini/mini-x86.c
+===================================================================
+--- mono/mini/mini-x86.c	(revision 159271)
++++ mono/mini/mini-x86.c	(working copy)
+@@ -65,6 +65,95 @@
+ MonoBreakpointInfo
+ mono_breakpoint_info [MONO_BREAKPOINT_ARRAY_SIZE];
+ 
++static gpointer mono_realloc_native_code(MonoCompile *cfg)
++{
++#ifdef __native_client_codegen__
++  guint old_padding;
++  gpointer native_code;
++  guint alignment_check;
++
++  /* Save the old alignment offset so we can re-align after the realloc. */
++  old_padding = (guint)(cfg-&gt;native_code - cfg-&gt;native_code_alloc);
++
++  cfg-&gt;native_code_alloc = g_realloc( cfg-&gt;native_code_alloc, 
++                                      cfg-&gt;code_size + kNaClAlignment );
++
++  /* Align native_code to next nearest kNaClAlignment byte. */
++  native_code = (guint)cfg-&gt;native_code_alloc + kNaClAlignment;
++  native_code = (guint)native_code &amp; ~kNaClAlignmentMask;
++
++  /* Shift the data to be 32-byte aligned again. */
++  memmove(native_code, cfg-&gt;native_code_alloc + old_padding, cfg-&gt;code_size);
++
++  alignment_check = (guint)native_code &amp; kNaClAlignmentMask;
++  g_assert(alignment_check == 0);
++  return native_code;
++#else
++  return g_realloc(cfg-&gt;native_code, cfg-&gt;code_size);
++#endif
++}
++
++#ifdef __native_client_codegen__
++
++/* nacl_pad: Add pad bytes of alignment instructions at code,       */
++/* Check that alignment doesn't cross an alignment boundary.        */
++guint8 *nacl_pad(guint8 *code, int pad) {
++  const int kMaxPadding = 7;    /* see x86-codegen.h: x86_padding() */
++
++  if (pad == 0) return code;
++  /* printf(&quot;nacl_pad(%x, %x)\n&quot;, code, pad); */
++  /* assertion: alignment cannot cross a block boundary */
++  g_assert(((guint)code &amp; (~kNaClAlignmentMask)) == 
++          (((guint)code + pad - 1) &amp; (~kNaClAlignmentMask)));
++  while (pad &gt;= kMaxPadding) {
++    x86_padding(code, kMaxPadding);
++    pad -= kMaxPadding;
++  }
++  if (pad != 0) x86_padding (code, pad);
++  return code;
++}
++
++/* nacl_pad_call(): Insert no-op padding for Native Client call instructions */
++/*    code     pointer to buffer for emitting code                           */
++/*    ilength  length of call instruction                                    */
++guint8 *nacl_pad_call(guint8 *code, guint8 ilength) {
++  int freeSpaceInBlock = kNaClAlignment - ((guint)code &amp; kNaClAlignmentMask);
++  int padding = freeSpaceInBlock - ilength;
++
++  if (padding &lt; 0) {
++    /* There isn't enough space in this block for the instruction. */
++    /* Fill this block and start a new one.                        */
++    code = nacl_pad(code, freeSpaceInBlock);
++    freeSpaceInBlock = kNaClAlignment;
++    padding = freeSpaceInBlock - ilength;
++  }
++  g_assert(ilength &gt; 0);
++  g_assert(padding &gt;= 0);
++  g_assert(padding &lt; kNaClAlignment);
++  if (0 == padding) return code;
++  /* printf(&quot;padding call at %x to %x\n&quot;, code, code + padding); */
++  return nacl_pad(code, padding);
++}
++
++guint8 *nacl_pad_call_imm(guint8 *code) {
++  return nacl_pad_call(code, kNaClLengthOfCallImm);
++}
++
++guint8 *nacl_pad_call_reg(guint8 *code) {
++  return nacl_pad_call(code, kNaClLengthOfCallReg);
++}
++
++guint8 *nacl_pad_call_membase(guint8 *code) {
++  return nacl_pad_call(code, kNaClLengthOfCallMembase);
++}
++
++guint8 *nacl_align(guint8 *code) {
++  int padding = kNaClAlignment - ((guint)code &amp; kNaClAlignmentMask);
++  if (padding != 32) code = nacl_pad(code, padding);
++  return code;
++}
++#endif /* __native_client_codegen__ */
++
+ /*
+  * The code generated for sequence points reads from this location, which is
+  * made read-only when single stepping is enabled.
+@@ -617,6 +706,9 @@
+ static int 
+ cpuid (int id, int* p_eax, int* p_ebx, int* p_ecx, int* p_edx)
+ {
++#if defined(__native_client__)
++	int have_cpuid = 1;
++#else
+ 	int have_cpuid = 0;
+ #ifndef _MSC_VER
+ 	__asm__  __volatile__ (
+@@ -650,6 +742,7 @@
+ 		mov have_cpuid, eax
+ 	}
+ #endif
++#endif /* __native_client__ */
+ 	if (have_cpuid) {
+ 		/* Have to use the code manager to get around WinXP DEP */
+ 		static CpuidFunc func = NULL;
+@@ -724,6 +817,7 @@
+ guint32
+ mono_arch_cpu_optimizazions (guint32 *exclude_mask)
+ {
++#if !defined(__native_client__)
+ 	int eax, ebx, ecx, edx;
+ 	guint32 opts = 0;
+ 	
+@@ -755,6 +849,9 @@
+ #endif
+ 	}
+ 	return opts;
++#else
++	return MONO_OPT_CMOV | MONO_OPT_FCMOV | MONO_OPT_SSE2;
++#endif
+ }
+ 
+ /*
+@@ -1522,6 +1619,32 @@
+ 	MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, cfg-&gt;ret-&gt;dreg, val-&gt;dreg);
+ }
+ 
++void nacl_align_inst(guint8 **pcode, int instlen);
++
++/* Prevent instructions from straddling a 32-byte alignment boundary.   */
++/* Instructions longer than 32 bytes must be aligned internally.        */
++/* IN: pcode, cfg, instlen                                              */
++/* OUT: pcode, cfg                                                      */
++/* This subroutine is a no-op if __native_client_codegen__ is not #defined.     */
++void nacl_align_inst(guint8 **pcode, int instlen) {
++#ifdef __native_client_codegen__
++  int space_in_block;
++
++  space_in_block = kNaClAlignment - ((guint)(*pcode) &amp; kNaClAlignmentMask);
++
++  /* printf(&quot;%d &lt;= %d?\n&quot;, instlen, space_in_block); */
++  if (instlen &lt;= space_in_block) {
++    /* g_print(&quot;%x: no padding (%d &lt;= %d)\n&quot;, (guint)code, instlen, space_in_block); */
++  } else if (instlen &gt;= kNaClAlignment) {
++    /* g_print(&quot;%x: big instruction (%d)\n&quot;, (guint)code, instlen); */
++  } else {
++    /* (instlen &gt; space_in_block &amp;&amp; instlen &lt; 32) */
++    /* g_print(&quot;padding %d\n&quot;, space_in_block); */
++    *pcode = nacl_pad(*pcode, space_in_block);
++  }
++#endif  /* __native_client_codegen__ */
++}
++
+ /*
+  * Allow tracing to work with this interface (with an optional argument)
+  */
+@@ -1539,8 +1662,12 @@
+ 	if (cfg-&gt;compile_aot) {
+ 		x86_push_imm (code, cfg-&gt;method);
+ 		x86_mov_reg_imm (code, X86_EAX, func);
++#ifdef __native_client_codegen__
++		code = nacl_pad_call_reg(code);
++#endif
+ 		x86_call_reg (code, X86_EAX);
+ 	} else {
++		x86_codegen_pre (&amp;code, 5);
+ 		mono_add_patch_info (cfg, code-cfg-&gt;native_code, MONO_PATCH_INFO_METHODCONST, cfg-&gt;method);
+ 		x86_push_imm (code, cfg-&gt;method);
+ 		mono_add_patch_info (cfg, code-cfg-&gt;native_code, MONO_PATCH_INFO_ABS, func);
+@@ -1646,8 +1773,12 @@
+ 	if (cfg-&gt;compile_aot) {
+ 		x86_push_imm (code, method);
+ 		x86_mov_reg_imm (code, X86_EAX, func);
++#ifdef __native_client_codegen__
++		code = nacl_pad_call_reg(code);
++#endif
+ 		x86_call_reg (code, X86_EAX);
+ 	} else {
++		x86_codegen_pre (&amp;code, 5);
+ 		mono_add_patch_info (cfg, code-cfg-&gt;native_code, MONO_PATCH_INFO_METHODCONST, method);
+ 		x86_push_imm (code, method);
+ 		mono_add_patch_info (cfg, code-cfg-&gt;native_code, MONO_PATCH_INFO_ABS, func);
+@@ -1698,6 +1829,7 @@
+ 	do {                                                        \
+ 		MonoInst *tins = mono_branch_optimize_exception_target (cfg, bb, exc_name); \
+ 		if (tins == NULL) {										\
++			x86_codegen_pre (&amp;code, 6); \
+ 			mono_add_patch_info (cfg, code - cfg-&gt;native_code,   \
+ 					MONO_PATCH_INFO_EXC, exc_name);  \
+ 			x86_branch32 (code, cond, 0, signed);               \
+@@ -1715,6 +1847,9 @@
+ static guint8*
+ emit_call (MonoCompile *cfg, guint8 *code, guint32 patch_type, gconstpointer data)
+ {
++#ifdef __native_client_codegen__
++	code = nacl_pad_call_imm(code);
++#endif  /* __native_client_codegen__ */
+ 	mono_add_patch_info (cfg, code - cfg-&gt;native_code, patch_type, data);
+ 	x86_call_code (code, 0);
+ 
+@@ -2011,6 +2146,7 @@
+ 			x86_alu_reg_reg (code, X86_XOR, X86_EAX, X86_EAX);				
+ 			x86_lea_membase (code, X86_EDI, X86_ESP, 12);
+ 			x86_cld (code);
++			x86_codegen_pre (&amp;code, 2);
+ 			x86_prefix (code, X86_REP_PREFIX);
+ 			x86_stosl (code);
+ 			x86_pop_reg (code, X86_EDI);
+@@ -2058,6 +2194,7 @@
+ 				
+ 		x86_lea_membase (code, X86_EDI, X86_ESP, offset);
+ 		x86_cld (code);
++		x86_codegen_pre (&amp;code, 2);
+ 		x86_prefix (code, X86_REP_PREFIX);
+ 		x86_stosl (code);
+ 		
+@@ -2142,6 +2279,7 @@
+ 		x86_mov_reg_mem (code, dreg, 0, 4);
+ 		x86_mov_reg_membase (code, dreg, dreg, tls_offset, 4);
+ 	} else {
++		x86_codegen_pre (&amp;code, 8);
+ 		x86_prefix (code, X86_GS_PREFIX);
+ 		x86_mov_reg_mem (code, dreg, tls_offset, 4);
+ 	}
+@@ -2211,6 +2349,11 @@
+ x86_pop_reg (code, X86_EDX); \
+ x86_pop_reg (code, X86_EAX);
+ 
++/* REAL_PRINT_REG does not appear to be used, and was not adapted to work with Native Client. */
++#ifdef __native__client_codegen__
++#define REAL_PRINT_REG(text, reg) g_assert_not_reached()
++#endif
++
+ /* benchmark and set based on cpu */
+ #define LOOP_ALIGNMENT 8
+ #define bb_is_loop_start(bb) ((bb)-&gt;loop_body_start &amp;&amp; (bb)-&gt;nesting)
+@@ -2237,7 +2380,23 @@
+ 			bb-&gt;native_offset = cfg-&gt;code_len;
+ 		}
+ 	}
++#ifdef __native_client_codegen__
++        {
++          /* For Native Client, all indirect call/jump targets must be   */
++          /* 32-byte aligned.  Exception handler blocks are jumped to    */
++          /* indirectly as well.                                         */
++          gboolean bb_needs_alignment = (bb-&gt;flags &amp; BB_INDIRECT_JUMP_TARGET) ||
++                                        (bb-&gt;flags &amp; BB_EXCEPTION_HANDLER);
+ 
++          /* if ((cfg-&gt;code_len &amp; kNaClAlignmentMask) != 0) { */
++          if ( bb_needs_alignment &amp;&amp; ((cfg-&gt;code_len &amp; kNaClAlignmentMask) != 0)) {
++            int pad = kNaClAlignment - (cfg-&gt;code_len &amp; kNaClAlignmentMask);
++            if (pad != kNaClAlignment) code = nacl_pad(code, pad);
++            cfg-&gt;code_len += pad;
++            bb-&gt;native_offset = cfg-&gt;code_len;
++          }
++        }
++#endif  /* __native_client_codegen__ */
+ 	if (cfg-&gt;verbose_level &gt; 2)
+ 		g_print (&quot;Basic block %d starting at offset 0x%x\n&quot;, bb-&gt;block_num, bb-&gt;native_offset);
+ 
+@@ -2262,9 +2421,14 @@
+ 
+ 		max_len = ((guint8 *)ins_get_spec (ins-&gt;opcode))[MONO_INST_LEN];
+ 
+-		if (G_UNLIKELY (offset &gt; (cfg-&gt;code_size - max_len - 16))) {
++#ifdef  __native_client_codegen__
++#define EXTRA_CODE_SPACE (16 + kNaClAlignment)
++#else
++#define EXTRA_CODE_SPACE  16
++#endif  /* __native_client_codegen__ */
++		if (G_UNLIKELY (offset &gt; (cfg-&gt;code_size - max_len - EXTRA_CODE_SPACE))) {
+ 			cfg-&gt;code_size *= 2;
+-			cfg-&gt;native_code = g_realloc (cfg-&gt;native_code, cfg-&gt;code_size);
++			cfg-&gt;native_code = mono_realloc_native_code(cfg);
+ 			code = cfg-&gt;native_code + offset;
+ 			mono_jit_stats.code_reallocs++;
+ 		}
+@@ -2442,6 +2606,7 @@
+ 			x86_breakpoint (code);
+ 			break;
+  		case OP_RELAXED_NOP:
++			x86_codegen_pre (&amp;code, 2);
+ 			x86_prefix (code, X86_REP_PREFIX);
+ 			x86_nop (code);
+ 			break;
+@@ -2828,6 +2993,8 @@
+ 			x86_mov_reg_imm (code, ins-&gt;dreg, 0);
+ 			break;
+ 		case OP_JUMP_TABLE:
++			x86_codegen_pre (&amp;code, 5);
++			offset = code - cfg-&gt;native_code;
+ 			mono_add_patch_info (cfg, offset, (MonoJumpInfoType)ins-&gt;inst_i1, ins-&gt;inst_p0);
+ 			x86_mov_reg_imm (code, ins-&gt;dreg, 0);
+ 			break;
+@@ -2836,10 +3003,14 @@
+ 			code = mono_arch_emit_load_got_addr (cfg-&gt;native_code, code, cfg, NULL);
+ 			break;
+ 		case OP_GOT_ENTRY:
++			x86_codegen_pre (&amp;code, kMovRegMembasePadding);
++			offset = code - cfg-&gt;native_code;
+ 			mono_add_patch_info (cfg, offset, (MonoJumpInfoType)ins-&gt;inst_right-&gt;inst_i1, ins-&gt;inst_right-&gt;inst_p0);
+ 			x86_mov_reg_membase (code, ins-&gt;dreg, ins-&gt;inst_basereg, 0xf0f0f0f0, 4);
+ 			break;
+ 		case OP_X86_PUSH_GOT_ENTRY:
++			x86_codegen_pre (&amp;code, 1 + kMaxMembaseEmitPadding);
++			offset = code - cfg-&gt;native_code;
+ 			mono_add_patch_info (cfg, offset, (MonoJumpInfoType)ins-&gt;inst_right-&gt;inst_i1, ins-&gt;inst_right-&gt;inst_p0);
+ 			x86_push_membase (code, ins-&gt;inst_basereg, 0xf0f0f0f0);
+ 			break;
+@@ -2945,6 +3116,9 @@
+ 		case OP_VOIDCALL_REG:
+ 		case OP_CALL_REG:
+ 			call = (MonoCallInst*)ins;
++#ifdef __native_client_codegen__
++			code = nacl_pad_call_reg(code);
++#endif
+ 			x86_call_reg (code, ins-&gt;sreg1);
+ 			if (call-&gt;stack_usage &amp;&amp; !CALLCONV_IS_STDCALL (call-&gt;signature)) {
+ 				if (call-&gt;stack_usage == 4)
+@@ -2969,6 +3143,9 @@
+ 			x86_nop (code);
+ 			x86_nop (code);
+ 
++#ifdef __native_client_codegen__
++			code = nacl_pad_call_membase(code);
++#endif
+ 			x86_call_membase (code, ins-&gt;sreg1, ins-&gt;inst_offset);
+ 			if (call-&gt;stack_usage &amp;&amp; !CALLCONV_IS_STDCALL (call-&gt;signature)) {
+ 				if (call-&gt;stack_usage == 4)
+@@ -2999,6 +3176,7 @@
+ 			x86_lea_membase (code, X86_EDI, X86_ESP, 12);
+ 			x86_mov_reg_imm (code, X86_ECX, (ins-&gt;inst_imm &gt;&gt; 2));
+ 			x86_cld (code);
++			x86_codegen_pre (&amp;code, 2);
+ 			x86_prefix (code, X86_REP_PREFIX);
+ 			x86_movsd (code);
+ 			x86_pop_reg (code, X86_ECX);
+@@ -3054,6 +3232,9 @@
+ 		}
+ 		case OP_CALL_HANDLER:
+ 			x86_alu_reg_imm (code, X86_SUB, X86_ESP, MONO_ARCH_FRAME_ALIGNMENT - 4);
++#ifdef __native_client_codegen__
++			code = nacl_pad_call_imm(code);
++#endif  /* __native_client_codegen__ */
+ 			mono_add_patch_info (cfg, code - cfg-&gt;native_code, MONO_PATCH_INFO_BB, ins-&gt;inst_target_bb);
+ 			x86_call_imm (code, 0);
+ 			mono_cfg_add_try_hole (cfg, ins-&gt;inst_eh_block, code, bb);
+@@ -3188,6 +3369,7 @@
+ 					x86_alu_reg_imm (code, X86_ADD, X86_ESP, 8);
+ 				}
+ 				else {
++					x86_codegen_pre (&amp;code, 6);
+ 					mono_add_patch_info (cfg, code - cfg-&gt;native_code, MONO_PATCH_INFO_R8, ins-&gt;inst_p0);
+ 					x86_fld (code, NULL, TRUE);
+ 				}
+@@ -3209,6 +3391,7 @@
+ 					x86_alu_reg_imm (code, X86_ADD, X86_ESP, 4);
+ 				}
+ 				else {
++					x86_codegen_pre (&amp;code, 6);
+ 					mono_add_patch_info (cfg, code - cfg-&gt;native_code, MONO_PATCH_INFO_R4, ins-&gt;inst_p0);
+ 					x86_fld (code, NULL, FALSE);
+ 				}
+@@ -3360,6 +3543,7 @@
+ 				else
+ 					x86_jump32 (code, 0);
+ 			} else {
++				x86_codegen_pre (&amp;code, 5);
+ 				mono_add_patch_info (cfg, code - cfg-&gt;native_code, MONO_PATCH_INFO_EXC, &quot;OverflowException&quot;);
+ 				x86_jump32 (code, 0);
+ 			}
+@@ -3807,6 +3991,7 @@
+ 			if (dreg != ins-&gt;sreg2)
+ 				x86_mov_reg_reg (code, ins-&gt;dreg, ins-&gt;sreg2, 4);
+ 
++			x86_codegen_pre (&amp;code, 9);
+ 			x86_prefix (code, X86_LOCK_PREFIX);
+ 			x86_xadd_membase_reg (code, ins-&gt;inst_basereg, ins-&gt;inst_offset, dreg, 4);
+ 
+@@ -3848,6 +4033,7 @@
+ 			}
+ 
+ 			x86_mov_reg_reg (code, dreg, ins-&gt;sreg2, 4);
++			x86_codegen_pre (&amp;code, 9);
+ 			x86_prefix (code, X86_LOCK_PREFIX);
+ 			x86_xadd_membase_reg (code, ins-&gt;inst_basereg, ins-&gt;inst_offset, dreg, 4);
+ 			/* dreg contains the old value, add with sreg2 value */
+@@ -3886,6 +4072,7 @@
+ 
+ 			x86_mov_reg_membase (code, X86_EAX, breg, ins-&gt;inst_offset, 4);
+ 
++			x86_codegen_pre (&amp;code, 9);
+ 			br [0] = code; x86_prefix (code, X86_LOCK_PREFIX);
+ 			x86_cmpxchg_membase_reg (code, breg, ins-&gt;inst_offset, sreg2);
+ 			br [1] = code; x86_branch8 (code, X86_CC_NE, -1, FALSE);
+@@ -3904,6 +4091,7 @@
+ 			g_assert (ins-&gt;sreg1 != X86_EAX);
+ 			g_assert (ins-&gt;sreg1 != ins-&gt;sreg2);
+ 
++			x86_codegen_pre (&amp;code, 9);
+ 			x86_prefix (code, X86_LOCK_PREFIX);
+ 			x86_cmpxchg_membase_reg (code, ins-&gt;sreg1, ins-&gt;inst_offset, ins-&gt;sreg2);
+ 
+@@ -4470,9 +4658,11 @@
+ 		}
+ 
+ 		if (G_UNLIKELY ((code - cfg-&gt;native_code - offset) &gt; max_len)) {
++#ifndef __native_client_codegen__
+ 			g_warning (&quot;wrong maximal instruction length of instruction %s (expected %d, got %d)&quot;,
+ 				   mono_inst_name (ins-&gt;opcode), max_len, code - cfg-&gt;native_code - offset);
+ 			g_assert_not_reached ();
++#endif  /* __native_client_codegen__ */
+ 		}
+ 	       
+ 		cpos += max_len;
+@@ -4555,13 +4745,30 @@
+ 	int alloc_size, pos, max_offset, i, cfa_offset;
+ 	guint8 *code;
+ 	gboolean need_stack_frame;
++#ifdef __native_client_codegen__
++	guint alignment_check;
++#endif
+ 
+ 	cfg-&gt;code_size = MAX (cfg-&gt;header-&gt;code_size * 4, 10240);
+ 
+ 	if (cfg-&gt;prof_options &amp; MONO_PROFILE_ENTER_LEAVE)
+ 		cfg-&gt;code_size += 512;
+ 
++#ifdef __native_client_codegen__
++	/* native_code_alloc is not 32-byte aligned, native_code is. */
++	cfg-&gt;native_code_alloc = g_malloc (cfg-&gt;code_size + kNaClAlignment);
++
++	/* Align native_code to next nearest kNaclAlignment byte. */
++	cfg-&gt;native_code = (guint)cfg-&gt;native_code_alloc + kNaClAlignment; 
++	cfg-&gt;native_code = (guint)cfg-&gt;native_code &amp; ~kNaClAlignmentMask;
++	
++	code = cfg-&gt;native_code;
++
++	alignment_check = (guint)cfg-&gt;native_code &amp; kNaClAlignmentMask;
++  	g_assert(alignment_check == 0);
++#else
+ 	code = cfg-&gt;native_code = g_malloc (cfg-&gt;code_size);
++#endif
+ 
+ 	/* Offset between RSP and the CFA */
+ 	cfa_offset = 0;
+@@ -4635,6 +4842,9 @@
+ 
+ 		/* save the current IP */
+ 		if (cfg-&gt;compile_aot) {
++#ifdef __native_client_codegen__
++			code = nacl_pad_call_imm(code);
++#endif  /* __native_client_codegen__ */
+ 			/* This pushes the current ip */
+ 			x86_call_imm (code, 0);
+ 		} else {
+@@ -4662,6 +4872,7 @@
+ 			 * through the mono_lmf_addr TLS variable.
+ 			 */
+ 			/* %eax = previous_lmf */
++			x86_codegen_pre (&amp;code, 8);
+ 			x86_prefix (code, X86_GS_PREFIX);
+ 			x86_mov_reg_mem (code, X86_EAX, lmf_tls_offset, 4);
+ 			/* skip esp + method_info + lmf */
+@@ -4669,6 +4880,7 @@
+ 			/* push previous_lmf */
+ 			x86_push_reg (code, X86_EAX);
+ 			/* new lmf = ESP */
++			x86_codegen_pre (&amp;code, 9);
+ 			x86_prefix (code, X86_GS_PREFIX);
+ 			x86_mov_mem_reg (code, lmf_tls_offset, X86_ESP, 4);
+ 		} else {
+@@ -4748,7 +4960,7 @@
+ 		if (G_UNLIKELY (required_code_size &gt;= (cfg-&gt;code_size - offset))) {
+ 			while (required_code_size &gt;= (cfg-&gt;code_size - offset))
+ 				cfg-&gt;code_size *= 2;
+-			cfg-&gt;native_code = g_realloc (cfg-&gt;native_code, cfg-&gt;code_size);
++			cfg-&gt;native_code = mono_realloc_native_code(cfg);
+ 			code = cfg-&gt;native_code + offset;
+ 			mono_jit_stats.code_reallocs++;
+ 		}
+@@ -4794,11 +5006,23 @@
+ 			/* max alignment for loops */
+ 			if ((cfg-&gt;opt &amp; MONO_OPT_LOOP) &amp;&amp; bb_is_loop_start (bb))
+ 				max_offset += LOOP_ALIGNMENT;
+-
++#ifdef __native_client_codegen__
++                        /* max alignment for native client */
++                        max_offset += kNaClAlignment;
++#endif
+ 			MONO_BB_FOR_EACH_INS (bb, ins) {
+ 				if (ins-&gt;opcode == OP_LABEL)
+ 					ins-&gt;inst_c1 = max_offset;
+-				
++#ifdef __native_client_codegen__
++				{
++				  int space_in_block = kNaClAlignment -
++				    ((max_offset + cfg-&gt;code_len) &amp; kNaClAlignmentMask);
++				  int max_len = ((guint8 *)ins_get_spec (ins-&gt;opcode))[MONO_INST_LEN];
++				  if (space_in_block &lt; max_len &amp;&amp; max_len &lt; kNaClAlignment) {
++				    max_offset += space_in_block;
++				  }
++				}
++#endif  /* __native_client_codegen__ */
+ 				max_offset += ((guint8 *)ins_get_spec (ins-&gt;opcode))[MONO_INST_LEN];
+ 			}
+ 		}
+@@ -4853,7 +5077,7 @@
+ 
+ 	while (cfg-&gt;code_len + max_epilog_size &gt; (cfg-&gt;code_size - 16)) {
+ 		cfg-&gt;code_size *= 2;
+-		cfg-&gt;native_code = g_realloc (cfg-&gt;native_code, cfg-&gt;code_size);
++		cfg-&gt;native_code = mono_realloc_native_code(cfg);
+ 		mono_jit_stats.code_reallocs++;
+ 	}
+ 
+@@ -4881,6 +5105,9 @@
+ 			patch = code;
+ 		        x86_branch8 (code, X86_CC_Z, 0, FALSE);
+ 			/* note that the call trampoline will preserve eax/edx */
++#ifdef __native_client_codegen__
++			code = nacl_pad_call_reg(code);
++#endif
+ 			x86_call_reg (code, X86_ECX);
+ 			x86_patch (patch, code);
+ 		} else {
+@@ -4895,6 +5122,7 @@
+ 			x86_mov_reg_membase (code, X86_ECX, X86_EBP, lmf_offset + G_STRUCT_OFFSET (MonoLMF, previous_lmf), 4);
+ 
+ 			/* lmf = previous_lmf */
++			x86_codegen_pre (&amp;code, 9);
+ 			x86_prefix (code, X86_GS_PREFIX);
+ 			x86_mov_mem_reg (code, lmf_tls_offset, X86_ECX, 4);
+ 		} else {
+@@ -5034,7 +5262,7 @@
+ 
+ 	while (cfg-&gt;code_len + code_size &gt; (cfg-&gt;code_size - 16)) {
+ 		cfg-&gt;code_size *= 2;
+-		cfg-&gt;native_code = g_realloc (cfg-&gt;native_code, cfg-&gt;code_size);
++		cfg-&gt;native_code = mono_realloc_native_code(cfg);
+ 		mono_jit_stats.code_reallocs++;
+ 	}
+ 
+@@ -5067,8 +5295,12 @@
+ 				guint32 size;
+ 
+ 				/* Compute size of code following the push &lt;OFFSET&gt; */
++#ifdef __native_client_codegen__
++				code = nacl_align(code);
++				size = kNaClAlignment;
++#else
+ 				size = 5 + 5;
+-
++#endif
+ 				/*This is aligned to 16 bytes by the callee. This way we save a few bytes here.*/
+ 
+ 				if ((code - cfg-&gt;native_code) - throw_ip &lt; 126 - size) {
+@@ -5090,6 +5322,9 @@
+ 				x86_push_imm (code, exc_class-&gt;type_token - MONO_TOKEN_TYPE_DEF);
+ 				patch_info-&gt;data.name = &quot;mono_arch_throw_corlib_exception&quot;;
+ 				patch_info-&gt;type = MONO_PATCH_INFO_INTERNAL_METHOD;
++#ifdef __native_client_codegen__
++                                code = nacl_pad_call_imm(code);
++#endif  /* __native_client_codegen__ */
+ 				patch_info-&gt;ip.i = code - cfg-&gt;native_code;
+ 				x86_call_code (code, 0);
+ 				x86_push_imm (buf, (code - cfg-&gt;native_code) - throw_ip);
+@@ -5183,8 +5418,16 @@
+ //[1 + 5] x86_jump_mem(inst,mem)
+ 
+ #define CMP_SIZE 6
++#ifdef __native_client_codegen__
++/* These constants should be coming from cpu-x86.md            */
++/* I suspect the size calculation below is actually incorrect. */
++/* TODO: fix the calculation that uses these sizes.            */
++#define BR_SMALL_SIZE 16
++#define BR_LARGE_SIZE 12
++#else
+ #define BR_SMALL_SIZE 2
+ #define BR_LARGE_SIZE 5
++#endif  /* __native_client_codegen__ */
+ #define JUMP_IMM_SIZE 6
+ #define ENABLE_WRONG_METHOD_CHECK 0
+ #define DEBUG_IMT 0
+@@ -5209,6 +5452,9 @@
+ 	int size = 0;
+ 	guint8 *code, *start;
+ 
++#ifdef __native_client_codegen__
++	/* g_print(&quot;mono_arch_build_imt_thunk needs to be aligned.\n&quot;); */
++#endif
+ 	for (i = 0; i &lt; count; ++i) {
+ 		MonoIMTCheckItem *item = imt_entries [i];
+ 		if (item-&gt;is_equals) {
+@@ -5503,17 +5749,19 @@
+ gpointer
+ mono_arch_get_vcall_slot (guint8 *code, mgreg_t *regs, int *displacement)
+ {
+-	guint8 buf [8];
++#if defined(__native_client_codegen__) || defined(__native_client__)
++  const int kBufSize = 16;
++#else
++  const int kBufSize = 8;	
++#endif  /* __native_client_codegen__ */
++	guint8 buf [kBufSize];
+ 	guint8 reg = 0;
+ 	gint32 disp = 0;
+ 
+-	mono_breakpoint_clean_code (NULL, code, 8, buf, sizeof (buf));
+-	code = buf + 8;
+-
++	mono_breakpoint_clean_code (NULL, code, kBufSize, buf, sizeof (buf));
++	code = buf + kBufSize - 6;
+ 	*displacement = 0;
+ 
+-	code -= 6;
+-
+ 	/* 
+ 	 * A given byte sequence can match more than case here, so we have to be
+ 	 * really careful about the ordering of the cases. Longer sequences
+@@ -5540,8 +5788,17 @@
+ 		 */
+ 		disp = 0;
+ 		reg = code [5] &amp; 0x07;
+-	}
+-	else
++#if defined(__native_client_codegen__) || defined(__native_client__)
++                /* TODO: Implement more robust checking for this */
++        } else if ((code[1] == 0x83) &amp;&amp; (code[2] == 0xe1) &amp;&amp; (code[4] == 0xff) &amp;&amp;
++                   (code[5] == 0xd1) &amp;&amp; (code[-5] == 0x8b)) {
++          disp = *((gint32*)(code - 3));
++          reg = code[-4] &amp; 0x07;
++        } else if ((code[-2] == 0x8b) &amp;&amp; (code[1] == 0x83) &amp;&amp; (code[4] == 0xff)) {
++          reg = code[-1] &amp; 0x07;
++          disp = (signed char)code[0];
++#endif
++	} else
+ 		return NULL;
+ 
+ 	*displacement = disp;
+@@ -5610,8 +5867,12 @@
+ 	} else {
+ 		int i = 0;
+ 		/* 8 for mov_reg and jump, plus 8 for each parameter */
+-		int code_reserve = 8 + (param_count * 8);
+-
++#ifdef __native_client_codegen__
++                /* TODO: calculate this size correctly */
++                int code_reserve = 13 + (param_count * 8) + 2 * kNaClAlignment;
++#else
++                int code_reserve = 8 + (param_count * 8);
++#endif  /* __native_client_codegen__ */
+ 		/*
+ 		 * The stack contains:
+ 		 * &lt;args in reverse order&gt;
+@@ -5965,6 +6226,9 @@
+ guint8*
+ mono_arch_emit_load_got_addr (guint8 *start, guint8 *code, MonoCompile *cfg, MonoJumpInfo **ji)
+ {
++#ifdef __native_client_codegen__
++	code = nacl_pad_call_imm(code);
++#endif  /* __native_client_codegen__ */
+ 	x86_call_imm (code, 0);
+ 	/* 
+ 	 * The patch needs to point to the pop, since the GOT offset needs 
+@@ -5993,6 +6257,7 @@
+ {
+ 	/* Load the mscorlib got address */
+ 	x86_mov_reg_membase (code, X86_EAX, MONO_ARCH_GOT_REG, sizeof (gpointer), 4);
++	x86_codegen_pre (&amp;code, kMovRegMembasePadding);
+ 	*ji = mono_patch_info_list_prepend (*ji, code - start, tramp_type, target);
+ 	/* arch_emit_got_access () patches this */
+ 	x86_mov_reg_membase (code, X86_EAX, X86_EAX, 0xf0f0f0f0, 4);
+Index: mono/mini/mini-x86.h
+===================================================================
+--- mono/mini/mini-x86.h	(revision 159271)
++++ mono/mini/mini-x86.h	(working copy)
+@@ -55,6 +55,10 @@
+ #define MONO_ARCH_USE_SIGACTION
+ #endif
+ 
++#if defined(__native_client__)
++#undef MONO_ARCH_USE_SIGACTION
++#endif
++
+ #ifndef HOST_WIN32
+ 
+ #ifdef HAVE_WORKING_SIGALTSTACK
+@@ -286,7 +290,7 @@
+ 
+ #define MONO_ARCH_HAVE_DECOMPOSE_LONG_OPTS 1
+ 
+-#if !defined(__APPLE__)
++#if !defined(__APPLE__) || defined(__native_client_codegen__)
+ #define MONO_ARCH_AOT_SUPPORTED 1
+ #endif
+ 
+Index: mono/mini/genmdesc.c
+===================================================================
+--- mono/mini/genmdesc.c	(revision 159271)
++++ mono/mini/genmdesc.c	(working copy)
+@@ -43,7 +43,7 @@
+ 	char spec [MONO_INST_MAX];
+ } OpDesc;
+ 
+-static int nacl;
++static int nacl = 0;
+ static GHashTable *table;
+ static GHashTable *template_table;
+ 
+@@ -75,6 +75,8 @@
+ 	line = 0;
+ 	while ((str = fgets (buf, sizeof (buf), f))) {
+ 		gboolean is_template = FALSE;
++		gboolean nacl_length_set = FALSE;
++
+ 		++line;
+ 		eat_whitespace (str);
+ 		if (!str [0])
+@@ -132,14 +134,20 @@
+ 				p += 7;
+ 				*/
+ 			} else if (strncmp (p, &quot;len:&quot;, 4) == 0) {
++				unsigned long size;
+ 				p += 4;
+-				desc-&gt;spec [MONO_INST_LEN] += strtoul (p, &amp;p, 10);
+-			} else if (strncmp (p, &quot;nacl:&quot;, 5) == 0){
++				size = strtoul (p, &amp;p, 10);
++				if (!nacl_length_set) {
++					desc-&gt;spec [MONO_INST_LEN] = size;
++				}
++			} else if (strncmp (p, &quot;nacl:&quot;, 5) == 0) {
+ 				unsigned long size;
+ 				p += 5;
+ 				size = strtoul (p, &amp;p, 10);
+-				if (nacl)
+-					desc-&gt;spec [MONO_INST_LEN] += size;
++				if (nacl) {
++					desc-&gt;spec [MONO_INST_LEN] = size;
++					nacl_length_set = TRUE;
++				}
+ 			} else if (strncmp (p, &quot;template:&quot;, 9) == 0) {
+ 				char *tname;
+ 				int i;
+@@ -298,7 +306,7 @@
+ 		return 1;
+ 	} else {
+ 		int i = 3;
+-		if (strcmp (argv [1], &quot;--nacl&quot;) == 0){
++		if (strcmp (argv [1], &quot;--nacl&quot;) == 0) {
+ 			nacl = 1;
+ 			i++;
+ 		}
+Index: mono/mini/Makefile.am
+===================================================================
+--- mono/mini/Makefile.am	(revision 159271)
++++ mono/mini/Makefile.am	(working copy)
+@@ -330,6 +330,7 @@
+ endif
+ 
+ regtests=basic.exe basic-float.exe basic-long.exe basic-calls.exe objects.exe arrays.exe basic-math.exe exceptions.exe iltests.exe devirtualization.exe generics.exe basic-simd.exe
++fsatests=basic.exe basic-float.exe basic-long.exe basic-calls.exe objects.exe arrays.exe basic-math.exe exceptions.exe devirtualization.exe basic-simd.exe
+ 
+ if X86
+ arch_sources = $(x86_sources) $(mono_debugger_sources)
+@@ -474,14 +475,20 @@
+ generics-variant-types.dll: generics-variant-types.il
+ 	$(ILASM) -dll -output=$@ $&lt;
+ 
++if NACL_CODEGEN
++GENMDESC_OPTS=--nacl
++else !NACL_CODEGEN
++GENMDESC_OPTS=
++endif !NACL_CODEGEN
++
+ # we don't always use the perl impl because it's an additional
+ # build dependency for the poor windows users
+ # $(arch_define) is the preprocessor symbol that enables all the opcodes
+ # for the specific platform in mini-ops.h
+ if CROSS_COMPILING
+-GENMDESC_PRG=perl $(srcdir)/genmdesc.pl $(arch_define) $(srcdir)
++GENMDESC_PRG=perl $(srcdir)/genmdesc.pl $(arch_define) $(srcdir) $(GENMDESC_OPTS)
+ else !CROSS_COMPILING
+-GENMDESC_PRG=./genmdesc
++GENMDESC_PRG=./genmdesc $(GENMDESC_OPTS)
+ endif !CROSS_COMPILING
+ 
+ cpu-x86.h: cpu-x86.md genmdesc$(EXEEXT)
+@@ -545,6 +552,20 @@
+ 	MONO_PATH=fullaot-tmp $(top_builddir)/runtime/mono-wrapper --aot=full fullaot-tmp/* || exit 1
+ 	for i in $(regtests); do echo $$i; MONO_PATH=fullaot-tmp $(top_builddir)/runtime/mono-wrapper --full-aot fullaot-tmp/$$i --exclude '!FULLAOT' || exit 1; done
+ 
++fsacheck: mono $(fsatests) fsacheck.c generics.exe
++	rm -rf fsa-tmp
++	mkdir fsa-tmp
++	cp $(CLASS)/mscorlib.dll $(CLASS)/System.Core.dll $(CLASS)/System.dll $(CLASS)/Mono.Posix.dll $(CLASS)/System.Configuration.dll $(CLASS)/System.Security.dll $(CLASS)/System.Xml.dll $(CLASS)/Mono.Security.dll $(CLASS)/Mono.Simd.dll \
++	$(fsatests) generics-variant-types.dll TestDriver.dll fsa-tmp/
++	cp $(fsatests) fsa-tmp/
++	MONO_PATH=fsa-tmp $(top_builddir)/runtime/mono-wrapper --aot=full,static fsa-tmp/*.dll || exit 1
++	MONO_PATH=fsa-tmp $(top_builddir)/runtime/mono-wrapper --aot=full,static fsa-tmp/*.exe || exit 1
++	$(CC) -o $@.out -g -static $(VPATH)/fsacheck.c fsa-tmp/*.o \
++	-lmono-2.0 -lpthread -lm -ldl -lrt \
++	-DTARGET_X86 -L.libs -I${prefix}/include/mono-2.0 \
++	-I${prefix} -I/usr/include/glib-2.0 -I/usr/lib/glib-2.0/include
++	for i in $(fsatests); do echo $$i; MONO_PATH=fsa-tmp ./$@.out $$i || exit 1; done
++
+ bench: mono test.exe
+ 	time env $(RUNTIME) --ncompile $(count) --compile Test:$(mtest) test.exe
+ 
+Index: mono/mini/image-writer.c
+===================================================================
+--- mono/mini/image-writer.c	(revision 159271)
++++ mono/mini/image-writer.c	(working copy)
+@@ -53,7 +53,7 @@
+  * TARGET_ASM_GAS == GNU assembler
+  */
+ #if !defined(TARGET_ASM_APPLE) &amp;&amp; !defined(TARGET_ASM_GAS)
+-#ifdef __MACH__
++#if defined(__MACH__) &amp;&amp; !defined(__native_client_codegen__)
+ #define TARGET_ASM_APPLE
+ #else
+ #define TARGET_ASM_GAS
+@@ -313,6 +313,11 @@
+ 		while (new_size &lt;= new_offset)
+ 			new_size *= 2;
+ 		data = g_malloc0 (new_size);
++#ifdef __native_client_codegen__
++		/* for Native Client, fill empty space with HLT instruction */
++		/* instead of 00.                                           */
++		memset(data, 0xf4, new_size);
++#endif		
+ 		memcpy (data, section-&gt;data, section-&gt;data_len);
+ 		g_free (section-&gt;data);
+ 		section-&gt;data = data;
+@@ -355,7 +360,23 @@
+ 	}
+ }
+ 
++#ifdef __native_client_codegen__
+ static void
++bin_writer_emit_nacl_call_alignment (MonoImageWriter *acfg) {
++  int offset = acfg-&gt;cur_section-&gt;cur_offset;
++  int padding = kNaClAlignment - (offset &amp; kNaClAlignmentMask) - kNaClLengthOfCallImm;
++  guint8 padc = '\x90';
++
++  if (padding &lt; 0) padding += kNaClAlignment;
++
++  while (padding &gt; 0) {
++    bin_writer_emit_bytes(acfg, &amp;padc, 1);
++    padding -= 1;
++  }
++}
++#endif  /* __native_client_codegen__ */
++
++static void
+ bin_writer_emit_pointer_unaligned (MonoImageWriter *acfg, const char *target)
+ {
+ 	BinReloc *reloc;
+@@ -1627,7 +1648,21 @@
+ #endif
+ }
+ 
++#ifdef __native_client_codegen__
+ static void
++asm_writer_emit_nacl_call_alignment (MonoImageWriter *acfg) {
++  int padding = kNaClAlignment - kNaClLengthOfCallImm;
++  guint8 padc = '\x90';
++
++  fprintf (acfg-&gt;fp, &quot;\n\t.align %d&quot;, kNaClAlignment);
++  while (padding &gt; 0) {
++    fprintf (acfg-&gt;fp, &quot;\n\t.byte %d&quot;, padc);
++    padding -= 1;
++  }
++}
++#endif  /* __native_client_codegen__ */
++
++static void
+ asm_writer_emit_pointer_unaligned (MonoImageWriter *acfg, const char *target)
+ {
+ 	asm_writer_emit_unset_mode (acfg);
+@@ -1909,7 +1944,21 @@
+ #endif
+ }
+ 
++#ifdef __native_client_codegen__
+ void
++img_writer_emit_nacl_call_alignment (MonoImageWriter *acfg) {
++#ifdef USE_BIN_WRITER
++	if (acfg-&gt;use_bin_writer)
++		bin_writer_emit_nacl_call_alignment (acfg);
++	else
++		asm_writer_emit_nacl_call_alignment (acfg);
++#else
++	g_assert_not_reached();
++#endif
++}
++#endif  /* __native_client_codegen__ */
++
++void
+ img_writer_emit_pointer_unaligned (MonoImageWriter *acfg, const char *target)
+ {
+ #ifdef USE_BIN_WRITER
+Index: mono/mini/image-writer.h
+===================================================================
+--- mono/mini/image-writer.h	(revision 159271)
++++ mono/mini/image-writer.h	(working copy)
+@@ -62,6 +62,10 @@
+ 
+ void img_writer_emit_alignment (MonoImageWriter *w, int size) MONO_INTERNAL;
+ 
++#ifdef __native_client_codegen__
++void img_writer_emit_nacl_call_alignment (MonoImageWriter *w) MONO_INTERNAL;
++#endif
++
+ void img_writer_emit_pointer_unaligned (MonoImageWriter *w, const char *target) MONO_INTERNAL;
+ 
+ void img_writer_emit_pointer (MonoImageWriter *w, const char *target) MONO_INTERNAL;
+Index: mono/mini/exceptions-x86.c
+===================================================================
+--- mono/mini/exceptions-x86.c	(revision 159271)
++++ mono/mini/exceptions-x86.c	(working copy)
+@@ -324,9 +324,14 @@
+ 	guint8 *code;
+ 	MonoJumpInfo *ji = NULL;
+ 	GSList *unwind_ops = NULL;
++#ifdef __native_client_codegen__
++	guint kMaxCodeSize = 128;
++#else
++	guint kMaxCodeSize = 64;
++#endif  /* __native_client_codegen__ */
+ 
+ 	/* call_filter (MonoContext *ctx, unsigned long eip) */
+-	start = code = mono_global_codeman_reserve (64);
++	start = code = mono_global_codeman_reserve (kMaxCodeSize);
+ 
+ 	x86_push_reg (code, X86_EBP);
+ 	x86_mov_reg_reg (code, X86_EBP, X86_ESP, 4);
+@@ -356,6 +361,9 @@
+ 	x86_push_reg (code, X86_EDX);
+ 
+ 	/* call the handler */
++#ifdef __native_client_codegen__
++	code = nacl_pad_call_reg(code);
++#endif
+ 	x86_call_reg (code, X86_ECX);
+ 
+ 	/* restore ESP */
+@@ -374,7 +382,7 @@
+ 	if (info)
+ 		*info = mono_tramp_info_create (g_strdup_printf (&quot;call_filter&quot;), start, code - start, ji, unwind_ops);
+ 
+-	g_assert ((code - start) &lt; 64);
++	g_assert ((code - start) &lt; kMaxCodeSize);
+ 	return start;
+ }
+ 
+@@ -473,9 +481,13 @@
+ 	int i, stack_size, stack_offset, arg_offsets [5], regs_offset;
+ 	MonoJumpInfo *ji = NULL;
+ 	GSList *unwind_ops = NULL;
++#ifdef __native_client_codegen__
++	guint kMaxCodeSize = 256;
++#else
++	guint kMaxCodeSize = 128;
++#endif
++	start = code = mono_global_codeman_reserve (kMaxCodeSize);
+ 
+-	start = code = mono_global_codeman_reserve (128);
+-
+ 	stack_size = 128;
+ 
+ 	/* 
+@@ -570,13 +582,16 @@
+ 		// So emit the got address loading code too
+ 		code = mono_arch_emit_load_got_addr (start, code, NULL, &amp;ji);
+ 		code = mono_arch_emit_load_aotconst (start, code, &amp;ji, MONO_PATCH_INFO_JIT_ICALL_ADDR, corlib ? &quot;mono_x86_throw_corlib_exception&quot; : &quot;mono_x86_throw_exception&quot;);
++#ifdef __native_client_codegen__
++		code = nacl_pad_call_reg(code);
++#endif  /* __native_client_codegen__ */
+ 		x86_call_reg (code, X86_EAX);
+ 	} else {
+ 		x86_call_code (code, corlib ? (gpointer)mono_x86_throw_corlib_exception : (gpointer)mono_x86_throw_exception);
+ 	}
+ 	x86_breakpoint (code);
+ 
+-	g_assert ((code - start) &lt; 128);
++	g_assert ((code - start) &lt; kMaxCodeSize);
+ 
+ 	mono_save_trampoline_xdebug_info (corlib ? (llvm_abs ? &quot;llvm_throw_corlib_exception_trampoline&quot; : &quot;llvm_throw_corlib_exception_trampoline&quot;) : &quot;llvm_throw_exception_trampoline&quot;, start, code - start, unwind_ops);
+ 
+@@ -821,6 +836,18 @@
+ void
+ mono_arch_sigctx_to_monoctx (void *sigctx, MonoContext *mctx)
+ {
++#if defined (__native_client__)
++	printf(&quot;WARNING: mono_arch_sigctx_to_monoctx() called!\n&quot;);
++	mctx-&gt;eax = 0xDEADBEEF;
++	mctx-&gt;ebx = 0xDEADBEEF;
++	mctx-&gt;ecx = 0xDEADBEEF;
++	mctx-&gt;edx = 0xDEADBEEF;
++	mctx-&gt;ebp = 0xDEADBEEF;
++	mctx-&gt;esp = 0xDEADBEEF;
++	mctx-&gt;esi = 0xDEADBEEF;
++	mctx-&gt;edi = 0xDEADBEEF;
++	mctx-&gt;eip = 0xDEADBEEF;
++#else
+ #ifdef MONO_ARCH_USE_SIGACTION
+ 	ucontext_t *ctx = (ucontext_t*)sigctx;
+ 	
+@@ -846,11 +873,15 @@
+ 	mctx-&gt;edi = ctx-&gt;SC_EDI;
+ 	mctx-&gt;eip = ctx-&gt;SC_EIP;
+ #endif
++#endif /* if defined(__native_client__) */
+ }
+ 
+ void
+ mono_arch_monoctx_to_sigctx (MonoContext *mctx, void *sigctx)
+ {
++#if defined(__native_client__)
++	printf(&quot;WARNING: mono_arch_monoctx_to_sigctx() called!\n&quot;);
++#else
+ #ifdef MONO_ARCH_USE_SIGACTION
+ 	ucontext_t *ctx = (ucontext_t*)sigctx;
+ 
+@@ -876,18 +907,24 @@
+ 	ctx-&gt;SC_EDI = mctx-&gt;edi;
+ 	ctx-&gt;SC_EIP = mctx-&gt;eip;
+ #endif
++#endif /* __native_client__ */
+ }	
+ 
+ gpointer
+ mono_arch_ip_from_context (void *sigctx)
+ {
++#if defined(__native_client__)
++	printf(&quot;WARNING: mono_arch_ip_from_context() called!\n&quot;);
++	return (NULL);
++#else
+ #ifdef MONO_ARCH_USE_SIGACTION
+ 	ucontext_t *ctx = (ucontext_t*)sigctx;
+ 	return (gpointer)UCONTEXT_REG_EIP (ctx);
+ #else
+ 	struct sigcontext *ctx = sigctx;
+ 	return (gpointer)ctx-&gt;SC_EIP;
+-#endif	
++#endif
++#endif	/* __native_client__ */
+ }
+ 
+ /*
+@@ -945,6 +982,9 @@
+ 	/* Arg1 */
+ 	x86_mov_membase_reg (code, X86_ESP, 0, X86_EAX, 4);
+ 	/* Branch to target */
++#ifdef __native_client_codegen__
++	code = nacl_pad_call_reg(code);
++#endif  /* __native_client_codegen__ */
+ 	x86_call_reg (code, X86_EDX);
+ 
+ 	g_assert ((code - start) &lt; 128);
+@@ -1115,6 +1155,9 @@
+ 	static guint8* saved = NULL;
+ 	guint8 *code, *start;
+ 
++#ifdef __native_client_codegen__
++	g_print(&quot;mono_tasklets_arch_restore needs to be aligned for Native Client\n&quot;);
++#endif
+ 	if (saved)
+ 		return (MonoContinuationRestore)saved;
+ 	code = start = mono_global_codeman_reserve (48);
+Index: mono/mini/aot-compiler.c
+===================================================================
+--- mono/mini/aot-compiler.c	(revision 159271)
++++ mono/mini/aot-compiler.c	(working copy)
+@@ -68,7 +68,7 @@
+ 
+ #if !defined(DISABLE_AOT) &amp;&amp; !defined(DISABLE_JIT)
+ 
+-#if defined(__linux__)
++#if defined(__linux__) || defined(__native_client_codegen__)
+ #define RODATA_SECT &quot;.rodata&quot;
+ #else
+ #define RODATA_SECT &quot;.text&quot;
+@@ -330,6 +330,13 @@
+ 	img_writer_emit_byte (acfg-&gt;w, val); 
+ }
+ 
++#ifdef __native_client_codegen__
++static inline void
++emit_nacl_call_alignment (MonoAotCompile *acfg) {
++	img_writer_emit_nacl_call_alignment(acfg-&gt;w);
++}
++#endif
++
+ static G_GNUC_UNUSED void
+ emit_global_inner (MonoAotCompile *acfg, const char *name, gboolean func)
+ {
+@@ -460,6 +467,10 @@
+ #else
+ #define AOT_FUNC_ALIGNMENT 16
+ #endif
++#if defined(TARGET_X86) &amp;&amp; defined(__native_client_codegen__)
++#undef AOT_FUNC_ALIGNMENT
++#define AOT_FUNC_ALIGNMENT 32
++#endif
+  
+ #if defined(TARGET_POWERPC64) &amp;&amp; !defined(__mono_ilp32__)
+ #define PPC_LD_OP &quot;ld&quot;
+@@ -654,12 +665,26 @@
+ #if defined(TARGET_X86)
+ 		guint32 offset = (acfg-&gt;plt_got_offset_base + index) * sizeof (gpointer);
+ 
++#ifdef __native_client_codegen__
++		const guint8 kSizeOfNaClJmp = 11;
++		guint8 bytes[kSizeOfNaClJmp];
++		guint8 *pbytes = &amp;bytes[0];
++		
++		x86_jump_membase32(pbytes, X86_EBX, offset);
++		emit_bytes (acfg, bytes, kSizeOfNaClJmp);
++		/* four bytes of data, used by mono_arch_patch_plt_entry              */
++		/* For Native Client, make this work with data embedded in push.      */
++		emit_byte (acfg, 0x68);  /* hide data in a push */
++		emit_int32 (acfg, acfg-&gt;plt_got_info_offsets [index]);
++		emit_alignment(acfg, AOT_FUNC_ALIGNMENT);
++#else
+ 		/* jmp *&lt;offset&gt;(%ebx) */
+ 		emit_byte (acfg, 0xff);
+ 		emit_byte (acfg, 0xa3);
+ 		emit_int32 (acfg, offset);
+ 		/* Used by mono_aot_get_plt_info_offset */
+ 		emit_int32 (acfg, acfg-&gt;plt_got_info_offsets [index]);
++#endif  /* __native_client_codegen__ */
+ #elif defined(TARGET_AMD64)
+ 		/*
+ 		 * We can't emit jumps because they are 32 bits only so they can't be patched.
+@@ -846,9 +871,20 @@
+ 	/* Branch to generic trampoline */
+ 	x86_jump_reg (code, X86_ECX);
+ 
++#ifdef __native_client_codegen__
++	{
++		/* emit nops to next 32 byte alignment */
++		int a = (~kNaClAlignmentMask) &amp; ((code - buf) + kNaClAlignment - 1);
++		while (code &lt; (buf + a)) x86_nop(code);
++	}
++#endif
+ 	emit_bytes (acfg, buf, code - buf);
+ 
++#ifdef __native_client_codegen__
++	*tramp_size = kNaClAlignment;
++#else
+ 	*tramp_size = 17;
++#endif
+ 	g_assert (code - buf == *tramp_size);
+ #else
+ 	g_assert_not_reached ();
+@@ -1038,9 +1074,21 @@
+ 	/* Branch to the target address */
+ 	x86_jump_membase (code, X86_ECX, (offset + 1) * sizeof (gpointer));
+ 
++#ifdef __native_client_codegen__
++	{
++		/* emit nops to next 32 byte alignment */
++		int a = (~kNaClAlignmentMask) &amp; ((code - buf) + kNaClAlignment - 1);
++		while (code &lt; (buf + a)) x86_nop(code);
++	}
++#endif
++
+ 	emit_bytes (acfg, buf, code - buf);
+ 
++#ifdef __native_client_codegen__
++	*tramp_size = kNaClAlignment;
++#else
+ 	*tramp_size = 15;
++#endif
+ 	g_assert (code - buf == *tramp_size);
+ #else
+ 	g_assert_not_reached ();
+@@ -1107,9 +1155,17 @@
+ 	*tramp_size = code - buf + 7;
+ #elif defined(TARGET_X86)
+ 	guint8 *buf, *code;
++#ifdef __native_client_codegen__
++	guint8 *buf_alloc;
++#endif
+ 	guint8 *labels [3];
+ 
++#ifdef __native_client_codegen__
++	buf_alloc = g_malloc (256 + kNaClAlignment);
++	code = buf = ((guint)buf_alloc + kNaClAlignment) &amp; ~kNaClAlignmentMask;
++#else
+ 	code = buf = g_malloc (256);
++#endif
+ 
+ 	/* Allocate a temporary stack slot */
+ 	x86_push_reg (code, X86_EAX);
+@@ -1151,6 +1207,13 @@
+ 	mono_x86_patch (labels [1], code);
+ 	x86_breakpoint (code);
+ 
++#ifdef __native_client_codegen__
++	{
++	  /* emit nops to next 32 byte alignment */
++	  int a = (~kNaClAlignmentMask) &amp; ((code - buf) + kNaClAlignment - 1);
++	  while (code &lt; (buf + a)) x86_nop(code);
++	}
++#endif
+ 	emit_bytes (acfg, buf, code - buf);
+ 	
+ 	*tramp_size = code - buf;
+@@ -3807,7 +3870,7 @@
+ 
+ 	emit_section_change (acfg, &quot;.text&quot;, 0);
+ 	emit_global (acfg, start_symbol, TRUE);
+-	emit_alignment (acfg, 16);
++	emit_alignment (acfg, AOT_FUNC_ALIGNMENT);
+ 	emit_label (acfg, start_symbol);
+ 
+ 	sprintf (symbol, &quot;%snamed_%s&quot;, acfg-&gt;temp_prefix, name);
+@@ -4006,7 +4069,7 @@
+ 			}
+ 
+ 			emit_global (acfg, symbol, TRUE);
+-			emit_alignment (acfg, 16);
++			emit_alignment (acfg, AOT_FUNC_ALIGNMENT);
+ 			emit_label (acfg, symbol);
+ 
+ 			acfg-&gt;trampoline_got_offset_base [ntype] = tramp_got_offset;
+@@ -4030,6 +4093,10 @@
+ 				default:
+ 					g_assert_not_reached ();
+ 				}
++#ifdef __native_client_codegen__
++				/* align to avoid 32-byte boundary crossings */
++				emit_alignment(acfg, AOT_FUNC_ALIGNMENT);
++#endif
+ 
+ 				if (!acfg-&gt;trampoline_size [ntype]) {
+ 					g_assert (tramp_size);
+@@ -4806,6 +4873,9 @@
+ 			}
+ 
+ 			emit_section_change (acfg, &quot;.text&quot;, 0);
++#ifdef __native_client_codegen__
++			emit_alignment(acfg, AOT_FUNC_ALIGNMENT);
++#endif
+ 			emit_global (acfg, symbol, TRUE);
+ 			emit_label (acfg, symbol);
+ 
+@@ -5678,7 +5748,7 @@
+ 		 * Emit a global symbol which can be passed by an embedding app to
+ 		 * mono_aot_register_module ().
+ 		 */
+-#if defined(__MACH__)
++#if defined(__MACH__) &amp;&amp; !defined(__native_client_codegen__)
+ 		sprintf (symbol, &quot;_mono_aot_module_%s_info&quot;, acfg-&gt;image-&gt;assembly-&gt;aname.name);
+ #else
+ 		sprintf (symbol, &quot;mono_aot_module_%s_info&quot;, acfg-&gt;image-&gt;assembly-&gt;aname.name);
+@@ -5934,6 +6004,12 @@
+ #define AS_OPTIONS &quot;&quot;
+ #endif
+ 
++#ifdef __native_client_codegen__
++#define AS_NAME &quot;nacl-as&quot;
++#else
++#define AS_NAME &quot;as&quot;
++#endif
++
+ #ifndef LD_OPTIONS
+ #define LD_OPTIONS &quot;&quot;
+ #endif
+@@ -5959,7 +6035,7 @@
+ 	} else {
+ 		objfile = g_strdup_printf (&quot;%s.o&quot;, acfg-&gt;tmpfname);
+ 	}
+-	command = g_strdup_printf (&quot;%sas %s %s -o %s&quot;, tool_prefix, AS_OPTIONS, acfg-&gt;tmpfname, objfile);
++	command = g_strdup_printf (&quot;%s%s %s %s -o %s&quot;, tool_prefix, AS_NAME, AS_OPTIONS, acfg-&gt;tmpfname, objfile);
+ 	printf (&quot;Executing the native assembler: %s\n&quot;, command);
+ 	if (system (command) != 0) {
+ 		g_free (command);
+Index: mono/mini/tramp-x86.c
+===================================================================
+--- mono/mini/tramp-x86.c	(revision 159271)
++++ mono/mini/tramp-x86.c	(working copy)
+@@ -144,12 +144,23 @@
+ 
+ 	/* Patch the jump table entry used by the plt entry */
+ 
++#if defined(__native_client_codegen__) || defined(__native_client__)
++	/* for both compiler and runtime      */
++	/* A PLT entry:                       */
++	/*        mov &lt;DISP&gt;(%ebx), %ecx      */
++	/*        and 0xffffffe0, %ecx        */
++	/*        jmp *%ecx                   */
++	g_assert (code [0] == 0x8b);
++	g_assert (code [1] == 0x8b);
++
++	offset = *(guint32*)(code + 2);
++#else
+ 	/* A PLT entry: jmp *&lt;DISP&gt;(%ebx) */
+ 	g_assert (code [0] == 0xff);
+ 	g_assert (code [1] == 0xa3);
+ 
+ 	offset = *(guint32*)(code + 2);
+-
++#endif  /* __native_client_codegen__ */
+ 	if (!got)
+ 		got = (gpointer*)(gsize) regs [MONO_ARCH_GOT_REG];
+ 	*(guint8**)((guint8*)got + offset) = addr;
+@@ -298,6 +309,9 @@
+ 	/* get the address of lmf for the current thread */
+ 	if (aot) {
+ 		code = mono_arch_emit_load_aotconst (buf, code, &amp;ji, MONO_PATCH_INFO_JIT_ICALL_ADDR, &quot;mono_get_lmf_addr&quot;);
++#ifdef __native_client_codegen__
++		code = nacl_pad_call_reg(code);
++#endif
+ 		x86_call_reg (code, X86_EAX);
+ 	} else {
+ 		x86_call_code (code, mono_get_lmf_addr);
+@@ -352,6 +366,9 @@
+ 	if (aot) {
+ 		char *icall_name = g_strdup_printf (&quot;trampoline_func_%d&quot;, tramp_type);
+ 		code = mono_arch_emit_load_aotconst (buf, code, &amp;ji, MONO_PATCH_INFO_JIT_ICALL_ADDR, icall_name);
++#ifdef __native_client_codegen__
++		code = nacl_pad_call_reg(code);
++#endif
+ 		x86_call_reg (code, X86_EAX);
+ 	} else {
+ 		tramp = (guint8*)mono_get_trampoline_func (tramp_type);
+@@ -369,6 +386,9 @@
+ 	x86_push_reg (code, X86_EAX);
+ 	if (aot) {
+ 		code = mono_arch_emit_load_aotconst (buf, code, &amp;ji, MONO_PATCH_INFO_JIT_ICALL_ADDR, &quot;mono_thread_force_interruption_checkpoint&quot;);
++#ifdef __native_client_codegen__
++		code = nacl_pad_call_reg(code);
++#endif
+ 		x86_call_reg (code, X86_EAX);
+ 	} else {
+ 		x86_call_code (code, (guint8*)mono_thread_force_interruption_checkpoint);
+@@ -481,7 +501,11 @@
+ 	
+ 	tramp = mono_get_trampoline_code (tramp_type);
+ 
+-	code = buf = mono_domain_code_reserve_align (domain, TRAMPOLINE_SIZE, 4);
++#ifdef __native_client_codegen__
++        code = buf = mono_domain_code_reserve_align (domain, TRAMPOLINE_SIZE, kNaClAlignment);
++#else
++        code = buf = mono_domain_code_reserve_align (domain, TRAMPOLINE_SIZE, 4);
++#endif  /* __native_client_codegen__ */
+ 
+ 	x86_push_imm (buf, arg1);
+ 	x86_jump_code (buf, tramp);
+@@ -523,7 +547,13 @@
+ 		index -= size - 1;
+ 	}
+ 
++#ifdef __native_client_codegen__
++	/* TODO: align for Native Client */
++	tramp_size = (aot ? 64 : 36) + 2 * kNaClAlignment +
++	  6 * (depth + kNaClAlignment);
++#else
+ 	tramp_size = (aot ? 64 : 36) + 6 * depth;
++#endif  /* __native_client_codegen__ */
+ 
+ 	code = buf = mono_global_codeman_reserve (tramp_size);
+ 
+@@ -640,7 +670,9 @@
+ 	mono_arch_flush_icache (code, code - buf);
+ 
+ 	g_assert (code - buf &lt;= tramp_size);
+-
++#ifdef __native_client_codegen__
++	g_assert (code - buf &lt;= kNaClAlignment);
++#endif
+ 	mono_save_trampoline_xdebug_info (&quot;generic_class_init_trampoline&quot;, buf, code - buf, unwind_ops);
+ 
+ 	if (info)
+@@ -687,7 +719,11 @@
+ 	owner_offset = MONO_THREADS_SYNC_MEMBER_OFFSET (owner_offset);
+ 	nest_offset = MONO_THREADS_SYNC_MEMBER_OFFSET (nest_offset);
+ 
++#ifdef __native_client_codegen__
++	tramp_size = 128;
++#else
+ 	tramp_size = 64;
++#endif
+ 
+ 	code = buf = mono_global_codeman_reserve (tramp_size);
+ 
+@@ -724,6 +760,7 @@
+ 		/* zero EAX */
+ 		x86_alu_reg_reg (code, X86_XOR, X86_EAX, X86_EAX);
+ 		/* compare and exchange */
++		x86_codegen_pre (&amp;code, 4);
+ 		x86_prefix (code, X86_LOCK_PREFIX);
+ 		x86_cmpxchg_membase_reg (code, X86_ECX, owner_offset, X86_EDX);
+ 		/* if not successful, jump to actual trampoline */
+@@ -803,7 +840,11 @@
+ 	nest_offset = MONO_THREADS_SYNC_MEMBER_OFFSET (nest_offset);
+ 	entry_count_offset = MONO_THREADS_SYNC_MEMBER_OFFSET (entry_count_offset);
+ 
++#ifdef __native_client_codegen__
++	tramp_size = 128;
++#else
+ 	tramp_size = 64;
++#endif  /* __native_client_codegen__ */
+ 
+ 	code = buf = mono_global_codeman_reserve (tramp_size);
+ 
+@@ -905,6 +946,9 @@
+ 	guint8 *code = ji-&gt;code_start;
+ 
+ 	x86_push_imm (code, func_arg);
++#ifdef __native_client_codegen__
++	code = nacl_pad_call_imm(code);
++#endif  /* __native_client_codegen__ */
+ 	x86_call_code (code, (guint8*)func);
+ }
+ 
+@@ -962,5 +1006,10 @@
+ guint32
+ mono_arch_get_plt_info_offset (guint8 *plt_entry, mgreg_t *regs, guint8 *code)
+ {
++#if defined(__native_client_codegen__) || defined(__native_client__)
++	// both code gen and runtime need this
++	return *(guint32*)(plt_entry + 12);
++#else
+ 	return *(guint32*)(plt_entry + 6);
++#endif
+ }
+Index: mono/mini/fsacheck.c
+===================================================================
+--- mono/mini/fsacheck.c	(revision 0)
++++ mono/mini/fsacheck.c	(revision 0)
+@@ -0,0 +1,141 @@
++#include &lt;stdio.h&gt;
++#include &lt;stdlib.h&gt;
++
++#include &lt;mono/metadata/appdomain.h&gt;
++#include &lt;mono/metadata/assembly.h&gt;
++#include &lt;mono/metadata/debug-helpers.h&gt;
++#include &lt;mono/metadata/object.h&gt;
++#include &lt;mono/jit/jit.h&gt;
++
++extern void* mono_aot_module_mscorlib_info;
++extern void* mono_aot_module_System_Core_info;
++extern void* mono_aot_module_System_info;
++extern void* mono_aot_module_Mono_Posix_info;
++extern void* mono_aot_module_System_Configuration_info;
++extern void* mono_aot_module_System_Security_info;
++extern void* mono_aot_module_System_Xml_info;
++/* extern void* mono_aot_module_System_Threading_info; */
++extern void* mono_aot_module_Mono_Security_info;
++extern void* mono_aot_module_Mono_Simd_info;
++extern void* mono_aot_module_TestDriver_info;
++
++extern void* mono_aot_module_basic_info;
++extern void* mono_aot_module_basic_float_info;
++extern void* mono_aot_module_basic_long_info;
++extern void* mono_aot_module_basic_calls_info;
++extern void* mono_aot_module_basic_simd_info;
++extern void* mono_aot_module_objects_info;
++extern void* mono_aot_module_arrays_info;
++extern void* mono_aot_module_basic_math_info;
++extern void* mono_aot_module_exceptions_info;
++extern void* mono_aot_module_devirtualization_info;
++extern void* mono_aot_module_generics_info;
++extern void* mono_aot_module_generics_variant_types_info;
++extern void* mono_aot_module_basic_simd_info;
++/* extern void* mono_aot_module_thread_stress_info; */
++
++
++extern void mono_aot_register_module(void *aot_info);
++extern void mono_aot_init(void);
++extern void mono_jit_set_aot_only(mono_bool aot_only);
++extern MonoDomain * mini_init (const char *filename, const char *runtime_version);
++
++
++void try_one(char *mname) {
++  MonoDomain *domain;
++  MonoAssembly *ma;
++  MonoImage *mi;
++  MonoClass *mc;
++  MonoMethodDesc *mmd;
++  MonoMethod *mm;
++  MonoObject *mo;
++  MonoArray *arg_array;
++  void *args [1];
++  char *cstr_arg = &quot;20&quot;;
++
++  mono_jit_set_aot_only(1);
++  domain = mono_jit_init(mname);
++  printf(&quot;mono domain: %p\n&quot;, domain);
++
++  ma = mono_domain_assembly_open(domain, mname);
++  if (0 == ma) {
++    printf(&quot;ERROR: could not open mono assembly\n&quot;);
++    exit(-1);
++  }
++  printf(&quot;opened mono assembly: %p\n&quot;, ma);
++
++  mi = mono_assembly_get_image(ma);
++  printf(&quot;mono image: %p\n&quot;, mi);
++
++  mo = mono_string_new(domain, cstr_arg);
++  mc = mono_class_from_name(mono_get_corlib(), &quot;System&quot;, &quot;String&quot;);
++  printf(&quot;string class: %p\n&quot;, mc);
++  arg_array = mono_array_new(domain, mc, 1);
++  mono_array_setref(arg_array, 0, mo);
++  args[0] = arg_array;
++
++  mmd = mono_method_desc_new(&quot;Tests:Main()&quot;, 1);
++  mm = mono_method_desc_search_in_image(mmd, mi);
++  if (0 == mm) {
++    mmd = mono_method_desc_new(&quot;Tests:Main(string[])&quot;, 1);
++    mm = mono_method_desc_search_in_image(mmd, mi);
++    if (0 == mm) {
++      mmd = mono_method_desc_new(&quot;SimdTests:Main(string[])&quot;, 1);
++      mm = mono_method_desc_search_in_image(mmd, mi);
++      if (0 == mm) {
++        printf(&quot;Couldn't find Tests:Main(), Tests:Main(string[]) or SimdTests:Main(string[])\n&quot;);
++        exit(-1);
++      }
++    }
++  }
++  printf(&quot;mono desc method: %p\n&quot;, mmd);
++  printf(&quot;mono method: %p\n&quot;, mm);
++
++  mo = mono_runtime_invoke(mm, NULL, args, NULL);
++  printf(&quot;mono object: %p\n&quot;, mo);
++
++  mono_jit_cleanup(domain);
++}
++
++int main(int argc, char *argv[]) {
++  mono_aot_register_module(mono_aot_module_mscorlib_info);
++  mono_aot_register_module(mono_aot_module_TestDriver_info);
++  mono_aot_register_module(mono_aot_module_System_Core_info);
++  mono_aot_register_module(mono_aot_module_System_info);
++  mono_aot_register_module(mono_aot_module_Mono_Posix_info);
++  mono_aot_register_module(mono_aot_module_System_Configuration_info);
++  mono_aot_register_module(mono_aot_module_System_Security_info);
++  mono_aot_register_module(mono_aot_module_System_Xml_info);
++  mono_aot_register_module(mono_aot_module_Mono_Security_info);
++  /*  mono_aot_register_module(mono_aot_module_System_Threading_info); */
++  mono_aot_register_module(mono_aot_module_Mono_Simd_info);
++
++  mono_aot_register_module(mono_aot_module_basic_info);
++  mono_aot_register_module(mono_aot_module_basic_float_info);
++  mono_aot_register_module(mono_aot_module_basic_long_info);
++  mono_aot_register_module(mono_aot_module_basic_calls_info);
++  mono_aot_register_module(mono_aot_module_basic_simd_info);
++  mono_aot_register_module(mono_aot_module_objects_info);
++  mono_aot_register_module(mono_aot_module_arrays_info);
++  mono_aot_register_module(mono_aot_module_basic_math_info);
++  mono_aot_register_module(mono_aot_module_exceptions_info);
++  mono_aot_register_module(mono_aot_module_devirtualization_info);
++  /*
++  mono_aot_register_module(mono_aot_module_generics_info);
++  mono_aot_register_module(mono_aot_module_generics_variant_types_info);
++  */
++
++  /*  mono_aot_register_module(mono_aot_module_thread_stress_info); */
++  if (argc &lt; 2) {
++    printf(&quot;no test specified; running basic.exe\n&quot;);
++    printf(&quot;==========================\n&quot;);
++    try_one(&quot;basic.exe&quot;);
++    printf(&quot;==========================\n&quot;);
++  } else {
++    printf(&quot;\nProgram %s %s output:\n&quot;, argv[0], argv[1]);
++    printf(&quot;==========================\n\n&quot;);
++    try_one(argv[1]);
++  }
++
++  return 0;
++}
+Index: mono/mini/driver.c
+===================================================================
+--- mono/mini/driver.c	(revision 159271)
++++ mono/mini/driver.c	(working copy)
+@@ -115,6 +115,9 @@
+ 	NULL
+ };
+ 
++#ifdef __native_client_codegen__
++extern guint8 nacl_align_byte;
++#endif
+ 
+ #define DEFAULT_OPTIMIZATIONS (	\
+ 	MONO_OPT_PEEPHOLE |	\
+@@ -1119,6 +1122,9 @@
+ 		&quot;    --trace[=EXPR]         Enable tracing, use --help-trace for details\n&quot;
+ 		&quot;    --jitmap               Output a jit method map to /tmp/perf-PID.map\n&quot;
+ 		&quot;    --help-devel           Shows more options available to developers\n&quot;
++#ifdef __native_client_codegen__
++		&quot;    --nacl-align-mask-off  Turn off Native Client 32-byte alignment mask (for debug only)\n&quot;
++#endif
+ 		&quot;\n&quot;
+ 		&quot;Runtime:\n&quot;
+ 		&quot;    --config FILE          Loads FILE as the Mono config\n&quot;
+@@ -1584,12 +1590,23 @@
+ #endif
+ 		} else if (strcmp (argv [i], &quot;--nollvm&quot;) == 0){
+ 			mono_use_llvm = FALSE;
++#ifdef __native_client_codegen__
++		} else if (strcmp (argv [i], &quot;--nacl-align-mask-off&quot;) == 0){
++			nacl_align_byte = 0xff;	
++#endif
+ 		} else {
+ 			fprintf (stderr, &quot;Unknown command line option: '%s'\n&quot;, argv [i]);
+ 			return 1;
+ 		}
+ 	}
+ 
++#ifdef __native_client_codegen__
++	if (getenv (&quot;MONO_NACL_ALIGN_MASK_OFF&quot;))
++	{
++		nacl_align_byte = 0xff;
++	}
++#endif
++
+ 	if (!argv [i]) {
+ 		mini_usage ();
+ 		return 1;
+Index: mono/mini/mini-posix.c
+===================================================================
+--- mono/mini/mini-posix.c	(revision 159271)
++++ mono/mini/mini-posix.c	(working copy)
+@@ -63,6 +63,46 @@
+ 
+ #include &quot;jit-icalls.h&quot;
+ 
++#if defined(__native_client__)
++
++void
++mono_runtime_setup_stat_profiler (void)
++{
++	printf(&quot;WARNING: mono_runtime_setup_stat_profiler() called!\n&quot;);
++}
++
++
++void
++mono_runtime_shutdown_stat_profiler (void)
++{
++}
++
++
++gboolean
++SIG_HANDLER_SIGNATURE (mono_chain_signal)
++{
++	return FALSE;
++}
++
++void
++mono_runtime_install_handlers (void)
++{
++}
++
++void
++mono_runtime_shutdown_handlers (void)
++{
++}
++
++void
++mono_runtime_cleanup_handlers (void)
++{
++}
++
++
++
++#else
++
+ static GHashTable *mono_saved_signal_handlers = NULL;
+ 
+ static gpointer
+@@ -620,3 +660,5 @@
+ 	return TRUE;
+ }
+ #endif
++#endif /* __native_client__ */
++
+Index: mono/utils/dlmalloc.c
+===================================================================
+--- mono/utils/dlmalloc.c	(revision 159271)
++++ mono/utils/dlmalloc.c	(working copy)
+@@ -483,6 +483,13 @@
+ #endif  /* HAVE_MORECORE */
+ #endif  /* DARWIN */
+ 
++#if defined(__native_client__)
++#undef HAVE_MMAP
++#undef HAVE_MREMAP
++#define HAVE_MMAP 0
++#define HAVE_MREMAP 0
++#endif
++
+ #ifndef LACKS_SYS_TYPES_H
+ #include &lt;sys/types.h&gt;  /* For size_t */
+ #endif  /* LACKS_SYS_TYPES_H */
+Index: mono/utils/mono-codeman.c
+===================================================================
+--- mono/utils/mono-codeman.c	(revision 159271)
++++ mono/utils/mono-codeman.c	(working copy)
+@@ -39,6 +39,14 @@
+ #else
+ #define MIN_ALIGN 8
+ #endif
++#ifdef __native_client_codegen__
++/* For Google Native Client, all targets of indirect control flow need to    */
++/* be aligned to a 32-byte boundary. MIN_ALIGN was updated to 32 to force    */
++/* alignment for calls from tramp-x86.c to mono_global_codeman_reserve()     */
++/* and mono_domain_code_reserve().                                           */
++#undef MIN_ALIGN
++#define MIN_ALIGN 32
++#endif
+ 
+ /* if a chunk has less than this amount of free space it's considered full */
+ #define MAX_WASTAGE 32
+Index: mono/arch/x86/x86-codegen.h
+===================================================================
+--- mono/arch/x86/x86-codegen.h	(revision 159271)
++++ mono/arch/x86/x86-codegen.h	(working copy)
+@@ -15,6 +15,21 @@
+ #ifndef X86_H
+ #define X86_H
+ #include &lt;assert.h&gt;
++
++#ifdef __native_client_codegen__
++#define kNaClAlignment 32
++#define kNaClAlignmentMask (kNaClAlignment - 1)
++extern guint8 nacl_align_byte;
++#endif /* __native_client_codegen__ */
++
++
++#if defined( __native_client_codegen__ ) &amp;&amp; defined( TARGET_X86 )
++#define x86_codegen_pre(inst_ptr_ptr, inst_len) do { nacl_align_inst(inst_ptr_ptr, inst_len); } while (0)
++#else
++#define x86_codegen_pre(inst_ptr_ptr, inst_len) do {} while (0)
++#endif  /* __native_client_codegen__ */
++
++
+ /*
+ // x86 register numbers
+ */
+@@ -278,6 +293,8 @@
+ #define x86_regp_emit(inst,r,regno)  do { x86_address_byte ((inst), 0, (r), (regno)); } while (0)
+ #define x86_mem_emit(inst,r,disp)    do { x86_address_byte ((inst), 0, (r), 5); x86_imm_emit32((inst), (disp)); } while (0)
+ 
++#define kMaxMembaseEmitPadding 6
++
+ #define x86_membase_emit(inst,r,basereg,disp)	do {\
+ 	if ((basereg) == X86_ESP) {	\
+ 		if ((disp) == 0) {	\
+@@ -307,6 +324,8 @@
+ 	}	\
+ 	} while (0)
+ 
++#define kMaxMemindexEmitPadding 6
++
+ #define x86_memindex_emit(inst,r,basereg,disp,indexreg,shift)	\
+ 	do {	\
+ 		if ((basereg) == X86_NOBASEREG) {	\
+@@ -343,7 +362,7 @@
+  * the instruction is inspected for validity and the correct displacement
+  * is inserted.
+  */
+-#define x86_patch(ins,target)	\
++#define x86_do_patch(ins,target)	\
+ 	do {	\
+ 		unsigned char* pos = (ins) + 1;	\
+ 		int disp, size = 0;	\
+@@ -367,10 +386,66 @@
+ 		else assert (0);	\
+ 	} while (0)
+ 
++#ifdef __native_client_codegen__
++#define x86_patch(ins, target)	\
++	do {	\
++		unsigned char* inst = (ins); \
++		int in_nop = 0; \
++		do { \
++			in_nop = 0; \
++			if (inst[0] == 0x90) { \
++				in_nop = 1; \
++				inst+=1; \
++			} \
++			if (inst[0] == 0x8b &amp;&amp; inst[1] == 0xc0) { \
++				in_nop = 1; \
++				inst+=2; \
++			} \
++			if (inst[0] == 0x8d &amp;&amp; inst[1] == 0x6d \
++			    &amp;&amp; inst[2] == 0x00) { \
++				in_nop = 1; \
++				inst+=3; \
++			} \
++			if (inst[0] == 0x8d &amp;&amp; inst[1] == 0x64 \
++			    &amp;&amp; inst[2] == 0x24 &amp;&amp; inst[3] == 0x00) { \
++				in_nop = 1; \
++				inst+=4; \
++			} \
++			/* skip inst+=5 case because it's the 4-byte + 1-byte case */ \
++			if (inst[0] == 0x8d &amp;&amp; inst[1] == 0xad \
++			    &amp;&amp; inst[2] == 0x00 &amp;&amp; inst[3] == 0x00 \
++			    &amp;&amp; inst[4] == 0x00 &amp;&amp; inst[5] == 0x00) { \
++				in_nop = 1; \
++				inst+=6; \
++			} \
++			if (inst[0] == 0x8d &amp;&amp; inst[1] == 0xa4 \
++			    &amp;&amp; inst[2] == 0x24 &amp;&amp; inst[3] == 0x00 \
++			    &amp;&amp; inst[4] == 0x00 &amp;&amp; inst[5] == 0x00 \
++			    &amp;&amp; inst[6] == 0x00 ) { \
++				in_nop = 1; \
++				inst+=7; \
++			} \
++		} while ( in_nop ); \
++		x86_do_patch(inst, target); \
++	} while (0)
++#else
++#define x86_patch(ins,target)	x86_do_patch(ins, target)
++#endif /* __native_client_codegen__ */
++
++#ifdef __native_client_codegen__
++/* The breakpoint instruction is illegal in Native Client, although the HALT   */
++/* instruction is allowed. The breakpoint is used several places in mini-x86.c */
++/* and exceptions-x86.c.                                                       */
+ #define x86_breakpoint(inst) \
+ 	do {	\
++		*(inst)++ = 0xf4;	\
++	} while (0)
++#else
++#define x86_breakpoint(inst) \
++	do {	\
+ 		*(inst)++ = 0xcc;	\
+ 	} while (0)
++#endif
+ 
+ #define x86_cld(inst) do { *(inst)++ =(unsigned char)0xfc; } while (0)
+ #define x86_stosb(inst) do { *(inst)++ =(unsigned char)0xaa; } while (0)
+@@ -390,6 +465,7 @@
+ 
+ #define x86_cmpxchg_reg_reg(inst,dreg,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xb1;	\
+ 		x86_reg_emit ((inst), (reg), (dreg));	\
+@@ -397,6 +473,7 @@
+ 	
+ #define x86_cmpxchg_mem_reg(inst,mem,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 7); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xb1;	\
+ 		x86_mem_emit ((inst), (reg), (mem));	\
+@@ -404,6 +481,7 @@
+ 	
+ #define x86_cmpxchg_membase_reg(inst,basereg,disp,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xb1;	\
+ 		x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+@@ -411,6 +489,7 @@
+ 
+ #define x86_xchg_reg_reg(inst,dreg,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		if ((size) == 1)	\
+ 			*(inst)++ = (unsigned char)0x86;	\
+ 		else	\
+@@ -420,6 +499,7 @@
+ 
+ #define x86_xchg_mem_reg(inst,mem,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		if ((size) == 1)	\
+ 			*(inst)++ = (unsigned char)0x86;	\
+ 		else	\
+@@ -429,6 +509,7 @@
+ 
+ #define x86_xchg_membase_reg(inst,basereg,disp,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		if ((size) == 1)	\
+ 			*(inst)++ = (unsigned char)0x86;	\
+ 		else	\
+@@ -438,6 +519,7 @@
+ 
+ #define x86_xadd_reg_reg(inst,dreg,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0x0F;     \
+ 		if ((size) == 1)	\
+ 			*(inst)++ = (unsigned char)0xC0;	\
+@@ -448,6 +530,7 @@
+ 
+ #define x86_xadd_mem_reg(inst,mem,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 7); \
+ 		*(inst)++ = (unsigned char)0x0F;     \
+ 		if ((size) == 1)	\
+ 			*(inst)++ = (unsigned char)0xC0;	\
+@@ -458,6 +541,7 @@
+ 
+ #define x86_xadd_membase_reg(inst,basereg,disp,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0F;     \
+ 		if ((size) == 1)	\
+ 			*(inst)++ = (unsigned char)0xC0;	\
+@@ -468,12 +552,14 @@
+ 
+ #define x86_inc_mem(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_mem_emit ((inst), 0, (mem)); 	\
+ 	} while (0)
+ 
+ #define x86_inc_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_membase_emit ((inst), 0, (basereg), (disp));	\
+ 	} while (0)
+@@ -482,12 +568,14 @@
+ 
+ #define x86_dec_mem(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_mem_emit ((inst), 1, (mem));	\
+ 	} while (0)
+ 
+ #define x86_dec_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_membase_emit ((inst), 1, (basereg), (disp));	\
+ 	} while (0)
+@@ -496,36 +584,42 @@
+ 
+ #define x86_not_mem(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_mem_emit ((inst), 2, (mem));	\
+ 	} while (0)
+ 
+ #define x86_not_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_membase_emit ((inst), 2, (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_not_reg(inst,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_reg_emit ((inst), 2, (reg));	\
+ 	} while (0)
+ 
+ #define x86_neg_mem(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_mem_emit ((inst), 3, (mem));	\
+ 	} while (0)
+ 
+ #define x86_neg_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_membase_emit ((inst), 3, (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_neg_reg(inst,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_reg_emit ((inst), 3, (reg));	\
+ 	} while (0)
+@@ -535,15 +629,18 @@
+ #define x86_alu_reg_imm(inst,opc,reg,imm) 	\
+ 	do {	\
+ 		if ((reg) == X86_EAX) {	\
++			x86_codegen_pre(&amp;(inst), 5); \
+ 			*(inst)++ = (((unsigned char)(opc)) &lt;&lt; 3) + 5;	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+ 			break;	\
+ 		}	\
+ 		if (x86_is_imm8((imm))) {	\
++			x86_codegen_pre(&amp;(inst), 3); \
+ 			*(inst)++ = (unsigned char)0x83;	\
+ 			x86_reg_emit ((inst), (opc), (reg));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 6); \
+ 			*(inst)++ = (unsigned char)0x81;	\
+ 			x86_reg_emit ((inst), (opc), (reg));	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+@@ -553,10 +650,12 @@
+ #define x86_alu_mem_imm(inst,opc,mem,imm) 	\
+ 	do {	\
+ 		if (x86_is_imm8((imm))) {	\
++			x86_codegen_pre(&amp;(inst), 7); \
+ 			*(inst)++ = (unsigned char)0x83;	\
+ 			x86_mem_emit ((inst), (opc), (mem));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 10); \
+ 			*(inst)++ = (unsigned char)0x81;	\
+ 			x86_mem_emit ((inst), (opc), (mem));	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+@@ -566,10 +665,12 @@
+ #define x86_alu_membase_imm(inst,opc,basereg,disp,imm) 	\
+ 	do {	\
+ 		if (x86_is_imm8((imm))) {	\
++			x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 			*(inst)++ = (unsigned char)0x83;	\
+ 			x86_membase_emit ((inst), (opc), (basereg), (disp));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 5 + kMaxMembaseEmitPadding); \
+ 			*(inst)++ = (unsigned char)0x81;	\
+ 			x86_membase_emit ((inst), (opc), (basereg), (disp));	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+@@ -578,6 +679,7 @@
+ 	
+ #define x86_alu_membase8_imm(inst,opc,basereg,disp,imm) 	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x80;	\
+ 		x86_membase_emit ((inst), (opc), (basereg), (disp));	\
+ 		x86_imm_emit8 ((inst), (imm)); \
+@@ -585,18 +687,21 @@
+ 
+ #define x86_alu_mem_reg(inst,opc,mem,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (((unsigned char)(opc)) &lt;&lt; 3) + 1;	\
+ 		x86_mem_emit ((inst), (reg), (mem));	\
+ 	} while (0)
+ 
+ #define x86_alu_membase_reg(inst,opc,basereg,disp,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (((unsigned char)(opc)) &lt;&lt; 3) + 1;	\
+ 		x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_alu_reg_reg(inst,opc,dreg,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (((unsigned char)(opc)) &lt;&lt; 3) + 3;	\
+ 		x86_reg_emit ((inst), (dreg), (reg));	\
+ 	} while (0)
+@@ -612,24 +717,28 @@
+  */
+ #define x86_alu_reg8_reg8(inst,opc,dreg,reg,is_dreg_h,is_reg_h)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (((unsigned char)(opc)) &lt;&lt; 3) + 2;	\
+ 		x86_reg8_emit ((inst), (dreg), (reg), (is_dreg_h), (is_reg_h));	\
+ 	} while (0)
+ 
+ #define x86_alu_reg_mem(inst,opc,reg,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (((unsigned char)(opc)) &lt;&lt; 3) + 3;	\
+ 		x86_mem_emit ((inst), (reg), (mem));	\
+ 	} while (0)
+ 
+ #define x86_alu_reg_membase(inst,opc,reg,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (((unsigned char)(opc)) &lt;&lt; 3) + 3;	\
+ 		x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_test_reg_imm(inst,reg,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		if ((reg) == X86_EAX) {	\
+ 			*(inst)++ = (unsigned char)0xa9;	\
+ 		} else {	\
+@@ -641,6 +750,7 @@
+ 
+ #define x86_test_mem_imm(inst,mem,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 10); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_mem_emit ((inst), 0, (mem));	\
+ 		x86_imm_emit32 ((inst), (imm));	\
+@@ -648,6 +758,7 @@
+ 
+ #define x86_test_membase_imm(inst,basereg,disp,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 5 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_membase_emit ((inst), 0, (basereg), (disp));	\
+ 		x86_imm_emit32 ((inst), (imm));	\
+@@ -655,18 +766,21 @@
+ 
+ #define x86_test_reg_reg(inst,dreg,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0x85;	\
+ 		x86_reg_emit ((inst), (reg), (dreg));	\
+ 	} while (0)
+ 
+ #define x86_test_mem_reg(inst,mem,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0x85;	\
+ 		x86_mem_emit ((inst), (reg), (mem));	\
+ 	} while (0)
+ 
+ #define x86_test_membase_reg(inst,basereg,disp,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x85;	\
+ 		x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+ 	} while (0)
+@@ -674,9 +788,11 @@
+ #define x86_shift_reg_imm(inst,opc,reg,imm)	\
+ 	do {	\
+ 		if ((imm) == 1) {	\
++			x86_codegen_pre(&amp;(inst), 2); \
+ 			*(inst)++ = (unsigned char)0xd1;	\
+ 			x86_reg_emit ((inst), (opc), (reg));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 3); \
+ 			*(inst)++ = (unsigned char)0xc1;	\
+ 			x86_reg_emit ((inst), (opc), (reg));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+@@ -686,9 +802,11 @@
+ #define x86_shift_mem_imm(inst,opc,mem,imm)	\
+ 	do {	\
+ 		if ((imm) == 1) {	\
++			x86_codegen_pre(&amp;(inst), 6); \
+ 			*(inst)++ = (unsigned char)0xd1;	\
+ 			x86_mem_emit ((inst), (opc), (mem));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 7); \
+ 			*(inst)++ = (unsigned char)0xc1;	\
+ 			x86_mem_emit ((inst), (opc), (mem));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+@@ -698,9 +816,11 @@
+ #define x86_shift_membase_imm(inst,opc,basereg,disp,imm)	\
+ 	do {	\
+ 		if ((imm) == 1) {	\
++			x86_codegen_pre(&amp;(inst), 6); \
+ 			*(inst)++ = (unsigned char)0xd1;	\
+ 			x86_membase_emit ((inst), (opc), (basereg), (disp));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 7); \
+ 			*(inst)++ = (unsigned char)0xc1;	\
+ 			x86_membase_emit ((inst), (opc), (basereg), (disp));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+@@ -709,18 +829,21 @@
+ 
+ #define x86_shift_reg(inst,opc,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xd3;	\
+ 		x86_reg_emit ((inst), (opc), (reg));	\
+ 	} while (0)
+ 
+ #define x86_shift_mem(inst,opc,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xd3;	\
+ 		x86_mem_emit ((inst), (opc), (mem));	\
+ 	} while (0)
+ 
+ #define x86_shift_membase(inst,opc,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xd3;	\
+ 		x86_membase_emit ((inst), (opc), (basereg), (disp));	\
+ 	} while (0)
+@@ -731,6 +854,7 @@
+ 
+ #define x86_shrd_reg(inst,dreg,reg)                     \
+         do {                                            \
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xad;	\
+ 		x86_reg_emit ((inst), (reg), (dreg));	\
+@@ -738,6 +862,7 @@
+ 
+ #define x86_shrd_reg_imm(inst,dreg,reg,shamt)           \
+         do {                                            \
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xac;	\
+ 		x86_reg_emit ((inst), (reg), (dreg));	\
+@@ -746,6 +871,7 @@
+ 
+ #define x86_shld_reg(inst,dreg,reg)                     \
+         do {                                            \
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xa5;	\
+ 		x86_reg_emit ((inst), (reg), (dreg));	\
+@@ -753,6 +879,7 @@
+ 
+ #define x86_shld_reg_imm(inst,dreg,reg,shamt)           \
+         do {                                            \
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xa4;	\
+ 		x86_reg_emit ((inst), (reg), (dreg));	\
+@@ -764,18 +891,21 @@
+  */
+ #define x86_mul_reg(inst,reg,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_reg_emit ((inst), 4 + ((is_signed) ? 1 : 0), (reg));	\
+ 	} while (0)
+ 
+ #define x86_mul_mem(inst,mem,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_mem_emit ((inst), 4 + ((is_signed) ? 1 : 0), (mem));	\
+ 	} while (0)
+ 
+ #define x86_mul_membase(inst,basereg,disp,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_membase_emit ((inst), 4 + ((is_signed) ? 1 : 0), (basereg), (disp));	\
+ 	} while (0)
+@@ -785,6 +915,7 @@
+  */
+ #define x86_imul_reg_reg(inst,dreg,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xaf;	\
+ 		x86_reg_emit ((inst), (dreg), (reg));	\
+@@ -792,6 +923,7 @@
+ 
+ #define x86_imul_reg_mem(inst,reg,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 7); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xaf;	\
+ 		x86_mem_emit ((inst), (reg), (mem));	\
+@@ -799,6 +931,7 @@
+ 
+ #define x86_imul_reg_membase(inst,reg,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0xaf;	\
+ 		x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+@@ -810,10 +943,12 @@
+ #define x86_imul_reg_reg_imm(inst,dreg,reg,imm)	\
+ 	do {	\
+ 		if (x86_is_imm8 ((imm))) {	\
++			x86_codegen_pre(&amp;(inst), 3); \
+ 			*(inst)++ = (unsigned char)0x6b;	\
+ 			x86_reg_emit ((inst), (dreg), (reg));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 6); \
+ 			*(inst)++ = (unsigned char)0x69;	\
+ 			x86_reg_emit ((inst), (dreg), (reg));	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+@@ -823,10 +958,12 @@
+ #define x86_imul_reg_mem_imm(inst,reg,mem,imm)	\
+ 	do {	\
+ 		if (x86_is_imm8 ((imm))) {	\
++			x86_codegen_pre(&amp;(inst), 7); \
+ 			*(inst)++ = (unsigned char)0x6b;	\
+ 			x86_mem_emit ((inst), (reg), (mem));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 6); \
+ 			*(inst)++ = (unsigned char)0x69;	\
+ 			x86_reg_emit ((inst), (reg), (mem));	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+@@ -836,10 +973,12 @@
+ #define x86_imul_reg_membase_imm(inst,reg,basereg,disp,imm)	\
+ 	do {	\
+ 		if (x86_is_imm8 ((imm))) {	\
++			x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 			*(inst)++ = (unsigned char)0x6b;	\
+ 			x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 5 + kMaxMembaseEmitPadding); \
+ 			*(inst)++ = (unsigned char)0x69;	\
+ 			x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+@@ -853,24 +992,28 @@
+ 
+ #define x86_div_reg(inst,reg,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_reg_emit ((inst), 6 + ((is_signed) ? 1 : 0), (reg));	\
+ 	} while (0)
+ 
+ #define x86_div_mem(inst,mem,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_mem_emit ((inst), 6 + ((is_signed) ? 1 : 0), (mem));	\
+ 	} while (0)
+ 
+ #define x86_div_membase(inst,basereg,disp,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xf7;	\
+ 		x86_membase_emit ((inst), 6 + ((is_signed) ? 1 : 0), (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_mov_mem_reg(inst,mem,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 7); \
+ 		switch ((size)) {	\
+ 		case 1: *(inst)++ = (unsigned char)0x88; break;	\
+ 		case 2: *(inst)++ = (unsigned char)0x66; /* fall through */	\
+@@ -882,6 +1025,7 @@
+ 
+ #define x86_mov_regp_reg(inst,regp,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		switch ((size)) {	\
+ 		case 1: *(inst)++ = (unsigned char)0x88; break;	\
+ 		case 2: *(inst)++ = (unsigned char)0x66; /* fall through */	\
+@@ -893,6 +1037,7 @@
+ 
+ #define x86_mov_membase_reg(inst,basereg,disp,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		switch ((size)) {	\
+ 		case 1: *(inst)++ = (unsigned char)0x88; break;	\
+ 		case 2: *(inst)++ = (unsigned char)0x66; /* fall through */	\
+@@ -904,6 +1049,7 @@
+ 
+ #define x86_mov_memindex_reg(inst,basereg,disp,indexreg,shift,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMemindexEmitPadding); \
+ 		switch ((size)) {	\
+ 		case 1: *(inst)++ = (unsigned char)0x88; break;	\
+ 		case 2: *(inst)++ = (unsigned char)0x66; /* fall through */	\
+@@ -915,6 +1061,7 @@
+ 
+ #define x86_mov_reg_reg(inst,dreg,reg,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		switch ((size)) {	\
+ 		case 1: *(inst)++ = (unsigned char)0x8a; break;	\
+ 		case 2: *(inst)++ = (unsigned char)0x66; /* fall through */	\
+@@ -926,6 +1073,7 @@
+ 
+ #define x86_mov_reg_mem(inst,reg,mem,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 7); \
+ 		switch ((size)) {	\
+ 		case 1: *(inst)++ = (unsigned char)0x8a; break;	\
+ 		case 2: *(inst)++ = (unsigned char)0x66; /* fall through */	\
+@@ -935,8 +1083,11 @@
+ 		x86_mem_emit ((inst), (reg), (mem));	\
+ 	} while (0)
+ 
++#define kMovRegMembasePadding (2 + kMaxMembaseEmitPadding)
++
+ #define x86_mov_reg_membase(inst,reg,basereg,disp,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), kMovRegMembasePadding); \
+ 		switch ((size)) {	\
+ 		case 1: *(inst)++ = (unsigned char)0x8a; break;	\
+ 		case 2: *(inst)++ = (unsigned char)0x66; /* fall through */	\
+@@ -948,6 +1099,7 @@
+ 
+ #define x86_mov_reg_memindex(inst,reg,basereg,disp,indexreg,shift,size)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMemindexEmitPadding); \
+ 		switch ((size)) {	\
+ 		case 1: *(inst)++ = (unsigned char)0x8a; break;	\
+ 		case 2: *(inst)++ = (unsigned char)0x66; /* fall through */	\
+@@ -964,6 +1116,7 @@
+ 
+ #define x86_mov_reg_imm(inst,reg,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 5); \
+ 		*(inst)++ = (unsigned char)0xb8 + (reg);	\
+ 		x86_imm_emit32 ((inst), (imm));	\
+ 	} while (0)
+@@ -971,15 +1124,18 @@
+ #define x86_mov_mem_imm(inst,mem,imm,size)	\
+ 	do {	\
+ 		if ((size) == 1) {	\
++			x86_codegen_pre(&amp;(inst), 7); \
+ 			*(inst)++ = (unsigned char)0xc6;	\
+ 			x86_mem_emit ((inst), 0, (mem));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+ 		} else if ((size) == 2) {	\
++			x86_codegen_pre(&amp;(inst), 9); \
+ 			*(inst)++ = (unsigned char)0x66;	\
+ 			*(inst)++ = (unsigned char)0xc7;	\
+ 			x86_mem_emit ((inst), 0, (mem));	\
+ 			x86_imm_emit16 ((inst), (imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 10); \
+ 			*(inst)++ = (unsigned char)0xc7;	\
+ 			x86_mem_emit ((inst), 0, (mem));	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+@@ -989,15 +1145,18 @@
+ #define x86_mov_membase_imm(inst,basereg,disp,imm,size)	\
+ 	do {	\
+ 		if ((size) == 1) {	\
++			x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 			*(inst)++ = (unsigned char)0xc6;	\
+ 			x86_membase_emit ((inst), 0, (basereg), (disp));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+ 		} else if ((size) == 2) {	\
++			x86_codegen_pre(&amp;(inst), 4 + kMaxMembaseEmitPadding); \
+ 			*(inst)++ = (unsigned char)0x66;	\
+ 			*(inst)++ = (unsigned char)0xc7;	\
+ 			x86_membase_emit ((inst), 0, (basereg), (disp));	\
+ 			x86_imm_emit16 ((inst), (imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 5 + kMaxMembaseEmitPadding); \
+ 			*(inst)++ = (unsigned char)0xc7;	\
+ 			x86_membase_emit ((inst), 0, (basereg), (disp));	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+@@ -1007,15 +1166,18 @@
+ #define x86_mov_memindex_imm(inst,basereg,disp,indexreg,shift,imm,size)	\
+ 	do {	\
+ 		if ((size) == 1) {	\
++			x86_codegen_pre(&amp;(inst), 2 + kMaxMemindexEmitPadding); \
+ 			*(inst)++ = (unsigned char)0xc6;	\
+ 			x86_memindex_emit ((inst), 0, (basereg), (disp), (indexreg), (shift));	\
+ 			x86_imm_emit8 ((inst), (imm));	\
+ 		} else if ((size) == 2) {	\
++			x86_codegen_pre(&amp;(inst), 4 + kMaxMemindexEmitPadding); \
+ 			*(inst)++ = (unsigned char)0x66;	\
+ 			*(inst)++ = (unsigned char)0xc7;	\
+ 			x86_memindex_emit ((inst), 0, (basereg), (disp), (indexreg), (shift));	\
+ 			x86_imm_emit16 ((inst), (imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 5 + kMaxMemindexEmitPadding); \
+ 			*(inst)++ = (unsigned char)0xc7;	\
+ 			x86_memindex_emit ((inst), 0, (basereg), (disp), (indexreg), (shift));	\
+ 			x86_imm_emit32 ((inst), (imm));	\
+@@ -1024,18 +1186,21 @@
+ 
+ #define x86_lea_mem(inst,reg,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 5); \
+ 		*(inst)++ = (unsigned char)0x8d;	\
+ 		x86_mem_emit ((inst), (reg), (mem));	\
+ 	} while (0)
+ 
+ #define x86_lea_membase(inst,reg,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x8d;	\
+ 		x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_lea_memindex(inst,reg,basereg,disp,indexreg,shift)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMemindexEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x8d;	\
+ 		x86_memindex_emit ((inst), (reg), (basereg), (disp), (indexreg), (shift));	\
+ 	} while (0)
+@@ -1044,6 +1209,7 @@
+ 	do {	\
+ 		unsigned char op = 0xb6;	\
+                 g_assert (is_half ||  X86_IS_BYTE_REG (reg)); \
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		if ((is_signed)) op += 0x08;	\
+ 		if ((is_half)) op += 0x01;	\
+@@ -1054,6 +1220,7 @@
+ #define x86_widen_mem(inst,dreg,mem,is_signed,is_half)	\
+ 	do {	\
+ 		unsigned char op = 0xb6;	\
++		x86_codegen_pre(&amp;(inst), 7); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		if ((is_signed)) op += 0x08;	\
+ 		if ((is_half)) op += 0x01;	\
+@@ -1064,6 +1231,7 @@
+ #define x86_widen_membase(inst,dreg,basereg,disp,is_signed,is_half)	\
+ 	do {	\
+ 		unsigned char op = 0xb6;	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		if ((is_signed)) op += 0x08;	\
+ 		if ((is_half)) op += 0x01;	\
+@@ -1074,6 +1242,7 @@
+ #define x86_widen_memindex(inst,dreg,basereg,disp,indexreg,shift,is_signed,is_half)	\
+ 	do {	\
+ 		unsigned char op = 0xb6;	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMemindexEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		if ((is_signed)) op += 0x08;	\
+ 		if ((is_half)) op += 0x01;	\
+@@ -1086,18 +1255,21 @@
+ 
+ #define x86_fp_op_mem(inst,opc,mem,is_double)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (is_double) ? (unsigned char)0xdc : (unsigned char)0xd8;	\
+ 		x86_mem_emit ((inst), (opc), (mem));	\
+ 	} while (0)
+ 
+ #define x86_fp_op_membase(inst,opc,basereg,disp,is_double)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (is_double) ? (unsigned char)0xdc : (unsigned char)0xd8;	\
+ 		x86_membase_emit ((inst), (opc), (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_fp_op(inst,opc,index)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xd8;	\
+ 		*(inst)++ = (unsigned char)0xc0+((opc)&lt;&lt;3)+((index)&amp;0x07);	\
+ 	} while (0)
+@@ -1105,6 +1277,7 @@
+ #define x86_fp_op_reg(inst,opc,index,pop_stack)	\
+ 	do {	\
+ 		static const unsigned char map[] = { 0, 1, 2, 3, 5, 4, 7, 6, 8};	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (pop_stack) ? (unsigned char)0xde : (unsigned char)0xdc;	\
+ 		*(inst)++ = (unsigned char)0xc0+(map[(opc)]&lt;&lt;3)+((index)&amp;0x07);	\
+ 	} while (0)
+@@ -1118,126 +1291,147 @@
+  */
+ #define x86_fp_int_op_membase(inst,opc,basereg,disp,is_int)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (is_int) ? (unsigned char)0xda : (unsigned char)0xde;	\
+ 		x86_membase_emit ((inst), opc, (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_fstp(inst,index)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xdd;	\
+ 		*(inst)++ = (unsigned char)0xd8+(index);	\
+ 	} while (0)
+ 
+ #define x86_fcompp(inst)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xde;	\
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 	} while (0)
+ 
+ #define x86_fucompp(inst)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xda;	\
+ 		*(inst)++ = (unsigned char)0xe9;	\
+ 	} while (0)
+ 
+ #define x86_fnstsw(inst)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xdf;	\
+ 		*(inst)++ = (unsigned char)0xe0;	\
+ 	} while (0)
+ 
+ #define x86_fnstcw(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		x86_mem_emit ((inst), 7, (mem));	\
+ 	} while (0)
+ 
+ #define x86_fnstcw_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		x86_membase_emit ((inst), 7, (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_fldcw(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		x86_mem_emit ((inst), 5, (mem));	\
+ 	} while (0)
+ 
+ #define x86_fldcw_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		x86_membase_emit ((inst), 5, (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_fchs(inst)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		*(inst)++ = (unsigned char)0xe0;	\
+ 	} while (0)
+ 
+ #define x86_frem(inst)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		*(inst)++ = (unsigned char)0xf8;	\
+ 	} while (0)
+ 
+ #define x86_fxch(inst,index)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		*(inst)++ = (unsigned char)0xc8 + ((index) &amp; 0x07);	\
+ 	} while (0)
+ 
+ #define x86_fcomi(inst,index)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xdb;	\
+ 		*(inst)++ = (unsigned char)0xf0 + ((index) &amp; 0x07);	\
+ 	} while (0)
+ 
+ #define x86_fcomip(inst,index)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xdf;	\
+ 		*(inst)++ = (unsigned char)0xf0 + ((index) &amp; 0x07);	\
+ 	} while (0)
+ 
+ #define x86_fucomi(inst,index)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xdb;	\
+ 		*(inst)++ = (unsigned char)0xe8 + ((index) &amp; 0x07);	\
+ 	} while (0)
+ 
+ #define x86_fucomip(inst,index)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xdf;	\
+ 		*(inst)++ = (unsigned char)0xe8 + ((index) &amp; 0x07);	\
+ 	} while (0)
+ 
+ #define x86_fld(inst,mem,is_double)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (is_double) ? (unsigned char)0xdd : (unsigned char)0xd9;	\
+ 		x86_mem_emit ((inst), 0, (mem));	\
+ 	} while (0)
+ 
+ #define x86_fld_membase(inst,basereg,disp,is_double)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (is_double) ? (unsigned char)0xdd : (unsigned char)0xd9;	\
+ 		x86_membase_emit ((inst), 0, (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_fld80_mem(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xdb;	\
+ 		x86_mem_emit ((inst), 5, (mem));	\
+ 	} while (0)
+ 
+ #define x86_fld80_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xdb;	\
+ 		x86_membase_emit ((inst), 5, (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_fild(inst,mem,is_long)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		if ((is_long)) {	\
+ 			*(inst)++ = (unsigned char)0xdf;	\
+ 			x86_mem_emit ((inst), 5, (mem));	\
+@@ -1249,6 +1443,7 @@
+ 
+ #define x86_fild_membase(inst,basereg,disp,is_long)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		if ((is_long)) {	\
+ 			*(inst)++ = (unsigned char)0xdf;	\
+ 			x86_membase_emit ((inst), 5, (basereg), (disp));	\
+@@ -1260,42 +1455,49 @@
+ 
+ #define x86_fld_reg(inst,index)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		*(inst)++ = (unsigned char)0xc0 + ((index) &amp; 0x07);	\
+ 	} while (0)
+ 
+ #define x86_fldz(inst)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		*(inst)++ = (unsigned char)0xee;	\
+ 	} while (0)
+ 
+ #define x86_fld1(inst)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		*(inst)++ = (unsigned char)0xe8;	\
+ 	} while (0)
+ 
+ #define x86_fldpi(inst)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xd9;	\
+ 		*(inst)++ = (unsigned char)0xeb;	\
+ 	} while (0)
+ 
+ #define x86_fst(inst,mem,is_double,pop_stack)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (is_double) ? (unsigned char)0xdd: (unsigned char)0xd9;	\
+ 		x86_mem_emit ((inst), 2 + ((pop_stack) ? 1 : 0), (mem));	\
+ 	} while (0)
+ 
+ #define x86_fst_membase(inst,basereg,disp,is_double,pop_stack)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (is_double) ? (unsigned char)0xdd: (unsigned char)0xd9;	\
+ 		x86_membase_emit ((inst), 2 + ((pop_stack) ? 1 : 0), (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_fst80_mem(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xdb;	\
+ 		x86_mem_emit ((inst), 7, (mem));	\
+ 	} while (0)
+@@ -1303,6 +1505,7 @@
+ 
+ #define x86_fst80_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xdb;	\
+ 		x86_membase_emit ((inst), 7, (basereg), (disp));	\
+ 	} while (0)
+@@ -1310,6 +1513,7 @@
+ 
+ #define x86_fist_pop(inst,mem,is_long)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		if ((is_long)) {	\
+ 			*(inst)++ = (unsigned char)0xdf;	\
+ 			x86_mem_emit ((inst), 7, (mem));	\
+@@ -1321,6 +1525,7 @@
+ 
+ #define x86_fist_pop_membase(inst,basereg,disp,is_long)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		if ((is_long)) {	\
+ 			*(inst)++ = (unsigned char)0xdf;	\
+ 			x86_membase_emit ((inst), 7, (basereg), (disp));	\
+@@ -1332,6 +1537,7 @@
+ 
+ #define x86_fstsw(inst)	\
+ 	do {	\
++			x86_codegen_pre(&amp;(inst), 3); \
+ 			*(inst)++ = (unsigned char)0x9b;	\
+ 			*(inst)++ = (unsigned char)0xdf;	\
+ 			*(inst)++ = (unsigned char)0xe0;	\
+@@ -1345,6 +1551,7 @@
+  */
+ #define x86_fist_membase(inst,basereg,disp,is_int)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		if ((is_int)) {	\
+ 			*(inst)++ = (unsigned char)0xdb;	\
+ 			x86_membase_emit ((inst), 2, (basereg), (disp));	\
+@@ -1362,24 +1569,28 @@
+ 
+ #define x86_push_regp(inst,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_regp_emit ((inst), 6, (reg));	\
+ 	} while (0)
+ 
+ #define x86_push_mem(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_mem_emit ((inst), 6, (mem));	\
+ 	} while (0)
+ 
+ #define x86_push_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_membase_emit ((inst), 6, (basereg), (disp));	\
+ 	} while (0)
+ 
+ #define x86_push_memindex(inst,basereg,disp,indexreg,shift)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMemindexEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_memindex_emit ((inst), 6, (basereg), (disp), (indexreg), (shift));	\
+ 	} while (0)
+@@ -1390,9 +1601,11 @@
+ 	do {	\
+ 		int _imm = (int) (imm);	\
+ 		if (x86_is_imm8 (_imm)) {	\
++			x86_codegen_pre(&amp;(inst), 2); \
+ 			*(inst)++ = (unsigned char)0x6A;	\
+ 			x86_imm_emit8 ((inst), (_imm));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 5); \
+ 			*(inst)++ = (unsigned char)0x68;	\
+ 			x86_imm_emit32 ((inst), (_imm));	\
+ 		}	\
+@@ -1405,12 +1618,14 @@
+ 
+ #define x86_pop_mem(inst,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0x87;	\
+ 		x86_mem_emit ((inst), 0, (mem));	\
+ 	} while (0)
+ 
+ #define x86_pop_membase(inst,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 1 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x87;	\
+ 		x86_membase_emit ((inst), 0, (basereg), (disp));	\
+ 	} while (0)
+@@ -1422,34 +1637,70 @@
+ 
+ #define x86_loop(inst,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xe2;	\
+ 		x86_imm_emit8 ((inst), (imm));	\
+ 	} while (0)
+ 
+ #define x86_loope(inst,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xe1;	\
+ 		x86_imm_emit8 ((inst), (imm));	\
+ 	} while (0)
+ 
+ #define x86_loopne(inst,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xe0;	\
+ 		x86_imm_emit8 ((inst), (imm));	\
+ 	} while (0)
+ 
+ #define x86_jump32(inst,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 5); \
+ 		*(inst)++ = (unsigned char)0xe9;	\
+ 		x86_imm_emit32 ((inst), (imm));	\
+ 	} while (0)
+ 
+ #define x86_jump8(inst,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		*(inst)++ = (unsigned char)0xeb;	\
+ 		x86_imm_emit8 ((inst), (imm));	\
+ 	} while (0)
+ 
++
++#ifdef __native_client_codegen__
++#define x86_jump_reg(inst,reg)	do {	\
++    x86_codegen_pre(&amp;(inst), 5);			\
++    *(inst)++ = (unsigned char)0x83;  /* and */		\
++    x86_reg_emit ((inst), 4, (reg));  /* reg */		\
++    *(inst)++ = (unsigned char)nacl_align_byte;		\
++    *(inst)++ = (unsigned char)0xff;			\
++    x86_reg_emit ((inst), 4, (reg));			\
++  } while (0)
++
++/* Let's hope ECX is available for these... */
++#define x86_jump_mem(inst,mem)	do {	\
++    x86_mov_reg_mem(inst, (X86_ECX), (mem), 4);		\
++    x86_jump_reg(inst, (X86_ECX));			\
++  } while (0)
++
++#define x86_jump_membase(inst,basereg,disp) do {	\
++    x86_mov_reg_membase(inst, (X86_ECX), basereg, disp, 4);	\
++    x86_jump_reg(inst, (X86_ECX));				\
++  } while (0)
++
++/* like x86_jump_membase, but force a 32-bit displacement  */
++#define x86_jump_membase32(inst,basereg,disp) do {	\
++    x86_codegen_pre(&amp;(inst), 6); \
++    *(inst)++ = (unsigned char)0x8b;			\
++    x86_address_byte ((inst), 2, X86_ECX, (basereg));	\
++    x86_imm_emit32 ((inst), (disp));			\
++    x86_jump_reg(inst, (X86_ECX));			\
++  } while (0)
++#else  /* __native_client_codegen__ */
+ #define x86_jump_reg(inst,reg)	\
+ 	do {	\
+ 		*(inst)++ = (unsigned char)0xff;	\
+@@ -1467,17 +1718,20 @@
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_membase_emit ((inst), 4, (basereg), (disp));	\
+ 	} while (0)
+-
++#endif  /* __native_client_codegen__ */
+ /*
+  * target is a pointer in our buffer.
+  */
+ #define x86_jump_code(inst,target)	\
+ 	do {	\
+-		int t = (unsigned char*)(target) - (inst) - 2;	\
++		int t; \
++		x86_codegen_pre(&amp;(inst), 2); \
++		t = (unsigned char*)(target) - (inst) - 2;	\
+ 		if (x86_is_imm8(t)) {	\
+ 			x86_jump8 ((inst), t);	\
+ 		} else {	\
+-			t -= 3;	\
++			x86_codegen_pre(&amp;(inst), 5); \
++			t = (unsigned char*)(target) - (inst) - 5;	\
+ 			x86_jump32 ((inst), t);	\
+ 		}	\
+ 	} while (0)
+@@ -1495,6 +1749,7 @@
+ 
+ #define x86_branch8(inst,cond,imm,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		if ((is_signed))	\
+ 			*(inst)++ = x86_cc_signed_map [(cond)];	\
+ 		else	\
+@@ -1504,6 +1759,7 @@
+ 
+ #define x86_branch32(inst,cond,imm,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 6); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		if ((is_signed))	\
+ 			*(inst)++ = x86_cc_signed_map [(cond)] + 0x10;	\
+@@ -1514,11 +1770,13 @@
+ 
+ #define x86_branch(inst,cond,target,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2); \
+ 		int offset = (target) - (inst) - 2;	\
+ 		if (x86_is_imm8 ((offset)))	\
+ 			x86_branch8 ((inst), (cond), offset, (is_signed));	\
+ 		else {	\
+-			offset -= 4;	\
++			x86_codegen_pre(&amp;(inst), 6); \
++			offset = (target) - (inst) - 6;	\
+ 			x86_branch32 ((inst), (cond), offset, (is_signed));	\
+ 		}	\
+ 	} while (0)
+@@ -1537,6 +1795,7 @@
+ #define x86_set_reg(inst,cond,reg,is_signed)	\
+ 	do {	\
+                 g_assert (X86_IS_BYTE_REG (reg)); \
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		if ((is_signed))	\
+ 			*(inst)++ = x86_cc_signed_map [(cond)] + 0x20;	\
+@@ -1547,6 +1806,7 @@
+ 
+ #define x86_set_mem(inst,cond,mem,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 7); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		if ((is_signed))	\
+ 			*(inst)++ = x86_cc_signed_map [(cond)] + 0x20;	\
+@@ -1557,6 +1817,7 @@
+ 
+ #define x86_set_membase(inst,cond,basereg,disp,is_signed)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		if ((is_signed))	\
+ 			*(inst)++ = x86_cc_signed_map [(cond)] + 0x20;	\
+@@ -1567,10 +1828,38 @@
+ 
+ #define x86_call_imm(inst,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 5); \
+ 		*(inst)++ = (unsigned char)0xe8;	\
+ 		x86_imm_emit32 ((inst), (int)(disp));	\
+ 	} while (0)
+ 
++
++#ifdef __native_client_codegen__
++#define x86_call_reg_internal(inst,reg)	\
++  do {							\
++    x86_codegen_pre(&amp;(inst), 5);			\
++    *(inst)++ = (unsigned char)0x83;  /* and */		\
++    x86_reg_emit ((inst), 4, (reg));  /* reg */		\
++    *(inst)++ = (unsigned char)nacl_align_byte;		\
++    *(inst)++ = (unsigned char)0xff;  /* call */	\
++    x86_reg_emit ((inst), 2, (reg));  /* reg */		\
++  } while (0)
++
++#define x86_call_reg(inst, reg) do {		\
++    x86_call_reg_internal(inst, reg);		\
++  } while (0)
++
++
++/* It appears that x86_call_mem() is never used, so I'm leaving it out. */
++#define x86_call_membase(inst,basereg,disp)  do {		\
++    /* x86_mov_reg_membase() inlined so its fixed size */	\
++    x86_codegen_pre(&amp;(inst), 6);				\
++    *(inst)++ = (unsigned char)0x8b;				\
++    x86_address_byte ((inst), 2, (X86_ECX), (basereg));		\
++    x86_imm_emit32 ((inst), (disp));				\
++    x86_call_reg_internal(inst, X86_ECX);			\
++  } while (0)
++#else  /* __native_client_codegen__ */
+ #define x86_call_reg(inst,reg)	\
+ 	do {	\
+ 		*(inst)++ = (unsigned char)0xff;	\
+@@ -1588,14 +1877,43 @@
+ 		*(inst)++ = (unsigned char)0xff;	\
+ 		x86_membase_emit ((inst), 2, (basereg), (disp));	\
+ 	} while (0)
++#endif  /* __native_client_codegen__ */
+ 
+ #define x86_call_code(inst,target)	\
+ 	do {	\
+-		int _x86_offset = (unsigned char*)(target) - (inst);	\
++		int _x86_offset; \
++		x86_codegen_pre(&amp;(inst), 5); \
++		_x86_offset = (unsigned char*)(target) - (inst);	\
+ 		_x86_offset -= 5;	\
+ 		x86_call_imm ((inst), _x86_offset);	\
+ 	} while (0)
+ 
++#ifdef __native_client_codegen__
++#define SIZE_OF_RET 6
++#define x86_ret(inst) do { \
++    *(inst)++ = (unsigned char)0x59;  /* pop ecx */		\
++    x86_codegen_pre(&amp;(inst), 5); \
++    *(inst)++ = (unsigned char)0x83;  /* and 0xffffffff, ecx */ \
++    *(inst)++ = (unsigned char)0xe1;				\
++    *(inst)++ = (unsigned char)nacl_align_byte;			\
++    *(inst)++ = (unsigned char)0xff;  /* jmp ecx */ 		\
++    *(inst)++ = (unsigned char)0xe1;				\
++  } while (0)
++
++/* pop return address */
++/* pop imm bytes from stack */
++/* return */
++#define x86_ret_imm(inst,imm)	do {	\
++    *(inst)++ = (unsigned char)0x59;  /* pop ecx */		\
++    x86_alu_reg_imm ((inst), X86_ADD, X86_ESP, imm);		\
++    x86_codegen_pre(&amp;(inst), 5); \
++    *(inst)++ = (unsigned char)0x83;  /* and 0xffffffff, ecx */ \
++    *(inst)++ = (unsigned char)0xe1;				\
++    *(inst)++ = (unsigned char)nacl_align_byte;			\
++    *(inst)++ = (unsigned char)0xff;  /* jmp ecx */ 		\
++    *(inst)++ = (unsigned char)0xe1;				\
++} while (0)
++#else  /* __native_client_codegen__ */
+ #define x86_ret(inst) do { *(inst)++ = (unsigned char)0xc3; } while (0)
+ 
+ #define x86_ret_imm(inst,imm)	\
+@@ -1603,13 +1921,16 @@
+ 		if ((imm) == 0) {	\
+ 			x86_ret ((inst));	\
+ 		} else {	\
++			x86_codegen_pre(&amp;(inst), 3); \
+ 			*(inst)++ = (unsigned char)0xc2;	\
+ 			x86_imm_emit16 ((inst), (imm));	\
+ 		}	\
+ 	} while (0)
++#endif  /* __native_client_codegen__ */
+ 
+ #define x86_cmov_reg(inst,cond,is_signed,dreg,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		*(inst)++ = (unsigned char) 0x0f;	\
+ 		if ((is_signed))	\
+ 			*(inst)++ = x86_cc_signed_map [(cond)] - 0x30;	\
+@@ -1620,6 +1941,7 @@
+ 
+ #define x86_cmov_mem(inst,cond,is_signed,reg,mem)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 7); \
+ 		*(inst)++ = (unsigned char) 0x0f;	\
+ 		if ((is_signed))	\
+ 			*(inst)++ = x86_cc_signed_map [(cond)] - 0x30;	\
+@@ -1630,6 +1952,7 @@
+ 
+ #define x86_cmov_membase(inst,cond,is_signed,reg,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char) 0x0f;	\
+ 		if ((is_signed))	\
+ 			*(inst)++ = x86_cc_signed_map [(cond)] - 0x30;	\
+@@ -1640,6 +1963,7 @@
+ 
+ #define x86_enter(inst,framesize)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0xc8;	\
+ 		x86_imm_emit16 ((inst), (framesize));	\
+ 		*(inst)++ = 0;	\
+@@ -1648,17 +1972,17 @@
+ #define x86_leave(inst) do { *(inst)++ = (unsigned char)0xc9; } while (0)
+ #define x86_sahf(inst)  do { *(inst)++ = (unsigned char)0x9e; } while (0)
+ 
+-#define x86_fsin(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xfe; } while (0)
+-#define x86_fcos(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xff; } while (0)
+-#define x86_fabs(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xe1; } while (0)
+-#define x86_ftst(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xe4; } while (0)
+-#define x86_fxam(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xe5; } while (0)
+-#define x86_fpatan(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xf3; } while (0)
+-#define x86_fprem(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xf8; } while (0)
+-#define x86_fprem1(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xf5; } while (0)
+-#define x86_frndint(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xfc; } while (0)
+-#define x86_fsqrt(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xfa; } while (0)
+-#define x86_fptan(inst) do { *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xf2; } while (0)
++#define x86_fsin(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xfe; } while (0)
++#define x86_fcos(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xff; } while (0)
++#define x86_fabs(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xe1; } while (0)
++#define x86_ftst(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xe4; } while (0)
++#define x86_fxam(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xe5; } while (0)
++#define x86_fpatan(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xf3; } while (0)
++#define x86_fprem(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xf8; } while (0)
++#define x86_fprem1(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xf5; } while (0)
++#define x86_frndint(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xfc; } while (0)
++#define x86_fsqrt(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xfa; } while (0)
++#define x86_fptan(inst) do { x86_codegen_pre(&amp;(inst), 2); *(inst)++ = (unsigned char)0xd9; *(inst)++ = (unsigned char)0xf2; } while (0)
+ 
+ #define x86_padding(inst,size)	\
+ 	do {	\
+@@ -1686,6 +2010,21 @@
+ 		}	\
+ 	} while (0)
+ 
++#ifdef __native_client_codegen__
++
++#define kNaClLengthOfCallReg 5
++#define kNaClLengthOfCallImm 5
++#define kNaClLengthOfCallMembase (kNaClLengthOfCallReg + 6)
++
++guint8 *nacl_pad(guint8 *code, int pad);
++guint8 *nacl_pad_call(guint8 *code, guint8 ilength);
++guint8 *nacl_pad_call_imm(guint8 *code);
++guint8 *nacl_pad_call_reg(guint8 *code);
++guint8 *nacl_pad_call_membase(guint8 *code);
++guint8 *nacl_align(guint8 *code);
++
++#endif  /* __native_client_codegen__ */
++
+ #define x86_prolog(inst,frame_size,reg_mask)	\
+ 	do {	\
+ 		unsigned i, m = 1;	\
+@@ -1853,6 +2192,7 @@
+ /* minimal SSE* support */
+ #define x86_movsd_reg_membase(inst,dreg,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xf2;	\
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x10;	\
+@@ -1861,6 +2201,7 @@
+ 
+ #define x86_cvttsd2si(inst,dreg,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0xf2;	\
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x2c;	\
+@@ -1869,6 +2210,7 @@
+ 
+ #define x86_sse_alu_reg_reg(inst,opc,dreg,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		*(inst)++ = (unsigned char)0x0F;	\
+ 		*(inst)++ = (unsigned char)(opc);	\
+ 		x86_reg_emit ((inst), (dreg), (reg));	\
+@@ -1876,6 +2218,7 @@
+ 
+ #define x86_sse_alu_reg_membase(inst,opc,sreg,basereg,disp)	\
+ 		do {	\
++			x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 			*(inst)++ = (unsigned char)0x0f;	\
+ 			*(inst)++ = (unsigned char)(opc);	\
+ 			x86_membase_emit ((inst), (sreg), (basereg), (disp));	\
+@@ -1883,6 +2226,7 @@
+ 
+ #define x86_sse_alu_membase_reg(inst,opc,basereg,disp,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0F;	\
+ 		*(inst)++ = (unsigned char)(opc);	\
+ 		x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+@@ -1891,30 +2235,35 @@
+ 
+ #define x86_sse_alu_pd_reg_reg(inst,opc,dreg,reg)       \
+ 	do {    \
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0x66;        \
+ 		x86_sse_alu_reg_reg ((inst), (opc), (dreg), (reg)); \
+ 	} while (0)
+ 
+ #define x86_sse_alu_pd_membase_reg(inst,opc,basereg,disp,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x66;	\
+ 		x86_sse_alu_membase_reg ((inst), (opc), (basereg), (disp), (reg)); \
+ 	} while (0)
+ 
+ #define x86_sse_alu_pd_reg_membase(inst,opc,dreg,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x66;	\
+ 		x86_sse_alu_reg_membase ((inst), (opc), (dreg),(basereg), (disp)); \
+ 	} while (0)
+ 
+ #define x86_sse_alu_pd_reg_reg_imm(inst,opc,dreg,reg,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 5); \
+ 		x86_sse_alu_pd_reg_reg ((inst), (opc), (dreg), (reg)); \
+ 		*(inst)++ = (unsigned char)(imm);	\
+ 	} while (0)
+ 
+ #define x86_sse_alu_pd_reg_membase_imm(inst,opc,dreg,basereg,disp,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 4 + kMaxMembaseEmitPadding); \
+ 		x86_sse_alu_pd_reg_membase ((inst), (opc), (dreg),(basereg), (disp)); \
+ 		*(inst)++ = (unsigned char)(imm);	\
+ 	} while (0)
+@@ -1927,6 +2276,7 @@
+ 
+ #define x86_sse_alu_ps_reg_reg_imm(inst,opc,dreg,reg, imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		x86_sse_alu_reg_reg ((inst), (opc), (dreg), (reg)); \
+ 		*(inst)++ = (unsigned char)imm;	\
+ 	} while (0)
+@@ -1934,12 +2284,14 @@
+ 
+ #define x86_sse_alu_sd_reg_reg(inst,opc,dreg,reg)       \
+ 	do {    \
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0xF2;        \
+ 		x86_sse_alu_reg_reg ((inst), (opc), (dreg), (reg)); \
+ 	} while (0)
+ 
+ #define x86_sse_alu_sd_membase_reg(inst,opc,basereg,disp,reg)	\
+ 	do {    \
++		x86_codegen_pre(&amp;(inst), 3 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xF2;        \
+ 		x86_sse_alu_membase_reg ((inst), (opc), (basereg), (disp), (reg));	\
+ 	} while (0)
+@@ -1947,12 +2299,14 @@
+ 
+ #define x86_sse_alu_ss_reg_reg(inst,opc,dreg,reg)       \
+ 	do {    \
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0xF3;        \
+ 		x86_sse_alu_reg_reg ((inst), (opc), (dreg), (reg)); \
+ 	} while (0)
+ 
+ #define x86_sse_alu_ss_membase_reg(inst,opc,basereg,disp,reg)       \
+ 	do {    \
++		x86_codegen_pre(&amp;(inst), 3 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0xF3;        \
+ 		x86_sse_alu_membase_reg ((inst), (opc), (basereg), (disp), (reg));	\
+ 	} while (0)
+@@ -1961,6 +2315,7 @@
+ 
+ #define x86_sse_alu_sse41_reg_reg(inst,opc,dreg,reg)       \
+ 	do {    \
++		x86_codegen_pre(&amp;(inst), 5); \
+ 		*(inst)++ = (unsigned char)0x66;        \
+ 		*(inst)++ = (unsigned char)0x0F;	\
+ 		*(inst)++ = (unsigned char)0x38;	\
+@@ -1970,6 +2325,7 @@
+ 
+ #define x86_movups_reg_membase(inst,sreg,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x10;	\
+ 		x86_membase_emit ((inst), (sreg), (basereg), (disp));	\
+@@ -1977,6 +2333,7 @@
+ 
+ #define x86_movups_membase_reg(inst,basereg,disp,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x11;	\
+ 		x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+@@ -1984,6 +2341,7 @@
+ 
+ #define x86_movaps_reg_membase(inst,sreg,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x28;	\
+ 		x86_membase_emit ((inst), (sreg), (basereg), (disp));	\
+@@ -1991,6 +2349,7 @@
+ 
+ #define x86_movaps_membase_reg(inst,basereg,disp,reg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 2 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x29;	\
+ 		x86_membase_emit ((inst), (reg), (basereg), (disp));	\
+@@ -1998,6 +2357,7 @@
+ 
+ #define x86_movaps_reg_reg(inst,dreg,sreg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3); \
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x28;	\
+ 		x86_reg_emit ((inst), (dreg), (sreg));	\
+@@ -2006,6 +2366,7 @@
+ 
+ #define x86_movd_reg_xreg(inst,dreg,sreg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0x66;	\
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x7e;	\
+@@ -2014,6 +2375,7 @@
+ 
+ #define x86_movd_xreg_reg(inst,dreg,sreg)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 4); \
+ 		*(inst)++ = (unsigned char)0x66;	\
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x6e;	\
+@@ -2022,6 +2384,7 @@
+ 
+ #define x86_movd_xreg_membase(inst,sreg,basereg,disp)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 3 + kMaxMembaseEmitPadding); \
+ 		*(inst)++ = (unsigned char)0x66;	\
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x6e;	\
+@@ -2030,6 +2393,7 @@
+ 
+ #define x86_pshufw_reg_reg(inst,dreg,sreg,mask,high_words)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 5); \
+ 		*(inst)++ = (unsigned char)(high_words) ? 0xF3 : 0xF2;	\
+ 		*(inst)++ = (unsigned char)0x0f;	\
+ 		*(inst)++ = (unsigned char)0x70;	\
+@@ -2039,6 +2403,7 @@
+ 
+ #define x86_sse_shift_reg_imm(inst,opc,mode, dreg,imm)	\
+ 	do {	\
++		x86_codegen_pre(&amp;(inst), 5); \
+ 		x86_sse_alu_pd_reg_reg (inst, opc, mode, dreg);	\
+ 		x86_imm_emit8 ((inst), (imm));	\
+ 	} while (0)
+Index: configure.in
+===================================================================
+--- configure.in	(revision 159271)
++++ configure.in	(working copy)
+@@ -181,6 +181,19 @@
+ 		AOT_SUPPORTED=&quot;yes&quot;
+ 		use_sigposix=yes
+ 		;;
++	*-*-nacl*)
++		host_win32=no
++		CPPFLAGS=&quot;$CPPFLAGS -DGC_LINUX_THREADS -D_GNU_SOURCE -D_REENTRANT -DUSE_MMAP&quot;
++		if test &quot;x$disable_munmap&quot; != &quot;xyes&quot;; then
++			CPPFLAGS=&quot;$CPPFLAGS -DUSE_MUNMAP&quot;
++		fi
++		libmono_cflags=&quot;-D_REENTRANT&quot;
++		libdl=
++		libgc_threads=pthreads
++		AOT_SUPPORTED=&quot;yes&quot;
++		gc_default=boehm
++		use_sigposix=yes
++		;;
+ 	*-*-hpux*)
+ 	        host_win32=no
+ 		CPPFLAGS=&quot;$CPPFLAGS -DGC_HPUX_THREADS -D_HPUX_SOURCE -D_XOPEN_SOURCE_EXTENDED -D_REENTRANT&quot;
+@@ -2013,7 +2026,17 @@
+ dnl **************
+ 
+ AC_ARG_ENABLE(llvm,[  --enable-llvm	Enable the experimental LLVM back-end], enable_llvm=$enableval, enable_llvm=no)
++AC_ARG_ENABLE(nacl_codegen, [  --enable-nacl-codegen      Enable Native Client code generation], enable_nacl_codegen=$enableval, enable_nacl_codegen=no)
+ 
++AM_CONDITIONAL(NACL_CODEGEN, test x$enable_nacl_codegen != xno)
++if test &quot;x$enable_nacl_codegen&quot; = &quot;xyes&quot;; then
++   MONO_NACL_ALIGN_MASK_OFF=1
++   CPPFLAGS=&quot;$CPPFLAGS -D__native_client_codegen__&quot;
++else
++   MONO_NACL_ALIGN_MASK_OFF=0
++fi
++AC_SUBST(MONO_NACL_ALIGN_MASK_OFF)
++
+ if test &quot;x$enable_llvm&quot; = &quot;xyes&quot;; then
+    AC_PATH_PROG(LLVM_CONFIG, llvm-config, no)
+    if test &quot;x$LLVM_CONFIG&quot; = &quot;xno&quot;; then
+Index: ikvm-native/jni.c
+===================================================================
+--- ikvm-native/jni.c	(revision 159271)
++++ ikvm-native/jni.c	(working copy)
+@@ -21,6 +21,9 @@
+   <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">jeroen at frijters.net</A>
+   
+ */
++
++#if !defined(__native_client__)
++
+ #include &lt;stdarg.h&gt;
+ #include &quot;jni.h&quot;
+ 
+@@ -502,3 +505,4 @@
+ {
+ 	return method(vm, reserved);
+ }
++#endif /* __native_client__ */
+Index: ikvm-native/os.c
+===================================================================
+--- ikvm-native/os.c	(revision 159271)
++++ ikvm-native/os.c	(working copy)
+@@ -21,6 +21,9 @@
+   <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">jeroen at frijters.net</A>
+   
+ */
++
++#if !defined(__native_client__)
++
+ #ifdef _WIN32
+ 	#include &lt;windows.h&gt;
+ 	#include &quot;jni.h&quot;
+@@ -98,3 +101,4 @@
+ 		return msync(address, size, MS_SYNC);
+ 	}
+ #endif
++#endif /* __native_client__ */
+</PRE>
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="035286.html">[Mono-dev] Problem with CA sending certified emails
+</A></li>
+	<LI>Next message: <A HREF="035309.html">[Mono-dev] Proposed Patch - Google Native Client
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35303">[ date ]</a>
+              <a href="thread.html#35303">[ thread ]</a>
+              <a href="subject.html#35303">[ subject ]</a>
+              <a href="author.html#35303">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

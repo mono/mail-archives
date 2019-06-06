@@ -1,0 +1,138 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH] Method invoke verification
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Method%20invoke%20verification&In-Reply-To=8cca42d80706111618k1d54ecfnb208bed2dcae9720%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="023885.html">
+   <LINK REL="Next"  HREF="023895.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH] Method invoke verification</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Method%20invoke%20verification&In-Reply-To=8cca42d80706111618k1d54ecfnb208bed2dcae9720%40mail.gmail.com"
+       TITLE="[Mono-dev] [PATCH] Method invoke verification">lupus at ximian.com
+       </A><BR>
+    <I>Tue Jun 12 12:02:17 EDT 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="023885.html">[Mono-dev] [PATCH] Method invoke verification
+</A></li>
+        <LI>Next message: <A HREF="023895.html">[Mono-dev] [PATCH] Method invoke verification
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23892">[ date ]</a>
+              <a href="thread.html#23892">[ thread ]</a>
+              <a href="subject.html#23892">[ subject ]</a>
+              <a href="author.html#23892">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 06/11/07 Rodrigo Kumpera wrote:
+&gt;<i> Index: verify.c
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- verify.c	(revision 79204)
+</I>&gt;<i> +++ verify.c	(working copy)
+</I>&gt;<i> +/* FIXME: we could just load the signature instead of the whole MonoMethod
+</I>&gt;<i> + * TODO handle vararg calls
+</I>&gt;<i> + * TODO handle non virt calls to non-final virtual calls (exception clause in page 52 of partition 3)
+</I>&gt;<i> + */
+</I>&gt;<i> +static void
+</I>&gt;<i> +do_invoke_method (VerifyContext *ctx, int method_token)
+</I>&gt;<i> +{
+</I>&gt;<i> +	int param_count, i;
+</I>&gt;<i> +	MonoMethodSignature *sig;
+</I>&gt;<i> +	ILStackDesc *value;
+</I>&gt;<i> +	MonoMethod *method = mono_get_method_full (ctx-&gt;image, method_token, NULL, ctx-&gt;generic_context);
+</I>&gt;<i> +
+</I>&gt;<i> +	if (!method) {
+</I>&gt;<i> +		ADD_VERIFY_ERROR (ctx, g_strdup_printf (&quot;Method 0x%08x not found at 0x%04x&quot;, method_token, ctx-&gt;ip_offset));
+</I>&gt;<i> +		return;
+</I>&gt;<i> +	}
+</I>&gt;<i> +
+</I>&gt;<i> +	if (!(sig = mono_method_signature (method)))
+</I>&gt;<i> +		sig = mono_method_get_signature (method, ctx-&gt;image, method_token);
+</I>&gt;<i> +
+</I>&gt;<i> +	param_count = sig-&gt;param_count + sig-&gt;hasthis;
+</I>&gt;<i> +	check_underflow (ctx, param_count);
+</I>&gt;<i> +
+</I>&gt;<i> +	for (i = sig-&gt;param_count - 1; i &gt;= 0; --i) {
+</I>&gt;<i> +		VERIFIER_DEBUG ( printf (&quot;verifying argument %d\n&quot;, i); );
+</I>&gt;<i> +		value = stack_pop (ctx);
+</I>
+If check_underflow failed, stack_pop() will access random memory: there
+are a few cases where after some errors, you can't continue checking for
+more, as it would involve either bugs as above or adding many more
+checks that slow down everything. Here we see a mismatch between the
+needs of a verifier for the JIT's use and an offline verifier: for the
+JIT it needs to bail out as soon as possible, for an offline verifier
+you may want to try to continue and provide to the user more useful
+feedback (sort of like compilers will try to check for more errors after
+the first). Please check all the uses of check_underflow() and similar
+for this issue.
+
+&gt;<i> +		if (!verify_type_compat (ctx, sig-&gt;params[i], value)) {
+</I>&gt;<i> +			ADD_VERIFY_ERROR (ctx, g_strdup_printf (&quot;Incompatible parameter value with function signature at 0x%04x&quot;, ctx-&gt;ip_offset));
+</I>&gt;<i> +			return;
+</I>&gt;<i> +		}
+</I>&gt;<i> +	}
+</I>&gt;<i> +
+</I>&gt;<i> +	if (sig-&gt;hasthis) {
+</I>&gt;<i> +		MonoType dummy;
+</I>&gt;<i> +
+</I>&gt;<i> +		VERIFIER_DEBUG ( printf (&quot;verifying this argument\n&quot;); );
+</I>&gt;<i> +
+</I>&gt;<i> +		memset (&amp;dummy, 0, sizeof (MonoType));
+</I>&gt;<i> +		dummy.data.klass = method-&gt;klass;
+</I>&gt;<i> +
+</I>&gt;<i> +		if (method-&gt;klass == mono_defaults.object_class)
+</I>&gt;<i> +			dummy.type = MONO_TYPE_OBJECT;
+</I>&gt;<i> +		else if(method-&gt;klass == mono_defaults.string_class)
+</I>&gt;<i> +			dummy.type = MONO_TYPE_STRING;
+</I>&gt;<i> +		else
+</I>&gt;<i> +			dummy.type = MONO_TYPE_CLASS;
+</I>
+Please don't construct a dummy type here: use klass-&gt;byval_arg for references
+and klass-&gt;this_arg for valuetypes.
+
+&gt;<i> +	if (sig-&gt;ret-&gt;type != MONO_TYPE_VOID) {
+</I>&gt;<i> +		check_overflow (ctx);
+</I>&gt;<i> +		set_stack_value (stack_push (ctx), sig-&gt;ret, FALSE);
+</I>
+Here is another example where we flag the overflow error, but continue
+and scribble over memory corrupting it.
+
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="023885.html">[Mono-dev] [PATCH] Method invoke verification
+</A></li>
+	<LI>Next message: <A HREF="023895.html">[Mono-dev] [PATCH] Method invoke verification
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23892">[ date ]</a>
+              <a href="thread.html#23892">[ thread ]</a>
+              <a href="subject.html#23892">[ subject ]</a>
+              <a href="author.html#23892">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

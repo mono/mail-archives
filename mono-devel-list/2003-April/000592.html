@@ -1,0 +1,174 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Patch: socket handles not freed
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Patch%3A%20socket%20handles%20not%20freed&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000591.html">
+   <LINK REL="Next"  HREF="000593.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Patch: socket handles not freed</H1>
+    <B>Pelle Johnsen</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Patch%3A%20socket%20handles%20not%20freed&In-Reply-To="
+       TITLE="[Mono-devel-list] Patch: socket handles not freed">pelle.johnsen at mail.dk
+       </A><BR>
+    <I>Wed Apr 30 16:16:07 EDT 2003</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000591.html">[Mono-devel-list] Starting System.EnterpriseServices
+</A></li>
+        <LI>Next message: <A HREF="000593.html">[Mono-devel-list] Re: Starting System.EnterpriseServices
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#592">[ date ]</a>
+              <a href="thread.html#592">[ thread ]</a>
+              <a href="subject.html#592">[ subject ]</a>
+              <a href="author.html#592">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi,
+
+I've found and fixed a problem with socket handles not being freed.
+
+Basically handles created for sockets (socket or accept) were allocated but
+never freed.
+
+I fixed this by having the normal closesocket just unref the handle and then
+do the real closing of the socket in socket_privat_close.
+
+Here's a post on gotmono on how I found it:
+<A HREF="http://www.gotmono.com/cgi-bin/yabb/YaBB.pl?board=news;action=display;num=10">http://www.gotmono.com/cgi-bin/yabb/YaBB.pl?board=news;action=display;num=10</A>
+50630682;start=15
+
+Here is the patch:
+
+Index: mono/io-layer/sockets.c
+===================================================================
+RCS file: /mono/mono/mono/io-layer/sockets.c,v
+retrieving revision 1.20
+diff -u -r1.20 sockets.c
+--- mono/io-layer/sockets.c	20 Mar 2003 15:01:59 -0000	1.20
++++ mono/io-layer/sockets.c	30 Apr 2003 19:45:07 -0000
+@@ -59,12 +59,43 @@
+
+ static void socket_close_private (gpointer handle)
+ {
++	struct _WapiHandlePrivate_socket *socket_private_handle;
++	gboolean ok;
++	int ret;
++
+ #ifdef DEBUG
+-	g_message(G_GNUC_PRETTY_FUNCTION &quot;: closing socket handle %p&quot;,
+-		  handle);
++	g_message (G_GNUC_PRETTY_FUNCTION &quot;: closing socket handle %p&quot;,
++		   handle);
+ #endif
+
+-	closesocket(GPOINTER_TO_UINT (handle));
++	if(startup_count==0) {
++		WSASetLastError(WSANOTINITIALISED);
++		return;
++	}
++
++	ok=_wapi_lookup_handle (GUINT_TO_POINTER (handle), WAPI_HANDLE_SOCKET,
++				NULL, (gpointer *)&amp;socket_private_handle);
++	if(ok==FALSE) {
++		g_warning (G_GNUC_PRETTY_FUNCTION
++			   &quot;: error looking up socket handle %p&quot;, handle);
++		WSASetLastError(WSAENOTSOCK);
++		return;
++	}
++
++	g_ptr_array_remove_fast(sockets, GUINT_TO_POINTER (handle));
++
++	ret=close(socket_private_handle-&gt;fd);
++	if(ret==-1) {
++		gint errnum = errno;
++#ifdef DEBUG
++		g_message(G_GNUC_PRETTY_FUNCTION &quot;: close error: %s&quot;,
++			  strerror(errno));
++#endif
++		errnum = errno_to_WSA (errnum, G_GNUC_PRETTY_FUNCTION);
++		WSASetLastError (errnum);
++
++		return;
++	}
+ }
+
+ int WSAStartup(guint32 requested, WapiWSAData *data)
+@@ -153,44 +184,8 @@
+
+ int closesocket(guint32 handle)
+ {
+-	struct _WapiHandlePrivate_socket *socket_private_handle;
+-	gboolean ok;
+-	int ret;
+-
+-#ifdef DEBUG
+-	g_message (G_GNUC_PRETTY_FUNCTION &quot;: closing socket handle 0x%x&quot;,
+-		   handle);
+-#endif
+-
+-	if(startup_count==0) {
+-		WSASetLastError(WSANOTINITIALISED);
+-		return(SOCKET_ERROR);
+-	}
+-
+-	ok=_wapi_lookup_handle (GUINT_TO_POINTER (handle), WAPI_HANDLE_SOCKET,
+-				NULL, (gpointer *)&amp;socket_private_handle);
+-	if(ok==FALSE) {
+-		g_warning (G_GNUC_PRETTY_FUNCTION
+-			   &quot;: error looking up socket handle 0x%x&quot;, handle);
+-		WSASetLastError(WSAENOTSOCK);
+-		return(SOCKET_ERROR);
+-	}
+-
+-	g_ptr_array_remove_fast(sockets, GUINT_TO_POINTER (handle));
+-
+-	ret=close(socket_private_handle-&gt;fd);
+-	if(ret==-1) {
+-		gint errnum = errno;
+-#ifdef DEBUG
+-		g_message(G_GNUC_PRETTY_FUNCTION &quot;: close error: %s&quot;,
+-			  strerror(errno));
+-#endif
+-		errnum = errno_to_WSA (errnum, G_GNUC_PRETTY_FUNCTION);
+-		WSASetLastError (errnum);
+-
+-		return SOCKET_ERROR;
+-	}
+-	return(ret);
++	_wapi_handle_unref(GUINT_TO_POINTER (handle));
++	return(0);
+ }
+
+ guint32 _wapi_accept(guint32 handle, struct sockaddr *addr,
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000591.html">[Mono-devel-list] Starting System.EnterpriseServices
+</A></li>
+	<LI>Next message: <A HREF="000593.html">[Mono-devel-list] Re: Starting System.EnterpriseServices
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#592">[ date ]</a>
+              <a href="thread.html#592">[ thread ]</a>
+              <a href="subject.html#592">[ subject ]</a>
+              <a href="author.html#592">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

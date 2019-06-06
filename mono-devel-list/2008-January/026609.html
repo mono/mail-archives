@@ -1,0 +1,277 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Control-C handler
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Control-C%20handler&In-Reply-To=1199983945.8432.240.camel%40lina.magi.jprl.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026579.html">
+   <LINK REL="Next"  HREF="026613.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Control-C handler</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Control-C%20handler&In-Reply-To=1199983945.8432.240.camel%40lina.magi.jprl.com"
+       TITLE="[Mono-dev] Control-C handler">lupus at ximian.com
+       </A><BR>
+    <I>Fri Jan 11 13:56:14 EST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026579.html">[Mono-dev] Control-C handler
+</A></li>
+        <LI>Next message: <A HREF="026613.html">[Mono-dev] Control-C handler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26609">[ date ]</a>
+              <a href="thread.html#26609">[ thread ]</a>
+              <a href="subject.html#26609">[ subject ]</a>
+              <a href="author.html#26609">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 01/10/08 Jonathan Pryor wrote:
+&gt;<i> Attached is an updated patch set which supports both the existing/new
+</I>&gt;<i> Stdlib.signal() semantics (as the previous patch set did) in which the
+</I>&gt;<i> signal handler is invoked on an internal helper thread, and adds a new
+</I>&gt;<i> Mono.Unix.UnixSignal type to permit polling and/or blocking as lupus
+</I>&gt;<i> originally suggested.
+</I>
+I think signal() should just be obsoleted, starting a thread yourself
+doesn't provide the same semantics and it is doesn't allow the user much
+control.
+
+&gt;<i> The one thing I don't like (but can't think of a workaround) is the
+</I>&gt;<i> interaction between UnixSignal and Stdlib.signal(): as currently
+</I>&gt;<i> implemented, UnixSignal and Stdlib.signal() can't handle the same signal
+</I>&gt;<i> simultaneously -- if UnixSignal registered to handle e.g. SIGINT, then
+</I>&gt;<i> Stdlib.signal() will return SIG_ERR, with errno set to EEXIST.
+</I>&gt;<i> 
+</I>&gt;<i> However, the alternate IS possible: UnixSignal can handle e.g. SIGINT if
+</I>&gt;<i> Stdlib.signal() was previously called to handle it (and will
+</I>&gt;<i> consequently replace the original Stdlib.signal() handler).  The
+</I>&gt;<i> &quot;original&quot; Stdlib.signal() handler will be replaced when the UnixSignal
+</I>&gt;<i> instance is destroyed.
+</I>
+I think there are two choices for Stdlib.signal(): either leave it alone
+or make it do nothing/throw an exception (this can happen after some
+time it has been obsoleted).
+
+&gt;<i> Of course, this could be used as an argument to dump Stdlib.signal()
+</I>&gt;<i> support entirely, but it needs to stick around to permit setting SIG_IGN
+</I>&gt;<i> on a given signal.  I suppose Stdlib.signal() could be restricted to
+</I>&gt;<i> just accepting SIG_IGN, SIG_ERR, and SIG_DFL and error out if any other
+</I>
+Just provide a sane interface to ignore a signal instead of this kludge.
+
+&gt;<i> delegate instance is passed, so that people use UnixSignal for all
+</I>&gt;<i> significant signal usage, but I don't like this either as currently each
+</I>&gt;<i> UnixSignal.WaitOne() call requires a separate pipe, while
+</I>
+This is an implementation detail of your version, it could be done
+differently.
+
+&gt;<i> Index: Mono.Unix.Native/Stdlib.cs
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- Mono.Unix.Native/Stdlib.cs	(revision 92060)
+</I>&gt;<i> +++ Mono.Unix.Native/Stdlib.cs	(working copy)
+</I>&gt;<i> @@ -31,6 +31,9 @@
+</I>&gt;<i>  using System.IO;
+</I>&gt;<i>  using System.Runtime.InteropServices;
+</I>&gt;<i>  using System.Text;
+</I>&gt;<i> +using System.Threading;
+</I>&gt;<i> +
+</I>&gt;<i> +using Mono.Unix;
+</I>&gt;<i>  using Mono.Unix.Native;
+</I>&gt;<i>  
+</I>&gt;<i>  namespace Mono.Unix.Native {
+</I>&gt;<i> @@ -359,7 +362,7 @@
+</I>&gt;<i>  	//        This is the case for using NativeConvert, which will throw an
+</I>&gt;<i>  	//        exception if an invalid/unsupported value is used.
+</I>&gt;<i>  	//
+</I>&gt;<i> -	public class Stdlib
+</I>&gt;<i> +	public unsafe class Stdlib
+</I>
+It's a bad idea to make the whole class unsafe.
+
+&gt;<i> @@ -494,6 +495,45 @@
+</I>&gt;<i>  #endif
+</I>&gt;<i>  		}
+</I>&gt;<i>  
+</I>&gt;<i> +		[DllImport (MPH, CallingConvention=CallingConvention.Cdecl,
+</I>&gt;<i> +				SetLastError=true, EntryPoint=&quot;_mph_set_signal_write_fd&quot;)]
+</I>&gt;<i> +		private static extern void set_signal_write_fd (int signum);
+</I>&gt;<i> +
+</I>&gt;<i> +		static object signal_dispatcher;
+</I>&gt;<i> +		static int    signal_read_fd;
+</I>&gt;<i> +
+</I>&gt;<i> +		private static void InitSignalSupport ()
+</I>&gt;<i> +		{
+</I>&gt;<i> +			if (Path.DirectorySeparatorChar == '\\')
+</I>&gt;<i> +				return;
+</I>
+This looks ugly.
+
+&gt;<i> +			if (signal_dispatcher == null) {
+</I>&gt;<i> +				object c = new Thread (SignalDispatcher);
+</I>&gt;<i> +				Thread.MemoryBarrier ();
+</I>&gt;<i> +				while (Interlocked.CompareExchange (ref signal_dispatcher, c, null) == null) {
+</I>&gt;<i> +					int writing;
+</I>&gt;<i> +					if (Syscall.pipe (out signal_read_fd, out writing) &lt; 0)
+</I>&gt;<i> +						throw UnixMarshal.CreateExceptionForLastError ();
+</I>&gt;<i> +					set_signal_write_fd (writing);
+</I>&gt;<i> +					Thread _c = (Thread) c;
+</I>&gt;<i> +					_c.IsBackground = true;
+</I>&gt;<i> +					_c.Name = &quot;Mono.Unix.Native Signal Dispatcher&quot;;
+</I>&gt;<i> +					_c.Start ();
+</I>&gt;<i> +				}
+</I>&gt;<i> +				Thread.MemoryBarrier ();
+</I>&gt;<i> +			}
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		private static unsafe void SignalDispatcher ()
+</I>&gt;<i> +		{
+</I>&gt;<i> +			byte c;
+</I>&gt;<i> +			while (Syscall.read (signal_read_fd, &amp;c, 1) &gt;= 1) {
+</I>&gt;<i> +				SignalHandler h = registered_signals [c];
+</I>&gt;<i> +				if (h != null)
+</I>&gt;<i> +					h (c);
+</I>&gt;<i> +			}
+</I>&gt;<i> +		}
+</I>
+There is no protection here about a callback throwing an exception, so
+the thread dies and everything falls apart. It's a bad idea anyway to
+try to support the broken interface and provide different semantics at
+the same time.
+
+&gt;<i> --- Mono.Unix/UnixSignal.cs	(revision 0)
+</I>&gt;<i> +++ Mono.Unix/UnixSignal.cs	(revision 0)
+</I>[...]
+&gt;<i> +namespace Mono.Unix {
+</I>&gt;<i> +	public class UnixSignal : WaitHandle {
+</I>&gt;<i> +		private Signum signum;
+</I>&gt;<i> +		private int _signum;
+</I>&gt;<i> +		private IntPtr signal_info;
+</I>&gt;<i> +
+</I>&gt;<i> +		public UnixSignal (Signum signum)
+</I>&gt;<i> +		{
+</I>&gt;<i> +			this.signum = signum;
+</I>&gt;<i> +			this._signum = NativeConvert.FromSignum (signum);
+</I>&gt;<i> +			lock (Stdlib.registered_signals) {
+</I>&gt;<i> +				this.signal_info = install (_signum);
+</I>&gt;<i> +			}
+</I>&gt;<i> +			if (this.signal_info == IntPtr.Zero) {
+</I>&gt;<i> +				throw new ArgumentException (&quot;Unable to handle signal&quot;, &quot;signum&quot;);
+</I>&gt;<i> +			}
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		public Signum Signum {
+</I>&gt;<i> +			get { return signum; }
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		[DllImport (Stdlib.MPH, CallingConvention=CallingConvention.Cdecl,
+</I>&gt;<i> +				EntryPoint=&quot;Mono_Unix_UnixSignal_install&quot;)]
+</I>&gt;<i> +		private static extern IntPtr install (int signum);
+</I>&gt;<i> +
+</I>&gt;<i> +		[DllImport (Stdlib.MPH, CallingConvention=CallingConvention.Cdecl,
+</I>&gt;<i> +				EntryPoint=&quot;Mono_Unix_UnixSignal_uninstall&quot;)]
+</I>&gt;<i> +		private static extern void uninstall (int signum);
+</I>
+My proposed interface allows registering multiple handlers per signals
+and this code can deal with just one.
+
+&gt;<i> +		public unsafe override bool WaitOne (int millisecondsTimeout, bool exitContext)
+</I>&gt;<i> +		{
+</I>&gt;<i> +			AssertValid ();
+</I>&gt;<i> +			if (exitContext)
+</I>&gt;<i> +				throw new InvalidOperationException (&quot;exitContext is not supported&quot;);
+</I>&gt;<i> +			if (millisecondsTimeout &lt; -1)
+</I>&gt;<i> +				throw new ArgumentOutOfRangeException (&quot;millisecondsTimeout&quot;);
+</I>&gt;<i> +			int read, write;
+</I>&gt;<i> +			bool close = true;
+</I>&gt;<i> +			read = write = -1;
+</I>&gt;<i> +			try {
+</I>&gt;<i> +				if (Syscall.pipe (out read, out write) &lt; 0) {
+</I>&gt;<i> +					close = false;
+</I>&gt;<i> +					throw UnixMarshal.CreateExceptionForLastError ();
+</I>&gt;<i> +				}
+</I>&gt;<i> +				Pollfd[] fds  = new Pollfd[1];
+</I>&gt;<i> +				fds[0].fd     = read;
+</I>&gt;<i> +				fds[0].events = PollEvents.POLLIN;
+</I>&gt;<i> +				if (IsSet)
+</I>&gt;<i> +					return true;
+</I>&gt;<i> +				Info-&gt;write_fd = write;
+</I>&gt;<i> +				int r = Syscall.poll (fds, 1, millisecondsTimeout);
+</I>
+Unless Syscall.poll() actually falls back to select() it shouldn't be
+used as for example the POS OS X doesn't implement it.
+
+&gt;<i> +				if (r == -1 &amp;&amp; Stdlib.GetLastError () != Errno.EINTR) {
+</I>&gt;<i> +					return false;
+</I>&gt;<i> +				}
+</I>&gt;<i> +				else
+</I>&gt;<i> +					r = Syscall.poll (fds, 1, 0);
+</I>&gt;<i> +				if (r &gt; 0) {
+</I>&gt;<i> +					byte c = 0;
+</I>&gt;<i> +					Syscall.read (read, &amp;c, 1);
+</I>
+No error checking. This stuff should be implemented in C anyway.
+
+&gt;<i> --- signal.c	(revision 92060)
+</I>&gt;<i> +++ signal.c	(working copy)
+</I>&gt;<i> +void*
+</I>&gt;<i> +Mono_Unix_UnixSignal_install (int sig)
+</I>&gt;<i> +{
+</I>&gt;<i> +	signal_info* n = realloc (registered_signals, 
+</I>&gt;<i> +			sizeof(signal_info)*(registered_signals_count+1));
+</I>&gt;<i> +	if (n) {
+</I>&gt;<i> +		signal_info* r;
+</I>&gt;<i> +		registered_signals = n;
+</I>&gt;<i> +		r = &amp;registered_signals [registered_signals_count++];
+</I>&gt;<i> +
+</I>&gt;<i> +		r-&gt;signum   = sig;
+</I>&gt;<i> +		r-&gt;count    = 0;
+</I>&gt;<i> +		r-&gt;write_fd = 0;
+</I>&gt;<i> +
+</I>&gt;<i> +		if ((r-&gt;handler = signal (sig, default_handler)) == SIG_ERR) {
+</I>&gt;<i> +			Mono_Posix_Signal_uninstall (sig);
+</I>&gt;<i> +			return NULL;
+</I>&gt;<i> +		}
+</I>&gt;<i> +		return r;
+</I>&gt;<i> +	}
+</I>&gt;<i> +	return NULL;
+</I>&gt;<i> +}
+</I>
+The handling of the registered_signals array is not thread safe and not
+signal safe.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026579.html">[Mono-dev] Control-C handler
+</A></li>
+	<LI>Next message: <A HREF="026613.html">[Mono-dev] Control-C handler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26609">[ date ]</a>
+              <a href="thread.html#26609">[ thread ]</a>
+              <a href="subject.html#26609">[ subject ]</a>
+              <a href="author.html#26609">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

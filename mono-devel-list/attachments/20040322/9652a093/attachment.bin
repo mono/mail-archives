@@ -1,0 +1,212 @@
+Index: appdomain.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/appdomain.h,v
+retrieving revision 1.68
+diff -u -r1.68 appdomain.h
+--- appdomain.h	23 Feb 2004 14:09:13 -0000	1.68
++++ appdomain.h	22 Mar 2004 08:35:25 -0000
+@@ -123,6 +123,7 @@
+ 	 * if the hashtable contains a GC visible reference to them.
+ 	 */
+ 	GHashTable         *finalizable_objects_hash;
++	GList			   *running_cctors_list;
+ };
+ 
+ /* This is a copy of System.AppDomain */
+Index: class.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/class.h,v
+retrieving revision 1.128
+diff -u -r1.128 class.h
+--- class.h	17 Mar 2004 23:59:47 -0000	1.128
++++ class.h	22 Mar 2004 08:35:29 -0000
+@@ -94,7 +94,6 @@
+ 
+ struct _MonoClass {
+ 	MonoImage *image;
+-
+ 	/* The underlying type of the enum */
+ 	MonoType *enum_basetype;
+ 	/* element class for arrays and enum */
+@@ -211,14 +210,16 @@
+ 	void *gc_descr; 	
+ 	MonoDomain *domain;  /* each object/vtable belongs to exactly one domain */
+ 	guint       max_interface_id;
+-        gpointer   *interface_offsets;   
+-        gpointer    data; /* to store static class data */
+-        gpointer    type; /* System.Type type for klass */
+-	guint remote          : 1; /* class is remotely activated */
+-	guint initialized     : 1; /* cctor has been run */
+-	guint initializing    : 1; /* cctor is running */
++	gpointer   *interface_offsets;   
++	gpointer    data; /* to store static class data */
++	gpointer    type; /* System.Type type for klass */
++	guint		remote          : 1; /* class is remotely activated */
++	guint		initialized     : 1; /* cctor has been run */
++	guint32 	cctor_tid;
++	GList 	   *cctor_waiting_threads;
++	CRITICAL_SECTION lock;
+ 	/* do not add any fields after vtable, the structure is dynamically extended */
+-        gpointer    vtable [MONO_ZERO_LEN_ARRAY];	
++	gpointer    vtable [MONO_ZERO_LEN_ARRAY];	
+ };
+ 
+ /*
+Index: domain.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/domain.c,v
+retrieving revision 1.46
+diff -u -r1.46 domain.c
+--- domain.c	5 Mar 2004 03:46:04 -0000	1.46
++++ domain.c	22 Mar 2004 08:35:29 -0000
+@@ -209,7 +209,8 @@
+ 	domain->class_init_trampoline_hash = mono_g_hash_table_new (NULL, NULL);
+ 	domain->finalizable_objects_hash = g_hash_table_new (NULL, NULL);
+ 	domain->domain_id = InterlockedIncrement (&appdomain_id_counter);
+-
++	domain->running_cctors_list = NULL;
++	
+ 	InitializeCriticalSection (&domain->lock);
+ 
+ 	EnterCriticalSection (&appdomains_mutex);
+@@ -612,6 +613,7 @@
+ 	g_hash_table_destroy (domain->jit_code_hash);
+ 	mono_g_hash_table_destroy (domain->ldstr_table);
+ 	mono_jit_info_table_free (domain->jit_info_table);
++	g_list_free (domain->running_cctors_list);
+ #ifdef DEBUG_DOMAIN_UNLOAD
+ 	mono_mempool_invalidate (domain->mp);
+ 	mono_code_manager_invalidate (domain->code_mp);
+Index: object.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/object.c,v
+retrieving revision 1.204
+diff -u -r1.204 object.c
+--- object.c	14 Mar 2004 18:29:40 -0000	1.204
++++ object.c	22 Mar 2004 08:35:29 -0000
+@@ -74,11 +74,11 @@
+ 	MonoClass *klass;
+ 	gchar *full_name;
+ 	gboolean found;
+-	MonoDomain *last_domain = NULL;
++	MonoDomain *domain, *last_domain = NULL;
+ 
+ 	MONO_ARCH_SAVE_REGS;
+ 
+-	if (vtable->initialized || vtable->initializing)
++	if (vtable->initialized)
+ 		return;
+ 
+ 	exc = NULL;
+@@ -95,30 +95,88 @@
+ 	}
+ 
+ 	if (found) {
+-		mono_domain_lock (vtable->domain);
++		gint32 tid = mono_thread_current ()->tid;
++		domain = mono_domain_get ();
++	
++		mono_domain_lock (domain);
++	
++		if (vtable->cctor_tid == tid) {
++			/* This thread already holds the lock for this vtable, return */
++			mono_domain_unlock (domain);
++			return;
++		}
++		else if (vtable->cctor_tid != 0) {
++			/* See whether any thread waiting for this thread to complete 
++		       already holds the lock */
++			GList *l = domain->running_cctors_list;
++			for (;l; l=l->next) {
++				MonoVTable *vt = (MonoVTable*) l->data;
++				if (vt->cctor_tid == tid) {
++					GList *wl;
++					for (wl=vt->cctor_waiting_threads; wl; wl=wl->next) {
++						if (GPOINTER_TO_UINT(wl->data) == vtable->cctor_tid) {
++							/* Avoid the deadlock */
++							mono_domain_unlock (domain);
++							return;
++						}
++					}
++				}
++			}
++		
++			if (vtable->initialized) {
++				mono_domain_unlock (domain);
++				return;
++			}
++		
++			/* No danger of deadlocks. It can safely wait until the cctor is completed */
++		
++			vtable->cctor_waiting_threads = g_list_prepend (vtable->cctor_waiting_threads, GUINT_TO_POINTER(tid));
++			mono_domain_unlock (domain);
++		
++			EnterCriticalSection (&vtable->lock);
++			LeaveCriticalSection (&vtable->lock);
++			g_assert (vtable->initialized);
++			return;
++		}
++	
++		/* Nobody is initializing this class, take the responsibility of doing it */
++		vtable->cctor_tid = tid;
++		domain->running_cctors_list = g_list_prepend (domain->running_cctors_list, vtable);
++	
++		EnterCriticalSection (&vtable->lock);
++		mono_domain_unlock (domain);
++	
+ 		/* double check... */
+-		if (vtable->initialized || vtable->initializing) {
+-			mono_domain_unlock (vtable->domain);
++		if (vtable->initialized) {
++			LeaveCriticalSection (&vtable->lock);
+ 			return;
+ 		}
+-		vtable->initializing = 1;
+-		if (mono_domain_get () != vtable->domain) {
++	
++		if (domain != vtable->domain) {
+ 			/* Transfer into the target domain */
+ 			last_domain = mono_domain_get ();
+ 			if (!mono_domain_set (vtable->domain, FALSE)) {
+ 				vtable->initialized = 1;
+-				vtable->initializing = 0;
+-				mono_domain_unlock (vtable->domain);
++				LeaveCriticalSection (&vtable->lock);
+ 				mono_raise_exception (mono_get_exception_appdomain_unloaded ());
+ 			}
+ 		}
++			
+ 		mono_runtime_invoke (method, NULL, NULL, (MonoObject **) &exc);
+ 		if (last_domain)
+ 			mono_domain_set (last_domain, TRUE);
+ 		vtable->initialized = 1;
+-		vtable->initializing = 0;
++		
+ 		/* FIXME: if the cctor fails, the type must be marked as unusable */
+-		mono_domain_unlock (vtable->domain);
++		LeaveCriticalSection (&vtable->lock);
++		DeleteCriticalSection (&vtable->lock);
++		
++		mono_domain_lock (domain);
++		g_list_free (vtable->cctor_waiting_threads);
++		vtable->cctor_waiting_threads = NULL;
++		domain->running_cctors_list = g_list_remove (domain->running_cctors_list, vtable);
++		mono_domain_unlock (domain);
++		
+ 	} else {
+ 		vtable->initialized = 1;
+ 		return;
+@@ -583,6 +641,13 @@
+ 		vt->remote = 1;
+ 	else
+ 		vt->remote = 0;
++
++	/* create a lock for the class constructor, if needed */
++	if (mono_class_needs_cctor_run (class, NULL)) {
++		InitializeCriticalSection (&vt->lock);
++		vt->cctor_tid = 0;
++		vt->cctor_waiting_threads = NULL;
++	}
+ 
+ 	return vt;
+ }

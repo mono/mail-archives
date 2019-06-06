@@ -1,0 +1,275 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] How To Convince Mono To Allocate Big Arrays
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20How%20To%20Convince%20Mono%20To%20Allocate%20Big%20Arrays&In-Reply-To=5870D652-7CBE-42CD-99FD-BFF1233CF52E%40verizon.net">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027995.html">
+   <LINK REL="Next"  HREF="028090.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] How To Convince Mono To Allocate Big Arrays</H1>
+    <B>Rodrigo Kumpera</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20How%20To%20Convince%20Mono%20To%20Allocate%20Big%20Arrays&In-Reply-To=5870D652-7CBE-42CD-99FD-BFF1233CF52E%40verizon.net"
+       TITLE="[Mono-dev] How To Convince Mono To Allocate Big Arrays">kumpera at gmail.com
+       </A><BR>
+    <I>Wed May 28 13:53:52 EDT 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027995.html">[Mono-dev] How To Convince Mono To Allocate Big Arrays
+</A></li>
+        <LI>Next message: <A HREF="028090.html">[Mono-dev]  [PATCH] How To Convince Mono To Allocate Big Arrays
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28047">[ date ]</a>
+              <a href="thread.html#28047">[ thread ]</a>
+              <a href="subject.html#28047">[ subject ]</a>
+              <a href="author.html#28047">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Luis,
+
+I have committed your patch with some changes or missing parts. Thanks for
+the contribuitins. Some of the comments were due to a more detailed review
+while merging your code in.
+
+
+Index: mono/metadata/object.c
+===================================================================
+--- mono/metadata/object.c    (revision 17)
++++ mono/metadata/object.c    (working copy)
+@@ -3513,12 +3513,23 @@
+ }
+
+ /* helper macros to check for overflow when calculating the size of arrays
+*/
+-#define MYGUINT32_MAX 4294967295U
++#if (GLIB_SIZEOF_SIZE_T &lt; 4 )
+
+I changed the check to be against MONO_BIG_ARRAYS.
+
+@@ -3548,34 +3559,32 @@
+     /* A single dimensional array with a 0 lower bound is the same as an
+szarray */
+....
+         if (CHECK_ADD_OVERFLOW_UN (byte_len, 3))
+-            mono_gc_out_of_memory (MYGUINT32_MAX);
++            mono_gc_out_of_memory (MONO_ARRAY_MAX_SIZE);
+         byte_len = (byte_len + 3) &amp; ~3;
+
+You might need to adjust this alignment check to be aware of your changes.
+
+===================================================================
+--- mono/metadata/icall.c    (revision 17)
++++ mono/metadata/icall.c    (working copy)
+@@ -527,11 +527,11 @@
+
+     aklass = mono_bounded_array_class_get (mono_class_from_mono_type
+(type-&gt;type), mono_array_length (lengths), bounded);
+
+-    sizes = alloca (aklass-&gt;rank * sizeof(guint32) * 2);
++    sizes = alloca (aklass-&gt;rank * sizeof(mono_array_size_t) * 2);
+     for (i = 0; i &lt; aklass-&gt;rank; ++i) {
+-        sizes [i] = mono_array_get (lengths, guint32, i);
++        sizes [i] = mono_array_get (lengths, gint32, i);
+         if (bounds)
+-            sizes [i + aklass-&gt;rank] = mono_array_get (bounds, guint32, i);
++            sizes [i + aklass-&gt;rank] = mono_array_get (bounds, gint32, i);
+         else
+             sizes [i + aklass-&gt;rank] = 0;
+     }
+
+
+Why are you using mono_array_get with gint32? I can't think of a reason for
+this change, as it won't matter for mono_array_new_full.  Besides that, this
+is asking for trouble as you are mixing signed and unsigned numbers.
+
+
+ @@ -560,6 +606,27 @@
+         mono_raise_exception (mono_get_exception_index_out_of_range ());
+
+     if (this-&gt;bounds == NULL)
++        length = this-&gt;max_length;
++    else
++        length = this-&gt;bounds [dimension].length;
++
++    if (length &gt; G_MAXINT32)
++            mono_raise_exception (mono_get_exception_overflow ());
++
++    return length;
++}
+
+I have put the length check inside a #ifdef MONO_BIG_ARRAYS
+
+
+
+@@ -541,6 +541,51 @@
+     return array;
+ }
+
++static MonoArray *
++ves_icall_System_Array_CreateInstanceImpl64 (MonoReflectionType *type,
+MonoArray *lengths, MonoArray *bounds)
+...
++    for (i = 0; i &lt; mono_array_length (lengths); i++)
++        if ((mono_array_get (lengths, gint64, i) &lt; 0) ||
++            (mono_array_get (lengths, gint64, i) &gt; MONO_ARRAY_MAX_INDEX))
++            mono_raise_exception (mono_get_exception_argument_out_of_range
+(NULL));
+
+Can't this expression be simplified to &quot;if ((mono_array_get (lengths,
+guint64, i) &gt; MONO_ARRAY_MAX_INDEX)&quot;,
+note we are reading it as an unsigned value.
+...
++    sizes = alloca (aklass-&gt;rank * sizeof(mono_array_size_t) * 2);
++    for (i = 0; i &lt; aklass-&gt;rank; ++i) {
++        sizes [i] = mono_array_get (lengths, gint64, i);
++        if (bounds)
++            sizes [i + aklass-&gt;rank] = mono_array_get (bounds, gint64, i);
++        else
++            sizes [i + aklass-&gt;rank] = 0;
++    }
+
+Note that sizes element type is an unsigned number, so we must read it
+acordingly and cast it to mono_array_size_t to
+ajust for the desired size - and avoid warnings as well.
+
+We can use the same code for the bound check I suggested for both
+CreateInstanceImpl versions. If we do that we could fix
+the ugly aspect of having two 99% identical functions by defining it as a
+MACRO and expanding it twice.
+
+
+
+On Fri, May 23, 2008 at 7:10 PM, Luis F. Ortiz &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">LuisOrtiz at verizon.net</A>&gt;
+wrote:
+
+&gt;<i> Rodrigo:
+</I>&gt;<i>     Sorry for the delayed response, things got busy, and I did not notice
+</I>&gt;<i> your message.
+</I>&gt;<i> Please go ahead and check in the parts that you feel most comfortable with,
+</I>&gt;<i> since I do not
+</I>&gt;<i> have commit rights.   I'll adapt any further submissions against the next
+</I>&gt;<i> official cut.
+</I>&gt;<i>
+</I>&gt;<i>    The changes I have made are to be released under the X11 license and I
+</I>&gt;<i> vouch that
+</I>&gt;<i> I have talked to the appropriate people at my employer (Interactive
+</I>&gt;<i> Supercomputing) and
+</I>&gt;<i> they agree as well to release this and any further contributions I make to
+</I>&gt;<i> Mono while
+</I>&gt;<i> under their employ under the X11 license.   There, that ought to make
+</I>&gt;<i> everybody happy.
+</I>&gt;<i>
+</I>&gt;<i> Luis F. Ortiz
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> On May 16, 2008, at 10:53 AM, Rodrigo Kumpera wrote:\
+</I>&gt;<i>
+</I>&gt;<i> Hi Luis,
+</I>&gt;<i>
+</I>&gt;<i> Most parts of your patch are ok to be commited. As I said before, it's
+</I>&gt;<i> better to have separate patches to speed up the review. As you get more
+</I>&gt;<i> changes in, it will ease your work on preparing patches and will ease on
+</I>&gt;<i> tracking head changes.
+</I>&gt;<i>
+</I>&gt;<i> Right now I'm ok with the configure, mono_array_t and related changes.
+</I>&gt;<i> These were easy to review and don't introduce any change in behavior, so we
+</I>&gt;<i> can check-in then right now. The others requires more testing from me and
+</I>&gt;<i> would be easier to both of us if done after.
+</I>&gt;<i> Do you mind cooking you a patch only with the ok parts.
+</I>&gt;<i>
+</I>&gt;<i> Remember that you need to either release these changes under the X11
+</I>&gt;<i> license or have done some copyright assignment paperwork.
+</I>&gt;<i>
+</I>&gt;<i> Thanks,
+</I>&gt;<i> Rodrigo
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> On Thu, May 8, 2008 at 8:21 PM, Luis F. Ortiz &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">LuisOrtiz at verizon.net</A>&gt;
+</I>&gt;<i> wrote:
+</I>&gt;<i>
+</I>&gt;&gt;<i> On May 8, 2008, at 9:29 AM, Rodrigo Kumpera wrote:
+</I>&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> One important thing I forgot. If you break your patch into a few smaller
+</I>&gt;&gt;&gt;<i> ones the review process will be a lot easier to every one involved.
+</I>&gt;&gt;&gt;<i> The first one can introduce new types and configuration foo; then other
+</I>&gt;&gt;&gt;<i> to fix codegen and Array methods and; at last, a bunch of fixes to classlib
+</I>&gt;&gt;&gt;<i> issues -like sockets, file i/o and so on.
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> Cheers,
+</I>&gt;&gt;&gt;<i> Rodrigo
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> OK, here is another stab at the changes.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> This modifies the following files:
+</I>&gt;&gt;<i>        configure.in
+</I>&gt;&gt;<i>        mono/metadata/object.c
+</I>&gt;&gt;<i>        mono/metadata/object.h
+</I>&gt;&gt;<i>        mono/metadata/icall-def.h
+</I>&gt;&gt;<i>        mono/metadata/icall.c
+</I>&gt;&gt;<i>        mono/metadata/socket-io.c
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> These files:
+</I>&gt;&gt;<i>  1) Add a new configuration option, --enable-big-arrays, which defines
+</I>&gt;&gt;<i> conditionally defines MONO_BIG_ARRAYS in config.h,
+</I>&gt;&gt;<i>  2) Add in mono/metadata/object.h :
+</I>&gt;&gt;<i>  A) A new typedef for mono_array_size_t to be either guint32 or guint64
+</I>&gt;&gt;<i>  B) A new #define for MONO_ARRAY_MAX_INDEX for the biggest valid array
+</I>&gt;&gt;<i> index, i.e. G_MAXINTxx
+</I>&gt;&gt;<i>  C) A new #define for MONO_ARRAY_MAX_SIZE for the biggest valid array
+</I>&gt;&gt;<i> allocation, i.e. G_MAXUINTxx
+</I>&gt;&gt;<i>  D) The above all controlled by MONO_BIG_ARRAYS
+</I>&gt;&gt;<i>  3) Modify the definitions of mono_array_new(), mono_array_new_full(), and
+</I>&gt;&gt;<i> mono_array_new_specific() to match,
+</I>&gt;&gt;<i>  4) Modify the usages of those functions in the metadata directory to
+</I>&gt;&gt;<i> match,
+</I>&gt;&gt;<i>  5) Add range checking in ves_icall_System_Array_CreateInstanceImpl64 so
+</I>&gt;&gt;<i> it works with or without MONO_BIG_ARRAYS,
+</I>&gt;&gt;<i>  6) Attempt to address all the mistakes you pointed out.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> These changes, in addition to the other changes I made, pass &quot;make check&quot;
+</I>&gt;&gt;<i> with the exception of Tests.test_0_regress_75832(), as previously confessed.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> /Ortiz/Luis
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20080528/98155c12/attachment.html">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20080528/98155c12/attachment.html</A> 
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027995.html">[Mono-dev] How To Convince Mono To Allocate Big Arrays
+</A></li>
+	<LI>Next message: <A HREF="028090.html">[Mono-dev]  [PATCH] How To Convince Mono To Allocate Big Arrays
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#28047">[ date ]</a>
+              <a href="thread.html#28047">[ thread ]</a>
+              <a href="subject.html#28047">[ subject ]</a>
+              <a href="author.html#28047">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

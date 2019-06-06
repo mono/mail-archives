@@ -1,0 +1,213 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] COF Update
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20COF%20Update&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010368.html">
+   <LINK REL="Next"  HREF="010370.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] COF Update</H1>
+    <B>Willibald Krenn</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20COF%20Update&In-Reply-To="
+       TITLE="[Mono-devel-list] COF Update">Willibald.Krenn at gmx.at
+       </A><BR>
+    <I>Wed Feb  9 16:41:50 EST 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010368.html">[Mono-devel-list] Binding Date/Time parameters in OracleClient..
+</A></li>
+        <LI>Next message: <A HREF="010370.html">[Mono-devel-list] Problem building for first time
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10369">[ date ]</a>
+              <a href="thread.html#10369">[ thread ]</a>
+              <a href="subject.html#10369">[ subject ]</a>
+              <a href="author.html#10369">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi!
+
+
+Just wanted to let you know that my work on the continuous optimization 
+framework (= dynamically recompile methods) has reached it's first 
+'milestone': The framework is selecting, recompiling and patching 'hot' 
+virtual methods.
+
+As you probably wonder how it's done (and my homepage is not 
+up-to-date), I'll give a short(?!) introduction into the topic below.
+
+If you are not interested in this kind of thing, I would strongly 
+suggest you to stop reading now ;-)
+
+
+Basically the framework is driven by three threads called SAM, PRE and 
+P/O. SAM stands for the 'sampling profiler', PRE for the 'dynamic (and 
+static) predictor' (phase change detector) and P/O for 'picker/optimizer'.
+Currently not supported, but thought of, is turning on/off these threads 
+based on command line options:
+
+&quot;off&quot;: Everything disabled.
+
+&quot;pgo&quot;: Profile Guided Optimizations without CO; No SAM, no PRE, but each 
+method compiled by mono may be added to a queue (once), be instrumented, 
+recompiled and forgotten.. (More or less a one-time recompile.)
+
+&quot;co&quot;:  Continuous Optimization without Profile Guided Optimizations: 
+SAM, PRE and P/O working. However, no instrumentation of methods is 
+allowed. Dynamic recompilation (even more than once) allowed.
+
+&quot;full&quot;: As 'co', but this time instrumentation of methods for gaining 
+custom profile data is allowed. (== 'pgo' + 'co')
+
+&quot;auto&quot; (default): as 'full', but the framework my turn itself off - 
+based on data that the static predictor has collected over the last few 
+application runs. On the other hand, 'auto' also means that even the 
+most expensive optimizations may be enabled at a time. (Low-Load ..)
+
+
+At this time, the COF does not support any profile based optimizations, 
+so it's basically running in 'co' (or 'off') mode.
+
+
+SAM
+===
+
+Upon thread start, each thread registers itself in the COF and gets a 
+thread specific data structure assigned. In this structure we find a 
+sample buffer (round-robin) and various other information about the 
+thread (e.g. the domain).
+Sampling is done via hook in the sigprof signal handler function and by 
+enabling the stat_profiler. Upon SIGPROF, the handler writes the IP 
+addr. of the thread at signal time in the thread-local sample buffer.
+SAM will periodically go through the list of registered threads, check 
+if enough samples have arrived and read them out - thereby filtering out 
+all native methods and translating the remainder into MonoJitInfo pointers.
+
+For easier maintenance, I've modified the MonoJitInfo structure and 
+added 64 bits of data needed to efficiently calculate the weight of the 
+method and track the general status.
+
+Weight calculation is a topic in itself - basically there are two 
+slightly different (in gain, that is) filters I currently use:
+
+(a) For methods below a certain threshold, the weight is calculated by
+          Weight(x) = Calls(x) + 0.5 * Weight(x-1) (x...generation)
+Seen as a filter, this is a stable first order IIR system that has a 
+maximum gain of 2, which effectively means that Weight can be twice the 
+time of the maximum Calls value. (It's also a low-pass filter, so the 
+weight won't follow quick changes in Call count very closely.)
+Weight is implemented as guint16 and saved in the MonoJitInfo structure, 
+making it very fast to manipulate.
+
+(b) Beyond a certain threshold, the method becomes interesting and added 
+to a global hit-list. As Weight and Calls are guint16 I changed the used 
+filter there to y[n] = Q(0.5*x[n]) + Q(0.5*y[n-1]) which is effectifely 
+the same filter as in (a), but the gain is unity - which means the 
+weight can't overflow.
+
+Each time a generation change is made, the sampling profiler writes out 
+10 of the heaviest methods in the hitlist, plus 10 methods that 
+'climbed' up most ld(Weight) 'buckets'. (Basically this means that 
+low-weight and frequently called methods are in this second list.)
+
+
+PRE
+===
+
+The dynamic predictor takes these selected methods and stores them in 
+two internal round-robin arrays. After this is done, the predictor 
+compares the top-10 'weighters' from the current generation with the 
+ones saved from previous generations and calculates some similarity figure.
+Based on that, the predictor now choses from what 'hitlist' it will pick 
+hot methods and forward them to the Picker/Optimizer.
+
+
+P/O
+===
+
+The Picker basically has three queues to look at: The one filled by PRE, 
+one filled by the optimizer when a method was instrumented and one that 
+could be filled by mono in case we run with 'pgo' profile.
+Currently only the predictor queue is implemented:
+The Picker goes through the predictor queue, (tests if the method is 
+virtual,) invokes the Optimizer to get a speedup estimate when applying 
+a certain set of optimizations (e.g.: speed,average,static,0) and if the 
+returned value is above some threshold, the method is added to the 
+Optimizer queue. Else the method is marked to be ignored by COF.
+
+The optimizer basically looks for new entries in the queue, applies the 
+optimization selected in the 'estimate speedup' run before and invokes 
+the patcher to replace the old method with the new one. Currently only 
+one optimization is supported: A mono_compile_with_opts run that has 
+almost all optimizations turned on.
+
+Still not implemented is proper memory management: If there is no thread 
+running inside the replace method, the memory should be reclaimed..
+
+
+ToDo
+~~~~~
+
+(*) Replace non virtual methods
+(*) Separate optimization and compilation so that once the IR is 
+gathered, more than one optimization run can be made on it before the 
+resulting IR is compiled into native code. (== split mono_compile_method 
+function)
+(*) Memory management of 'old' code
+(*) Add optimizations
+(*) add missing pieces to framework
+(*) bugs...
+
+
+Given that the COF is implemented in &gt; 10 new files, I wonder how I 
+should contribute this to mono?!
+
+Thanks for reading,
+  Willi
+
+P.S.: Sample output:
+
+COF: P/O     4   (10, 2) System.Collections.Hashtable:get_Item (object)
+COF: P/O Candidate; Slot  8
+COF: OPT added 0xa57b58
+COF: P/O     7   (10, 2) System.Text.UTF8Encoding:GetBytes 
+(string,int,int,byte[],int)
+COF: P/O Candidate; Slot  18
+COF: OPT added 0xc4c928
+COF: Recompiling 0xa57b58 .... recompiled!
+patching.. 0x93e3f0 -&gt; 0x2a983f3310
+COF: OPT: 0xa57b58 dequeued
+COF: Recompiling 0xc4c928 .... recompiled!
+patching.. 0x8eb2a0 -&gt; 0x2a98d7bf20
+COF: OPT: 0xc4c928 dequeued
+...
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010368.html">[Mono-devel-list] Binding Date/Time parameters in OracleClient..
+</A></li>
+	<LI>Next message: <A HREF="010370.html">[Mono-devel-list] Problem building for first time
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10369">[ date ]</a>
+              <a href="thread.html#10369">[ thread ]</a>
+              <a href="subject.html#10369">[ subject ]</a>
+              <a href="author.html#10369">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

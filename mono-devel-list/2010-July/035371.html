@@ -1,0 +1,136 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH] altstack for osx
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20altstack%20for%20osx&In-Reply-To=F346AC52-FE14-4B98-AE64-1231EA5D2817%40novell.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="035380.html">
+   <LINK REL="Next"  HREF="035375.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH] altstack for osx</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20altstack%20for%20osx&In-Reply-To=F346AC52-FE14-4B98-AE64-1231EA5D2817%40novell.com"
+       TITLE="[Mono-dev] [PATCH] altstack for osx">lupus at ximian.com
+       </A><BR>
+    <I>Thu Jul  1 09:12:50 EDT 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="035380.html">[Mono-dev] Adding documentation for new namespace
+</A></li>
+        <LI>Next message: <A HREF="035375.html">[Mono-dev] [PATCH] Make mono_dl_register_library into a fallback
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35371">[ date ]</a>
+              <a href="thread.html#35371">[ thread ]</a>
+              <a href="subject.html#35371">[ subject ]</a>
+              <a href="author.html#35371">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 06/23/10 Geoff Norton wrote:
+&gt;<i> Attached is a patch which enables sigaltstack for OSX (x86 and amd64).
+</I>&gt;<i> 
+</I>&gt;<i> The configure.in check passes on amd64 and fails on x86 for some reason (the signal isn't delivered to the child ?)
+</I>&gt;<i> but the support appears to work correctly on both.
+</I>
+&gt;<i> --- a/mono/mini/exceptions-amd64.c
+</I>&gt;<i> +++ b/mono/mini/exceptions-amd64.c
+</I>&gt;<i> @@ -723,7 +723,6 @@ handle_signal_exception (gpointer obj, gboolean test_only)
+</I>&gt;<i>  gboolean
+</I>&gt;<i>  mono_arch_handle_exception (void *sigctx, gpointer obj, gboolean test_only)
+</I>&gt;<i>  {
+</I>&gt;<i> -#if defined(MONO_ARCH_USE_SIGACTION) &amp;&amp; defined(UCONTEXT_GREGS)
+</I>&gt;<i>  	/*
+</I>&gt;<i>  	 * Handling the exception in the signal handler is problematic, since the original
+</I>&gt;<i>  	 * signal is disabled, and we could run arbitrary code though the debugger. So
+</I>&gt;<i> @@ -748,29 +747,8 @@ mono_arch_handle_exception (void *sigctx, gpointer obj, gboolean test_only)
+</I>&gt;<i>  	UCONTEXT_REG_RIP (sigctx) = (guint64)handle_signal_exception;
+</I>&gt;<i>  
+</I>&gt;<i>  	return TRUE;
+</I>&gt;<i> -#else
+</I>&gt;<i> -	MonoContext mctx;
+</I>&gt;<i> -
+</I>&gt;<i> -	mono_arch_sigctx_to_monoctx (sigctx, &amp;mctx);
+</I>&gt;<i> -
+</I>&gt;<i> -	if (mono_debugger_handle_exception (&amp;mctx, (MonoObject *)obj))
+</I>&gt;<i> -		return TRUE;
+</I>&gt;<i> -
+</I>&gt;<i> -	mono_handle_exception (&amp;mctx, obj, MONO_CONTEXT_GET_IP (&amp;mctx), test_only);
+</I>&gt;<i> -
+</I>&gt;<i> -	mono_arch_monoctx_to_sigctx (&amp;mctx, sigctx);
+</I>&gt;<i> -
+</I>&gt;<i> -	return TRUE;
+</I>&gt;<i> -#endif
+</I>
+I would leave the alternate code in, it may be needed for other ports.
+
+&gt;<i> diff --git a/mono/mini/mini-exceptions.c b/mono/mini/mini-exceptions.c
+</I>&gt;<i> index 5a73ac9..3881b7e 100644
+</I>&gt;<i> --- a/mono/mini/mini-exceptions.c
+</I>&gt;<i> +++ b/mono/mini/mini-exceptions.c
+</I>&gt;<i> @@ -1594,13 +1594,23 @@ mono_handle_exception (MonoContext *ctx, gpointer obj, gpointer original_ip, gbo
+</I>&gt;<i>  #error &quot;Can't use sigaltstack without sigaction&quot;
+</I>&gt;<i>  #endif
+</I>&gt;<i>  
+</I>&gt;<i> +/*
+</I>&gt;<i> + * Handling a ovf on osx requires a lot more stack space than on linux because
+</I>&gt;<i> + * we might end up in CoreFoundation getting the locale
+</I>
+You might want to adjust also the minimum thread stack size to account
+for this (adding a check in metadata/threads.c). Bonus points for also
+fixing the race with the mono_threads_set_default_stacksize() calls in
+threadpool.c (maybe adding a stack size argument to
+mono_thread_create_internal() in a separate patch).
+
+&gt;<i> @@ -1682,13 +1699,19 @@ static gboolean
+</I>&gt;<i>  try_restore_stack_protection (MonoJitTlsData *jit_tls, int extra_bytes)
+</I>&gt;<i>  {
+</I>&gt;<i>  	gint32 unprotect_size = jit_tls-&gt;stack_ovf_guard_size;
+</I>&gt;<i> +	/* OSX requires a ton of stack space when we're handling an overflow exception, because
+</I>&gt;<i> +	 * we might call into corefoundation to get the locale and other such things
+</I>&gt;<i> +	 * as such we'll just give the entire page back to the system
+</I>&gt;<i> +	 */
+</I>
+In this case some of the more complex stack overflow scenarios won't be
+handled. We unprotect a page at a time to have a chance of handling
+an additional overflow during finally or catch handlers.
+Anyway, the patch is ok to commit.
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="035380.html">[Mono-dev] Adding documentation for new namespace
+</A></li>
+	<LI>Next message: <A HREF="035375.html">[Mono-dev] [PATCH] Make mono_dl_register_library into a fallback
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#35371">[ date ]</a>
+              <a href="thread.html#35371">[ thread ]</a>
+              <a href="subject.html#35371">[ subject ]</a>
+              <a href="author.html#35371">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

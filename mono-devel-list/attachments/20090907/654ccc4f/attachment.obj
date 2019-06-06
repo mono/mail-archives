@@ -1,0 +1,1740 @@
+Index: System.Runtime.Remoting.dll.sources
+===================================================================
+--- System.Runtime.Remoting.dll.sources	(revision 140243)
++++ System.Runtime.Remoting.dll.sources	(working copy)
+@@ -36,6 +36,16 @@
+ System.Runtime.Remoting.Channels.Ipc.Unix/IpcClientChannel.cs
+ System.Runtime.Remoting.Channels.Ipc.Unix/IpcServerChannel.cs
+ System.Runtime.Remoting.Channels.Ipc.Unix/UnixChannelLoader.cs
++System.Runtime.Remoting.Channels.Tcp/ProcessMessageCallback.cs
++System.Runtime.Remoting.Channels.Tcp/ProcessMessageState.cs
++System.Runtime.Remoting.Channels.Tcp/ReceiveHeadersCallback.cs
++System.Runtime.Remoting.Channels.Tcp/ReceiveHeadersState.cs
++System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStatusCallback.cs
++System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStatusState.cs
++System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStreamCallback.cs
++System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStreamState.cs
++System.Runtime.Remoting.Channels.Tcp/SendHeadersCallback.cs
++System.Runtime.Remoting.Channels.Tcp/SendHeadersState.cs
+ System.Runtime.Remoting.Channels.Tcp/TcpChannel.cs
+ System.Runtime.Remoting.Channels.Tcp/TcpClientChannel.cs
+ System.Runtime.Remoting.Channels.Tcp/TcpMessageIO.cs
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 140243)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,25 @@
++2009-09-07  Dick Porter <dporter@codicesoftware.com>
++
++	* System.Runtime.Remoting.Channels.Tcp.TcpServerChannel.cs: Add an
++	optional asynchronous processing path.  Add 'run_async = true' to the
++	channel configuration to enable it.
++
++	Use the system threadpool to run the message processing look instead
++	of a custom one.
++
++	* System.Runtime.Remoting.Channels.Tcp.TcpServerTransportSink.cs,
++	System.Runtime.Remoting.Channels.Tcp.TcpMessageIO.cs:
++	Added an asynchronous message processing path using the system
++	threadpool.
++
++	* System.Runtime.Remoting.dll.sources: Add internal helper classes
++	ReceiveHeadersState.cs, ReceiveMessageStreamCallback.cs,
++	ProcessMessageState.cs, SendHeadersState.cs, ReceiveHeadersCallback.cs,
++	ReceiveMessageStatusState.cs, SendHeadersCallback.cs,
++	ReceiveMessageStreamState.cs and ReceiveMessageStatusCallback.cs
++	to System.Runtime.Remoting.Channels.Tcp for the asynchronous message
++	path.
++
+ 2008-09-19  Michael Hutchinson  <mhutchinson@novell.com>
+ 
+ 	* System.Runtime.Remoting_test.dll.sources: add HttpBugtests.cs.
+Index: System.Runtime.Remoting.Channels.Tcp/ReceiveHeadersState.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/ReceiveHeadersState.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/ReceiveHeadersState.cs	(revision 0)
+@@ -0,0 +1,110 @@
++// System.Runtime.Remoting.Channels.Tcp.ReceiveHeadersState.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.IO;
++
++namespace System.Runtime.Remoting.Channels.Tcp 
++{
++	internal class ReceiveHeadersState
++	{
++		Stream stream;
++		byte[] buffer;
++		ReceiveHeadersCallback callback;
++		object state;
++		byte headerType;
++		TransportHeaders headers;
++		string key;
++			
++		public ReceiveHeadersState (Stream stream, byte[] buffer,
++					    ReceiveHeadersCallback callback,
++					    object state)
++		{
++			this.stream = stream;
++			this.buffer = buffer;
++			this.callback = callback;
++			this.state = state;
++				
++			this.headers = new TransportHeaders ();
++		}
++			
++		public Stream Stream
++		{
++			get {
++				return stream;
++			}
++		}
++			
++		public byte[] Buffer
++		{
++			get {
++				return buffer;
++			}
++		}
++			
++		public ReceiveHeadersCallback Callback
++		{
++			get {
++				return callback;
++			}
++		}
++			
++		public object State
++		{
++			get {
++				return state;
++			}
++		}
++			
++		public byte HeaderType 
++		{
++			get {
++				return headerType;
++			}
++			set {
++				headerType = value;
++			}
++		}
++			
++		public string Key
++		{
++			get {
++				return key;
++			}
++			set {
++				key = value;
++			}
++		}
++			
++		public TransportHeaders Headers
++		{
++			get {
++				return headers;
++			}
++		}
++	}
++}
+Index: System.Runtime.Remoting.Channels.Tcp/TcpServerTransportSink.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/TcpServerTransportSink.cs	(revision 140243)
++++ System.Runtime.Remoting.Channels.Tcp/TcpServerTransportSink.cs	(working copy)
+@@ -126,12 +126,65 @@
+ 					TcpMessageIO.SendMessageStream (stream, responseStream, responseHeaders, connection.Buffer);
+ 					stream.Flush ();
+ 					break;
++					
++				case ServerProcessing.Async:
++				case ServerProcessing.OneWay:
++					break;
++			}
++		}
++		
++		internal void AsyncInternalProcessMessage (ClientConnection connection, Stream stream, ProcessMessageCallback callback, object state)
++		{
++			// Reads the headers and the request stream
+ 
++			ProcessMessageState msgstate = new ProcessMessageState (connection, stream, callback, state);
++
++			TcpMessageIO.AsyncReceiveMessageStream (stream, connection.Buffer, new ReceiveMessageStreamCallback (OnReceiveMessageStream), msgstate);
++		}
++
++		void OnReceiveMessageStream (ReceiveMessageStreamState state)
++		{
++			ProcessMessageState msgstate = (ProcessMessageState)state.State;
++			ITransportHeaders requestHeaders = state.Headers;
++
++			requestHeaders [CommonTransportKeys.IPAddress] = msgstate.Connection.ClientAddress;
++			requestHeaders [CommonTransportKeys.ConnectionId] = msgstate.Connection.Id;
++
++			string uri = (string) requestHeaders [CommonTransportKeys.RequestUri];
++			TcpChannel.ParseChannelUrl (uri, out uri);
++			
++			if (uri != null)
++				requestHeaders [CommonTransportKeys.RequestUri] = uri;
++			
++			// Pushes the connection object together with the sink. This information
++			// will be used for sending the response in an async call.
++
++			ServerChannelSinkStack sinkStack = new ServerChannelSinkStack();
++			sinkStack.Push(this, msgstate.Connection);
++
++			ITransportHeaders responseHeaders;
++			Stream responseStream;
++			IMessage responseMsg;
++
++			ServerProcessing proc = next_sink.ProcessMessage(sinkStack, null, requestHeaders, state.RequestStream, out responseMsg, out responseHeaders, out responseStream);
++
++			switch (proc)
++			{
++				case ServerProcessing.Complete:
++					TcpMessageIO.AsyncSendMessageStream (msgstate.Stream, responseStream, responseHeaders, msgstate.Connection.Buffer, false, new ProcessMessageCallback (OnSendMessageStream), msgstate);
++					break;
++
+ 				case ServerProcessing.Async:
+ 				case ServerProcessing.OneWay:
+ 					break;
+ 			}
+ 		}
++
++		void OnSendMessageStream (ProcessMessageState state)
++		{
++			state.Stream.Flush ();
++			state.Callback (state);
++		}
+ 	}
+ }
+ 
+Index: System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStreamCallback.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStreamCallback.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStreamCallback.cs	(revision 0)
+@@ -0,0 +1,33 @@
++// System.Runtime.Remoting.Channels.Tcp.ReceiveMessageStreamCallback.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System.IO;
++
++namespace System.Runtime.Remoting.Channels.Tcp
++{
++	internal delegate void ReceiveMessageStreamCallback (ReceiveMessageStreamState state);
++}
+Index: System.Runtime.Remoting.Channels.Tcp/TcpMessageIO.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/TcpMessageIO.cs	(revision 140243)
++++ System.Runtime.Remoting.Channels.Tcp/TcpMessageIO.cs	(working copy)
+@@ -47,15 +47,139 @@
+ 							
+ 		public static int DefaultStreamBufferSize = 1000;
+ 
+-		// Identifies an incoming message
+-		public static MessageStatus ReceiveMessageStatus (Stream networkStream, byte[] buffer)
++		class StreamReadState
+ 		{
+-			try {
+-				StreamRead (networkStream, buffer, 6);
+-			} catch (Exception ex) {
+-				throw new RemotingException ("Tcp transport error.", ex);
++			Stream stream;
++			byte[] buffer;
++			int count;
++			AsyncCallback callback;
++			object state;
++			int received;
++			Exception exception;
++
++			public StreamReadState (Stream stream, byte[] buffer,
++						int count,
++						AsyncCallback callback,
++						object state)
++			{
++				this.stream = stream;
++				this.buffer = buffer;
++				this.count = count;
++				this.callback = callback;
++				this.state = state;
+ 			}
+ 
++			public Stream Stream 
++			{
++				get {
++					return stream;
++				}
++			}
++			
++			public byte[] Buffer
++			{
++				get {
++					return buffer;
++				}
++			}
++			
++			public int Count
++			{
++				get {
++					return count;
++				}
++			}
++			
++			public AsyncCallback Callback 
++			{
++				get {
++					return callback;
++				}
++			}
++			
++			public object State 
++			{
++				get {
++					return state;
++				}
++			}
++			
++			public int Received
++			{
++				get {
++					return received;
++				}
++				
++				set {
++					received = value;
++				}
++			}
++			
++			public Exception Exception
++			{
++				get {
++					return exception;
++				}
++
++				set {
++					exception = value;
++				}
++			}
++		}
++
++		static void OnStreamRead (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++
++			int pr = state.Stream.EndRead (ares);
++			if (pr == 0) {
++				state.Exception = new RemotingException ("Connection closed");
++				state.Callback (ares);
++			}
++			
++			state.Received += pr;
++			
++			if (state.Received < state.Count) {
++				state.Stream.BeginRead (state.Buffer, state.Received, state.Count - state.Received, new AsyncCallback (OnStreamRead), state);
++			} else {
++				state.Callback (ares);
++			}			
++		}
++
++		static void AsyncStreamRead (Stream networkStream, byte[] buffer, int count, AsyncCallback callback, object state) 
++		{
++			StreamReadState asyncstate = new StreamReadState (networkStream, buffer, count, callback, state);
++			
++			networkStream.BeginRead (buffer, 0, count, new AsyncCallback (OnStreamRead), asyncstate);
++		}
++
++		public static void AsyncReceiveMessageStatus (Stream networkStream, byte[] buffer, ReceiveMessageStatusCallback callback, object state)
++		{
++			ReceiveMessageStatusState recvstate = new ReceiveMessageStatusState (networkStream, buffer, callback, state);
++			
++			AsyncStreamRead (networkStream, buffer, 6, new AsyncCallback (OnReceiveMessageStatus), recvstate);
++		}
++		
++		static void OnReceiveMessageStatus (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveMessageStatusState recvstate = (ReceiveMessageStatusState)state.State;
++
++			if (state.Exception != null) {
++				recvstate.Exception = state.Exception;
++			} else {
++				try {
++					recvstate.MessageStatus = DecodeMessageStatus (recvstate.Buffer);
++				} catch (Exception ex) {
++					recvstate.Exception = ex;
++				}
++			}
++			
++			recvstate.Callback (recvstate);
++		}
++
++		static MessageStatus DecodeMessageStatus (byte[] buffer)
++		{
+ 			try
+ 			{
+ 				bool[] isOnTrack = new bool[_msgHeaders.Length];
+@@ -83,6 +207,18 @@
+ 			}
+ 		}
+ 		
++		// Identifies an incoming message
++		public static MessageStatus ReceiveMessageStatus (Stream networkStream, byte[] buffer)
++		{
++			try {
++				StreamRead (networkStream, buffer, 6);
++			} catch (Exception ex) {
++				throw new RemotingException ("Tcp transport error.", ex);
++			}
++
++			return DecodeMessageStatus (buffer);
++		}
++		
+ 		static bool StreamRead (Stream networkStream, byte[] buffer, int count)
+ 		{
+ 			int nr = 0;
+@@ -95,11 +231,201 @@
+ 			return true;
+ 		}
+ 
++		class SendMessageStreamState
++		{
++			Stream network_stream;
++			Stream data;
++			ITransportHeaders request_headers;
++			byte[] buffer;
++			bool is_one_way;
++			ProcessMessageCallback callback;
++			ProcessMessageState state;
++			
++			public SendMessageStreamState (Stream network_stream,
++						       Stream data,
++						       ITransportHeaders headers,
++						       byte[] buffer,
++						       bool is_one_way,
++						       ProcessMessageCallback callback,
++						       ProcessMessageState state)
++			{
++				this.network_stream = network_stream;
++				this.data = data;
++				this.request_headers = headers;
++				this.buffer = buffer;
++				this.is_one_way = is_one_way;
++				this.callback = callback;
++				this.state = state;
++			}
++			
++			public Stream NetworkStream
++			{
++				get {
++					return network_stream;
++				}
++			}
++			
++			public Stream DataStream
++			{
++				get {
++					return data;
++				}
++			}
++			
++			public ITransportHeaders RequestHeaders
++			{
++				get {
++					return request_headers;
++				}
++			}
++			
++			public byte[] Buffer
++			{
++				get {
++					return buffer;
++				}
++			}
++			
++			public bool IsOneWay
++			{
++				get {
++					return is_one_way;
++				}
++			}
++			
++			public ProcessMessageCallback Callback
++			{
++				get {
++					return callback;
++				}
++			}
++			
++			public ProcessMessageState State
++			{
++				get {
++					return state;
++				}
++			}
++		}
++		
++		public static void AsyncSendMessageStream (Stream networkStream, Stream data, ITransportHeaders requestHeaders, byte[] buffer, bool isOneWay, ProcessMessageCallback callback, ProcessMessageState state)
++		{
++			if (buffer == null) buffer = new byte[DefaultStreamBufferSize];
++
++			SendMessageStreamState sendstate = new SendMessageStreamState (networkStream, data, requestHeaders, buffer, isOneWay, callback, state);
++			
++			// Writes the message start header
++			byte[] dotnetHeader = _msgHeaders[(int) MessageStatus.MethodMessage];
++			networkStream.BeginWrite (dotnetHeader, 0, dotnetHeader.Length, new AsyncCallback (OnSendMessageHeaderWrite), sendstate);
++		}
++
++		static void OnSendMessageHeaderWrite (IAsyncResult ares)
++		{
++			SendMessageStreamState sendstate = (SendMessageStreamState)ares.AsyncState;
++
++			sendstate.NetworkStream.EndWrite (ares);
++
++			// Writes the header tag
++			// 0x0000 - request stream
++			// 0x0001 - OneWay request stream
++			// 0x0002 - response stream
++			byte[] buffer = sendstate.Buffer;
++			
++			if(sendstate.RequestHeaders[CommonTransportKeys.RequestUri]!=null) {
++				buffer [0] = sendstate.IsOneWay ? (byte) 1 : (byte) 0;
++			}
++			else {
++				buffer[0] = (byte) 2;
++			}
++			buffer [1] = (byte) 0 ;
++
++			// Writes ID
++			buffer [2] = (byte) 0;
++
++			// Writes assemblyID????
++			buffer [3] = (byte) 0;
++
++			// Writes the length of the stream being sent (not including the headers)
++			int num = (int)sendstate.DataStream.Length;
++			buffer [4] = (byte) num;
++			buffer [5] = (byte) (num >> 8);
++			buffer [6] = (byte) (num >> 16);
++			buffer [7] = (byte) (num >> 24);
++			sendstate.NetworkStream.BeginWrite (buffer, 0, 8, new AsyncCallback (OnSendMessageHeaderLengthWrite), sendstate);
++		}
++
++		static void OnSendMessageHeaderLengthWrite (IAsyncResult ares)
++		{
++			SendMessageStreamState sendstate = (SendMessageStreamState)ares.AsyncState;
++
++			sendstate.NetworkStream.EndWrite (ares);
++
++			AsyncSendHeaders (sendstate.NetworkStream, sendstate.RequestHeaders, sendstate.Buffer, new SendHeadersCallback (OnSendMessageHeaders), sendstate);
++		}
++		
++		static void OnSendMessageHeaders (SendHeadersState state)
++		{
++			SendMessageStreamState sendstate = (SendMessageStreamState)state.State;
++
++			if (sendstate.DataStream.Length == 0) {
++				sendstate.Callback (sendstate.State);
++				return;
++			}
++
++			// Writes the stream
++			if (sendstate.DataStream is MemoryStream)
++			{
++				// The copy of the stream can be optimized. The internal
++				// buffer of MemoryStream can be used.
++				MemoryStream memStream = (MemoryStream)sendstate.DataStream;
++				sendstate.NetworkStream.BeginWrite (memStream.GetBuffer(), 0, (int)memStream.Length, new AsyncCallback (OnSendMessageStreamWrite), sendstate);
++			}
++			else
++			{
++				// Don't use AsyncStreamRead here as we need
++				// to check the amount actually read, rather
++				// than read up to the amount requested
++
++				sendstate.DataStream.BeginRead (sendstate.Buffer, 0, sendstate.Buffer.Length, new AsyncCallback (OnSendMessageStreamRead), sendstate);
++			}
++		}
++
++		static void OnSendMessageStreamRead (IAsyncResult ares)
++		{
++			SendMessageStreamState sendstate = (SendMessageStreamState)ares.AsyncState;
++
++			int nread = sendstate.DataStream.EndRead (ares);
++			if (nread > 0) {
++				sendstate.NetworkStream.BeginWrite (sendstate.Buffer, 0, nread, new AsyncCallback (OnSendMessageStreamPartialWrite), sendstate);
++			} else {
++				sendstate.Callback (sendstate.State);
++			}
++		}
++
++		static void OnSendMessageStreamPartialWrite (IAsyncResult ares)
++		{
++			SendMessageStreamState sendstate = (SendMessageStreamState)ares.AsyncState;
++
++			sendstate.NetworkStream.EndWrite (ares);
++
++			/* Loop */
++			AsyncStreamRead (sendstate.DataStream, sendstate.Buffer, sendstate.Buffer.Length, new AsyncCallback (OnSendMessageStreamRead), sendstate);
++		}
++
++		static void OnSendMessageStreamWrite (IAsyncResult ares)
++		{
++			SendMessageStreamState sendstate = (SendMessageStreamState)ares.AsyncState;
++
++			sendstate.NetworkStream.EndWrite (ares);
++			
++			sendstate.Callback (sendstate.State);
++		}
++
+ 		public static void SendMessageStream (Stream networkStream, Stream data, ITransportHeaders requestHeaders, byte[] buffer)
+ 		{
+ 			SendMessageStream (networkStream, data, requestHeaders, buffer, false);
+ 		}
+-
++		
+ 		public static void SendMessageStream (Stream networkStream, Stream data, ITransportHeaders requestHeaders, byte[] buffer, bool isOneWay)
+ 		{
+ 			if (buffer == null) buffer = new byte[DefaultStreamBufferSize];
+@@ -164,6 +490,98 @@
+ 		static byte[] msgDefaultTransportKey = new byte[] { 1, 0, 1 };
+ 		static byte[] msgHeaderTerminator = new byte[] { 0, 0 };
+ 
++		private static void AsyncSendHeaders (Stream networkStream, ITransportHeaders requestHeaders, byte[] buffer, SendHeadersCallback callback, object state)
++		{
++			SendHeadersState headerstate = new SendHeadersState (networkStream, requestHeaders, buffer, callback, state);
++
++			if (networkStream == null) {
++				callback (headerstate);
++			}
++
++			headerstate.HeaderEnumerator = requestHeaders.GetEnumerator ();
++			if (headerstate.HeaderEnumerator.MoveNext ()) {
++				SendOneHeader (headerstate);
++			} else {
++				SendHeaderTerminator (headerstate);
++			}
++		}
++
++		private static void SendOneHeader (SendHeadersState headerstate)
++		{
++			DictionaryEntry hdr = (DictionaryEntry)headerstate.HeaderEnumerator.Current;
++
++			switch (hdr.Key.ToString ())
++			{
++			case CommonTransportKeys.RequestUri:
++				headerstate.Stream.BeginWrite (msgUriTransportKey, 0, 4, new AsyncCallback (SendHeaderValue), headerstate);
++				break;
++			case "Content-Type":
++				headerstate.Stream.BeginWrite (msgContentTypeTransportKey, 0, 4, new AsyncCallback (SendHeaderValue), headerstate);
++				break;
++			default:
++				headerstate.Stream.BeginWrite (msgDefaultTransportKey, 0, 3, new AsyncCallback (OnSendHeaderDefault), headerstate);
++				break;
++			}
++		}
++
++		private static void OnSendHeaderDefault (IAsyncResult ares)
++		{
++			SendHeadersState headerstate = (SendHeadersState)ares.AsyncState;
++			
++			headerstate.Stream.EndWrite (ares);
++			
++			DictionaryEntry hdr = (DictionaryEntry)headerstate.HeaderEnumerator.Current;
++			AsyncSendString (headerstate.Stream, hdr.Key.ToString (), headerstate.Buffer, new AsyncCallback (OnSendHeaderDefaultKey), headerstate);
++		}
++
++		private static void OnSendHeaderDefaultKey (IAsyncResult ares)
++		{
++			SendHeadersState headerstate = (SendHeadersState)ares.AsyncState;
++			
++			headerstate.Stream.EndWrite (ares);
++
++			byte[] bytebuf = new byte[1];
++			bytebuf[0] = (byte)1;
++			
++			headerstate.Stream.BeginWrite (bytebuf, 0, 1, new AsyncCallback (SendHeaderValue), headerstate);
++		}
++
++		private static void SendHeaderValue (IAsyncResult ares)
++		{
++			SendHeadersState headerstate = (SendHeadersState)ares.AsyncState;
++			
++			headerstate.Stream.EndWrite (ares);
++
++			DictionaryEntry hdr = (DictionaryEntry)headerstate.HeaderEnumerator.Current;
++			AsyncSendString (headerstate.Stream, hdr.Value.ToString (), headerstate.Buffer, new AsyncCallback (OnSendHeaderValue), headerstate);
++		}
++		
++		private static void OnSendHeaderValue (IAsyncResult ares)
++		{
++			SendHeadersState headerstate = (SendHeadersState)ares.AsyncState;
++
++			headerstate.Stream.EndWrite (ares);
++			
++			if (headerstate.HeaderEnumerator.MoveNext ()) {
++				SendOneHeader (headerstate);
++			} else {
++				SendHeaderTerminator (headerstate);
++			}
++		}
++
++		private static void SendHeaderTerminator (SendHeadersState headerstate)
++		{
++			headerstate.Stream.BeginWrite (msgHeaderTerminator, 0, 2, new AsyncCallback (OnSendHeaderTerminator), headerstate);
++		}
++
++		private static void OnSendHeaderTerminator (IAsyncResult ares)
++		{
++			SendHeadersState headerstate = (SendHeadersState)ares.AsyncState;
++			
++			headerstate.Stream.EndWrite (ares);
++			headerstate.Callback (headerstate);
++		}
++		
+ 		private static void SendHeaders(Stream networkStream, ITransportHeaders requestHeaders, byte[] buffer)
+ 		{
+ 			// Writes the headers as a sequence of strings
+@@ -193,6 +611,82 @@
+ 			networkStream.Write (msgHeaderTerminator, 0, 2);	// End of headers
+ 		}
+ 		
++		public static void AsyncReceiveHeaders (Stream networkStream, byte[] buffer, ReceiveHeadersCallback callback, object state)
++		{
++			ReceiveHeadersState headerstate = new ReceiveHeadersState (networkStream, buffer, callback, state);
++			AsyncStreamRead (networkStream, buffer, 2, new AsyncCallback (OnReceiveHeaderType), headerstate);
++		}
++		
++		static void OnReceiveHeaderType (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveHeadersState headerstate = (ReceiveHeadersState)state.State;
++			byte[] buffer = headerstate.Buffer;
++			headerstate.HeaderType = buffer [0];
++			
++			if (headerstate.HeaderType != 0) {
++				AsyncStreamRead (headerstate.Stream, buffer, 1, new AsyncCallback (OnReceiveHeaderKeyStart), headerstate);
++			} else {
++				headerstate.Callback (headerstate);
++			}
++		}
++		
++		static void OnReceiveHeaderKeyStart (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveHeadersState headerstate = (ReceiveHeadersState)state.State;
++
++			switch(headerstate.HeaderType)
++			{
++			case 4: {
++				headerstate.Key = CommonTransportKeys.RequestUri;
++				AsyncStreamRead (headerstate.Stream, headerstate.Buffer, 1, new AsyncCallback (OnReceiveHeaderValueStart), headerstate);
++				break;
++			}
++			case 6: {
++				headerstate.Key = "Content-Type";
++				AsyncStreamRead (headerstate.Stream, headerstate.Buffer, 1, new AsyncCallback (OnReceiveHeaderValueStart), headerstate);
++				break;
++			}
++			case 1: {
++				AsyncReceiveString (headerstate.Stream, headerstate.Buffer, new AsyncCallback (OnReceiveHeaderKeyName), headerstate);
++				break;
++			}
++			default: throw new NotSupportedException ("Unknown header code: " + headerstate.HeaderType);
++			}
++
++		}
++		
++		static void OnReceiveHeaderKeyName (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveStringState strstate = (ReceiveStringState)state.State;
++			ReceiveHeadersState headerstate = (ReceiveHeadersState)strstate.State;
++
++			headerstate.Key = strstate.String;
++			
++			AsyncStreamRead (headerstate.Stream, headerstate.Buffer, 1, new AsyncCallback (OnReceiveHeaderValueStart), headerstate);
++		}
++		
++		static void OnReceiveHeaderValueStart (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveHeadersState headerstate = (ReceiveHeadersState)state.State;
++			AsyncReceiveString (headerstate.Stream, headerstate.Buffer, new AsyncCallback (OnReceiveHeaderValue), headerstate);
++		}
++		
++		static void OnReceiveHeaderValue (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveStringState strstate = (ReceiveStringState)state.State;
++			ReceiveHeadersState headerstate = (ReceiveHeadersState)strstate.State;
++			
++			headerstate.Headers[headerstate.Key] = strstate.String;
++			
++			/* Loop */
++			AsyncStreamRead (headerstate.Stream, headerstate.Buffer, 2, new AsyncCallback (OnReceiveHeaderType), headerstate);
++		}
++		
+ 		public static ITransportHeaders ReceiveHeaders (Stream networkStream, byte[] buffer)
+ 		{
+ 			StreamRead (networkStream, buffer, 2);
+@@ -221,6 +715,55 @@
+ 			return headers;
+ 		}
+ 		
++		public static void AsyncReceiveMessageStream (Stream networkStream, byte[] buffer, ReceiveMessageStreamCallback callback, object state)
++		{
++			if (buffer == null) buffer = new byte[DefaultStreamBufferSize];
++			
++			ReceiveMessageStreamState recvstate = new ReceiveMessageStreamState (networkStream, buffer, callback, state);
++
++			// Reads header tag:  0 -> Stream with headers or 2 -> Response Stream
++			// +
++			// Gets the length of the data stream
++			AsyncStreamRead (networkStream, buffer, 8, new AsyncCallback (OnReceiveMessageStreamLength), recvstate);
++		}
++		
++		static void OnReceiveMessageStreamLength (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveMessageStreamState recvstate = (ReceiveMessageStreamState)state.State;
++			byte[] buffer = recvstate.Buffer;
++			
++			recvstate.ByteCount = (buffer [4] | (buffer [5] << 8) |
++				(buffer [6] << 16) | (buffer [7] << 24));
++
++			// Reads the headers
++			AsyncReceiveHeaders (recvstate.Stream, recvstate.Buffer, new ReceiveHeadersCallback (OnReceiveMessageHeaders), recvstate);
++		}
++		
++		static void OnReceiveMessageHeaders (ReceiveHeadersState state)
++		{
++			ReceiveMessageStreamState recvstate = (ReceiveMessageStreamState)state.State;
++
++			recvstate.Headers = state.Headers;
++			
++			if (recvstate.ByteCount > 0) {
++				recvstate.ResultBuffer = new byte[recvstate.ByteCount];
++				AsyncStreamRead (recvstate.Stream, recvstate.ResultBuffer, recvstate.ByteCount, new AsyncCallback (OnReceiveMessageStream), recvstate);
++			} else {
++				recvstate.RequestStream = new MemoryStream ();
++				recvstate.Callback (recvstate);
++			}
++		}
++
++		static void OnReceiveMessageStream (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveMessageStreamState recvstate = (ReceiveMessageStreamState)state.State;
++			
++			recvstate.RequestStream = new MemoryStream (recvstate.ResultBuffer);
++			recvstate.Callback (recvstate);
++		}
++		
+ 		public static Stream ReceiveMessageStream (Stream networkStream, out ITransportHeaders headers, byte[] buffer)
+ 		{
+ 			headers = null;
+@@ -247,7 +790,7 @@
+ 			}
+ 		}		
+ 
+-		private static void SendString (Stream networkStream, string str, byte[] buffer)
++		private static byte[] SendStringPrepare (string str, byte[] buffer, out int num)
+ 		{
+ 			// Allocates a buffer. Use the internal buffer if it is 
+ 			// big enough. If not, create a new one.
+@@ -256,7 +799,7 @@
+ 			if (maxBytes > buffer.Length)
+ 				buffer = new byte[maxBytes];
+ 
+-			int num = Encoding.UTF8.GetBytes (str, 0, str.Length, buffer, 4);
++			num = Encoding.UTF8.GetBytes (str, 0, str.Length, buffer, 4);
+ 
+ 			// store number of bytes (not number of chars!)
+ 
+@@ -265,10 +808,143 @@
+ 			buffer [2] = (byte) (num >> 16);
+ 			buffer [3] = (byte) (num >> 24);
+ 
++			return buffer;
++		}
++		
++		private static void AsyncSendString (Stream networkStream, string str, byte[] buffer, AsyncCallback callback, object state)
++		{
++			int num;
++			
++			buffer = SendStringPrepare (str, buffer, out num);
++			
++			networkStream.BeginWrite (buffer, 0, num + 4, callback, state);
++		}
++		
++		private static void SendString (Stream networkStream, string str, byte[] buffer)
++		{
++			int num;
++			
++			buffer = SendStringPrepare (str, buffer, out num);
++			
+ 			// Write the string bytes
+ 			networkStream.Write (buffer, 0, num + 4);
+ 		}
+ 
++		class ReceiveStringState
++		{
++			Stream stream;
++			byte[] buffer;
++			string str;
++			int count;
++			AsyncCallback callback;
++			object state;
++			
++			public ReceiveStringState (Stream stream, byte[] buffer, AsyncCallback callback, object state)
++			{
++				this.stream = stream;
++				this.buffer = buffer;
++				this.callback = callback;
++				this.state = state;
++			}
++			
++			public Stream Stream
++			{
++				get {
++					return stream;
++				}
++			}
++			
++			public byte[] Buffer
++			{
++				get {
++					return buffer;
++				}
++				set {
++					buffer = value;
++				}
++			}
++			
++			public string String
++			{
++				get {
++					return str;
++				}
++				set {
++					str = value;
++				}
++			}
++			
++			public int Count
++			{
++				get {
++					return count;
++				}
++				set {
++					count = value;
++				}
++			}
++			
++			public AsyncCallback Callback
++			{
++				get {
++					return callback;
++				}
++			}
++			
++			public object State
++			{
++				get {
++					return state;
++				}
++			}
++		}
++		
++		private static void AsyncReceiveString (Stream networkStream, byte[] buffer, AsyncCallback callback, object state)
++		{
++			ReceiveStringState strstate = new ReceiveStringState (networkStream, buffer, callback, state);
++			AsyncStreamRead (networkStream, buffer, 4, new AsyncCallback (OnReceiveStringLength), strstate);
++		}
++		
++		static void OnReceiveStringLength (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveStringState strstate = (ReceiveStringState)state.State;
++
++			// Reads the number of bytes (not chars!)
++
++			byte[] buffer = strstate.Buffer;
++			strstate.Count = (buffer [0] | (buffer [1] << 8) |
++				(buffer [2] << 16) | (buffer [3] << 24));
++
++			if (strstate.Count == 0) {
++				strstate.String = string.Empty;
++				strstate.Callback (ares);
++			} else {
++				// Allocates a buffer of the correct
++				// size. Use the internal buffer if it
++				// is big enough
++
++				if (strstate.Count > buffer.Length) {
++					strstate.Buffer = new byte[strstate.Count];
++				}
++
++				// Reads the string
++
++				AsyncStreamRead (strstate.Stream, strstate.Buffer, strstate.Count, new AsyncCallback (OnReceiveStringData), strstate);
++			}
++		}
++
++		static void OnReceiveStringData (IAsyncResult ares)
++		{
++			StreamReadState state = (StreamReadState)ares.AsyncState;
++			ReceiveStringState strstate = (ReceiveStringState)state.State;
++			
++			char[] chars = Encoding.UTF8.GetChars (strstate.Buffer, 0, strstate.Count);
++			
++			strstate.String = new string(chars);
++			strstate.Callback (ares);
++		}
++		
+ 		private static string ReceiveString (Stream networkStream, byte[] buffer)
+ 		{
+ 			StreamRead (networkStream, buffer, 4);
+Index: System.Runtime.Remoting.Channels.Tcp/ProcessMessageState.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/ProcessMessageState.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/ProcessMessageState.cs	(revision 0)
+@@ -0,0 +1,90 @@
++// System.Runtime.Remoting.Channels.Tcp.ProcessMessageState.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.IO;
++
++namespace System.Runtime.Remoting.Channels.Tcp 
++{
++	internal class ProcessMessageState
++	{
++		ProcessMessageCallback callback;
++		object state;
++		Exception exception;
++		ClientConnection connection;
++		Stream stream;
++
++		public ProcessMessageState (ClientConnection connection,
++					    Stream stream,
++					    ProcessMessageCallback callback,
++					    object state)
++		{
++			this.connection = connection;
++			this.stream = stream;
++			this.callback = callback;
++			this.state = state;
++		}
++
++		public ClientConnection Connection
++		{
++			get {
++				return connection;
++			}
++		}
++
++		public Stream Stream
++		{
++			get {
++				return stream;
++			}
++		}
++			
++		public ProcessMessageCallback Callback
++		{
++			get {
++				return callback;
++			}
++		}
++			
++		public object State
++		{
++			get {
++				return state;
++			}
++		}
++			
++		public Exception Exception 
++		{
++			get {
++				return exception;
++			}
++			set {
++				exception = value;
++			}
++		}
++	}
++}
+Index: System.Runtime.Remoting.Channels.Tcp/SendHeadersState.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/SendHeadersState.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/SendHeadersState.cs	(revision 0)
+@@ -0,0 +1,101 @@
++// System.Runtime.Remoting.Channels.Tcp.SendHeadersState.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.IO;
++using System.Collections;
++
++namespace System.Runtime.Remoting.Channels.Tcp 
++{
++	internal class SendHeadersState
++	{
++		Stream stream;
++		ITransportHeaders request_headers;
++		byte[] buffer;
++		SendHeadersCallback callback;
++		object state;
++		IEnumerator enumerator;
++			
++		public SendHeadersState (Stream stream,
++					 ITransportHeaders request_headers,
++					 byte[] buffer,
++					 SendHeadersCallback callback,
++					 object state)
++		{
++			this.stream = stream;
++			this.request_headers = request_headers;
++			this.buffer = buffer;
++			this.callback = callback;
++			this.state = state;
++		}
++			
++		public Stream Stream
++		{
++			get {
++				return stream;
++			}
++		}
++
++		public ITransportHeaders RequestHeaders
++		{
++			get {
++				return request_headers;
++			}
++		}
++			
++		public byte[] Buffer
++		{
++			get {
++				return buffer;
++			}
++		}
++			
++		public SendHeadersCallback Callback
++		{
++			get {
++				return callback;
++			}
++		}
++			
++		public object State
++		{
++			get {
++				return state;
++			}
++		}
++
++		public IEnumerator HeaderEnumerator
++		{
++			get {
++				return enumerator;
++			}
++			set {
++				enumerator = value;
++			}
++		}
++	}
++}
+Index: System.Runtime.Remoting.Channels.Tcp/ReceiveHeadersCallback.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/ReceiveHeadersCallback.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/ReceiveHeadersCallback.cs	(revision 0)
+@@ -0,0 +1,31 @@
++// System.Runtime.Remoting.Channels.Tcp.ReceiveHeadersCallback.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++namespace System.Runtime.Remoting.Channels.Tcp
++{
++	internal delegate void ReceiveHeadersCallback (ReceiveHeadersState state);
++}
+Index: System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStatusState.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStatusState.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStatusState.cs	(revision 0)
+@@ -0,0 +1,98 @@
++// System.Runtime.Remoting.Channels.Tcp.ReceiveMessageStatusState.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.IO;
++
++namespace System.Runtime.Remoting.Channels.Tcp 
++{
++	internal class ReceiveMessageStatusState
++	{
++		Stream stream;
++		byte[] buffer;
++		ReceiveMessageStatusCallback callback;
++		object state;
++		Exception exception;
++		MessageStatus status;
++
++		public ReceiveMessageStatusState (Stream stream, byte[] buffer, ReceiveMessageStatusCallback callback, object state)
++		{
++			this.stream = stream;
++			this.buffer = buffer;
++			this.callback = callback;
++			this.state = state;
++		}
++
++		public Stream Stream
++		{
++			get {
++				return stream;
++			}
++		}
++			
++		public byte[] Buffer
++		{
++			get {
++				return buffer;
++			}
++		}
++			
++		public ReceiveMessageStatusCallback Callback
++		{
++			get {
++				return callback;
++			}
++		}
++			
++		public object State
++		{
++			get {
++				return state;
++			}
++		}
++			
++		public Exception Exception 
++		{
++			get {
++				return exception;
++			}
++			set {
++				exception = value;
++			}
++		}
++
++		public MessageStatus MessageStatus
++		{
++			get {
++				return status;
++			}
++			set {
++				status = value;
++			}
++		}
++	}
++}
+Index: System.Runtime.Remoting.Channels.Tcp/ProcessMessageCallback.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/ProcessMessageCallback.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/ProcessMessageCallback.cs	(revision 0)
+@@ -0,0 +1,31 @@
++// System.Runtime.Remoting.Channels.Tcp.ProcessMessageCallback.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++namespace System.Runtime.Remoting.Channels.Tcp
++{
++	internal delegate void ProcessMessageCallback (ProcessMessageState state);
++}
+Index: System.Runtime.Remoting.Channels.Tcp/SendHeadersCallback.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/SendHeadersCallback.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/SendHeadersCallback.cs	(revision 0)
+@@ -0,0 +1,31 @@
++// System.Runtime.Remoting.Channels.Tcp.SendHeadersCallback.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++namespace System.Runtime.Remoting.Channels.Tcp
++{
++	internal delegate void SendHeadersCallback (SendHeadersState state);
++}
+Index: System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStreamState.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStreamState.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStreamState.cs	(revision 0)
+@@ -0,0 +1,120 @@
++// System.Runtime.Remoting.Channels.Tcp.ReceiveMessageStreamState.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.IO;
++
++namespace System.Runtime.Remoting.Channels.Tcp 
++{
++	internal class ReceiveMessageStreamState
++	{
++		Stream stream;
++		byte[] buffer;
++		ReceiveMessageStreamCallback callback;
++		object state;
++		int bytecount;
++		byte[] result_buffer;
++		Stream request_stream;
++		TransportHeaders headers;
++			
++		public ReceiveMessageStreamState (Stream stream, byte[] buffer, ReceiveMessageStreamCallback callback, object state)
++		{
++			this.stream = stream;
++			this.buffer = buffer;
++			this.callback = callback;
++			this.state = state;
++		}
++			
++		public Stream Stream
++		{
++			get {
++				return stream;
++			}
++		}
++			
++		public byte[] Buffer
++		{
++			get {
++				return buffer;
++			}
++		}
++			
++		public ReceiveMessageStreamCallback Callback
++		{
++			get {
++				return callback;
++			}
++		}
++			
++		public object State
++		{
++			get {
++				return state;
++			}
++		}
++
++		public int ByteCount
++		{
++			get {
++				return bytecount;
++			}
++			set {
++				bytecount = value;
++			}
++		}
++
++		public TransportHeaders Headers 
++		{
++			get {
++				return headers;
++			}
++			set {
++				headers = value;
++			}
++		}
++
++		public byte[] ResultBuffer
++		{
++			get {
++				return result_buffer;
++			}
++			set {
++				result_buffer = value;
++			}
++		}
++
++		public Stream RequestStream
++		{
++			get {
++				return request_stream;
++			}
++			set {
++				request_stream = value;
++			}
++		}
++	}
++}
+Index: System.Runtime.Remoting.Channels.Tcp/TcpServerChannel.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/TcpServerChannel.cs	(revision 140243)
++++ System.Runtime.Remoting.Channels.Tcp/TcpServerChannel.cs	(working copy)
+@@ -53,9 +53,9 @@
+ 		TcpListener listener;
+ 		TcpServerTransportSink sink;
+ 		ChannelDataStore channel_data;
++
++		bool async = false;
+ 		
+-		RemotingThreadPool threadPool;
+-		
+ #if TARGET_JVM
+ 		private volatile bool stopped = false;
+ #endif
+@@ -137,6 +137,9 @@
+ 					case "machineName":
+ 						host = property.Value as string;
+ 						break;
++					case "run_async":
++						async = Convert.ToBoolean (property.Value);
++						break;
+ 				}
+ 			}
+ 			Init (sinkProvider);
+@@ -215,9 +218,16 @@
+ 				{
+ 					Socket socket = listener.AcceptSocket ();
+ 					ClientConnection reader = new ClientConnection (this, socket, sink);
++
+ 					try {
+-						if (!threadPool.RunThread (new ThreadStart (reader.ProcessMessages)))
+-							socket.Close ();
++						WaitCallback cb;
++						
++						if (async) {
++							cb = new WaitCallback (reader.AsyncProcessMessages);
++						} else {
++							cb = new WaitCallback (reader.ProcessMessages);
++						}
++						ThreadPool.QueueUserWorkItem (cb, null);
+ 					} catch (Exception e) 
+ 					{
+ #if DEBUG
+@@ -242,7 +252,6 @@
+ 			listener = new TcpListener (bindAddress, port);
+ 			if (server_thread == null) 
+ 			{
+-				threadPool = RemotingThreadPool.GetSharedPool ();
+ 				listener.Start ();
+ 				
+ 				if (port == 0)
+@@ -272,7 +281,6 @@
+ 			server_thread.Interrupt ();
+ #endif
+ 			listener.Stop ();
+-			threadPool.Free ();
+ 			server_thread.Join ();
+ 			server_thread = null;			
+ 		}
+@@ -304,9 +312,58 @@
+ 			get { return _buffer; }
+ 		}
+ 
+-		public void ProcessMessages()
++		void OnProcessMessage (ProcessMessageState state)
+ 		{
++			ReceiveMessageStatusState recvstate = (ReceiveMessageStatusState)state.State;
++			
++			/* Loop */
++			TcpMessageIO.AsyncReceiveMessageStatus (recvstate.Stream, recvstate.Buffer, new ReceiveMessageStatusCallback (OnReceiveMessageStatus), null);
++		}
++		
++		void OnReceiveMessageStatus (ReceiveMessageStatusState state)
++		{
++			if (state.Exception != null) {
++#if DEBUG
++				Console.WriteLine ("The exception was caught during TcpServerChannel.ProcessMessages: {0}, {1}", state.Exception.GetType(), state.Exception.Message);
++#endif
++				try {
++					_stream.Close();
++					_socket.Close ();
++				}
++				catch { }
++			}
++
++			MessageStatus type = state.MessageStatus;
++
++			switch (type)
++			{
++			case MessageStatus.MethodMessage:
++				_sink.AsyncInternalProcessMessage (this, _stream, new ProcessMessageCallback (OnProcessMessage), state);
++				break;
++					
++			case MessageStatus.Unknown:
++			case MessageStatus.CancelSignal:
++				try {
++					_stream.Flush ();
++					_stream.Close();
++					_socket.Close ();
++				}
++				catch { }
++				break;
++			}
++		}
++
++		public void AsyncProcessMessages (object unused)
++		{
+ 			byte[] buffer = new byte[256];
++			_stream = new NetworkStream (_socket);
++
++			TcpMessageIO.AsyncReceiveMessageStatus (_stream, buffer, new ReceiveMessageStatusCallback (OnReceiveMessageStatus), null);
++		}
++
++		public void ProcessMessages(object unused)
++		{
++			byte[] buffer = new byte[256];
+ 			NetworkStream ns = new NetworkStream (_socket);
+ 			_stream = new BufferedStream (ns);
+ 
+Index: System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStatusCallback.cs
+===================================================================
+--- System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStatusCallback.cs	(revision 0)
++++ System.Runtime.Remoting.Channels.Tcp/ReceiveMessageStatusCallback.cs	(revision 0)
+@@ -0,0 +1,31 @@
++// System.Runtime.Remoting.Channels.Tcp.ReceiveMessageStatusCallback.cs
++//
++// Author: Dick Porter (dporter@codicesoftware.com)
++//
++// (C) 2009 Codice Software
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++namespace System.Runtime.Remoting.Channels.Tcp
++{
++	internal delegate void ReceiveMessageStatusCallback (ReceiveMessageStatusState state);
++}

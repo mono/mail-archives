@@ -1,0 +1,316 @@
+Index: metadata/debug-helpers.c
+===================================================================
+--- metadata/debug-helpers.c	(revision 84441)
++++ metadata/debug-helpers.c	(working copy)
+@@ -558,6 +558,18 @@
+ }
+ 
+ char *
++mono_field_full_name (MonoClassField *field)
++{
++	char *res;
++	const char *nspace = field->parent->name_space;
++
++	res = g_strdup_printf ("%s%s%s:%s", nspace, *nspace ? "." : "",
++						   field->parent->name, field->name);
++
++	return res;
++}
++
++char *
+ mono_method_full_name (MonoMethod *method, gboolean signature)
+ {
+ 	char *res;
+Index: metadata/debug-helpers.h
+===================================================================
+--- metadata/debug-helpers.h	(revision 84441)
++++ metadata/debug-helpers.h	(working copy)
+@@ -40,6 +40,8 @@
+ 
+ char*           mono_method_full_name (MonoMethod *method, gboolean signature);
+ 
++char*           mono_field_full_name (MonoClassField *field);
++
+ G_END_DECLS
+ 
+ #endif /* __MONO_DEBUG_HELPERS_H__ */
+Index: metadata/class-internals.h
+===================================================================
+--- metadata/class-internals.h	(revision 84441)
++++ metadata/class-internals.h	(working copy)
+@@ -172,7 +172,9 @@
+ 	MONO_EXCEPTION_MISSING_METHOD = 5,
+ 	MONO_EXCEPTION_MISSING_FIELD = 6,
+ 	MONO_EXCEPTION_TYPE_LOAD = 7,
+-	MONO_EXCEPTION_FILE_NOT_FOUND = 8
++	MONO_EXCEPTION_FILE_NOT_FOUND = 8,
++	MONO_EXCEPTION_METHOD_ACCESS = 9,
++	MONO_EXCEPTION_FIELD_ACCESS = 10,
+ 	/* add other exception type */
+ };
+ 
+Index: mini/mini.c
+===================================================================
+--- mini/mini.c	(revision 84441)
++++ mini/mini.c	(working copy)
+@@ -87,6 +87,18 @@
+ 		if (cfg->exception_type != MONO_EXCEPTION_NONE)\
+ 			goto exception_exit;\
+ 	} while (0)
++#define METHOD_ACCESS_FAILURE do {\
++		cfg->exception_type = MONO_EXCEPTION_METHOD_ACCESS;\
++		cfg->exception_message = g_strdup_printf ("Cannot access method `%s' from method `%s'\n",\
++			mono_method_full_name (cil_method, TRUE), mono_method_full_name (method, TRUE));\
++		goto exception_exit;\
++	} while (0)
++#define FIELD_ACCESS_FAILURE do {\
++		cfg->exception_type = MONO_EXCEPTION_FIELD_ACCESS;\
++		cfg->exception_message = g_strdup_printf ("Cannot access field `%s' from method `%s'\n",\
++			mono_field_full_name (field), mono_method_full_name (method, TRUE));\
++		goto exception_exit;\
++	} while (0)
+ 
+ /* 
+  * this is used to determine when some branch optimizations are possible: we exclude FP compares
+@@ -4560,7 +4572,7 @@
+ 				if (!cmethod)
+ 					goto load_error;
+ 				if (!dont_verify && !cfg->skip_visibility && !mono_method_can_access_method (method, cil_method))
+-					UNVERIFIED;
++					METHOD_ACCESS_FAILURE;
+ 
+ 				if (!virtual && (cmethod->flags & METHOD_ATTRIBUTE_ABSTRACT))
+ 					/* MS.NET seems to silently convert this to a callvirt */
+@@ -5964,7 +5976,7 @@
+ 				goto load_error;
+ 			mono_class_init (klass);
+ 			if (!dont_verify && !cfg->skip_visibility && !mono_method_can_access_field (method, field))
+-				UNVERIFIED;
++				FIELD_ACCESS_FAILURE;
+ 
+ 			foffset = klass->valuetype? field->offset - sizeof (MonoObject): field->offset;
+ 			/* FIXME: mark instructions for use in SSA */
+@@ -6141,6 +6153,8 @@
+ 			if (!field)
+ 				goto load_error;
+ 			mono_class_init (klass);
++			if (!dont_verify && !cfg->skip_visibility && !mono_method_can_access_field (method, field))
++				FIELD_ACCESS_FAILURE;
+ 
+ 			g_assert (!(field->type->attrs & FIELD_ATTRIBUTE_LITERAL));
+ 
+@@ -10763,6 +10778,18 @@
+ 		mono_raise_exception (ex);
+ 		break;
+ 	}
++	case MONO_EXCEPTION_METHOD_ACCESS: {
++		MonoException *ex = mono_exception_from_name_msg (mono_defaults.corlib, "System", "MethodAccessException", cfg->exception_message);
++		mono_destroy_compile (cfg);
++		mono_raise_exception (ex);
++		break;
++	}
++	case MONO_EXCEPTION_FIELD_ACCESS: {
++		MonoException *ex = mono_exception_from_name_msg (mono_defaults.corlib, "System", "FieldAccessException", cfg->exception_message);
++		mono_destroy_compile (cfg);
++		mono_raise_exception (ex);
++		break;
++	}
+ 	/* this can only be set if the security manager is active */
+ 	case MONO_EXCEPTION_SECURITY_LINKDEMAND: {
+ 		MonoAssembly *assembly = mono_image_get_assembly (method->klass->image);
+Index: tests/method-access.il
+===================================================================
+--- tests/method-access.il	(revision 0)
++++ tests/method-access.il	(revision 0)
+@@ -0,0 +1,83 @@
++.assembly extern mscorlib {}
++
++.assembly 'method-access' {}
++
++.class public MethFail extends [mscorlib]System.Object {
++
++	.method private void foo ()
++	{
++		ret
++	}
++
++	.method static private void sfoo ()
++	{
++		ret
++	}
++
++	.method public specialname rtspecialname instance void  .ctor()
++	{
++		ldarg.0
++		call       instance void [mscorlib]System.Object::.ctor()
++		ret
++	}
++}
++
++.class Test {
++
++	.method static void call_sfoo ()
++	{
++		call void MethFail::sfoo ()
++		ret
++	}
++
++	.method static void call_foo ()
++	{
++		.locals (MethFail mf)
++
++		newobj instance void MethFail::.ctor()
++		stloc mf
++		ldloc mf
++		call instance void MethFail::foo ()
++		ret
++	}
++
++	.method static int32 Main ()
++	{
++		.entrypoint
++
++		.try {
++			call void Test::call_sfoo ()
++			br fail
++		} catch [mscorlib]System.MethodAccessException {
++			pop
++			br continue
++		} catch [mscorlib]System.Exception {
++			pop
++			br fail
++		}
++
++continue:
++		.try {
++			call void Test::call_foo ()
++			br fail
++		} catch [mscorlib]System.MethodAccessException {
++			pop
++			br success
++		} catch [mscorlib]System.Exception {
++			pop
++			br fail
++		}
++		
++success:
++		ldstr "PASS"
++		call void [mscorlib]System.Console::WriteLine(string)
++		ldc.i4.0
++		ret
++
++fail:
++		ldstr "FAIL"
++		call void [mscorlib]System.Console::WriteLine(string)
++		ldc.i4.1
++		ret
++	}
++}
+
+Property changes on: tests/method-access.il
+___________________________________________________________________
+Name: svn:eol-style
+   + native
+
+Index: tests/Makefile.am
+===================================================================
+--- tests/Makefile.am	(revision 84441)
++++ tests/Makefile.am	(working copy)
+@@ -253,6 +253,8 @@
+ 	vararg.cs
+ 
+ TEST_IL_SRC=			\
++	field-access.il		\
++	method-access.il	\
+ 	cpblkTest.il		\
+ 	vbinterface.il		\
+ 	jmpTest.il		\
+Index: tests/field-access.il
+===================================================================
+--- tests/field-access.il	(revision 0)
++++ tests/field-access.il	(revision 0)
+@@ -0,0 +1,79 @@
++.assembly extern mscorlib {}
++
++.assembly 'field-access' {}
++
++.class public FieldFail extends [mscorlib]System.Object {
++
++	.field private static string _sfield
++
++	.field private string _field
++
++	.method public specialname rtspecialname instance void  .ctor()
++	{
++		ldarg.0
++		call       instance void [mscorlib]System.Object::.ctor()
++		ret
++	}
++}
++
++.class Test {
++
++	.method static void read_sfield ()
++	{
++		ldsfld string FieldFail::_sfield
++		pop
++		ret
++	}
++
++	.method static void read_field ()
++	{
++		.locals (FieldFail ff)
++
++		newobj instance void FieldFail::.ctor()
++		stloc ff
++		ldloc ff
++		ldfld string FieldFail::_field
++		pop
++		ret
++	}
++
++	.method static int32 Main ()
++	{
++		.entrypoint
++
++		.try {
++			call void Test::read_sfield ()
++			br fail
++		} catch [mscorlib]System.FieldAccessException {
++			pop
++			br continue
++		} catch [mscorlib]System.Exception {
++			pop
++			br fail
++		}
++
++continue:
++		.try {
++			call void Test::read_field ()
++			br fail
++		} catch [mscorlib]System.FieldAccessException {
++			pop
++			br success
++		} catch [mscorlib]System.Exception {
++			pop
++			br fail
++		}
++		
++success:
++		ldstr "PASS"
++		call void [mscorlib]System.Console::WriteLine(string)
++		ldc.i4.0
++		ret
++
++fail:
++		ldstr "FAIL"
++		call void [mscorlib]System.Console::WriteLine(string)
++		ldc.i4.1
++		ret
++	}
++}
+
+Property changes on: tests/field-access.il
+___________________________________________________________________
+Name: svn:eol-style
+   + native

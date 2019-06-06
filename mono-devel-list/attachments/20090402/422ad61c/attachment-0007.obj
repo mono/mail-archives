@@ -1,0 +1,240 @@
+Index: backend/arch/Architecture.cs
+===================================================================
+--- backend/arch/Architecture.cs	(revision 130915)
++++ backend/arch/Architecture.cs	(working copy)
+@@ -12,15 +12,16 @@
+ 		protected readonly ProcessServant process;
+ 		protected readonly TargetInfo TargetInfo;
+ 
+-		BfdDisassembler disassembler;
++		Disassembler disassembler;
+ 		X86_Opcodes opcodes;
+ 
+ 		protected Architecture (ProcessServant process, TargetInfo info)
+ 		{
+ 			this.process = process;
+-			this.TargetInfo = info;
+-
+-			disassembler = new BfdDisassembler (process, info.TargetAddressSize == 8);
++			this.TargetInfo = info;
++
++			if (!Inferior.IsRunningOnWindows)
++				disassembler = new BfdDisassembler (process, info.TargetAddressSize == 8);
+ 			if (info.TargetAddressSize == 8)
+ 				opcodes = new Opcodes_X86_64 (process);
+ 			else
+Index: backend/arch/BfdDisassembler.cs
+===================================================================
+--- backend/arch/BfdDisassembler.cs	(revision 130915)
++++ backend/arch/BfdDisassembler.cs	(working copy)
+@@ -199,7 +199,7 @@
+ 			}
+ 		}
+ 
+-		public void Dispose ()
++		public override void Dispose ()
+ 		{
+ 			Dispose (true);
+ 			// Take yourself off the Finalization queue
+Index: backend/arch/Disassembler.cs
+===================================================================
+--- backend/arch/Disassembler.cs	(revision 130915)
++++ backend/arch/Disassembler.cs	(working copy)
+@@ -2,7 +2,7 @@
+ 
+ namespace Mono.Debugger
+ {
+-	internal abstract class Disassembler
++	internal abstract class Disassembler : IDisposable
+ 	{
+ 		// <summary>
+ 		//   Get the size of the current instruction.
+@@ -23,6 +23,12 @@
+ 		// </summary>
+ 		public abstract AssemblerLine DisassembleInstruction (TargetMemoryAccess memory,
+ 								      Method method,
+-								      TargetAddress address);
++								      TargetAddress address);
++
++		#region IDisposable Members
++
++		public abstract void Dispose ();
++
++		#endregion
+ 	}
+ }
+Index: backend/arch/X86_Opcodes.cs
+===================================================================
+--- backend/arch/X86_Opcodes.cs	(revision 130915)
++++ backend/arch/X86_Opcodes.cs	(working copy)
+@@ -8,15 +8,16 @@
+ 	internal abstract class X86_Opcodes : Opcodes
+ 	{
+ 		ProcessServant process;
+-		TargetMemoryInfo target_info;
+-		BfdDisassembler disassembler;
++		TargetMemoryInfo target_info;
++		Disassembler disassembler;
+ 
+ 		protected X86_Opcodes (ProcessServant process)
+ 		{
+ 			this.process = process;
+ 
+ 			target_info = Inferior.GetTargetMemoryInfo (AddressDomain.Global);
+-			disassembler = new BfdDisassembler (null, Is64BitMode);
++			if (!Inferior.IsRunningOnWindows)
++				disassembler = new BfdDisassembler (null, Is64BitMode);
+ 		}
+ 
+ 		public abstract bool Is64BitMode {
+Index: backend/Inferior.cs
+===================================================================
+--- backend/Inferior.cs	(revision 130915)
++++ backend/Inferior.cs	(working copy)
+@@ -41,7 +41,13 @@
+ 		Architecture arch;
+ 
+ 		bool has_signals;
+-		SignalInfo signal_info;
++		SignalInfo signal_info;
++
++		public static bool IsRunningOnWindows {
++			get {
++				return ((int)Environment.OSVersion.Platform < 4);
++			}
++		}
+ 
+ 		public bool HasTarget {
+ 			get {
+@@ -169,8 +175,8 @@
+ 		[DllImport("monodebuggerserver")]
+ 		static extern TargetError mono_debugger_server_get_threads (IntPtr handle, out int count, out IntPtr data);
+ 
+-		[DllImport("monodebuggerserver")]
+-		static extern TargetError mono_debugger_server_get_application (IntPtr handle, out string exe_file, out string cwd, out int nargs, out IntPtr data);
++		[DllImport("monodebuggerserver")]
++		static extern TargetError mono_debugger_server_get_application (IntPtr handle, out IntPtr exe_file, out IntPtr cwd, out int nargs, out IntPtr data);
+ 
+ 		[DllImport("monodebuggerserver")]
+ 		static extern TargetError mono_debugger_server_detach_after_fork (IntPtr handle);
+@@ -1311,25 +1317,31 @@
+ 		}
+ 
+ 		protected string GetApplication (out string cwd, out string[] cmdline_args)
+-		{
+-			IntPtr data = IntPtr.Zero;
++		{
++			IntPtr data = IntPtr.Zero;
++			IntPtr p_exe = IntPtr.Zero;
++			IntPtr p_cwd = IntPtr.Zero;
+ 			try {
+ 				int count;
+ 				string exe_file;
+-				check_error (mono_debugger_server_get_application (
+-						     server_handle, out exe_file, out cwd,
++				check_error (mono_debugger_server_get_application (
++							 server_handle, out p_exe, out p_cwd,
+ 						     out count, out data));
+ 
+-				cmdline_args = new string [count];
++				cmdline_args = new string [count];
++				exe_file = Marshal.PtrToStringAnsi (p_exe);
++				cwd = Marshal.PtrToStringAnsi (p_cwd);
+ 
+ 				for (int i = 0; i < count; i++) {
+ 					IntPtr ptr = Marshal.ReadIntPtr (data, i * IntPtr.Size);
+-					cmdline_args [i] = Marshal.PtrToStringAuto (ptr);
++					cmdline_args [i] = Marshal.PtrToStringAnsi (ptr);
+ 				}
+ 
+ 				return exe_file;
+-			} finally {
+-				g_free (data);
++			} finally {
++				g_free (data);
++				g_free (p_exe);
++				g_free (p_cwd);
+ 			}
+ 		}
+ 
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 130915)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,76 @@
++2009-04-03  Jonathan Chambers  <joncham@gmail.com>
++
++	* backend/arch/Architecture.cs: Use Disassembler instead of BfdDisassembler
++	and only create on non-Windows platforms.
++
++	* backend/arch/BfdDisasembler.cs: Override Dispose since base now implements.
++
++	* backend/arch/Disasembler.cs: Derive from IDisposable.
++
++	* backend/arch/X86_Opcodes.cs: Use Disassembler instead of BfdDisassembler
++	and only create on non-Windows platforms.
++
++	* backend/Inferior.cs
++	(IsRunningOnWindows): Add.
++	(mono_debugger_server_get_application): Change out string to out IntPtr.
++	(GetApplication): Marshal strings manually since on Windows they are freed
++	via CoTaskMemFree instead of g_free.
++
++2009-04-03  Jonathan Chambers  <joncham@gmail.com>
++
++	* classes/DebuggerConfiguration.cs
++	(DebuggerConfiguration): Use Environment.SpecialFolder.Personal
++	instead of HOME environment variable.
++	(LoadConfigurationFromStream): Verify file exists before trying to access it.
++
++2009-04-03  Jonathan Chambers  <joncham@gmail.com>
++
++	* frontend/CSharpExpressionParser.cs.win: Add generated files for
++	Windows to build easily in Visual Studio.
++
++2009-04-03  Jonathan Chambers  <joncham@gmail.com>
++
++	* frontend/Style.cs: Add braces to work around bug 478101.
++
++	* languages/mono/MonoLanguageBackend.cs: Add braces to work around bug 478101.
++
++2009-04-03  Jonathan Chambers  <joncham@gmail.com>
++
++	* backend/server/breakpoints.c: Add HAVE_UNISTD_H #ifdef.
++
++	* backend/server/library.c: Add HAVE_UNISTD_H check and add Windows InferiorVTable.
++	(mono_debugger_server_create_inferior): Access through vtable.
++	(mono_debugger_server_get_current_pid): Access through vtable.
++	(mono_debugger_server_get_current_thread): Access through vtable.
++	(mono_debugger_server_static_init): Access through vtable.
++	(mono_debugger_server_get_pending_sigint): Access through vtable.
++	(mono_debugger_server_sem_init): Access through vtable.
++	(mono_debugger_server_sem_wait): Access through vtable.
++	(mono_debugger_server_sem_post): Access through vtable.
++	(mono_debugger_server_sem_get_value): Access through vtable.
++
++	* backend/server/monodebuggerserver.def: Add.
++
++	* backend/server/mutex.c: Add mono_debugger_cond_timed_wait.
++
++	* backend/server/server.h: Add declarations for vtable changes above.
++
++	* backend/server/x86-ptrace.c: Implement vtable functions formerly in library.c.
++
++	* backend/server/x86-windows.c: Added.
++
++	* build/debugger.sln: Added.
++
++	* build/mdb.csproj: Added.
++
++	* build/Mono.Debugger.csproj: Added.
++
++	* build/Mono.Debugger.Frontend.csproj: Added.
++
++	* build/Mono.Debugger.SymbolWriter.csproj: Added.
++
++	* build/monodebuggerserver.vcproj: Added.
++
+ 2009-03-31  Martin Baulig  <martin@ximian.com>
+ 
+ 	* backend/MonoThreadManager.cs

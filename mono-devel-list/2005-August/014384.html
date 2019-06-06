@@ -1,0 +1,360 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Patch for compiling System.Wen/httpApplicationFactory.cs under TARGET_J2EE
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%20for%20compiling%20System.Wen/httpApplicationFactory.cs%0A%20under%20TARGET_J2EE&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014407.html">
+   <LINK REL="Next"  HREF="014395.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Patch for compiling System.Wen/httpApplicationFactory.cs under TARGET_J2EE</H1>
+    <B>Eyal Alaluf</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%20for%20compiling%20System.Wen/httpApplicationFactory.cs%0A%20under%20TARGET_J2EE&In-Reply-To="
+       TITLE="[Mono-dev] Patch for compiling System.Wen/httpApplicationFactory.cs under TARGET_J2EE">eyala at mainsoft.com
+       </A><BR>
+    <I>Mon Aug 29 06:25:59 EDT 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014407.html">[Mono-dev] Patch for	compiling	System.Web/HttpResponseStream.cs under TARGET_JVM
+</A></li>
+        <LI>Next message: <A HREF="014395.html">[Mono-dev] Patch for compiling	System.Wen/httpApplicationFactory.cs under TARGET_J2EE
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14384">[ date ]</a>
+              <a href="thread.html#14384">[ thread ]</a>
+              <a href="subject.html#14384">[ subject ]</a>
+              <a href="author.html#14384">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi, all.
+
+The attached diff is a patch compiling for System.Web/HttpApplicationFactory.cs under
+the TARGET_J2EE (Grasshoper) configuration.
+The main portability issue for TARGET_J2EE handled in this patch is the lack of support for an
+AppDomain specific static fields. In order to resolve this issue we read the value
+of static fields that have AppDomain specific value explicitly from AppDomain.
+Since HttpApplicationFactory code used many static fields, it made less sense to define
+a property that gets and sets each value from AppDomain. I instead made all these fields
+into instance fields and defined a static instance - theFactory - that is used to access them.
+Therefore the patch contains the following changes:
+  * Make all static fields of HttpApplicationFactory into instance fields.
+  * Define 'theFactory' as a singleton static instance. Define a TARGET_J2EE 'theFactory'
+    property to handle the AppDomain specific retrieval.
+  * Make (almost) all the private methods of HttpApplicationFactory into instance methods.
+  * Use 'theFactory' in the static internal &amp; public methods in order to access the fields.
+  * Use 'theFactory' as the lock where before 'typeof(HttpApplicationFactory)' was used.
+  * I modified 'FireOnAppStart' to be a private method since nobody used it from outside
+    of HttpApplicationFactory and it is similar to 'FireOnAppEnd' which is private.
+  * Add a TARGET_J2EE version of getting the app instance since we don't support on the
+    fly compilation of ASPX pages.
+
+Eyal.
+
+-------------- next part --------------
+Index: System.Web/HttpApplicationFactory.cs
+
+===================================================================
+
+--- System.Web/HttpApplicationFactory.cs	(revision 49056)
+
++++ System.Web/HttpApplicationFactory.cs	(working copy)
+
+@@ -47,17 +47,39 @@
+
+ namespace System.Web {
+ 	class HttpApplicationFactory {
+ 		// Initialized in InitType
+-		static bool needs_init = true;
+-		static Type app_type;
+-		static HttpApplicationState app_state;
+-		static FileSystemWatcher app_file_watcher;
+-		static FileSystemWatcher bin_watcher;
+-		static Stack available = new Stack ();
++#if TARGET_J2EE
++		static HttpApplicationFactory theFactory {
++			get
++			{
++				HttpApplicationFactory factory = (HttpApplicationFactory)AppDomain.CurrentDomain.GetData(&quot;HttpApplicationFactory&quot;);
++				if (factory == null) {
++					lock(typeof(HttpApplicationFactory)) {
++						factory = (HttpApplicationFactory)AppDomain.CurrentDomain.GetData(&quot;HttpApplicationFactory&quot;);
++						if (factory == null) {
++							factory = new HttpApplicationFactory();
++							System.Threading.Thread.Sleep(1);
++							AppDomain.CurrentDomain.SetData(&quot;HttpApplicationFactory&quot;, factory);
++						}
++					}
++				}
++				return factory;
++			}
++		}
++#else
++		static HttpApplicationFactory theFactory = new HttpApplicationFactory();
++#endif
++
++		bool needs_init = true;
++		Type app_type;
++		HttpApplicationState app_state;
++		FileSystemWatcher app_file_watcher;
++		FileSystemWatcher bin_watcher;
++		Stack available = new Stack ();
+ 		
+ 		// Watch this thing out when getting an instance
+-		static IHttpHandler custom_application;
++		IHttpHandler custom_application;
+ 
+-		static bool IsEventHandler (MethodInfo m)
++		bool IsEventHandler (MethodInfo m)
+ 		{
+ 			if (m.ReturnType != typeof (void))
+ 				return false;
+@@ -77,7 +99,7 @@
+
+ 			return true;
+ 		}
+ 
+-		static void AddEvent (MethodInfo method, Hashtable appTypeEventHandlers)
++		void AddEvent (MethodInfo method, Hashtable appTypeEventHandlers)
+ 		{
+ 			string name = method.Name.Replace (&quot;_On&quot;, &quot;_&quot;);
+ 			if (appTypeEventHandlers [name] == null) {
+@@ -97,7 +119,7 @@
+
+ 			list.Add (method);
+ 		}
+ 		
+-		static Hashtable GetApplicationTypeEvents (HttpApplication app)
++		Hashtable GetApplicationTypeEvents (HttpApplication app)
+ 		{
+ 			Type appType = app.GetType ();
+ 			Hashtable appTypeEventHandlers = new Hashtable ();
+@@ -115,7 +137,7 @@
+
+ 			return appTypeEventHandlers;
+ 		}
+ 
+-		static bool FireEvent (string method_name, object target, object [] args)
++		bool FireEvent (string method_name, object target, object [] args)
+ 		{
+ 			Hashtable possibleEvents = GetApplicationTypeEvents ((HttpApplication) target);
+ 			MethodInfo method = possibleEvents [method_name] as MethodInfo;
+@@ -130,7 +152,7 @@
+
+ 			return true;
+ 		}
+ 
+-		internal static void FireOnAppStart (HttpContext context)
++		void FireOnAppStart (HttpContext context)
+ 		{
+ 			HttpApplication app = (HttpApplication) Activator.CreateInstance (app_type, true);
+ 			app.SetContext (context);
+@@ -139,7 +161,7 @@
+
+ 			Recycle (app);
+ 		}
+ 
+-		static void FireOnAppEnd ()
++		void FireOnAppEnd ()
+ 		{
+ 			if (app_type == null)
+ 				return; // we didn't even get an application
+@@ -155,10 +177,10 @@
+
+ 		//
+ 		public static void Dispose ()
+ 		{
+-			FireOnAppEnd ();
++			theFactory.FireOnAppEnd ();
+ 		}
+ 			
+-		static FileSystemWatcher CreateWatcher (string file, FileSystemEventHandler hnd)
++		FileSystemWatcher CreateWatcher (string file, FileSystemEventHandler hnd)
+ 		{
+ 			FileSystemWatcher watcher = new FileSystemWatcher ();
+ 
+@@ -174,7 +196,7 @@
+
+ 			return watcher;
+ 		}
+ 
+-		static void OnAppFileChanged (object sender, FileSystemEventArgs args)
++		void OnAppFileChanged (object sender, FileSystemEventArgs args)
+ 		{
+ 			bin_watcher.EnableRaisingEvents = false;
+ 			app_file_watcher.EnableRaisingEvents = false;
+@@ -183,7 +205,8 @@
+
+ 
+ 		internal static void AttachEvents (HttpApplication app)
+ 		{
+-			Hashtable possibleEvents = GetApplicationTypeEvents (app);
++			HttpApplicationFactory factory = theFactory;
++			Hashtable possibleEvents = factory.GetApplicationTypeEvents (app);
+ 			foreach (string key in possibleEvents.Keys) {
+ 				int pos = key.IndexOf ('_');
+ 				if (pos == -1 || key.Length &lt;= pos + 1)
+@@ -210,17 +233,17 @@
+
+ 					continue;
+ 
+ 				if (methodData is MethodInfo) {
+-					AddHandler (evt, target, app, (MethodInfo) methodData);
++					factory.AddHandler (evt, target, app, (MethodInfo) methodData);
+ 					continue;
+ 				}
+ 
+ 				ArrayList list = (ArrayList) methodData;
+ 				foreach (MethodInfo method in list)
+-					AddHandler (evt, target, app, method);
++					factory.AddHandler (evt, target, app, method);
+ 			}
+ 		}
+ 
+-		static void AddHandler (EventInfo evt, object target, HttpApplication app, MethodInfo method)
++		void AddHandler (EventInfo evt, object target, HttpApplication app, MethodInfo method)
+ 		{
+ 			int length = method.GetParameters ().Length;
+ 
+@@ -246,33 +269,41 @@
+
+ 			return coll;
+ 		}
+ 		
+-		static internal HttpApplicationState ApplicationState {
++		internal static HttpApplicationState ApplicationState {
++#if TARGET_J2EE
+ 			get {
+-				if (app_state == null) {
++				HttpApplicationFactory factory = theFactory;
++				if (factory.app_state == null)
++					factory.app_state = new HttpApplicationState (null, null);
++				return factory.app_state;
++			}
++#else
++			get {
++				if (theFactory.app_state == null) {
+ 					HttpStaticObjectsCollection app = MakeStaticCollection (GlobalAsaxCompiler.ApplicationObjects);
+ 					HttpStaticObjectsCollection ses = MakeStaticCollection (GlobalAsaxCompiler.SessionObjects);
+ 
+-					app_state = new HttpApplicationState (app, ses);
++					theFactory.app_state = new HttpApplicationState (app, ses);
+ 				}
+-
+-				return app_state;
++				return theFactory.app_state;
+ 			}
++#endif
+ 		}
+ 
+ 		public static void SetCustomApplication (IHttpHandler customApplication)
+ 		{
+-			custom_application = customApplication;
++			theFactory.custom_application = customApplication;
+ 		}
+ 
+-		static internal Type AppType {
++		internal static Type AppType {
+ 			get {
+-				return app_type;
++				return theFactory.app_type;
+ 			}
+ 		}
+ 
+-		static void InitType (HttpContext context)
++		void InitType (HttpContext context)
+ 		{
+-			lock (typeof (HttpApplicationFactory)){
++			lock (this) {
+ 				if (!needs_init)
+ 					return;
+ 				
+@@ -286,6 +317,9 @@
+
+ 				WebConfigurationSettings.Init (context);
+ 				
+ 				if (File.Exists (app_file)) {
++#if TARGET_J2EE
++					app_type = System.Web.J2EE.PageMapper.GetObjectType(app_file);
++#else
+ 					app_type = ApplicationFileParser.GetCompiledApplicationType (app_file, context);
+ 					if (app_type == null) {
+ 						string msg = String.Format (&quot;Error compiling application file ({0}).&quot;, app_file);
+@@ -293,6 +327,7 @@
+
+ 					}
+ 					
+ 					app_file_watcher = CreateWatcher (app_file, new FileSystemEventHandler (OnAppFileChanged));
++#endif
+ 				} else {
+ 					app_type = typeof (System.Web.HttpApplication);
+ 					app_state = new HttpApplicationState ();
+@@ -312,26 +347,31 @@
+
+ 		//
+ 		internal static HttpApplication GetApplication (HttpContext context)
+ 		{
+-			if (needs_init){
+-				InitType (context);
+-				FireOnAppStart (context);
++			HttpApplicationFactory factory = theFactory;
++			if (factory.needs_init){
++				if (context == null)
++					return null;
++
++				factory.InitType (context);
++				factory.FireOnAppStart (context);
+ 			}
+ 
+-			lock (typeof (HttpApplicationFactory)){
+-				if (available.Count &gt; 0)
+-					return (HttpApplication) available.Pop ();
++			lock (factory) {
++				if (factory.available.Count &gt; 0)
++					return (HttpApplication) factory.available.Pop ();
+ 			}
+ 			
+-			HttpApplication app = (HttpApplication) Activator.CreateInstance (app_type, true);
++			HttpApplication app = (HttpApplication) Activator.CreateInstance (factory.app_type, true);
+ 
+ 			return app;
+ 		}
+ 
+ 		internal static void Recycle (HttpApplication app)
+ 		{
+-			lock (typeof (HttpApplication)){
+-				if (available.Count &lt; 32)
+-					available.Push (app);
++			HttpApplicationFactory factory = theFactory;
++			lock (factory) {
++				if (factory.available.Count &lt; 32)
++					factory.available.Push (app);
+ 				else
+ 					app.Dispose ();
+ 			}
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014407.html">[Mono-dev] Patch for	compiling	System.Web/HttpResponseStream.cs under TARGET_JVM
+</A></li>
+	<LI>Next message: <A HREF="014395.html">[Mono-dev] Patch for compiling	System.Wen/httpApplicationFactory.cs under TARGET_J2EE
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14384">[ date ]</a>
+              <a href="thread.html#14384">[ thread ]</a>
+              <a href="subject.html#14384">[ subject ]</a>
+              <a href="author.html#14384">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

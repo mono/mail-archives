@@ -1,0 +1,520 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Patch for compiling HttpApplication for Grasshopper (without use of yield)
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%20for%20compiling%20HttpApplication%20for%20Grasshopper%0A%20%28without%20use%20of%20yield%29&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014838.html">
+   <LINK REL="Next"  HREF="014938.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Patch for compiling HttpApplication for Grasshopper (without use of yield)</H1>
+    <B>Eyal Alaluf</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%20for%20compiling%20HttpApplication%20for%20Grasshopper%0A%20%28without%20use%20of%20yield%29&In-Reply-To="
+       TITLE="[Mono-dev] Patch for compiling HttpApplication for Grasshopper (without use of yield)">eyala at mainsoft.com
+       </A><BR>
+    <I>Tue Sep 13 09:55:12 EDT 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014838.html">[Mono-dev] Re: [Mono-devel-list] System.Data : DataTable.Select	performance
+</A></li>
+        <LI>Next message: <A HREF="014938.html">[Mono-dev] Re: Patch for compiling HttpApplication for Grasshopper	(without use of yield)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14751">[ date ]</a>
+              <a href="thread.html#14751">[ thread ]</a>
+              <a href="subject.html#14751">[ subject ]</a>
+              <a href="author.html#14751">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi, Ben &amp; all.
+
+Attached is a patch to rewrite the 'Pipeline' &amp; 'RunHooks' methods without the use of yield.
+The code is under '#if TARGET_JVM' and is meant for the Grasshopper configuration.
+Ben &amp; Miguel - would you prefer having this patch as is (including the #if TARGET_J2EE) or
+is it acceptable that we will share the new code for Mono and remove the use of 'yield' from
+HttpApplication?
+Here is a brief description of the changes:
+   * RunHooks creates an instance of RunHooksEnumerator.
+       * RunHooksEnumerator is rather simple - it goes over the delegate invocation list
+ 	and processes each delegate (code taken from the original RunHooks).
+ 	If the ProcessDelegate returns true the enumerator MoveNext returns and the enumerator
+ 	Current value will be the app's stop_processing flag.
+   * Pipeline creates and instance of PipeLineEnumerator. PipeLineEnumerator is more complex.
+       * It main logic is to enumerate delegates through the RunHooks enumerator.
+       * I took the central parts of Pipeline and broke them into three methods
+ 	AllocateHandler, ProcessHandler &amp; ReleaseHandler. When these methods return true the
+ 	enumerator MoveNext stops and returns true.
+       * The scheduler of Pipeline is in FindNextDelegate which has a switch that lists
+ 	the delegates that the pipeline enumerates by their order.
+   * Tick didn't work as is in the TARGET_J2EE model. We don't manage our own thread pool for
+     ASP.Net (the J2EE servlet does this) and I replaced the 'if (pipeline.MoveNext ())'
+     with a 'while (pipeline.MoveNext ())'. I do not understand well enough how the Tick
+     ticks in Mono, especially where I see in Resume that it does not Tick if it's still
+     in the state of 'in_begin'.
+Any comments on the class design and correctness of this rewrite are more then welcome.
+If you can elaborate more about 'Tick' and how it works in Mono it will help me to understand
+where the TARGET_J2EE behaves differently and find the correct solution for this (I see the
+use of 'while' as hack).
+
+Eyal.
+-------------- next part --------------
+Index: System.Web/HttpApplication.cs
+
+===================================================================
+
+--- System.Web/HttpApplication.cs	(revision 49680)
+
++++ System.Web/HttpApplication.cs	(working copy)
+
+@@ -553,17 +553,33 @@
+
+ 		//
+ 		// Ticks the clock: next step on the pipeline.
+ 		//
++#if TARGET_J2EE
+ 		void Tick ()
+ 		{
+ 			try {
++				while (pipeline.MoveNext ()){
++					if ((bool)pipeline.Current) {
++						PipelineDone ();
++						break;
++					}
++				}
++			} catch (Exception e) {
++				Console.WriteLine (&quot;Tick caught an exception that has not been propagated:\n&quot; + e.GetType().FullName + e.Message + e.StackTrace);
++			}
++		}
++#else
++		void Tick ()
++		{
++			try {
+ 				if (pipeline.MoveNext ()){
+ 					if ((bool)pipeline.Current)
+ 						PipelineDone ();
+ 				}
+ 			} catch (Exception e) {
+-				Console.WriteLine (&quot;Tick caught an exception that has not been propagated:\n&quot; + e);
++				Console.WriteLine (&quot;Tick caught an exception that has not been propagated:\n&quot; + e.GetType().FullName + e.Message + e.StackTrace);
+ 			}
+ 		}
++#endif
+ 
+ 		void Resume ()
+ 		{
+@@ -602,14 +618,106 @@
+
+ 			
+ 			Resume ();
+ 		}
+-		
++
+ 		//
+ 		// This enumerator yields whether processing must be stopped:
+ 		//    true:  processing of the pipeline must be stopped
+ 		//    false: processing of the pipeline must not be stopped
+ 		//
++#if TARGET_JVM
++		internal class RunHooksEnumerator : IEnumerable, IEnumerator
++		{
++			Delegate [] delegates;
++			int currentStep = 0;
++			HttpApplication app;
++
++			internal RunHooksEnumerator(HttpApplication app, Delegate list)
++			{
++				this.app = app;
++				delegates = list.GetInvocationList ();
++			}
++
++			public virtual IEnumerator GetEnumerator() { return this; }
++			public virtual object Current { get{ return app.stop_processing; } }
++			public virtual void Reset()
++			{
++				throw new NotImplementedException(&quot;HttpApplication.RunHooksEnumerator.Reset called.&quot;);
++			}
++			public virtual bool MoveNext ()
++			{
++				while (currentStep &lt; delegates.Length) {
++					if (ProcessDelegate((EventHandler)delegates[currentStep++]))
++						return true;
++				}
++				return false;
++			}
++
++			bool ProcessDelegate(EventHandler d)
++			{
++				if (d.Target != null &amp;&amp; (d.Target is AsyncInvoker)){
++					app.current_ai = (AsyncInvoker) d.Target;
++
++					try {
++						app.must_yield = true;
++						app.in_begin = true;
++						app.context.BeginTimeoutPossible ();
++						app.current_ai.begin (app, EventArgs.Empty, new AsyncCallback(app.async_callback_completed_cb), app.current_ai.data);
++					}
++					catch (ThreadAbortException taex){
++						object obj = taex.ExceptionState;
++						Thread.ResetAbort ();
++						app.stop_processing = true;
++						if (obj is StepTimeout)
++							app.ProcessError (new HttpException (&quot;The request timed out.&quot;));
++					}
++					catch (Exception e){
++						app.ProcessError (e);
++					}
++					finally {
++						app.in_begin = false;
++						app.context.EndTimeoutPossible ();
++					}
++
++					//
++					// If things are still moving forward, yield this
++					// thread now
++					//
++					if (app.must_yield)
++						return true;
++					else if (app.stop_processing)
++						return true;
++				}
++				else {
++					try {
++						app.context.BeginTimeoutPossible ();
++						d (app, EventArgs.Empty);
++					} catch (ThreadAbortException taex){
++						object obj = taex.ExceptionState;
++						Thread.ResetAbort ();
++						app.stop_processing = true;
++						if (obj is StepTimeout)
++							app.ProcessError (new HttpException (&quot;The request timed out.&quot;));
++					}
++					catch (Exception e){
++						app.ProcessError (e);
++					}
++					finally {
++						app.context.EndTimeoutPossible ();
++					}
++					if (app.stop_processing)
++						return true;
++				}
++				return false;
++			}
++		}
++
+ 		IEnumerable RunHooks (Delegate list)
+ 		{
++			return new RunHooksEnumerator(this, list);
++		}
++#else
++		IEnumerable RunHooks (Delegate list)
++		{
+ 			Delegate [] delegates = list.GetInvocationList ();
+ 
+ 			foreach (EventHandler d in delegates){
+@@ -620,7 +728,7 @@
+
+ 						must_yield = true;
+ 						in_begin = true;
+ 						context.BeginTimeoutPossible ();
+-						current_ai.begin (this, EventArgs.Empty, async_callback_completed_cb, current_ai.data);
++						current_ai.begin (this, EventArgs.Empty, new AsyncCallback(async_callback_completed_cb), current_ai.data);
+ 					} catch (ThreadAbortException taex){
+ 						object obj = taex.ExceptionState;
+ 						Thread.ResetAbort ();
+@@ -662,6 +770,7 @@
+
+ 				}
+ 			}
+ 		}
++#endif
+ 
+ 		static void FinalErrorWrite (HttpResponse response, string error)
+ 		{
+@@ -756,6 +865,215 @@
+
+ 			PostDone ();
+ 		}
+ 
++#if TARGET_JVM
++		class PipeLineEnumerator : IEnumerator
++		{
++			HttpApplication app;
++			IEnumerator currentEnumerator = null;
++			int currentStep = 0;
++			bool pipelineFinished = false;
++			IHttpHandler handler = null;
++			bool currentVal;
++			InternalStepDelegate AllocateHandlerDel;
++			InternalStepDelegate ProcessHandlerDel;
++			InternalStepDelegate ReleaseHandlerDel;
++
++			// true means that we need to yield and return the current value;
++			// false means that we need to go on to the next delegate and return
++			// values from there.
++			delegate bool InternalStepDelegate();
++
++			internal PipeLineEnumerator(HttpApplication app)
++			{
++				this.app = app;
++				AllocateHandlerDel = new InternalStepDelegate(AllocateHandler);
++				ProcessHandlerDel = new InternalStepDelegate(ProcessHandler);
++				ReleaseHandlerDel = new InternalStepDelegate(ReleaseHandler);
++			}
++
++			public virtual object Current
++			{
++				get
++				{
++					if (currentEnumerator != null)
++						return currentEnumerator.Current;
++					return currentVal;
++				}
++			}
++
++			// See InternalStepDelegate for meaning of true/false return value
++			bool AllocateHandler()
++			{
++				// Obtain the handler for the request.
++				try {
++					handler = app.GetHandler (app.context);
++				}
++				catch (FileNotFoundException fnf){
++					if (app.context.Request.IsLocal)
++						app.ProcessError (new HttpException (404, String.Format (&quot;File not found {0}&quot;, fnf.FileName), fnf));
++					else
++						app.ProcessError (new HttpException (404, &quot;File not found&quot;, fnf));
++				} catch (DirectoryNotFoundException dnf){
++					app.ProcessError (new HttpException (404, &quot;Directory not found&quot;, dnf));
++				} catch (Exception e) {
++					app.ProcessError (e);
++				}
++
++				if (app.stop_processing) {
++					currentVal = false;
++					return true;
++				}
++				return false;
++			}
++
++			// See InternalStepDelegate for meaning of true/false return value
++			bool ProcessHandler()
++			{
++				//
++				// From this point on, we need to ensure that we call
++				// ReleaseRequestState, so the code below jumps to
++				// `release:' to guarantee it rather than yielding.
++				//
++				if (app.PreRequestHandlerExecute != null)
++					foreach (bool stop in app.RunHooks (app.PreRequestHandlerExecute))
++						if (stop)
++							return false;
++
++				try {
++					app.context.BeginTimeoutPossible ();
++					if (handler != null){
++						IHttpAsyncHandler async_handler = handler as IHttpAsyncHandler;
++					
++						if (async_handler != null){
++							app.must_yield = true;
++							app.in_begin = true;
++							async_handler.BeginProcessRequest (app.context, new AsyncCallback(app.async_handler_complete_cb), handler);
++						} else {
++							app.must_yield = false;
++							handler.ProcessRequest (app.context);
++						}
++					}
++				}
++				catch (ThreadAbortException taex){
++					object obj = taex.ExceptionState;
++					Thread.ResetAbort ();
++					app.stop_processing = true;
++					if (obj is StepTimeout)
++						app.ProcessError (new HttpException (&quot;The request timed out.&quot;));
++				}
++				catch (Exception e){
++					app.ProcessError (e);
++				}
++				finally {
++					app.in_begin = false;
++					app.context.EndTimeoutPossible ();
++				}
++				if (app.must_yield) {
++					currentVal = app.stop_processing;
++					return true;
++				}
++				else if (app.stop_processing)
++					return false;
++			
++				// These are executed after the application has returned
++				if (app.PostRequestHandlerExecute != null)
++					foreach (bool stop in app.RunHooks (app.PostRequestHandlerExecute))
++						if (stop)
++							return false;
++
++				return false;
++			}
++
++			// See InternalStepDelegate for meaning of true/false return value
++			bool ReleaseHandler()
++			{
++				if (app.ReleaseRequestState != null){
++					foreach (bool stop in app.RunHooks (app.ReleaseRequestState)){
++						//
++						// Ignore the stop signal while release the state
++						//
++					}
++				}
++
++				if (app.stop_processing) {
++					currentVal = true;
++					return true;
++				}
++				return false;
++			}
++
++			Delegate FindNextDelegate ()
++			{
++				switch(currentStep++) {
++					case  1: return app.BeginRequest;
++					case  2: return app.AuthenticateRequest;
++					case  3: return app.DefaultAuthentication;
++#if NET_2_0
++					case  4: return app.PostAuthenticateRequest;
++#endif
++					case  5: return app.AuthorizeRequest;
++#if NET_2_0
++					case  6: return app.PostAuthorizeRequest;
++#endif
++					case  7: return app.ResolveRequestCache;
++					case  8: return AllocateHandlerDel;
++#if NET_2_0
++					case  9: return app.PostResolveRequestCache;
++#endif
++#if NET_2_0
++					case 10: return app.PostMapRequestHandler;
++#endif
++					case 11: return app.AcquireRequestState;
++#if NET_2_0
++					case 12: return app.PostAcquireRequestState;
++#endif
++					case 13: return app.ResolveRequestCache;
++					case 14: return ProcessHandlerDel;
++					case 15: return ReleaseHandlerDel;
++#if NET_2_0
++					case 16: return app.PostReleaseRequestState;
++#endif
++					case 17: return app.UpdateRequestCache;
++#if NET_2_0
++					case 18: return app.PostUpdateRequestCache;
++#endif
++					case 19: pipelineFinished = true; return null;
++				}
++				return null;
++			}
++
++			public virtual bool MoveNext ()
++			{
++				while (!pipelineFinished) {
++					if (currentEnumerator != null &amp;&amp; currentEnumerator.MoveNext())
++						return true;
++					currentEnumerator = null;
++
++					Delegate d = FindNextDelegate();
++					InternalStepDelegate d1 = d as InternalStepDelegate;
++					if (d1 != null) {
++						if (d1())
++							return true;
++					}
++					else if (d != null)
++						currentEnumerator = app.RunHooks(d).GetEnumerator();
++				}
++
++				app.PipelineDone ();
++				return false;
++			}
++
++			public virtual void Reset()
++			{
++				throw new NotImplementedException(&quot;HttpApplication.PipelineEnumerator.Reset called.&quot;);
++			}
++		}
++
++		IEnumerator Pipeline ()
++		{
++			return new PipeLineEnumerator(this);
++		}
++#else
+ 		//
+ 		// Events fired as described in `Http Runtime Support, HttpModules,
+ 		// Handling Public Events'
+@@ -882,14 +1200,12 @@
+
+ 			
+ 		release:
+ 			if (ReleaseRequestState != null){
+-#pragma warning disable 168
+ 				foreach (bool stop in RunHooks (ReleaseRequestState)){
+ 					//
+ 					// Ignore the stop signal while release the state
+ 					//
+ 					
+ 				}
+-#pragma warning restore 168
+ 			}
+ 			
+ 			if (stop_processing)
+@@ -912,6 +1228,7 @@
+
+ #endif
+ 			PipelineDone ();
+ 		}
++#endif
+ 
+ 		void PreStart ()
+ 		{
+@@ -1016,12 +1333,15 @@
+
+ 			done.Reset ();
+ 			
+ 			begin_iar = new AsyncRequestState (done, cb, extraData);
+-
++#if TARGET_J2EE
++			Start (null);
++#else
+ 			if (Thread.CurrentThread.IsThreadPoolThread)
+ 				Start (null);
+ 			else
+ 				ThreadPool.QueueUserWorkItem (new WaitCallback (Start), null);
+-			
++#endif
++
+ 			return begin_iar;
+ 		}
+ 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014838.html">[Mono-dev] Re: [Mono-devel-list] System.Data : DataTable.Select	performance
+</A></li>
+	<LI>Next message: <A HREF="014938.html">[Mono-dev] Re: Patch for compiling HttpApplication for Grasshopper	(without use of yield)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14751">[ date ]</a>
+              <a href="thread.html#14751">[ thread ]</a>
+              <a href="subject.html#14751">[ subject ]</a>
+              <a href="author.html#14751">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

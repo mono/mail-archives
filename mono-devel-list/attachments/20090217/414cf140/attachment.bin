@@ -1,0 +1,323 @@
+Index: mono/metadata/ChangeLog
+===================================================================
+--- mono/metadata/ChangeLog	(revision 127036)
++++ mono/metadata/ChangeLog	(working copy)
+@@ -1,3 +1,16 @@
++2009-02-17  Scott Peterson  <lunchtimemama@gmail.com>
++
++	This adds runtime generic variance support for reference types.
++	This patch is contributed under the MIT/X11 license.
++
++	* class.c: Added mono_class_is_variant_of which determins if the second
++	class is a legal variant of the first. Added
++	mono_class_interface_offset_with_variance to look for interfaces in a
++	variance-aware fashion. Modified mono_class_is_assignable_from to use
++	mono_class_is_variant_of.
++
++	* class-internals.h: Added mono_class_interface_offset_with_variance.
++
+ 2009-02-16 Rodrigo Kumpera  <rkumpera@novell.com>
+ 
+ 	* loader.c (method_from_memberref): Don't abort if the array
+Index: mono/metadata/class-internals.h
+===================================================================
+--- mono/metadata/class-internals.h	(revision 127036)
++++ mono/metadata/class-internals.h	(working copy)
+@@ -407,6 +407,7 @@
+ 
+ #define MONO_CLASS_IMPLEMENTS_INTERFACE(k,uiid) (((uiid) <= (k)->max_interface_id) && ((k)->interface_bitmap [(uiid) >> 3] & (1 << ((uiid)&7))))
+ int mono_class_interface_offset (MonoClass *klass, MonoClass *itf);
++int mono_class_interface_offset_with_variance (MonoClass *klass, MonoClass *itf) MONO_INTERNAL;
+ 
+ typedef gpointer MonoRuntimeGenericContext;
+ 
+Index: mono/metadata/class.c
+===================================================================
+--- mono/metadata/class.c	(revision 127036)
++++ mono/metadata/class.c	(working copy)
+@@ -67,6 +67,7 @@
+ static void setup_generic_array_ifaces (MonoClass *class, MonoClass *iface, MonoMethod **methods, int pos);
+ 
+ static MonoMethod* mono_class_get_virtual_methods (MonoClass* klass, gpointer *iter);
++static gboolean mono_class_has_variant_generic_params (MonoClass *klass);
+ 
+ void (*mono_debugger_class_init_func) (MonoClass *klass) = NULL;
+ void (*mono_debugger_class_loaded_methods_func) (MonoClass *klass) = NULL;
+@@ -2124,6 +2125,36 @@
+ 	return (key->interface_id - element->interface_id);
+ }
+ 
++static gboolean
++mono_class_is_variant_of (MonoClass *klass, MonoClass *oklass) {
++	int i;
++	MonoClass *generic = klass->generic_class->container_class;
++	MonoClass *ogeneric = oklass->generic_class->container_class;
++	MonoGenericContainer *container = ogeneric->generic_container;
++
++	if (generic != vgeneric)
++		return FALSE;
++
++	for (i = 0; i < container->type_argc; i++) {
++		MonoClass *param_class = mono_class_from_mono_type (klass->generic_class->context.class_inst->type_argv [i]);
++		MonoClass *oparam_class = mono_class_from_mono_type (oklass->generic_class->context.class_inst->type_argv [i]);
++
++		// FIXME this is incorrect
++		if (param_class->valuetype || oparam_class->valuetype)
++			return FALSE;
++
++		if (container->type_params [i].flags & GENERIC_PARAMETER_ATTRIBUTE_VARIANCE_MASK) {
++			if ((container->type_params [i].flags & GENERIC_PARAMETER_ATTRIBUTE_CONTRAVARIANT) && !mono_class_is_assignable_from (param_class, oparam_class))
++				return FALSE;
++			if ((container->type_params [i].flags & GENERIC_PARAMETER_ATTRIBUTE_COVARIANT) && !mono_class_is_assignable_from (oparam_class, param_class))
++				return FALSE;
++		} else if (param_class != oparam_class)
++			return FALSE;
++	}
++
++	return TRUE;
++}
++
+ int
+ mono_class_interface_offset (MonoClass *klass, MonoClass *itf) {
+ 	MonoClass **result = bsearch (
+@@ -2139,6 +2170,21 @@
+ 	}
+ }
+ 
++int
++mono_class_interface_offset_with_variance (MonoClass *klass, MonoClass *itf) {
++	int i = mono_class_interface_offset (klass, itf);
++	if (i >= 0) {
++		return i;
++	} else if (mono_class_has_variant_generic_params (itf)) {
++		for (i = 0; i < klass->interface_offsets_count; i++) {
++			if (mono_class_is_variant_of (klass->interfaces_packed[i], itf)) {
++				return klass->interface_offsets_packed [i];
++			}
++		}
++	}
++	return -1;
++}
++
+ static void
+ print_implemented_interfaces (MonoClass *klass) {
+ 	GPtrArray *ifaces = NULL;
+@@ -5948,38 +5994,8 @@
+ 					if ((container_class2->interfaces_packed [i] == container_class1) || (container_class2->interfaces_packed [i]->generic_class && (container_class2->interfaces_packed [i]->generic_class->container_class == container_class1)))
+ 						match = TRUE;
+ 
+-				if (match) {
+-					MonoGenericContainer *container;
+-
+-					container = klass->generic_class->container_class->generic_container;
+-
+-					match = TRUE;
+-					for (i = 0; i < container->type_argc; ++i) {
+-						MonoClass *param1_class = mono_class_from_mono_type (klass->generic_class->context.class_inst->type_argv [i]);
+-						MonoClass *param2_class = mono_class_from_mono_type (oklass->generic_class->context.class_inst->type_argv [i]);
+-
+-						if (param1_class->valuetype != param2_class->valuetype) {
+-							match = FALSE;
+-							break;
+-						}
+-						/*
+-						 * The _VARIANT and _COVARIANT constants should read _COVARIANT and
+-						 * _CONTRAVARIANT, but they are in a public header so we can't fix it.
+-						 */
+-						if (param1_class != param2_class) {
+-							if ((container->type_params [i].flags & MONO_GEN_PARAM_VARIANT) && mono_class_is_assignable_from (param1_class, param2_class))
+-								;
+-							else if (((container->type_params [i].flags & MONO_GEN_PARAM_COVARIANT) && mono_class_is_assignable_from (param2_class, param1_class)))
+-								;
+-							else {
+-								match = FALSE;
+-								break;
+-							}
+-						}
+-					}
+-
+-					if (match)
+-						return TRUE;
++				if (match && mono_class_is_variant_of (klass, oklass)) {
++					return TRUE;
+ 				}
+ 			}
+ 		}
+Index: mono/mini/ChangeLog
+===================================================================
+--- mono/mini/ChangeLog	(revision 127036)
++++ mono/mini/ChangeLog	(working copy)
+@@ -1,3 +1,15 @@
++2009-02-17  Scott Peterson  <lunchtimemama@gmail.com>
++
++	Contributed under the MIT/X11 license.
++
++	* mini-trampolines.cs: Use the new
++	mono_class_interface_offset_with_variance method to find interface
++	offsets. This is nessisary because the callsite of variant interfaces
++	may be done through an interface which the target does not actual
++	implement, so we need to find the offset of the varaint interface.
++
++	* generics-variant-types.cs: Added C# variance test.
++
+ 2009-02-16  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* aot-compiler.c (compile_method): Only add wrappers referenced by
+Index: mono/mini/generics-variant-types.cs
+===================================================================
+--- mono/mini/generics-variant-types.cs	(revision 0)
++++ mono/mini/generics-variant-types.cs	(revision 0)
+@@ -0,0 +1,128 @@
++// Compiler options: -langversion:future
++
++interface ICovariant<out T> {
++	T Foo { get; }
++}
++
++interface IContravariant<in T> {
++	string Foo (T t);
++}
++
++interface IBothVariants <out T1, in T2> : ICovariant<T1>, IContravariant<T2>
++{
++}
++
++interface IInvariant <T> : ICovariant<T>, IContravariant<T>
++{
++}
++
++class Covariant : ICovariant<string> {
++	readonly string foo;
++	public Covariant (string foo) {
++		this.foo = foo;
++	}
++	public string Foo { get { return foo; } }
++}
++
++class Contravariant : IContravariant<object> {
++	public string Bar (object t) {
++		return t.GetType ().Name;
++	}
++}
++
++class BothVariants <T1, T2> : IBothVariants <T1, T2>
++{
++	public BothVariants (T1 foo)
++	{
++		Foo = foo;
++	}
++
++	public T1 Foo { get; private set; }
++
++	public string Foo (T2 f)
++	{
++		return f.GetType ().Name + Foo.GetType ().Name;
++	}
++}
++
++class Invariant <T> : IInvariant<T> where T : new()
++{
++	public T Foo { get { return new T (); } }
++
++	public string Foo (T f)
++	{
++		return f.GetType ().Name;
++	}
++}
++
++delegate T Covariant<out T> ();
++
++delegate int Contravariant<in T> (T t);
++
++class A
++{
++	public virtual string Fruit { get { return "Apple"; } }
++}
++
++class B : A
++{
++	public override string Fruit { get { return "Banana"; } }
++}
++
++class C : B
++{
++	public override string Fruit { get { return "Carrot which I know is not a fruit but you better shut up about it before I cut you"; } }
++}
++
++public class Test {
++	static int Main () {
++		string foo = "Who is John Galt?";
++		ICovariant<string> co1 = new Covariant(foo);
++		ICovariant<object> co2 = co1;
++		if (!co2.Bar.Equals (foo))
++			return 1;
++
++		co2 = new Covariant(bar);
++		if (co2.Bar != bar)
++			return 2;
++
++		ICovariant<object> contra1 = new Contravariant ();
++		ICovariant<string> contra2 = contra1;
++
++		if (contra2.Bar ("blah") != typeof (string).Name)
++			return 3;
++
++		contra2 = new Contravariant();
++		if (contra2.Bar ("blah") != typeof (string).Name)
++			return 4;
++
++		Covariant<string> co3 = delegate () { return foo; } }
++		Covariant<object> co4 = co3;
++		if (co4 ().GetHashCode () != foo.GetHashCode ())
++			return 5;
++
++		Contravariant<object> contra3 = delegate (object o) { return o.GetHashCode (); } }
++		Contravariant<string> contra4 = contra3;
++		if (contra4 (foo) != foo.GetHashCode ())
++			return 6;
++
++		var b = new B ();
++		var c = new C ();
++
++		IBothVariants<A, C> both = new BothVariants<B,B> (b);
++
++		if (both.Bar (c) != (b.GetHashCode () ^ c.GetHashCode ()))
++			return 7;
++
++		IInvariant<B> neither = new Invariant<B> ();
++		ICovariant<A> co3 = neither;
++		if (co3.Foo.Fruit != "Banana")
++			return 8;
++
++		IContravariant<C> contra5 = neither;
++		if (contra5.Bar (c) != "C")
++			return 9;
++
++		return 0;
++	}
++}
+Index: mono/mini/Makefile.am
+===================================================================
+--- mono/mini/Makefile.am	(revision 127036)
++++ mono/mini/Makefile.am	(working copy)
+@@ -287,6 +287,7 @@
+ 	test.cs			\
+ 	generics.cs		\
+ 	generics-variant-types.il\
++	generics-variant-types.cs\
+ 	basic-simd.cs
+ 
+ if MONO_DEBUGGER_SUPPORTED
+Index: mono/mini/mini-trampolines.c
+===================================================================
+--- mono/mini/mini-trampolines.c	(revision 127036)
++++ mono/mini/mini-trampolines.c	(working copy)
+@@ -60,7 +60,7 @@
+ 		int interface_offset;
+ 		int imt_slot = MONO_IMT_SIZE + displacement;
+ 
+-		interface_offset = mono_class_interface_offset (vt->klass, imt_method->klass);
++		interface_offset = mono_class_interface_offset_with_variance (vt->klass, imt_method->klass);
+ 
+ 		if (interface_offset < 0) {
+ 			g_print ("%s doesn't implement interface %s\n", mono_type_get_name_full (&vt->klass->byval_arg, 0), mono_type_get_name_full (&imt_method->klass->byval_arg, 0));

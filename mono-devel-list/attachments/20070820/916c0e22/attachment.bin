@@ -1,0 +1,457 @@
+Index: mono/mono/metadata/file-io.c
+===================================================================
+--- mono/mono/metadata/file-io.c	(revision 84466)
++++ mono/mono/metadata/file-io.c	(working copy)
+@@ -10,6 +10,11 @@
+  */
+ 
+ #include <config.h>
++
++#ifdef PLATFORM_WIN32
++#define _WIN32_WINNT 0x0500
++#endif
++
+ #include <glib.h>
+ #include <string.h>
+ #include <errno.h>
+@@ -384,6 +389,36 @@
+ }
+ 
+ MonoBoolean
++ves_icall_System_IO_MonoIO_ReplaceFile (MonoString *sourceFileName, MonoString *destinationFileName,
++					MonoString *destinationBackupFileName, MonoBoolean ignoreMetadataErrors,
++					gint32 *error)
++{
++	gboolean ret;
++	gunichar2 *utf16_sourceFileName = NULL, *utf16_destinationFileName = NULL, *utf16_destinationBackupFileName = NULL;
++	guint32 replaceFlags = REPLACEFILE_WRITE_THROUGH;
++
++	MONO_ARCH_SAVE_REGS;
++
++	if (sourceFileName)
++		utf16_sourceFileName = mono_string_chars (sourceFileName);
++	if (destinationFileName)
++		utf16_destinationFileName = mono_string_chars (destinationFileName);
++	if (destinationBackupFileName)
++		utf16_destinationBackupFileName = mono_string_chars (destinationBackupFileName);
++
++	*error = ERROR_SUCCESS;
++	if (ignoreMetadataErrors)
++		replaceFlags |= REPLACEFILE_IGNORE_MERGE_ERRORS;
++
++	ret = ReplaceFile (utf16_destinationFileName, utf16_sourceFileName, utf16_destinationBackupFileName,
++			 replaceFlags, NULL, NULL);
++	if (ret == FALSE)
++		*error = GetLastError ();
++
++	return ret;
++}
++
++MonoBoolean
+ ves_icall_System_IO_MonoIO_CopyFile (MonoString *path, MonoString *dest,
+ 				     MonoBoolean overwrite, gint32 *error)
+ {
+Index: mono/mono/metadata/file-io.h
+===================================================================
+--- mono/mono/metadata/file-io.h	(revision 84466)
++++ mono/mono/metadata/file-io.h	(working copy)
+@@ -230,6 +230,11 @@
+ extern void ves_icall_System_IO_MonoIO_Unlock (HANDLE handle, gint64 position,
+ 					       gint64 length, gint32 *error) MONO_INTERNAL;
+ 
++extern MonoBoolean
++ves_icall_System_IO_MonoIO_ReplaceFile (MonoString *sourceFileName, MonoString *destinationFileName,
++					MonoString *destinationBackupFileName, MonoBoolean ignoreMetadataErrors,
++					gint32 *error) MONO_INTERNAL;
++
+ G_END_DECLS
+ 
+ #endif /* _MONO_METADATA_FILEIO_H_ */
+Index: mono/mono/metadata/icall-def.h
+===================================================================
+--- mono/mono/metadata/icall-def.h	(revision 84466)
++++ mono/mono/metadata/icall-def.h	(working copy)
+@@ -271,6 +271,7 @@
+ ICALL(MONOIO_16, "Open(string,System.IO.FileMode,System.IO.FileAccess,System.IO.FileShare,System.IO.FileOptions,System.IO.MonoIOError&)", ves_icall_System_IO_MonoIO_Open)
+ ICALL(MONOIO_17, "Read(intptr,byte[],int,int,System.IO.MonoIOError&)", ves_icall_System_IO_MonoIO_Read)
+ ICALL(MONOIO_18, "RemoveDirectory(string,System.IO.MonoIOError&)", ves_icall_System_IO_MonoIO_RemoveDirectory)
++ICALL(MONOIO_18M, "ReplaceFile(string,string,string,bool,System.IO.MonoIOError&)", ves_icall_System_IO_MonoIO_ReplaceFile)
+ ICALL(MONOIO_19, "Seek(intptr,long,System.IO.SeekOrigin,System.IO.MonoIOError&)", ves_icall_System_IO_MonoIO_Seek)
+ ICALL(MONOIO_20, "SetCurrentDirectory(string,System.IO.MonoIOError&)", ves_icall_System_IO_MonoIO_SetCurrentDirectory)
+ ICALL(MONOIO_21, "SetFileAttributes(string,System.IO.FileAttributes,System.IO.MonoIOError&)", ves_icall_System_IO_MonoIO_SetFileAttributes)
+Index: mono/mono/io-layer/io.c
+===================================================================
+--- mono/mono/io-layer/io.c	(revision 84466)
++++ mono/mono/io-layer/io.c	(working copy)
+@@ -1835,6 +1835,56 @@
+ 	return(ret);
+ }
+ 
++gboolean
++write_file (int src_fd, int dest_fd, struct stat *st_src, gboolean report_errors)
++{
++	int remain, n;
++	char *buf, *wbuf;
++	int buf_size = st_src->st_blksize;
++
++	buf_size = buf_size < 8192 ? 8192 : (buf_size > 65536 ? 65536 : buf_size);
++	buf = (char *) malloc (buf_size);
++
++	for (;;) {
++		remain = read (src_fd, buf, buf_size);
++		if (remain < 0) {
++			if (errno == EINTR && !_wapi_thread_cur_apc_pending ())
++				continue;
++
++			if (report_errors)
++				_wapi_set_last_error_from_errno ();
++
++			free (buf);
++			return FALSE;
++		}
++		if (remain == 0) {
++			break;
++		}
++
++		wbuf = buf;
++		while (remain > 0) {
++			if ((n = write (dest_fd, wbuf, remain)) < 0) {
++				if (errno == EINTR && !_wapi_thread_cur_apc_pending ())
++					continue;
++
++				if (report_errors)
++					_wapi_set_last_error_from_errno ();
++#ifdef DEBUG
++				g_message ("%s: write failed.", __func__);
++#endif
++				free (buf);
++				return FALSE;
++			}
++
++			remain -= n;
++			wbuf += n;
++		}
++	}
++
++	free (buf);
++	return TRUE ;
++}
++
+ /**
+  * CopyFile:
+  * @name: a pointer to a NULL-terminated unicode string, that names
+@@ -1852,10 +1902,8 @@
+ {
+ 	gchar *utf8_src, *utf8_dest;
+ 	int src_fd, dest_fd;
+-	int buf_size;
+-	char *buf;
+-	int remain, n;
+ 	struct stat st;
++	gboolean ret = TRUE;
+ 	
+ 	if(name==NULL) {
+ #ifdef DEBUG
+@@ -1945,63 +1993,107 @@
+ 		g_free (utf8_src);
+ 		g_free (utf8_dest);
+ 		close (src_fd);
+-		
++
+ 		return(FALSE);
+ 	}
+-	
+-	buf_size = st.st_blksize;
+-	buf = (char *) alloca (buf_size);
+-	
+-	for (;;) {
+-		remain = read (src_fd, buf, buf_size);
+-		
+-		if (remain < 0) {
+-			if (errno == EINTR && !_wapi_thread_cur_apc_pending()) {
+-				continue;
+-			}
+-			
+-			_wapi_set_last_error_from_errno ();
+ 
+-			g_free (utf8_src);
+-			g_free (utf8_dest);
+-			close (src_fd);
+-			close (dest_fd);
+-			
+-			return(FALSE);
+-		}
+-		
+-		if (remain == 0) {
+-			break;
+-		}
++	if (!write_file (src_fd, dest_fd, &st, TRUE))
++		ret = FALSE;
+ 
+-		while (remain > 0) {
+-			if ((n = write (dest_fd, buf, remain)) < 0) {
+-				if (errno == EINTR && !_wapi_thread_cur_apc_pending())
+-					continue;
++	g_free (utf8_src);
++	g_free (utf8_dest);
++	close (src_fd);
++	close (dest_fd);
+ 
+-				_wapi_set_last_error_from_errno ();
++	return ret;
++}
++
++gchar*
++convert_arg_to_utf8 (const gunichar2 *arg, const gchar *arg_name)
++{
++	gchar *utf8_ret;
++
++	if (arg == NULL) {
+ #ifdef DEBUG
+-				g_message ("%s: write failed.", __func__);
++		g_message ("%s: %s is NULL", __func__, arg_name);
+ #endif
++		SetLastError (ERROR_INVALID_NAME);
++		return NULL;
++	}
+ 
+-				g_free (utf8_src);
+-				g_free (utf8_dest);
+-				close (src_fd);
+-				close (dest_fd);
++	utf8_ret = mono_unicode_to_external (arg);
++	if (utf8_ret == NULL) {
++#ifdef DEBUG
++		g_message ("%s: unicode conversion of %s returned NULL",
++			   __func__, arg_name);
++#endif
++		SetLastError (ERROR_INVALID_PARAMETER);
++		return NULL;
++	}
+ 
+-				return (FALSE);
++	return utf8_ret;
++}
++
++gboolean
++ReplaceFile (const gunichar2 *replacedFileName, const gunichar2 *replacementFileName,
++		      const gunichar2 *backupFileName, guint32 replaceFlags, 
++		      gpointer exclude, gpointer reserved)
++{
++	int result, errno_copy, backup_fd = -1,replaced_fd = -1;
++	gchar *utf8_replacedFileName, *utf8_replacementFileName = NULL, *utf8_backupFileName = NULL;
++	struct stat stBackup;
++	gboolean ret = FALSE;
++
++	if (!(utf8_replacedFileName = convert_arg_to_utf8 (replacedFileName, "replacedFileName")))
++		return FALSE;
++	if (!(utf8_replacementFileName = convert_arg_to_utf8 (replacementFileName, "replacementFileName")))
++		goto replace_cleanup;
++	if (backupFileName != NULL) {
++		if (!(utf8_backupFileName = convert_arg_to_utf8 (backupFileName, "backupFileName")))
++			goto replace_cleanup;
++	}
++
++	if (utf8_backupFileName) {
++		// Open the backup file for read so we can restore the file if an error occurs.
++		backup_fd = _wapi_open (utf8_backupFileName, O_RDONLY, 0);
++		result = _wapi_rename (utf8_replacedFileName, utf8_backupFileName);
++		errno_copy = errno;
++		if (result == -1)
++			goto replace_cleanup;
++	}
++
++	result = _wapi_rename (utf8_replacementFileName, utf8_replacedFileName);
++	errno_copy = errno;
++	if (result == -1) {
++		_wapi_set_last_path_error_from_errno (NULL, utf8_replacementFileName);
++		_wapi_rename (utf8_backupFileName, utf8_replacedFileName);
++		if (backup_fd != -1 && !fstat (backup_fd, &stBackup)) {
++			replaced_fd = open (utf8_backupFileName, O_WRONLY | O_CREAT | O_TRUNC,
++					     stBackup.st_mode);
++			if (replaced_fd == -1) {
++				replaced_fd = open (utf8_backupFileName, O_WRONLY | O_CREAT,
++					     stBackup.st_mode);
+ 			}
++			if (replaced_fd == -1)
++				goto replace_cleanup;
+ 
+-			remain -= n;
++			write_file (backup_fd, replaced_fd, &stBackup, FALSE);
+ 		}
++
++		goto replace_cleanup;
+ 	}
+ 
+-	g_free (utf8_src);
+-	g_free (utf8_dest);
+-	close (src_fd);
+-	close (dest_fd);
++	ret = TRUE;
+ 
+-	return(TRUE);
++replace_cleanup:
++	g_free (utf8_replacedFileName);
++	g_free (utf8_replacementFileName);
++	g_free (utf8_backupFileName);
++	if (backup_fd != -1)
++		close (backup_fd);
++	if (replaced_fd != -1)
++		close (replaced_fd);
++	return ret;
+ }
+ 
+ static gpointer stdhandle_create (int fd, const gchar *name)
+Index: mono/mono/io-layer/io.h
+===================================================================
+--- mono/mono/io-layer/io.h	(revision 84466)
++++ mono/mono/io-layer/io.h	(working copy)
+@@ -82,6 +82,9 @@
+ #define FILE_FLAG_OVERLAPPED			0x40000000
+ #define FILE_FLAG_WRITE_THROUGH			0x80000000
+ 
++#define REPLACEFILE_WRITE_THROUGH       0x00000001
++#define REPLACEFILE_IGNORE_MERGE_ERRORS 0x00000002
++
+ #define MAX_PATH	260
+ 
+ typedef enum {
+@@ -185,6 +188,9 @@
+ extern gboolean MoveFile (const gunichar2 *name, const gunichar2 *dest_name);
+ extern gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ 			  gboolean fail_if_exists);
++extern gboolean ReplaceFile (const gunichar2 *replacedFileName, const gunichar2 *replacementFileName,
++			     const gunichar2 *backupFileName, guint32 replaceFlags, 
++			     gpointer exclude, gpointer reserved);
+ extern guint32 GetFileAttributes (const gunichar2 *name);
+ extern gboolean GetFileAttributesEx (const gunichar2 *name,
+ 				     WapiGetFileExInfoLevels level,
+Index: mcs/class/corlib/Test/System.IO/FileTest.cs
+===================================================================
+--- mcs/class/corlib/Test/System.IO/FileTest.cs	(revision 84466)
++++ mcs/class/corlib/Test/System.IO/FileTest.cs	(working copy)
+@@ -1638,5 +1638,38 @@
+ 			if (File.Exists (path))
+ 				File.Delete (path);
+ 		}
++
++#if NET_2_0
++		[Test]
++		public void ReplaceTest ()
++		{
++			string tmp = Path.Combine (TempFolder, "ReplaceTest");
++			Directory.CreateDirectory (tmp);
++			string origFile = Path.Combine (tmp, "origFile");
++			string replaceFile = Path.Combine (tmp, "replaceFile");
++			string backupFile = Path.Combine (tmp, "backupFile");
++
++			using (StreamWriter sw = File.CreateText (origFile)) {
++				sw.WriteLine ("origFile");
++			}
++			using (StreamWriter sw = File.CreateText (replaceFile)) {
++				sw.WriteLine ("replaceFile");
++			}
++			using (StreamWriter sw = File.CreateText (backupFile)) {
++				sw.WriteLine ("backupFile");
++			}
++
++			File.Replace (origFile, replaceFile, backupFile);
++			Assertion.Assert ("origFile should not exists", !File.Exists (origFile));
++			using (StreamReader sr = File.OpenText (replaceFile)) {
++				string txt = sr.ReadLine ();
++				Assertion.AssertEquals ("#2", "origFile", txt);
++			}
++			using (StreamReader sr = File.OpenText (backupFile)) {
++				string txt = sr.ReadLine ();
++				Assertion.AssertEquals ("#3", "replaceFile", txt);
++			}
++		}
++#endif
+ 	}
+ }
+Index: mcs/class/corlib/System.IO/File.cs
+===================================================================
+--- mcs/class/corlib/System.IO/File.cs	(revision 84466)
++++ mcs/class/corlib/System.IO/File.cs	(working copy)
+@@ -399,7 +399,7 @@
+ 					    string destinationFileName,
+ 					    string destinationBackupFileName)
+ 		{
+-			throw new NotImplementedException ();
++			Replace (sourceFileName, destinationFileName, destinationBackupFileName, false);
+ 		}
+ 		
+ 		public static void Replace (string sourceFileName,
+@@ -407,7 +407,53 @@
+ 					    string destinationBackupFileName,
+ 					    bool ignoreMetadataErrors)
+ 		{
+-			throw new NotImplementedException ();
++			MonoIOError error;
++
++			if (sourceFileName == null)
++				throw new ArgumentNullException ("sourceFileName");
++			if (destinationFileName == null)
++				throw new ArgumentNullException ("destinationFileName");
++			if (sourceFileName.Trim () == "" || sourceFileName.IndexOfAny (Path.InvalidPathChars) != -1)
++				throw new ArgumentException ("sourceFileName");
++			if (destinationFileName.Trim () == "" || destinationFileName.IndexOfAny (Path.InvalidPathChars) != -1)
++				throw new ArgumentException ("destinationFileName");
++
++			string fullSource = Path.GetFullPath (sourceFileName);
++			string fullDest = Path.GetFullPath (destinationFileName);
++			if (MonoIO.ExistsDirectory (fullSource, out error))
++				throw new IOException (Locale.GetText ("{0} is a directory", sourceFileName));
++			if (MonoIO.ExistsDirectory (fullDest, out error))
++				throw new IOException (Locale.GetText ("{0} is a directory", destinationFileName));
++
++			if (!Exists (fullSource))
++				throw new FileNotFoundException (Locale.GetText ("{0} does not exist", sourceFileName), 
++								 sourceFileName);
++			if (!Exists (fullDest))
++				throw new FileNotFoundException (Locale.GetText ("{0} does not exist", destinationFileName), 
++								 destinationFileName);
++			if (fullSource == fullDest) 
++				throw new IOException (Locale.GetText ("Source and destination arguments are the same file."));
++
++			string fullBackup = null;
++			if (destinationBackupFileName != null) {
++				if (destinationBackupFileName.Trim () == "" || 
++				    destinationBackupFileName.IndexOfAny (Path.InvalidPathChars) != -1)
++					throw new ArgumentException ("destinationBackupFileName");
++
++				fullBackup = Path.GetFullPath (destinationBackupFileName);
++				if (MonoIO.ExistsDirectory (fullBackup, out error))
++					throw new IOException (Locale.GetText ("{0} is a directory", destinationBackupFileName));
++				if (fullSource == fullBackup)
++					throw new IOException (Locale.GetText ("Source and backup arguments are the same file."));
++				if (fullDest == fullBackup)
++					throw new IOException (Locale.GetText (
++							       "Destination and backup arguments are the same file."));
++			}
++
++			if (!MonoIO.ReplaceFile (fullSource, fullDest, fullBackup, 
++						 ignoreMetadataErrors, out error)) {
++				throw MonoIO.GetException (error);
++			}
+ 		}
+ 		
+ 		public static void SetAccessControl (string path,
+Index: mcs/class/corlib/System.IO/MonoIO.cs
+===================================================================
+--- mcs/class/corlib/System.IO/MonoIO.cs	(revision 84466)
++++ mcs/class/corlib/System.IO/MonoIO.cs	(working copy)
+@@ -178,6 +178,13 @@
+ 						      out MonoIOError error);
+ 
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall)]
++		public extern static bool ReplaceFile (string sourceFileName, 
++						       string destinationFileName, 
++						       string destinationBackupFileName, 
++						       bool ignoreMetadataErrors,
++						       out MonoIOError error);
++
++		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+ 		public extern static FileAttributes GetFileAttributes (string path, out MonoIOError error);
+ 
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall)]

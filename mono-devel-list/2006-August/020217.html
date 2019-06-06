@@ -1,0 +1,212 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Announce: Mono.Fuse (+ Required Mono.Posix Changes)
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Announce%3A%20Mono.Fuse%20%28%2B%20Required%20Mono.Posix%20Changes%29&In-Reply-To=20060830160755.GU7835%40debian.org">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020197.html">
+   <LINK REL="Next"  HREF="020218.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Announce: Mono.Fuse (+ Required Mono.Posix Changes)</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Announce%3A%20Mono.Fuse%20%28%2B%20Required%20Mono.Posix%20Changes%29&In-Reply-To=20060830160755.GU7835%40debian.org"
+       TITLE="[Mono-dev] Announce: Mono.Fuse (+ Required Mono.Posix Changes)">jonpryor at vt.edu
+       </A><BR>
+    <I>Wed Aug 30 21:51:34 EDT 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020197.html">[Mono-dev] Announce: Mono.Fuse (+ Required Mono.Posix Changes)
+</A></li>
+        <LI>Next message: <A HREF="020218.html">[Mono-dev] Announce: Mono.Fuse (+ Required Mono.Posix Changes)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20217">[ date ]</a>
+              <a href="thread.html#20217">[ thread ]</a>
+              <a href="subject.html#20217">[ subject ]</a>
+              <a href="author.html#20217">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Wed, 2006-08-30 at 18:07 +0200, Paolo Molaro wrote:
+&gt;<i> &gt; The biggest problem with the mono module is that no headers are
+</I>&gt;<i> &gt; installed, making it difficult to make use of libMonoPosixHelper.so.
+</I>&gt;<i> 
+</I>&gt;<i> This is for a good reason. libMonoPosixHelper.so is an internal
+</I>&gt;<i> implementation detail, it is not a good library to export for a million
+</I>&gt;<i> reasons and no header should be installed for it. It would be a
+</I>&gt;<i> compatibility nightmare.
+</I>
+I'm not entirely sure I see the &quot;compatibility nightmare.&quot;  Nor do I see
+the &quot;million reasons.&quot;  The only reasons I can think of is that there
+are some symbols which should be removed (e.g. the old Mono.Posix
+namespace functions such as &quot;wifexited&quot; and &quot;helper_Mono_Posix_Stat&quot;).
+
+Regardless, here's the scenario I'm trying to solve: MonoFuseHelper is a
+C library which has functions which register with FUSE.  The
+MonoFuseHelper functions invoke delegates registered by Mono.Fuse.dll,
+e.g.
+
+	/* Within MonoFuseHelper */
+	static int
+	mfh_getattr (const char *path, struct stat *stat)
+	{
+		/* invoke delegate registered by Mono.Fuse.dll */
+		return _mfh_get_private_data()-&gt;getattr (path, 
+			what_to_pass_here?);
+	}
+
+The question is this: what should MonoFuseHelper pass to Mono.Fuse.dll?
+There are two answers:
+
+(1) Translate the native types into the managed types within
+MonoFuseHelper, then invoke the Mono.Fuse.dll callback:
+
+	/* stat(2) */
+	static int
+	mfh_getattr (const char *path, struct stat *stat)
+	{
+		struct Mono_Posix_Stat _stat;
+		Mono_Posix_ToStat (stat, &amp;_stat);
+		int r= _mfh_get_private_data()-&gt;getattr (path, &amp;_stat);
+		Mono_Posix_FromErrno (r, &amp;r);
+		return -r;
+	}
+
+(The Errno translation &amp; negation is because FUSE methods need to return
+-errno on error.)
+
+Pro:
+  - Requires fewer P/Invoke transitions, as all type conversions are 
+    done in native code before invoking managed code (calling into 
+    MonoPosixHelper).
+  - More efficient (due to above).
+
+Con:
+  - Requires that MonoPosixHelper headers be installed so that the
+    Mono.Posix types &amp; functions are accessible.
+
+(2) Don't translate in native code, but just forward them to managed
+code for translation within Mono.Fuse.dll:
+
+	/* stat(2) */
+	static int
+	mfh_getattr (const char *path, struct stat *stat)
+	{
+		return _mfh_get_private_data()-&gt;getattr (path, stat);
+	}
+
+Managed code must then do everything:
+
+	private static int _OnGetFileAttributes (string path, IntPtr b)
+	{
+		Stat s;
+		NativeConvert.Copy (b, out s);
+		Errno e = OnGetFileAttributes (path, out s);
+		return - NativeConvert.FromErrno (e);
+	}
+
+Pro:
+  - Doesn't require installing any headers for MonoPosixHelper.
+
+Con:
+  - Requires more P/Invoke transitions.
+    - One P/Invoke transition to call NativeConvert.FromErrno
+      (done for each delegate invoked).
+    - One P/Invoke transition for each parameter that needs to
+      be converted (e.g. converting the IntPtr into a Stat, above).
+  - Requires adding several new methods to 
+    Mono.Unix.Native.NativeConvert to copy structures between managed
+    and native (e.g. the NativeConvert.Copy() method used above).
+
+I implemented solution (1) for efficiency reasons -- why invoke extra
+P/Invoke calls when they can be avoided?
+
+So I implemented (2) for comparison.  The result: to copy a 100000000
+byte file using `cat':
+
+	            Average Copy Time
+	Solution 1:  4.8362s
+	Solution 2:  4.8613s
+
+Since FUSE reads file contents in 4KB chunks, there is an average
+overhead of .25us/call using (2).
+
+So my efficiency concerns are likely overblown, and doing everything
+from managed code will have acceptable performance.
+
+&gt;<i> &gt; mono-config.h is necessary because it needs to contain
+</I>&gt;<i> &gt; platform-specific macros.  In particular, Linux needs:
+</I>&gt;<i> 
+</I>&gt;<i> Sorry, but there is no way to grab the mono-config.h name for this.
+</I>
+I'm sorry, but I don't understand this comment.
+
+&gt;<i> &gt; There are two major changes:
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt;   * The addition of one public attributes to the API:
+</I>&gt;<i> \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\&gt; 
+</I>&gt;<i> &gt;     // targets Class, Delegate, Enum, Field, Struct
+</I>&gt;<i> &gt;     class Mono.Unix.Native.MapAttribute {
+</I>&gt;<i> &gt;       public MapAttribute ();
+</I>&gt;<i> &gt;       public MapAttribute (string nativeType);
+</I>&gt;<i> &gt;       public string NativeType {get;}
+</I>&gt;<i> &gt;       public string NativeSymbolPrefix {get; set;}
+</I>&gt;<i> &gt;     }
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt;   * A major revamp to make-map.exe
+</I>&gt;<i> 
+</I>&gt;<i> I don't think these changes are appropriate for mcs/. The Map attribute
+</I>&gt;<i> and make-map.exe are hacks that are tolerated only because they are used
+</I>&gt;<i> only internally. Exposing them for public use would only create
+</I>&gt;<i> comaptibility issues: they are not tools that can be maintained with the
+</I>&gt;<i> needed API and ABI stability required by a mono release.
+</I>
+I'm still not sure I see the compatibility issues.
+
+Regardless, it sounds like you don't want MapAttribute to be a public
+API in any way, and would prefer copy+pasting code between any projects
+that want to make use of the make-map.exe mechanism.
+
+I'm not entirely fond of extra copy+pasting if not necessary...
+
+So a question/proposal: could we make make-map.exe/create-native-map
+follow the &quot;Applications Guidelines&quot; for an unstable API to copy
+create-native-map.exe itself and a .cs file for use within that
+application?
+
+Thus, instead of Mono.Posix.dll exporting a public attribute, we have an
+easier way for people to make use of create-native-map without them
+needing to copy the existing source code (they can instead copy an
+existing binary &amp; update as needed).
+
+Thanks,
+ - Jon
+
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020197.html">[Mono-dev] Announce: Mono.Fuse (+ Required Mono.Posix Changes)
+</A></li>
+	<LI>Next message: <A HREF="020218.html">[Mono-dev] Announce: Mono.Fuse (+ Required Mono.Posix Changes)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20217">[ date ]</a>
+              <a href="thread.html#20217">[ thread ]</a>
+              <a href="subject.html#20217">[ subject ]</a>
+              <a href="author.html#20217">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,226 @@
+Index: configure.in
+===================================================================
+--- configure.in	(revision 73955)
++++ configure.in	(working copy)
+@@ -70,7 +70,7 @@
+ 			export CC
+ 		fi
+ 		HOST_CC="gcc"
+-		CPPFLAGS="$CPPFLAGS -DWIN32_THREADS -DFD_SETSIZE=1024"
++		CPPFLAGS="$CPPFLAGS -DWIN32_THREADS -DFD_SETSIZE=1024 -DUNICODE -D_UNICODE"
+ 		libmono_cflags="-mno-cygwin"
+ 		libmono_ldflags="-mno-cygwin"
+ 		libdl=
+Index: mono/metadata/appdomain.c
+===================================================================
+--- mono/metadata/appdomain.c	(revision 73955)
++++ mono/metadata/appdomain.c	(working copy)
+@@ -37,6 +37,9 @@
+ #include <mono/utils/mono-logger.h>
+ #include <mono/utils/mono-path.h>
+ #include <mono/utils/mono-stdlib.h>
++#ifdef PLATFORM_WIN32
++#include <direct.h>
++#endif
+ 
+ #define MONO_CORLIB_VERSION 54
+ 
+@@ -851,8 +854,8 @@
+ 	
+ 	hash = get_cstring_hash (bname);
+ 	hash2 = get_cstring_hash (g_path_get_dirname (filename));
+-	snprintf (name_hash, sizeof (name_hash), "%08x", hash);
+-	snprintf (path_hash, sizeof (path_hash), "%08x_%08x", hash ^ hash2, hash2);
++	g_snprintf (name_hash, sizeof (name_hash), "%08x", hash);
++	g_snprintf (path_hash, sizeof (path_hash), "%08x_%08x", hash ^ hash2, hash2);
+ 	return g_build_filename (mono_string_to_utf8 (domain->setup->dynamic_base), 
+ 				 "assembly", 
+ 				 "shadow", 
+@@ -865,6 +868,56 @@
+ static gboolean
+ ensure_directory_exists (const char *filename)
+ {
++#ifdef PLATFORM_WIN32
++	gchar *dir_utf8 = g_path_get_dirname (filename);
++	gunichar2 *p;
++	gunichar2 *dir_utf16 = NULL;
++	int retval;
++	
++	if (!dir_utf8 || !dir_utf8 [0])
++		return FALSE;
++
++	dir_utf16 = g_utf8_to_utf16 (dir_utf8, strlen (dir_utf8), NULL, NULL, NULL);
++	g_free (dir_utf8);
++
++	if (!dir_utf16)
++		return FALSE;
++
++	p = dir_utf16;
++
++	/* make life easy and only use one directory seperator */
++	while (*p != '\0')
++	{
++		if (*p == '/')
++			*p = '\\';
++		p++;
++	}
++
++	p = dir_utf16;
++
++	/* get past C:\ )*/
++	while (*p++ != '\\')	
++	{
++	}
++
++	while (1) {
++		BOOL bRet = FALSE;
++		p = wcschr (p, '\\');
++		if (p)
++			*p = '\0';
++		retval = _wmkdir (dir_utf16);
++		if (retval != 0 && errno != EEXIST) {
++			g_free (dir_utf16);
++			return FALSE;
++		}
++		if (!p)
++			break;
++		*p++ = '\\';
++	}
++	
++	g_free (dir_utf16);
++	return TRUE;
++#else
+ 	char *p;
+ 	gchar *dir = g_path_get_dirname (filename);
+ 	int retval;
+@@ -880,11 +933,7 @@
+ 		p = strchr (p, '/');
+ 		if (p)
+ 			*p = '\0';
+-#ifdef PLATFORM_WIN32
+-		retval = mkdir (dir);
+-#else
+ 		retval = mkdir (dir, 0777);
+-#endif
+ 		if (retval != 0 && errno != EEXIST) {
+ 			g_free (dir);
+ 			return FALSE;
+@@ -896,6 +945,7 @@
+ 	
+ 	g_free (dir);
+ 	return TRUE;
++#endif
+ }
+ 
+ static char *
+Index: mono/metadata/ChangeLog
+===================================================================
+--- mono/metadata/ChangeLog	(revision 73955)
++++ mono/metadata/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2007-03-08  Jonathan Chambers  <joncham@gmail.com>
++
++	* appdomain.c:  Fix shadow copy on Windows.
++        
+ 2007-03-06  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* metadata.c (mono_type_to_unmanaged): Only convert object to
+Index: mono/io-layer/ChangeLog
+===================================================================
+--- mono/io-layer/ChangeLog	(revision 73955)
++++ mono/io-layer/ChangeLog	(working copy)
+@@ -1,4 +1,8 @@
++2007-03-08  Jonathan Chambers  <joncham@gmail.com>
+ 
++	* io-layer.h:  Remove UNICODE and _UNICODE defines as 
++        these are done by configure.in now.
++        
+ Thu Mar 8 19:42:17 CET 2007 Paolo Molaro <lupus@ximian.com>
+ 
+ 	* shared.c: partial support for MONO_DISABLE_SHM env var.
+Index: mono/io-layer/io-layer.h
+===================================================================
+--- mono/io-layer/io-layer.h	(revision 73955)
++++ mono/io-layer/io-layer.h	(working copy)
+@@ -13,8 +13,6 @@
+ 
+ #if defined(__WIN32__)
+ /* Native win32 */
+-#define UNICODE
+-#define _UNICODE
+ #define __USE_W32_SOCKETS
+ #include <winsock2.h>
+ #include <windows.h>
+Index: mono/utils/mono-dl.c
+===================================================================
+--- mono/utils/mono-dl.c	(revision 73955)
++++ mono/utils/mono-dl.c	(working copy)
+@@ -32,7 +32,7 @@
+ #include <psapi.h>
+ 
+ #define SO_HANDLE_TYPE HMODULE
+-#define LL_SO_OPEN(file,flags) (file)? LoadLibrary ((file)): GetModuleHandle (NULL)
++#define LL_SO_OPEN(file,flags) w32_load_module ((file), (flags))
+ #define LL_SO_CLOSE(module) do { if (!(module)->main_module) FreeLibrary ((module)->handle); } while (0)
+ #define LL_SO_SYMBOL(module, name) w32_find_symbol ((module), (name))
+ #define LL_SO_TRFLAGS(flags) 0
+@@ -86,15 +86,16 @@
+ static char*
+ w32_dlerror (void)
+ {
+-	char* ret;
+-	TCHAR* buf = NULL;
++	char* ret = NULL;
++	wchar_t* buf = NULL;
+ 	DWORD code = GetLastError ();
+ 
+-	FormatMessage (FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER, NULL,
+-		code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf, 0, NULL);
+-
+-	ret = g_strdup (buf);
+-	LocalFree (buf);
++	if (FormatMessage (FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER, NULL,
++		code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf, 0, NULL))
++	{
++		ret = g_utf16_to_utf8 (buf, wcslen(buf), NULL, NULL, NULL);
++		LocalFree (buf);
++	}
+ 	return ret;
+ }
+ 
+@@ -155,6 +156,23 @@
+ 	return NULL;
+ }
+ 
++
++static gpointer
++w32_load_module (const char* file, int flags)
++{
++	gpointer hModule = NULL;
++	if (file)
++	{
++		gunichar2* file_utf16 = g_utf8_to_utf16 (file, strlen (file), NULL, NULL, NULL);
++		hModule = LoadLibrary (file_utf16);
++		g_free (file_utf16);
++	}
++	else
++	{
++		hModule = GetModuleHandle (NULL);
++	}
++	return hModule;
++}
+ #endif
+ 
+ /*
+Index: mono/utils/ChangeLog
+===================================================================
+--- mono/utils/ChangeLog	(revision 73955)
++++ mono/utils/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2007-03-08  Jonathan Chambers  <joncham@gmail.com>
++
++	* io-layer.h:  Use Unicode characters for Win32 functions.
++        
+ 2007-01-26  Robert Jordan  <robertj@gmx.net>
+ 
+ 	* mono-dl.c (w32_find_symbol): Implement in-proc symbol lookup

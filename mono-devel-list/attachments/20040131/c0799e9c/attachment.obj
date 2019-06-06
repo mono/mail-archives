@@ -1,0 +1,150 @@
+Index: debug-mono-symfile.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/debug-mono-symfile.h,v
+retrieving revision 1.52
+diff -u -3 -p -r1.52 debug-mono-symfile.h
+--- debug-mono-symfile.h	16 Jan 2004 16:31:58 -0000	1.52
++++ debug-mono-symfile.h	31 Jan 2004 17:43:30 -0000
+@@ -119,7 +119,7 @@ struct _MonoSymbolFile {
+ };
+ 
+ #define MONO_SYMBOL_FILE_VERSION		36
+-#define MONO_SYMBOL_FILE_MAGIC			0x45e82623fd7fa614
++#define MONO_SYMBOL_FILE_MAGIC			0x45e82623fd7fa614ULL
+ 
+ MonoSymbolFile *
+ mono_debug_open_mono_symbol_file   (MonoDebugHandle           *handle,
+@@ -139,7 +139,7 @@ _mono_debug_address_from_il_offset (Mono
+ 				    guint32                   il_offset);
+ 
+ MonoDebugMethodInfo *
+-mono_debug_find_method             (MonoSymbolFile           *symfile,
++mono_debug_find_method             (MonoDebugHandle           *handle,
+ 				    MonoMethod               *method);
+ 
+ #endif /* __MONO_SYMFILE_H__ */
+Index: debug-mono-symfile.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/debug-mono-symfile.c,v
+retrieving revision 1.55
+diff -u -3 -p -r1.55 debug-mono-symfile.c
+--- debug-mono-symfile.c	12 Nov 2003 13:15:34 -0000	1.55
++++ debug-mono-symfile.c	31 Jan 2004 17:43:30 -0000
+@@ -44,12 +44,9 @@ get_class_name (MonoClass *klass)
+ static int
+ load_symfile (MonoDebugHandle *handle, MonoSymbolFile *symfile)
+ {
+-	MonoSymbolFileMethodEntry *me;
+-	MonoSymbolFileMethodIndexEntry *ie;
+ 	const char *ptr, *start;
+ 	guint64 magic;
+ 	long version;
+-	int i;
+ 
+ 	ptr = start = symfile->raw_contents;
+ 	if (!ptr)
+@@ -58,7 +55,7 @@ load_symfile (MonoDebugHandle *handle, M
+ 	magic = *((guint64 *) ptr);
+ 	ptr += sizeof(guint64);
+ 	if (magic != MONO_SYMBOL_FILE_MAGIC) {
+-		g_warning ("Symbol file %s has is not a mono symbol file", handle->image_file);
++		g_warning ("Symbol file %s is not a mono symbol file", handle->image_file);
+ 		return FALSE;
+ 	}
+ 
+@@ -73,40 +70,9 @@ load_symfile (MonoDebugHandle *handle, M
+ 
+ 	symfile->offset_table = (MonoSymbolFileOffsetTable *) ptr;
+ 
+-	/*
+-	 * Read method table.
+-	 *
+-	 */
+-
+ 	symfile->method_hash = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL,
+ 							     (GDestroyNotify) free_method_info);
+ 
+-	ie = (MonoSymbolFileMethodIndexEntry *)
+-		(symfile->raw_contents + symfile->offset_table->method_table_offset);
+-
+-	for (i = 0; i < symfile->offset_table->method_count; i++, me++, ie++) {
+-		MonoMethod *method;
+-		MonoDebugMethodInfo *minfo;
+-
+-		me = (MonoSymbolFileMethodEntry *) (symfile->raw_contents + ie->file_offset);
+-
+-		method = mono_get_method (handle->image, me->token, NULL);
+-
+-		if (!method)
+-			continue;
+-
+-		minfo = g_new0 (MonoDebugMethodInfo, 1);
+-		minfo->index = i + 1;
+-		minfo->method = method;
+-		minfo->handle = handle;
+-		minfo->num_il_offsets = me->num_line_numbers;
+-		minfo->il_offsets = (MonoSymbolFileLineNumberEntry *)
+-			(symfile->raw_contents + me->line_number_table_offset);
+-		minfo->entry = me;
+-
+-		g_hash_table_insert (symfile->method_hash, method, minfo);
+-	}
+-
+ 	return TRUE;
+ }
+ 
+@@ -239,11 +205,51 @@ _mono_debug_address_from_il_offset (Mono
+ 	return -1;
+ }
+ 
++static int
++compare_method (const void *key, const void *object)
++{
++	guint32 token = GPOINTER_TO_UINT (key);
++	MonoSymbolFileMethodIndexEntry *me = (MonoSymbolFileMethodIndexEntry*)object;
++
++	return token - me->token;
++}
++
+ MonoDebugMethodInfo *
+-mono_debug_find_method (MonoSymbolFile *symfile, MonoMethod *method)
++mono_debug_find_method (MonoDebugHandle *handle, MonoMethod *method)
+ {
++	MonoSymbolFileMethodEntry *me;
++	MonoSymbolFileMethodIndexEntry *first_ie, *ie;
++	MonoDebugMethodInfo *minfo;
++	MonoSymbolFile *symfile = handle->symfile;
++
+ 	if (!symfile->method_hash)
+ 		return NULL;
+-	else
+-		return g_hash_table_lookup (symfile->method_hash, method);
++
++	if (handle->image != method->klass->image)
++		return NULL;
++
++	first_ie = (MonoSymbolFileMethodIndexEntry *)
++		(symfile->raw_contents + symfile->offset_table->method_table_offset);
++
++	ie = bsearch (GUINT_TO_POINTER (method->token), first_ie,
++				   symfile->offset_table->method_count,
++				   sizeof (MonoSymbolFileMethodIndexEntry), compare_method);
++
++	if (!ie)
++		return NULL;
++
++	me = (MonoSymbolFileMethodEntry *) (symfile->raw_contents + ie->file_offset);
++
++	minfo = g_new0 (MonoDebugMethodInfo, 1);
++	minfo->index = (ie - first_ie) + 1;
++	minfo->method = method;
++	minfo->handle = handle;
++	minfo->num_il_offsets = me->num_line_numbers;
++	minfo->il_offsets = (MonoSymbolFileLineNumberEntry *)
++		(symfile->raw_contents + me->line_number_table_offset);
++	minfo->entry = me;
++
++	g_hash_table_insert (symfile->method_hash, method, minfo);
++
++	return minfo;
+ }

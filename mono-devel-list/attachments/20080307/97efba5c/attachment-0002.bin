@@ -1,0 +1,138 @@
+Index: mono/metadata/object-internals.h
+===================================================================
+--- mono/metadata/object-internals.h	(revision 97635)
++++ mono/metadata/object-internals.h	(working copy)
+@@ -1004,6 +1004,15 @@
+ } MonoReflectionGuidAttribute;
+ 
+ typedef struct {
++    MonoObject object;
++    MonoArray *code;
++    gint32 code_len;
++    gint32 max_stack;
++    MonoArray *exceptions;
++    MonoArray *localsig;
++} MonoReflectionDynamicILInfo;
++
++typedef struct {
+ 	MonoObject object;
+ 	MonoMethod *mhandle;
+ 	MonoString *name;
+@@ -1019,8 +1028,10 @@
+ 	MonoArray *refs;
+ 	GSList *referenced_by;
+ 	MonoReflectionType *owner;
++    MonoReflectionDynamicILInfo *dynil;
+ } MonoReflectionDynamicMethod;	
+ 
++
+ typedef struct {
+ 	MonoObject object;
+ 	MonoReflectionModuleBuilder *module;
+Index: mono/metadata/reflection.c
+===================================================================
+--- mono/metadata/reflection.c	(revision 97635)
++++ mono/metadata/reflection.c	(working copy)
+@@ -75,6 +75,7 @@
+ 	/* for PInvoke */
+ 	int charset, extra_flags, native_cc;
+ 	MonoString *dll, *dllentry;
++	MonoReflectionDynamicILInfo *dynil;
+ } ReflectionMethodBuilder;
+ 
+ typedef struct {
+@@ -1454,7 +1455,7 @@
+ 	rmb->attrs = mb->attrs;
+ 	rmb->iattrs = 0;
+ 	rmb->call_conv = mb->call_conv;
+-	rmb->code = NULL;
++    rmb->code = NULL;
+ 	rmb->type = (MonoObject *) mb->owner;
+ 	rmb->name = mb->name;
+ 	rmb->table_idx = NULL;
+@@ -1468,6 +1469,7 @@
+ 	rmb->mhandle = mb->mhandle;
+ 	rmb->nrefs = 0;
+ 	rmb->refs = NULL;
++	rmb->dynil = mb->dynil;
+ }	
+ 
+ static void
+@@ -8682,6 +8684,16 @@
+ 			num_locals = rmb->ilgen->locals ? mono_array_length (rmb->ilgen->locals) : 0;
+ 			if (rmb->ilgen->ex_handlers)
+ 				num_clauses = method_count_clauses (rmb->ilgen);
++		} else if (rmb->dynil) {
++			char *ptr = mono_array_addr (rmb->dynil->localsig, guint8, 0);
++			code = mono_array_addr (rmb->dynil->code, guint8, 0);
++			code_size = rmb->dynil->code_len;
++			max_stack = rmb->dynil->max_stack;
++			if (*ptr == 0x07)
++			{
++				ptr++;
++				num_locals = mono_metadata_decode_value (ptr, &ptr);
++			}
+ 		} else {
+ 			if (rmb->code) {
+ 				code = mono_array_addr (rmb->code, guint8, 0);
+@@ -8705,20 +8717,38 @@
+ 		header->init_locals = rmb->init_locals;
+ 		header->num_locals = num_locals;
+ 
+-		for (i = 0; i < num_locals; ++i) {
+-			MonoReflectionLocalBuilder *lb = 
+-				mono_array_get (rmb->ilgen->locals, MonoReflectionLocalBuilder*, i);
++		if (rmb->ilgen)
++		{
++			for (i = 0; i < num_locals; ++i) {
++				MonoReflectionLocalBuilder *lb = 
++					mono_array_get (rmb->ilgen->locals, MonoReflectionLocalBuilder*, i);
+ 
+-			header->locals [i] = mp_g_new0 (mp, MonoType, 1);
+-			memcpy (header->locals [i], lb->type->type, sizeof (MonoType));
++				header->locals [i] = mp_g_new0 (mp, MonoType, 1);
++				memcpy (header->locals [i], lb->type->type, sizeof (MonoType));
++			}
+ 		}
+ 
++		if (rmb->dynil)
++		{
++			const char *ptr = mono_array_addr (rmb->dynil->localsig, guint8, 0);
++			ptr += 2;
++			for (i = 0; i < num_locals; i++)
++			{
++				MonoType *t = mono_metadata_parse_type_full(NULL, NULL, MONO_PARSE_LOCAL,
++															0, ptr, &ptr);
++				header->locals[i] = mp_g_new0 (mp, MonoType, 1);
++				memcpy (header->locals[i], t, sizeof (MonoType));
++			}
++		}
++
+ 		header->num_clauses = num_clauses;
+ 		if (num_clauses) {
+ 			header->clauses = method_encode_clauses ((MonoDynamicImage*)klass->image,
+ 				 rmb->ilgen, num_clauses);
+ 		}
+ 
++		/* FIXME - handle clauses for dynil */
++
+ 		pm->header = header;
+ 	}
+ 
+@@ -9611,12 +9641,15 @@
+ MonoArray *
+ mono_reflection_sighelper_get_signature_local (MonoReflectionSigHelper *sig)
+ {
+-	MonoDynamicImage *assembly = sig->module->dynamic_image;
++	MonoDynamicImage *assembly = NULL;
+ 	guint32 na = mono_array_length (sig->arguments);
+ 	guint32 buflen, i;
+ 	MonoArray *result;
+ 	SigBuffer buf;
+ 
++	if (sig->module)
++		assembly = sig->module->dynamic_image;
++
+ 	sigbuffer_init (&buf, 32);
+ 
+ 	sigbuffer_add_value (&buf, 0x07);

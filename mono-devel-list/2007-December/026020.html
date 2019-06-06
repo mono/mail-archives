@@ -1,0 +1,226 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Generics sharing issues
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Generics%20sharing%20issues&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026019.html">
+   <LINK REL="Next"  HREF="026030.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Generics sharing issues</H1>
+    <B>Mark Probst</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Generics%20sharing%20issues&In-Reply-To="
+       TITLE="[Mono-dev] Generics sharing issues">mark.probst at gmail.com
+       </A><BR>
+    <I>Mon Dec 10 07:13:56 EST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026019.html">[Mono-dev] Debugger exceptions
+</A></li>
+        <LI>Next message: <A HREF="026030.html">[Mono-dev] Generics sharing issues
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26020">[ date ]</a>
+              <a href="thread.html#26020">[ thread ]</a>
+              <a href="subject.html#26020">[ subject ]</a>
+              <a href="author.html#26020">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi everybody!
+
+This is a writeup of the generics sharing issues we (mainly Paolo,
+Rodrigo Kumpera, Zoltan, Hari, Massi, and me) discussed at the Mono
+Summit, and how we want to solve them.  I hope I didn't miss anything
+or get things wrong.  If so, please correct me.  Also, if you have any
+additional ideas, or if you see any problems we've missed, don't
+hesitate to let us know.
+
+
+
+-*- outline -*-
+
+* Problems
+
+** recursive generics
+
+A generic class or method might potentially lead to an infinite number
+of type expansions.  Therefore type expansion must in some cases be
+done lazily.
+
+*** superclasses
+
+class A&lt;T&gt;
+class B&lt;T&gt; : A&lt;B&lt;B&lt;T&gt;&gt;&gt;
+
+*** other types
+
+class A&lt;T&gt; {
+  static void test (int n) {
+    if (n &gt; 0)
+      A&lt;A&lt;T&gt;&gt;.test (n - 1);
+    else
+      return;
+  }
+}
+
+** interface calls
+
+To resolve an interface call we need the MonoMethod* of the interface
+method.  It's not enough to have the open method because the class
+might implement more than one generic instance of the interface.
+
+** type argument slots must be superclass-compatible
+
+class A&lt;T&gt;
+class B&lt;T&gt; : A&lt;List&lt;T&gt;&gt;
+
+For B&lt;string&gt;: A&lt;T&gt; assumes typeargs[0] to be string, but it will be
+List&lt;string&gt; in out current implementation.
+
+** even non-generic classes might need rgctx
+
+class A&lt;T&gt;
+class B : A&lt;string&gt;
+
+B needs a rgctx!
+
+** function pointers of static methods
+
+A static method of a generic type demands to be passed a rgctx pointer
+as an implicit argument, while no such argument needs to be, or can
+be, given when doing an indirect call using a function pointer.
+
+* Solutions
+
+** lazy filling of rgctx
+
+We need to have the possibility of leaving fields in the rgctx null
+and instantiate them lazily.  To that end we probably need a small
+trampoline which is passed the rgctx and a location within it.  It has
+to check whether the slot is already filled.  If it is it just returns
+its value.  Otherwise it has to call an unmanaged function to compute
+the slot value.
+
+*** maybe only in cases of increasing depth
+
+We can instantiate the types and fill the corresponding slots if we
+know that doing so will not lead to endless recursion.  The simplest
+heuristic for this is the depth of the type.  Since there is only a
+finite number of types the recursion must terminate eventually (in
+most non-contrived examples very quickly).  Example:
+
+class A&lt;T&gt; {
+  static void test () {
+    new B&lt;T&gt;;
+    new C&lt;D&lt;T&gt;&gt;;
+  }
+}
+
+The slot for B&lt;T&gt; can be filled and fetching its value doesn't need
+the trampoline, whereas the slot for C&lt;D&lt;T&gt;&gt; would be left empty and
+filled lazily with the trampoline.
+
+** put methods for interface calls in rgctx
+
+To resolve interface calls we put the MonoMethod pointers in the
+rgctx.
+
+** extensible rgctx
+
+We need to be able to extend a class's rgctx even after is has already
+been created, to allow fast access to &quot;other&quot; types as well as to
+interface methods (Do we really need extensibility for methods?  We
+already know which interface methods a class provides when we init
+it.).
+
+The extensible part of the rgctx can be a fixed number of slots with
+one or more additional indirect slots.  We could have one indirect
+slots which points to a reallocatable array, or a number of indirect
+slots which point to lazily allocated fixed size arrays of increasing
+size.
+
+*** layout must be compatible with superclasses
+
+As with the other parts of the rgctx, the extensible part must be
+compatible with those of the class's superclasses.  One of the
+consequence is that slots which are filled in a class must be marked
+as not used but occupied in all its superclasses.  For example:
+
+class A&lt;T&gt;
+class B&lt;T&gt; : A&lt;T&gt;
+
+Now we add the type C&lt;string&gt; to B&lt;string&gt;'s rgctx, at slot 0.  If we
+do not mark this slot as occupied in A&lt;string&gt; then we might add
+another type, say D&lt;string&gt; to A&lt;string&gt;'s rgctx at slot 0, which
+would then require us to put D&lt;string&gt; into slot 0 B&lt;string&gt;'s rgctx,
+because B&lt;string&gt;'s rgctx must be usable wherever A&lt;string&gt;'s rgctx is
+usable.  Slot 0 is already occpuied by another type in B&lt;string&gt;,
+though.
+
+*** extending existing rgctxs
+
+Depending on how we access the rgctx in the trampoline we could get
+away with not extending already existing rgctxs.  First, all slots in
+the extensible portion would have to be lazily filled.  We would also
+need an additional null check for the indirect slot(s) and allocate
+that lazily, too.  That would only work for fixed-size indirect
+slot arrays, though.
+
+Alternatively we would have to keep track of all closed generic
+classes for each open generic class and each time we occupy a new slot
+in the extensible portion we would have to run through all of them and
+fill the slot and/or (re)allocate the indirect slot arrays.  That
+would obviate the need for the null check for indirect slots and would
+also enable us to do eager allocation for slots where we may do so.
+
+*** need rgctx template
+
+To be able to manage the extending portion of the rgctx we need to
+keep the layout of it for each open generic class.
+
+** type argument slots
+
+Simplest solution: Separate slots for each class in the superclass
+chain.
+
+In most cases they probably overlap, so try to reuse slots.
+
+** taking the function pointer of a static method
+
+We will need to provide a pointer to a stub when taking the function
+pointer, which adds the rgctx pointer as the implicit argument.  We
+must make sure to create a stub at most once, otherwise we'll leak
+memory.
+
+
+
+
+Mark
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026019.html">[Mono-dev] Debugger exceptions
+</A></li>
+	<LI>Next message: <A HREF="026030.html">[Mono-dev] Generics sharing issues
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26020">[ date ]</a>
+              <a href="thread.html#26020">[ thread ]</a>
+              <a href="subject.html#26020">[ subject ]</a>
+              <a href="author.html#26020">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,218 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] some sysctl fixes for OpenBSD
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20some%20sysctl%20fixes%20for%20OpenBSD&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034696.html">
+   <LINK REL="Next"  HREF="034707.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] some sysctl fixes for OpenBSD</H1>
+    <B>Robert Nagy</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20some%20sysctl%20fixes%20for%20OpenBSD&In-Reply-To="
+       TITLE="[Mono-dev] some sysctl fixes for OpenBSD">robert at openbsd.org
+       </A><BR>
+    <I>Thu Apr  8 04:42:53 EDT 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034696.html">[Mono-dev] Build Microsoft Visual Studio Solution under Mono
+</A></li>
+        <LI>Next message: <A HREF="034707.html">[Mono-dev] some sysctl fixes for OpenBSD
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34694">[ date ]</a>
+              <a href="thread.html#34694">[ thread ]</a>
+              <a href="subject.html#34694">[ subject ]</a>
+              <a href="author.html#34694">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hey
+
+The following diff removes the XXX hacks from the io-layer OpenBSD
+specific code and and support for get_process_name_from_proc() too.
+It also makes mono-proclib to use the correct kinfo struct.
+ 
+Index: mono/io-layer/processes.c
+===================================================================
+--- mono/io-layer/processes.c	(revision 155030)
++++ mono/io-layer/processes.c	(working copy)
+@@ -1533,7 +1533,7 @@
+ 	name[2] = KERN_PROC_ALL;
+ 	name[3] = 0;
+ 	name[4] = sizeof(struct kinfo_proc2);
+-	name[5] = 400; /* XXX */
++	name[5] = 0;
+ #else
+ 	struct kinfo_proc *result;
+ 	static const int name[] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+@@ -1543,7 +1543,7 @@
+ 	
+ 	result = NULL;
+ 	done = FALSE;
+-	
++
+ 	do {
+ 		proclength = 0;
+ #if defined(__OpenBSD__)
+@@ -1558,7 +1558,11 @@
+ 
+ 			if (result == NULL)
+ 				return FALSE;
+-			
++
++#if defined(__OpenBSD__)	
++			name[5] = (int)(proclength / sizeof(struct kinfo_proc2));
++#endif
++
+ 			err = sysctl ((int *) name, size, result, &amp;proclength, NULL, 0);
+ 
+ 			if (err == 0) 
+@@ -2224,10 +2228,12 @@
+ 
+ static gchar *get_process_name_from_proc (pid_t pid)
+ {
++#if !defined(__OpenBSD__)
++	FILE *fp;
+ 	gchar *filename = NULL;
++	gchar buf[256];
++#endif
+ 	gchar *ret = NULL;
+-	gchar buf[256];
+-	FILE *fp;
+ 
+ #if defined(PLATFORM_SOLARIS)
+ 	filename = g_strdup_printf (&quot;/proc/%d/psinfo&quot;, pid);
+@@ -2248,6 +2254,40 @@
+ 	proc_name (pid, buf, sizeof(buf));
+ 	if (strlen (buf) &gt; 0)
+ 		ret = g_strdup (buf);
++#elif defined(__OpenBSD__)
++	int mib [6];
++	size_t size;
++	struct kinfo_proc2 *pi;
++
++	mib [0] = CTL_KERN;
++	mib [1] = KERN_PROC2;
++	mib [2] = KERN_PROC_PID;
++	mib [3] = pid;
++	mib [4] = sizeof(struct kinfo_proc2);
++	mib [5] = 0;
++
++retry:
++	if (sysctl(mib, 6, NULL, &amp;size, NULL, 0) &lt; 0)
++		return(ret);
++
++	if ((pi = malloc(size)) == NULL)
++		return(ret);
++
++	mib[5] = (int)(size / sizeof(struct kinfo_proc2));
++
++	if ((sysctl (mib, 6, pi, &amp;size, NULL, 0) &lt; 0) ||
++	    (size != sizeof (struct kinfo_proc2))) {
++		if (errno == ENOMEM) {
++			free(pi);
++			goto retry;
++		}
++		return(ret);
++	}
++
++	if (strlen (pi-&gt;p_comm) &gt; 0)
++		ret = g_strdup (pi-&gt;p_comm);
++
++	free(pi);
+ #else
+ 	memset (buf, '\0', sizeof(buf));
+ 	filename = g_strdup_printf (&quot;/proc/%d/exe&quot;, pid);
+Index: mono/utils/mono-proclib.c
+===================================================================
+--- mono/utils/mono-proclib.c	(revision 155030)
++++ mono/utils/mono-proclib.c	(working copy)
+@@ -22,8 +22,13 @@
+ #include &lt;sys/user.h&gt;
+ #endif
+ #ifdef HAVE_STRUCT_KINFO_PROC_KP_PROC
+-#define kinfo_pid_member kp_proc.p_pid
+-#define kinfo_name_member kp_proc.p_comm
++#  ifdef KERN_PROC2
++#    define kinfo_pid_member p_pid
++#    define kinfo_name_member p_comm
++#  else
++#    define kinfo_pid_member kp_proc.p_pid
++#    define kinfo_name_member kp_proc.p_comm
++#  endif
+ #else
+ #define kinfo_pid_member ki_pid
+ #define kinfo_name_member ki_comm
+@@ -46,11 +51,12 @@
+ #ifdef KERN_PROC2
+ 	int mib [6];
+ 	size_t data_len = sizeof (struct kinfo_proc2) * 400;
++	struct kinfo_proc2 *processes = malloc (data_len);
+ #else
+ 	int mib [4];
+ 	size_t data_len = sizeof (struct kinfo_proc) * 400;
++	struct kinfo_proc *processes = malloc (data_len);
+ #endif /* KERN_PROC2 */
+-	struct kinfo_proc *processes = malloc (data_len);
+ 	void **buf = NULL;
+ 
+ 	if (size)
+@@ -181,11 +187,12 @@
+ #ifdef KERN_PROC2
+ 	int mib [6];
+ 	size_t data_len = sizeof (struct kinfo_proc2);
++	struct kinfo_proc2 processi;
+ #else
+ 	int mib [4];
+ 	size_t data_len = sizeof (struct kinfo_proc);
++	struct kinfo_proc processi;
+ #endif /* KERN_PROC2 */
+-	struct kinfo_proc processi;
+ 
+ 	memset (buf, 0, len);
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034696.html">[Mono-dev] Build Microsoft Visual Studio Solution under Mono
+</A></li>
+	<LI>Next message: <A HREF="034707.html">[Mono-dev] some sysctl fixes for OpenBSD
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34694">[ date ]</a>
+              <a href="thread.html#34694">[ thread ]</a>
+              <a href="subject.html#34694">[ subject ]</a>
+              <a href="author.html#34694">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

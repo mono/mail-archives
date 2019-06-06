@@ -1,0 +1,275 @@
+Index: mono/mini/mini-ppc.c
+===================================================================
+--- mono.orig/mini/mini-ppc.c	2009-01-24 14:18:51.000000000 +0100
++++ mono/mini/mini-ppc.c	2009-01-24 16:52:47.000000000 +0100
+@@ -11,6 +11,17 @@
+  */
+ #include "mini.h"
+ #include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <pthread.h>
++#ifdef __linux__
++#include <elf.h>
++#include <link.h>
++#include <asm/cputable.h>
++#include <sys/utsname.h>
++#include <string.h>
++#endif
+ 
+ #include <mono/metadata/appdomain.h>
+ #include <mono/metadata/debug-helpers.h>
+@@ -131,6 +142,206 @@
+ 	return "unknown";
+ }
+ 
++#ifdef PPC_FEATURE_ICACHE_SNOOP
++#define HAS_ICACHE_SNOOP (linux_ppc_hwcap & PPC_FEATURE_ICACHE_SNOOP)
++#else
++#define HAS_ICACHE_SNOOP 0
++#endif
++
++#ifdef __linux__
++
++/* Scan the env to find the aux vector. */
++static inline char**
++find_aux_in_env (void)
++{
++	char **result = __environ;
++	/* Scan over the env vector looking for the ending NULL */
++	for (; *result != NULL; ++result)
++		;
++	/* Bump the pointer one more step, which should be the auxv. */
++	return ++result;
++}
++
++volatile static ElfW(auxv_t) *linux_auxv_buf = NULL;
++
++static ElfW(auxv_t) *
++linux_get_auxv (void)
++{
++	ElfW(auxv_t) *auxv_temp = (ElfW(auxv_t) *)linux_auxv_buf;
++	int auxv_f;
++	size_t page_size = getpagesize ();
++	ssize_t bytes;
++
++	/* If the /proc/self/auxv file has not been copied into the heap
++	   yet, then do it */
++
++	if (!auxv_temp) {
++		auxv_f = open ("/proc/self/auxv", O_RDONLY);
++
++		if (auxv_f == -1) {
++			/* Older kernels did not support /proc/<PID>/auxv. But the auvx
++			   table does exist in the process address space following the
++			   env table. So try scanning over the environment table to find
++			   the auxv. */
++			if (errno == ENOENT) {
++				auxv_temp = (ElfW(auxv_t)*) find_aux_in_env ();
++				/* If someone has done a setenv() the __environ pointer may
++				   have been moved and the assumption that the auxv follows is
++				   not true. So look at the first entry and verify that it is
++				   an auxv entry. */
++				if (auxv_temp->a_type != AT_IGNOREPPC) {
++					g_warning ("Error opening /proc/self/auxv and auvx not following env");
++					return NULL;
++				}
++			} else {
++				g_warning ("Error opening file for reading");
++				return 0;
++			}
++		} else {
++			auxv_temp = (ElfW(auxv_t)*) g_malloc (page_size);
++
++			bytes = read (auxv_f, (void*)auxv_temp, page_size);
++
++			if (bytes <= 0) {
++				g_free (auxv_temp);
++				close (auxv_f);
++				auxv_temp = NULL;
++				g_warning ("Error /proc/self/auxv read failed");
++				return NULL;
++			}
++			/* We have the auxv buffered and the file handle is no longer
++			   needed. so close the file. */
++			if (close (auxv_f))
++				g_warning ("Error close failed");
++		}
++		linux_auxv_buf = auxv_temp;
++	}
++	return (ElfW(auxv_t)*)auxv_temp;
++}
++
++static pthread_once_t auxv_once_control = PTHREAD_ONCE_INIT;
++
++static void
++linux_auxv_init_once (void)
++{
++	ElfW(auxv_t) *auxv_temp = (ElfW(auxv_t) *)linux_auxv_buf;
++
++	if (!auxv_temp) {
++		if (pthread_once (&auxv_once_control,
++				  (void (*)(void))linux_get_auxv)) {
++			g_warning ("Error pthread_once(linux_get_auxv()) failed");
++		}
++	}
++}
++
++static ElfW(Addr)
++linux_query_auxv (int type)
++{
++	ElfW(auxv_t) *auxv_temp;
++	int i = 0;
++
++	/* if the /proc/self/auxv file has not been manually copied into the heap
++	   yet, then do it */
++
++	auxv_temp = (ElfW(auxv_t) *)linux_auxv_buf;
++	if (!auxv_temp)
++		auxv_temp = linux_get_auxv();
++
++	i = 0;
++	do {
++		if (auxv_temp[i].a_type == type)
++			return auxv_temp[i].a_un.a_val;
++		i++;
++	} while (auxv_temp[i].a_type != AT_NULL);
++
++	return 0;
++}
++
++static unsigned long	linux_ppc_hwcap;
++static char 		*linux_ppc_platform;
++static int		linux_ppc_ISA2x; /* PowerISA-2.0 or newer */
++static unsigned long	linux_ppc_ISA2x_mask = 0
++#ifdef PPC_FEATURE_POWER4 /* PowerISA-2.01 */
++			| PPC_FEATURE_POWER4
++#endif
++#ifdef PPC_FEATURE_POWER5 /* PowerISA-2.03 */
++			| PPC_FEATURE_POWER5
++#endif
++#ifdef PPC_FEATURE_POWER5_PLUS  /* PowerISA-2.04 */
++			| PPC_FEATURE_POWER5_PLUS
++#endif
++#ifdef PPC_FEATURE_CELL
++			| PPC_FEATURE_CELL
++#endif
++#ifdef PPC_FEATURE_PA6T
++			| PPC_FEATURE_PA6T
++#endif
++#ifdef PPC_FEATURE_ARCH_2_05
++			| PPC_FEATURE_ARCH_2_05
++#endif
++	; /* it took a while to figure out that the AT_HWCAP should represent
++	     ISA versions and optional categories/features and the AT_PLATFORM
++	     should represent the CHIP design and specific micro-architecture.
++	     Which explains the mess above.*/
++
++/* Default to SMP true in case we can't find out.  */
++static int		linux_ppc_SMP = 1;
++
++/* Number of independent load store pipes in each core. */
++static int		linux_ppc_LSUs = 0;
++/* Number of independent fixed point pipes in each core. */
++static int		linux_ppc_FXUs = 0;
++/* Number of independent floating point pipes in each core. */
++static int		linux_ppc_FPUs = 0;
++
++static int
++linux_init_ppc_SMP (void)
++{
++	struct utsname u;
++
++	/* FIXME For 2.6.26 kernels we can try to use /sys/devices/system/cpu/possible,
++	   but we would have to fall back to uname for early kernels anyway. */
++
++	if (uname (&u) != 0) {
++		g_warning ("Error uname syscall failer\n");
++		return 1;
++	}
++
++	if (strstr (u.version, "SMP"))
++		return 1;
++	else {
++		if (strstr (u.version, "smp"))
++			return 1;
++		else
++			return 0;
++	}
++}
++
++static void
++linux_init_ppc_platform(void)
++{
++	linux_ppc_hwcap = (unsigned long) linux_query_auxv (AT_HWCAP);
++	linux_ppc_platform = (char*) linux_query_auxv (AT_PLATFORM);
++	linux_ppc_ISA2x = (linux_ppc_hwcap & linux_ppc_ISA2x_mask) != 0L;
++	linux_ppc_SMP = linux_init_ppc_SMP ();
++
++	if ((strcmp (linux_ppc_platform, "power4") >= 0)
++			&& (strcmp (linux_ppc_platform, "power6x") <= 0)) {
++		linux_ppc_LSUs = 2;
++		linux_ppc_FXUs = 2;
++		linux_ppc_FPUs = 2;
++	} else if (strcmp (linux_ppc_platform, "ppc970") == 0) {
++		linux_ppc_LSUs = 2;
++		linux_ppc_FXUs = 2;
++		linux_ppc_FPUs = 2;
++	} else if (strcmp (linux_ppc_platform, "cell") == 0) {
++		linux_ppc_LSUs = 1;
++		linux_ppc_FXUs = 1;
++		linux_ppc_FPUs = 1;
++	}
++}
++#endif
++
+ /* this function overwrites r0, r11, r12 */
+ static guint8*
+ emit_memcpy (guint8 *code, int size, int dreg, int doffset, int sreg, int soffset)
+@@ -459,6 +670,10 @@
+ void
+ mono_arch_cpu_init (void)
+ {
++#ifdef __linux__
++	linux_auxv_init_once();
++	linux_init_ppc_platform();
++#endif
+ }
+ 
+ /*
+@@ -587,11 +802,6 @@
+ 	return 2;
+ }
+ 
+-typedef struct {
+-	long int type;
+-	long int value;
+-} AuxVec;
+-
+ void
+ mono_arch_flush_icache (guint8 *code, gint size)
+ {
+@@ -615,20 +825,10 @@
+ 			/*g_print ("setting cl size to %d\n", cachelinesize);*/
+ 		}
+ #elif defined(__linux__)
+-		/* sadly this will work only with 2.6 kernels... */
+-		FILE* f = fopen ("/proc/self/auxv", "rb");
+-		if (f) {
+-			AuxVec vec;
+-			while (fread (&vec, sizeof (vec), 1, f) == 1) {
+-				if (vec.type == 19) {
+-					cachelinesize = vec.value;
+-					break;
+-				}
+-			}
+-			fclose (f);
+-		}
++		cachelinesize = (long) linux_query_auxv (AT_DCACHEBSIZE);
+ 		if (!cachelinesize)
+ 			cachelinesize = 128;
++		cachelineinc = cachelinesize;
+ #elif defined(G_COMPILER_CODEWARRIOR)
+ 	cachelinesize = 32;
+ 	cachelineinc = 32;

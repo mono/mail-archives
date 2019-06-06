@@ -1,0 +1,592 @@
+Index: browser/provider.cs
+===================================================================
+--- browser/provider.cs	(revision 49194)
++++ browser/provider.cs	(working copy)
+@@ -21,6 +21,8 @@
+ using System.Xml.XPath;
+ using ICSharpCode.SharpZipLib.Zip;
+ 
++using Monodoc.Lucene.Net.Index;
++using Monodoc.Lucene.Net.Analysis.Standard;
+ /// <summary>
+ ///    This tree is populated by the documentation providers, or populated
+ ///    from a binary encoding of the tree.  The format of the tree is designed
+@@ -667,6 +669,15 @@
+ 		output.Write ("</body></html>");
+ 		return output.ToString ();
+ 	}
++
++	//
++	// Create different Documents for adding to Lucene search index
++	// The default action is do nothing. Subclasses should add the docs
++	// 
++	public virtual void PopulateSearchableIndex (IndexWriter writer) {
++		return;
++	}
++
+ }
+ 
+ public abstract class Provider {
+@@ -1272,6 +1283,45 @@
+ 		Console.WriteLine ("Documentation index updated");
+ 	}
+ 	
++	// Search Index
++	public SearchableIndex GetSearchIndex ()
++	{
++		return SearchableIndex.Load (Path.Combine (basedir, "search_index"));
++	}
++
++	public static void MakeSearchIndex ()
++	{
++		// Loads the RootTree
++		Console.WriteLine ("Loading the monodoc tree...");
++		RootTree root = LoadTree ();
++		if (root == null)
++			return;
++
++		string dir = Path.Combine (root.basedir, "search_index");
++		IndexWriter writer;
++		//try to create the dir to store the index
++		try {
++			if (!Directory.Exists (dir)) 
++				Directory.CreateDirectory (dir);
++
++			writer = new IndexWriter(Lucene.Net.Store.FSDirectory.GetDirectory(dir, true), new StandardAnalyzer(), true);
++		} catch (UnauthorizedAccessException) {
++			Console.WriteLine ("You don't have permissions to wirte on " + dir);
++			return;
++		}
++
++		//Collect all the documents
++		Console.WriteLine ("Collecting and adding documents...");
++		foreach (HelpSource hs in root.HelpSources) 
++			hs.PopulateSearchableIndex (writer);
++	
++		//Optimize and close
++		Console.WriteLine ("Closing...");
++		writer.Optimize();
++		writer.Close();
++	}
++
++
+ 	public ICollection HelpSources { get { return new ArrayList(help_sources); } }
+ 
+ 	[System.Runtime.InteropServices.DllImport ("libc")]
+Index: browser/ecmaspec-provider.cs
+===================================================================
+--- browser/ecmaspec-provider.cs	(revision 48386)
++++ browser/ecmaspec-provider.cs	(working copy)
+@@ -16,6 +16,9 @@
+ using System.Xml.XPath;
+ using System.Xml.Xsl;
+ using System.Xml;
++using System.Collections;
++using Monodoc.Lucene.Net.Index;
++using Monodoc.Lucene.Net.Documents;
+ 
+ public class EcmaSpecProvider : Provider {
+ 	string basedir;
+@@ -165,5 +168,76 @@
+ 		
+ 		return output.ToString ();
+ 	}
++
++	public override void PopulateSearchableIndex (IndexWriter writer) 
++	{
++		foreach (Node n in Tree.Nodes)
++			AddDocuments (writer, n);
++	}
++	void AddDocuments (IndexWriter writer, Node node) 
++	{
++		string url = node.URL;
++		Stream file_stream = GetHelpStream (url.Substring (9));
++		if (file_stream == null) //Error
++			return;
++		XmlDocument xdoc = new XmlDocument ();
++		xdoc.Load (new XmlTextReader (file_stream));
++
++		//Obtain the title
++		XmlNode nelem = xdoc.DocumentElement;
++		string title = nelem.Attributes["number"].Value + ": " + nelem.Attributes["title"].Value;
++
++		//Obtain the text
++		StringBuilder s = new StringBuilder ();
++		GetTextNode (nelem, s);
++		string text = s.ToString ();
++
++		//Obatin the examples
++		StringBuilder s2 = new StringBuilder ();
++		GetExamples (nelem, s2);
++		string examples = s2.ToString ();
++
++		//Write to the Lucene Index all the parts
++		SearchableDocument doc = new SearchableDocument ();
++		doc.title = title;
++		doc.hottext = title.Substring (title.IndexOf (':')); 
++		doc.url = url;
++		doc.text = text;
++		doc.examples = examples;
++		writer.AddDocument (doc.LuceneDoc);
++		
++		if (node.IsLeaf)
++			return;
++
++		foreach (Node n in node.Nodes)
++			AddDocuments (writer, n);
++	}
++
++	void GetTextNode (XmlNode n, StringBuilder s) 
++	{
++		//dont include c# code
++		if (n.Name == "code_example")
++			return;
++		//include all text from nodes
++		if (n.NodeType == XmlNodeType.Text)
++			s.Append (n.Value);
++		
++		//recursively explore all nodes
++		if (n.HasChildNodes)
++			foreach (XmlNode n_child in n.ChildNodes)
++				GetTextNode (n_child, s);
++	}
++
++	void GetExamples (XmlNode n, StringBuilder s)
++	{
++	if (n.Name == "code_example") {
++		if (n.FirstChild.Name == "#cdata-section")
++			s.Append (n.FirstChild.Value);
++	} else {
++		if (n.HasChildNodes)
++			foreach (XmlNode n_child in n.ChildNodes)
++				GetExamples (n_child, s);
++	}
++	}
+ }
+ }
+Index: browser/SearchableIndex.cs
+===================================================================
+--- browser/SearchableIndex.cs	(revision 0)
++++ browser/SearchableIndex.cs	(revision 0)
+@@ -0,0 +1,119 @@
++//
++//
++// SearchableIndex.cs: Index that uses Lucene to search through the docs 
++//
++// Author: Mario Sopena
++//
++
++using System;
++using System.IO;
++using System.Collections;
++// Lucene imports
++using Monodoc.Lucene.Net.Index;
++using Monodoc.Lucene.Net.Documents;
++using Monodoc.Lucene.Net.Analysis;
++using Monodoc.Lucene.Net.Analysis.Standard;
++using Monodoc.Lucene.Net.Search;
++using Monodoc.Lucene.Net.QueryParsers;
++
++namespace Monodoc
++{
++
++//TODO: where do I call searcher.close()
++public class SearchableIndex 
++{
++	IndexSearcher searcher;
++    string dir;
++	public string Dir {
++		get { 
++			if (dir == null) dir = "search_index";
++			return dir;
++		}
++		set { dir = value; }
++	}
++	public ArrayList Results;
++	
++	public static SearchableIndex Load (string dir) { 
++		SearchableIndex s = new SearchableIndex ();
++		s.dir = dir;
++		s.Results = new ArrayList (20);
++		try {
++			s.searcher = new IndexSearcher (dir);
++		} catch (IOException) {
++			Console.WriteLine ("Index nonexistent or in bad format");
++			return null;
++		}
++		return s;
++	}
++		
++	//
++	// Search the index with term
++	//
++	public Result Search (string term) {
++		try {
++			Query q1 = QueryParser.Parse (term, "hottext", new StandardAnalyzer ());
++			Query q2 = QueryParser.Parse (term, "text", new StandardAnalyzer ());
++			q2.SetBoost (0.7f);
++			Query q3 = QueryParser.Parse (term, "examples", new StandardAnalyzer ());
++			q3.SetBoost (0.5f);
++			BooleanQuery q = new BooleanQuery();
++			q.Add (q1, false, false);
++			q.Add (q2, false, false);
++			q.Add (q3, false, false);
++			Hits hits = searcher.Search(q);
++			Result r = new Result (term, hits);
++			Results.Add (r);
++			return r;
++		} catch (IOException) {
++			Console.WriteLine ("No index in {0}", dir);
++			return null;
++		}
++	}
++	
++}
++//
++// An object representing the search term with the results
++// 
++public class Result {
++	string term;
++	public string Term {
++		get { return term;}
++	}
++	public Hits hits;
++
++	public int Count {
++		get { return hits.Length(); }
++	}
++	public Document this [int i] {
++		get { return hits.Doc (i); }
++	}
++	
++	public string GetTitle (int i) 
++	{
++		Document d = hits.Doc (i);
++		if (d == null)
++			return "";
++		else
++			return d.Get ("title");
++	}
++	public string GetUrl (int i)
++	{
++		Document d = hits.Doc (i);
++		if (d == null)
++			return "";
++		else
++			return d.Get ("url");
++		
++	}
++	public float Score (int i)
++	{
++		return hits.Score (i);
++	}
++	public Result (string Term, Hits hits) 
++	{
++		this.term = Term;
++		this.hits = hits;
++	}
++}
++}
++
+Index: browser/ChangeLog
+===================================================================
+--- browser/ChangeLog	(revision 49194)
++++ browser/ChangeLog	(working copy)
+@@ -1,4 +1,17 @@
+ 2005-08-31 Mario Sopena Novales <mario.sopena@gmail.com>
++	Implement basic searching capabilities
++	* provider.cs: 
++		- Add a method (PopulateSearchableIndex) to HelpSource to generate
++		  the searchable index which every subclass should implement
++		- Added GetSearchIndex (retrieve the searchable index) and
++		  MakeSearchIndex (entry point for the creation of the index) to RootTree
++	* ecmaspec-provider.cs: Implement PopulateSearchableIndex 
++	* ecma-provider.cs: Implement PopulateSearchableIndex
++	* SearchableDocument.cs: added. Abstracts the Lucene Document model
++	* SearchableIndex.cs: added. For searching the index
++	* Makefile.am: Added new files and Lucene sources
++
++2005-08-31 Mario Sopena Novales <mario.sopena@gmail.com>
+ 	* editing.cs: 
+ 		- Add a new Attribute NodeUrl to Change
+ 		- When saving changes, fill the new Attribute NodeUrl
+Index: browser/SearchableDocument.cs
+===================================================================
+--- browser/SearchableDocument.cs	(revision 0)
++++ browser/SearchableDocument.cs	(revision 0)
+@@ -0,0 +1,29 @@
++//
++//
++// SearchableDocument.cs: Abstracts our model of document from the Lucene Document 
++//
++// Author: Mario Sopena
++//
++using Monodoc.Lucene.Net.Documents;
++
++namespace Monodoc {
++struct SearchableDocument {
++	public string title;
++	public string url;
++	public string hottext;
++	public string text;
++	public string examples;
++
++	public Document LuceneDoc {
++		get {
++			Document doc = new Document ();
++			doc.Add (Field.UnIndexed ("title", title));
++			doc.Add (Field.UnIndexed ("url", url));
++			doc.Add (Field.UnStored ("hottext", hottext));
++			doc.Add (Field.UnStored ("text", text));
++			doc.Add (Field.UnStored ("examples", examples));
++			return doc;
++		}
++	}
++}
++}
+Index: browser/ecma-provider.cs
+===================================================================
+--- browser/ecma-provider.cs	(revision 49194)
++++ browser/ecma-provider.cs	(working copy)
+@@ -25,6 +25,8 @@
+ using System.Text;
+ using System.Collections;
+ using ICSharpCode.SharpZipLib.Zip;
++using Monodoc.Lucene.Net.Index;
++using Monodoc.Lucene.Net.Documents;
+ 
+ using BF = System.Reflection.BindingFlags;
+ 
+@@ -1513,6 +1515,205 @@
+ 			}
+ 		}
+ 	}
++	//
++	// Create list of documents for searching
++	//
++	public override void PopulateSearchableIndex (IndexWriter writer)
++	{
++		StringBuilder text;
++		foreach (Node ns_node in Tree.Nodes) {
++			Console.WriteLine ("\tNamespace: {0} ({1})", ns_node.Caption, ns_node.Nodes.Count);
++			foreach (Node type_node in ns_node.Nodes) {
++				string typename = type_node.Caption.Substring (0, type_node.Caption.IndexOf (' '));
++				string full = ns_node.Caption + "." + typename;
++				string doc_tag = GetKindFromCaption (type_node.Caption);
++				string url = "T:" + full;
++				string rest;
++				XmlDocument xdoc = GetXmlFromUrl (type_node.URL, out rest);
++				if (xdoc == null)
++					continue;
++				
++				// 
++				// For classes, structures or interfaces add a doc for the overview and
++				// add a doc for every constructor, method, event, ...
++				// 
++				if (doc_tag == "Class" || doc_tag == "Structure" || doc_tag == "Interface"){
++					
++					// Adds a doc for every overview of every type
++					SearchableDocument doc = new SearchableDocument ();
++					doc.title = type_node.Caption;
++					doc.hottext = typename;
++					doc.url = url;
++					
++					XmlNode node_sel = xdoc.SelectSingleNode ("/Type/Docs");
++					text  = new StringBuilder ();
++					GetTextFromNode (node_sel, text);
++					doc.text = text.ToString ();
++
++					text  = new StringBuilder ();
++					GetExamples (node_sel, text);
++					doc.examples = text.ToString ();
++					
++					writer.AddDocument (doc.LuceneDoc);
++
++					//Add docs for contructors, methods, etc.
++					foreach (Node c in type_node.Nodes) { // c = Constructors || Fields || Events || Properties || Methods || Operators
++						
++						if (c.Element == "*")
++							continue;
++						int i = 1;
++						foreach (Node nc in c.Nodes) {
++							//xpath to the docs xml node
++							string xpath;
++							if (c.Caption == "Constructors")
++								xpath = String.Format ("/Type/Members/Member[{0}]/Docs", i++);
++							else if (c.Caption == "Operators")
++								xpath = String.Format ("/Type/Members/Member[@MemberName='op_{0}']/Docs", nc.Caption);
++							else
++								xpath = String.Format ("/Type/Members/Member[@MemberName='{0}']/Docs", nc.Caption);
++							//construct url of the form M:Array.Sort
++							string urlnc;
++							if (c.Caption == "Constructors")
++								urlnc = String.Format ("{0}:{1}.{2}", c.Caption[0], ns_node.Caption, nc.Caption);
++							else
++								urlnc = String.Format ("{0}:{1}.{2}.{3}", c.Caption[0], ns_node.Caption, typename, nc.Caption);
++
++							//create the doc
++							SearchableDocument doc_nod = new SearchableDocument ();
++							doc_nod.title = LargeName (nc);
++							//dont add the parameters to the hottext
++							int ppos = nc.Caption.IndexOf ('(');
++							if (ppos != -1)
++								doc_nod.hottext =  nc.Caption.Substring (0, ppos);
++							else
++								doc_nod.hottext = nc.Caption;
++
++							doc_nod.url = urlnc;
++
++							XmlNode xmln = xdoc.SelectSingleNode (xpath);
++							if (xmln == null) {
++								Console.WriteLine ("Problem: {0}, with xpath: {1}", urlnc, xpath);
++								continue;
++							}
++
++							text = new StringBuilder ();
++							GetTextFromNode (xmln, text);
++							doc_nod.text = text.ToString ();
++
++							text = new StringBuilder ();
++							GetExamples (xmln, text);
++							doc_nod.examples = text.ToString ();
++
++							writer.AddDocument (doc_nod.LuceneDoc);
++						}
++					}
++				//
++				// Enumerations: add the enumeration values
++				//
++				} else if (doc_tag == "Enumeration"){
++										
++					XmlNodeList members = xdoc.SelectNodes ("/Type/Members/Member");
++					if (members == null)
++						continue;
++
++					text = new StringBuilder ();
++					foreach (XmlNode member_node in members) {
++						string enum_value = member_node.Attributes ["MemberName"].InnerText;
++						text.Append (enum_value);
++						text.Append (" ");
++						GetTextFromNode (member_node["Docs"], text);
++						text.Append ("\n");
++					}
++					SearchableDocument doc = new SearchableDocument ();
++
++					text = new StringBuilder ();
++					GetExamples (xdoc.SelectSingleNode ("/Type/Docs"), text);
++					doc.examples = text.ToString ();
++
++					doc.title = type_node.Caption;
++					doc.hottext = xdoc.DocumentElement.Attributes["Name"].Value;
++					doc.url = url;
++					doc.text = text.ToString();
++					writer.AddDocument (doc.LuceneDoc);
++				//
++				// Add delegates
++				//
++				} else if (doc_tag == "Delegate"){
++					SearchableDocument doc = new SearchableDocument ();
++					doc.title = type_node.Caption;
++					doc.hottext = xdoc.DocumentElement.Attributes["Name"].Value;
++					doc.url = url; 
++					
++					XmlNode node_sel = xdoc.SelectSingleNode ("/Type/Docs");
++
++					text = new StringBuilder ();
++					GetTextFromNode (node_sel, text);
++					doc.text = text.ToString();
++
++					text = new StringBuilder ();
++					GetExamples (node_sel, text);
++					doc.examples = text.ToString();
++
++					writer.AddDocument (doc.LuceneDoc);
++				} 
++			}
++		}
++	}
++	
++	//
++	// Extract the interesting text from the docs node
++	//
++	void GetTextFromNode (XmlNode n, StringBuilder sb) 
++	{
++		//don't include example code
++		if (n.Name == "code") 
++			return;
++
++		//include the url to which points the see tag
++		if (n.Name == "see" && n.Attributes.Count > 0)
++				sb.Append (n.Attributes [0].Value);
++		
++		//include the name of the parameter
++		if (n.Name == "paramref" && n.Attributes.Count > 0)
++			sb.Append (n.Attributes [0].Value);
++
++		//include the contents for the node that contains text
++		if (n.NodeType == XmlNodeType.Text)
++			sb.Append (n.Value);
++		
++		//add the rest of xml tags recursively
++		if (n.HasChildNodes)
++			foreach (XmlNode n_child in n.ChildNodes)
++				GetTextFromNode (n_child, sb);
++	}
++	//
++	// Extract the code nodes from the docs
++	//
++	void GetExamples (XmlNode n, StringBuilder sb)
++	{
++		if (n.Name == "code") {
++			sb.Append (n.InnerText);
++		} else {
++			if (n.HasChildNodes)
++				foreach (XmlNode n_child in n.ChildNodes)
++					GetExamples (n_child, sb);
++		}
++	}
++	//
++	// Extract a large name for the Node
++	//  (copied from mono-tools/docbrowser/browser.Render()
++	static string LargeName (Node matched_node)
++	{
++		string[] parts = matched_node.URL.Split('/', '#');			
++		if(parts.Length == 3 && parts[2] != String.Empty) { //List of Members, properties, events, ...
++			return parts[1] + ": " + matched_node.Caption;
++		} else if(parts.Length >= 4) { //Showing a concrete Member, property, ...					
++			return parts[1] + "." + matched_node.Caption;
++		} else {
++			return matched_node.Caption;
++		}
++	}
++
+ }
+ 
+ public class EcmaUncompiledHelpSource : EcmaHelpSource {
+Index: browser/Makefile.am
+===================================================================
+--- browser/Makefile.am	(revision 49194)
++++ browser/Makefile.am	(working copy)
+@@ -27,8 +27,13 @@
+ 	$(srcdir)/settings.cs		\
+ 	$(srcdir)/commentservice.cs	\
+ 	$(srcdir)/XmlNodeWriter.cs	\
++	$(srcdir)/SearchableIndex.cs	\
++	$(srcdir)/SearchableDocument.cs	\
+ 	AssemblyInfo.cs	
+ 
++lucene_sources = \
++	$(srcdir)/Lucene.Net.dll.sources 
++
+ assembler_sources = \
+ 	$(srcdir)/assembler.cs 
+ 
+@@ -74,7 +79,7 @@
+ 	cp $(top_srcdir)/mono.pub .
+ 
+ monodoc.dll: $(monodoc_sources) mono-ecma.xsl mono.pub ecmaspec-html-css.xsl ecmaspec.css base.css mono-ecma-css.xsl mono-ecma.css home.html
+-	$(CSC) -debug -out:monodoc.dll -target:library /resource:$(srcdir)/mono-ecma.xsl,mono-ecma.xsl /resource:$(srcdir)/ecmaspec-html.xsl,ecmaspec-html.xsl /resource:$(srcdir)/ecmaspec-html-css.xsl,ecmaspec-html-css.xsl /resource:$(srcdir)/base.css,base.css /resource:$(srcdir)/ecmaspec.css,ecmaspec.css /resource:$(srcdir)/mono-ecma-css.xsl,mono-ecma-css.xsl /resource:$(srcdir)/mono-ecma.css,mono-ecma.css /resource:$(srcdir)/home.html,home.html $(monodoc_sources) -r:ICSharpCode.SharpZipLib.dll -r:System.Web -r:System.Web.Services
++	$(CSC) -debug -out:monodoc.dll -target:library /resource:$(srcdir)/mono-ecma.xsl,mono-ecma.xsl /resource:$(srcdir)/ecmaspec-html.xsl,ecmaspec-html.xsl /resource:$(srcdir)/ecmaspec-html-css.xsl,ecmaspec-html-css.xsl /resource:$(srcdir)/base.css,base.css /resource:$(srcdir)/ecmaspec.css,ecmaspec.css /resource:$(srcdir)/mono-ecma-css.xsl,mono-ecma-css.xsl /resource:$(srcdir)/mono-ecma.css,mono-ecma.css /resource:$(srcdir)/home.html,home.html $(monodoc_sources)  @$(lucene_sources) -r:ICSharpCode.SharpZipLib.dll -r:System.Web -r:System.Web.Services
+ 
+ monodoc.dll.config: $(srcdir)/monodoc.dll.config.in Makefile
+ 	if sed 's,@''monodoc_refdir@,$(monodoc_refdir),' $(srcdir)/monodoc.dll.config.in > $@t; then mv $@t $@; else rm -f $@t ; exit 1; fi

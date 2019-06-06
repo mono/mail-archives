@@ -1,0 +1,188 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Patch to boost speed of UnicodeEncoding
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%20to%20boost%20speed%20of%20UnicodeEncoding&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017605.html">
+   <LINK REL="Next"  HREF="017541.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Patch to boost speed of UnicodeEncoding</H1>
+    <B>Zac Bowling</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%20to%20boost%20speed%20of%20UnicodeEncoding&In-Reply-To="
+       TITLE="[Mono-dev] Patch to boost speed of UnicodeEncoding">zac at zacbowling.com
+       </A><BR>
+    <I>Sat Mar 11 07:09:46 EST 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017605.html">[Mono-dev] [Patch] Some bugs in xbuild and DirectorySeparator.
+</A></li>
+        <LI>Next message: <A HREF="017541.html">[Mono-dev] Patch to boost speed of UnicodeEncoding
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17540">[ date ]</a>
+              <a href="thread.html#17540">[ thread ]</a>
+              <a href="subject.html#17540">[ subject ]</a>
+              <a href="author.html#17540">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Alright guys,
+
+Here is a cool (and still incomplete) patch to speed up 
+System.Text.UnicodeEncoding I'm working on. Just want to make sure this 
+is sane before I finish it by getting everyone's opinions.
+
+I was tinkering with this idea. Since the strings are stored in memory 
+as UTF-16 (UCS 2) already, the idea of converting them with like we do 
+with a while loop, one char at a time, was really bothering me. 
+Directly copying whats in memory seems a little bit more sane. I don't 
+want to make it sound that easy because it isn't (and maybe why it 
+wasn't done like this when it was first written). :-P
+
+The biggest problem is that UnicodeEncoding can be bigEndian or 
+littleEndian so I went through the logic and testing to see if the 
+system's endian (with 'BitConverter.IsLittleEndian') matched the endian 
+of the current Encoding class (using the 'bigEndian' bool field) and if 
+it doesn't then use the same method we already use. (Is that right? Is 
+the internal version of utf-16 we use in our strings specific to the 
+endian of the system? I assumed yes here but if it's not, it's a simple 
+change to remark it out.)
+
+Also since the memcpy function in String.cs uses some unsafe logic, 
+taking a possible hit for that with a really small string seems silly, 
+so I put in an condition that if the char count is less then or equal 
+to 10 chars, then use the existing method. (Maybe 10 chars should be 
+adjusted or is that idea silly?)
+
+Below is an unfinished sample of my idea. Of course I will have to 
+reverse this logic for GetChars() (instead of GetBytes below) and 
+finish the overloads in System.Text.UnicodeEncoding's GetBytes and 
+GetChars methods but I want to see what everything thinks.
+
+
+Index: System/String.cs
+===================================================================
+--- System/String.cs    (revision 57749)
++++ System/String.cs    (working copy)
+@@ -1746,6 +1746,22 @@
+                        return n;
+                }
+
++
++               internal unsafe int InternalStrToByteArr(Byte[] tmp, 
+int offset)
++               {
++                       //shortcut function for System.Text.UnicodeEncoding
++
++                       //byte[] tmp = new Byte[this.length * 2];
++                       fixed (byte* dest = tmp){
++                               fixed (char* src = this)
++                               {
++                                       memcpy ((byte*) (dest+offset), 
+(byte*)src, this.length * 2);
++                               }
++                       }
++                       return this.length * 2;
++
++               }
++
+                internal unsafe void InternalSetChar (int idx, char val)
+                {
+                        if ((uint) idx &gt;= (uint) Length)
+Index: System.Text/UnicodeEncoding.cs
+===================================================================
+--- System.Text/UnicodeEncoding.cs      (revision 57749)
++++ System.Text/UnicodeEncoding.cs      (working copy)
+@@ -123,22 +123,36 @@
+                if ((bytes.Length - byteIndex) &lt; (charCount * 2)) {
+                        throw new ArgumentException 
+(_(&quot;Arg_InsufficientSpace&quot;));
+                }
+-               int posn = byteIndex;
++
++               int retval;
+                char ch;
+-               if (bigEndian) {
+-                       while (charCount-- &gt; 0) {
+-                               ch = chars[charIndex++];
+-                               bytes[posn++] = (byte)(ch &gt;&gt; 8);
+-                               bytes[posn++] = (byte)ch;
+-                       }
+-               } else {
+-                       while (charCount-- &gt; 0) {
+-                               ch = chars[charIndex++];
+-                               bytes[posn++] = (byte)ch;
+-                               bytes[posn++] = (byte)(ch &gt;&gt; 8);
+-                       }
++
++               // Shortcut unicode encoding process if the system 
+matches this encoding endian
++               // otherwise, use the byte by byte method (unless the 
+string is really
++               // small, in which case, using this shortcut can hurt us)
++               if (BitConverter.IsLittleEndian == bigEndian || 
+charCount &lt;= 10) {
++                       int posn = byteIndex;
++                       if (bigEndian) {
++                               while (charCount-- &gt; 0) {
++                                       ch = chars[charIndex++];
++                                       bytes[posn++] = (byte)(ch &gt;&gt; 8);
++                                       bytes[posn++] = (byte)ch;
++                               }
++                       } else {
++                               while (charCount-- &gt; 0) {
++                                       ch = chars[charIndex++];
++                                       bytes[posn++] = (byte)ch;
++                                       bytes[posn++] = (byte)(ch &gt;&gt; 8);
++                               } //
++
++                       } //
++
++                       retval = posn - byteIndex;
+                }
+-               return posn - byteIndex;
++               else {
++                       retval = (new 
+String(chars,charIndex,charCount)).InternalStrToByteArr(bytes, 
+byteIndex);
++               }
++               return retval;
+        }
+
+
+
+-- 
+Zac Bowling
+<A HREF="http://zacbowling.com/">http://zacbowling.com/</A>
+
+
+
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017605.html">[Mono-dev] [Patch] Some bugs in xbuild and DirectorySeparator.
+</A></li>
+	<LI>Next message: <A HREF="017541.html">[Mono-dev] Patch to boost speed of UnicodeEncoding
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17540">[ date ]</a>
+              <a href="thread.html#17540">[ thread ]</a>
+              <a href="subject.html#17540">[ subject ]</a>
+              <a href="author.html#17540">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

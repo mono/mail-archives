@@ -1,0 +1,244 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] The future of Mono's profiler API
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.dot.net?Subject=Re%3A%20%5BMono-dev%5D%20The%20future%20of%20Mono%27s%20profiler%20API&In-Reply-To=%3CCAH9TF6M%2BBvn_LDSWCnSict%3D4oxFOj5bTe72AD%2B1znGA3bZhfJw%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="044408.html">
+   <LINK REL="Next"  HREF="044419.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] The future of Mono's profiler API</H1>
+    <B>Alex Rønne Petersen</B> 
+    <A HREF="mailto:mono-devel-list%40lists.dot.net?Subject=Re%3A%20%5BMono-dev%5D%20The%20future%20of%20Mono%27s%20profiler%20API&In-Reply-To=%3CCAH9TF6M%2BBvn_LDSWCnSict%3D4oxFOj5bTe72AD%2B1znGA3bZhfJw%40mail.gmail.com%3E"
+       TITLE="[Mono-dev] The future of Mono's profiler API">alex at alexrp.com
+       </A><BR>
+    <I>Tue Jun 20 08:50:53 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="044408.html">[Mono-dev] mkbundle targets for mono 5.0 (Mono-devel-list Digest, Vol 146, Issue 17)
+</A></li>
+        <LI>Next message (by thread): <A HREF="044419.html">[Mono-dev] The future of Mono's profiler API
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#44418">[ date ]</a>
+              <a href="thread.html#44418">[ thread ]</a>
+              <a href="subject.html#44418">[ subject ]</a>
+              <a href="author.html#44418">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello everyone,
+
+As part of our ongoing effort to make Mono's log profiler useful for
+more scenarios, I'm planning to make it possible to interact with the
+profiler at runtime - you can enable, disable, and tweak specific
+profiler features in certain sections of your application, so you get
+exactly the data that you're interested in. In order to do this, the
+log profiler needs to be able to change its event flags and installed
+callbacks dynamically at runtime.
+
+# The Problem
+
+It is currently impossible for any profiler to reliably change its
+setup at runtime because Mono's profiler API (metadata/profiler.h)
+only allows modifying the most recently installed profiler. Mono
+supports having multiple profilers active at the same time, and we do
+in fact use this feature in the Xamarin platform products. There's no
+way around it: We need to rethink the profiler API. All functions must
+take an explicit MonoProfiler* parameter.
+
+This isn't the only problem with the current API.
+
+Another issue is that multiple callbacks are installed through the
+same function. For example, mono_profiler_install_exception installs
+callbacks for thrown exceptions, exceptional method exits, and
+exception clauses. When I had to add an extra parameter to the
+exception clause callback recently, I introduced
+mono_profiler_install_exception_clause for version 2 of that callback.
+This means that new code will pass NULL to the third parameter of
+mono_profiler_install_exception from now on. This just adds confusion.
+It would be much clearer if the old function had been called
+mono_profiler_install_exception_clause and I'd just been able to
+introduce a mono_profiler_install_exception_v2 function. New users of
+the API will likely wonder why mono_profiler_install_exception_clause
+isn't part of mono_profiler_install_exception since the API has a
+precedent of bundling related callbacks into the same installation
+function.
+
+There are also multiple callbacks in the API that aren't guarded by
+event flags. For example, the code buffer callbacks should logically
+be guarded by MONO_PROFILE_JIT_COMPILATION, but that's a change we
+can't make now as it would be breaking. Another curiosity is that the
+GC handle callbacks are guarded by MONO_PROFILE_GC_ROOTS even though
+it's entirely likely that someone would be interested in GC handles
+but not GC roots (see: Alan McGovern's GC handle profiler). It's also
+odd that the exceptional method exit callback is guarded by
+MONO_PROFILE_EXCEPTIONS when in fact most uses of this callback have
+little to do with profiling exceptions and everything to do with
+keeping track of method entries/exits as with the normal method
+enter/exit callbacks (which are guarded by MONO_PROFILE_ENTER_LEAVE).
+
+We also have callbacks that serve no actual purpose, and never will.
+For example, the notion of a 'class unload' does not exist in the Mono
+runtime. Never has, probably never will. Entire images are unloaded at
+once, so this callback is literally never invoked. I'd actually say
+having that callback there adds negative value to the API. The
+managed/native transition callback was never implemented, either.
+
+Finally, some features in the API have not been maintained or tested
+for years. The call chain sampling API is a great example of this.
+Another example: Did you know that the profiler API supports two
+coverage modes which are mutually exclusive? You might think that
+MONO_PROFILE_COVERAGE is the flag that you're supposed to be using.
+Nope; it's MONO_PROFILE_INS_COVERAGE. The former is implemented in a
+very platform-specific manner that has resulted in it not being
+maintained, tested, or ported fully to new platforms.
+
+In short, the current profiler API is pretty bad. We need a new API.
+Of course, the elephant in the room is backwards compatibility. The
+question is: Do we introduce a new profiler API and make the old one
+'simply' call the new one? Or do we just replace the old API entirely,
+backwards compatibility be damned?
+
+# The New Profiler API
+
+The new API would not be all that different from the old one. The main
+changes would be:
+
+1. All functions in the API take an explicit MonoProfiler* parameter.
+2. Callbacks can be changed safely at runtime.
+3. One installation function installs exactly one callback.
+4. You will no longer need to specify event flags.
+5. Unmaintained and unfinished features (see above) will be removed.
+
+As an example, old code might look like this:
+
+void
+mono_profiler_startup (const char *args)
+{
+    MonoProfiler *prof = malloc (...);
+    profiler_specific_setup (prof);
+    mono_profiler_install (prof, my_shutdown_callback);
+    mono_profiler_install_enter_leave (my_enter_callback, my_leave_callback);
+    mono_profiler_set_events (MONO_PROFILE_ENTER_LEAVE);
+}
+
+New code would look like this:
+
+void
+mono_profiler_startup (const char *args)
+{
+    MonoProfiler *prof = malloc (...);
+    profiler_specific_setup (prof);
+    mono_profiler_install (prof);
+    mono_profiler_set_shutdown_callback (prof, my_shutdown_callback);
+    mono_profiler_set_enter_callback (prof, my_enter_callback);
+    mono_profiler_set_leave_callback (prof, my_leave_callback);
+}
+
+We would still use flags internally so we don't slow the runtime down
+with unnecessary profiler API calls, but that will be completely
+hidden from users. All a user would have to worry about is (un)setting
+callbacks, which can be done at any point during an app's lifetime.
+
+Transitioning to the new API should be fairly painless. I'd estimate
+it to take an hour or two at worst for e.g. the log profiler.
+
+# Approach One: Backwards Compatibility
+
+In this approach, we would introduce a new metadata/profiler-v2.h
+header. This header would provide the new API and have no dependencies
+on the old one. The old API would remain in metadata/profiler.h and
+people's code would continue to compile and work. We would need to
+bridge the old API to the new one and make sure that it's done in a
+backwards-compatible way.
+
+The advantage here is fairly obvious: Nobody likes having to rewrite
+their code because the authors of a library decided to change the API,
+especially if that change doesn't carry an obvious benefit to users,
+which it could be argued this change wouldn't for most (all?) current
+users of Mono's profiler API.
+
+On the other hand, this is a significant maintenance burden, both in
+the short and long term. Writing the code to bridge the nonsensical
+aspects of the old API with the new one would be tricky to say the
+least. In addition, there's the risk that any change to the new API in
+the future could break the old API.
+
+# Approach Two: Replacing the API
+
+In this approach, we replace the old API in metadata/profiler.h with
+the new one, with zero regard for backwards compatibility. People's
+code would fail to compile, and old compiled profiler modules would
+fail to run. In both cases, the failures should be fairly loud - a
+compiler error, or a dynamic linker error.
+
+The advantage of this approach is that it's significantly less effort
+to implement and maintain. It also avoids any potential confusion for
+new users of the API, in that there's only one set of functions to
+use.
+
+If we go down this route, all projects that use Mono's profiler API
+would need to change their code slightly, and people would need to
+compile separate versions of their profiler modules if they want to
+support older Mono versions.
+
+# My Opinion
+
+I'm strongly in favor of the second approach. Frankly, as the person
+who'll be implementing and maintaining the new API, I don't
+particularly enjoy the idea of having to also maintain the old one in
+a backwards compatible fashion. I think there are much better things I
+could be working on in Mono's profiling infrastructure.
+
+I also firmly believe that this is the only time we'll have to do such
+a drastic breaking change to the profiler API. This isn't a proposal
+to jump on some fancy new API design fad. Using a mutable global
+variable as an implicit parameter to an entire API was pretty bad
+design, even by 2002 standards. Just by passing an explicit
+MonoProfiler* argument to all API functions, we open ourselves up to
+much easier, backwards-compatible expansion of the API in the future.
+
+Finally, as I mentioned earlier, transitioning to the new API would be
+very easy, and users would have to do it sooner or later anyway, as we
+wouldn't want to keep the old API around forever, even in the first
+approach. Also, in the grand scheme of things, this probably won't
+affect that many people, unlike breaking changes to the core embedding
+API.
+
+What's everyone's thoughts on this?
+
+Regards,
+Alex
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="044408.html">[Mono-dev] mkbundle targets for mono 5.0 (Mono-devel-list Digest, Vol 146, Issue 17)
+</A></li>
+	<LI>Next message (by thread): <A HREF="044419.html">[Mono-dev] The future of Mono's profiler API
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#44418">[ date ]</a>
+              <a href="thread.html#44418">[ thread ]</a>
+              <a href="subject.html#44418">[ subject ]</a>
+              <a href="author.html#44418">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.dot.net/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

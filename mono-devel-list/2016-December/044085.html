@@ -1,0 +1,176 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [android-devel] Runtime crashes on Android
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.dot.net?Subject=Re%3A%20%5BMono-dev%5D%20%5Bandroid-devel%5D%20Runtime%20crashes%20on%20Android&In-Reply-To=%3CBN6PR03MB2770674D54048191B4D67C30C2870%40BN6PR03MB2770.namprd03.prod.outlook.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="044094.html">
+   <LINK REL="Next"  HREF="044086.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [android-devel] Runtime crashes on Android</H1>
+    <B>Bernhard Urban</B> 
+    <A HREF="mailto:mono-devel-list%40lists.dot.net?Subject=Re%3A%20%5BMono-dev%5D%20%5Bandroid-devel%5D%20Runtime%20crashes%20on%20Android&In-Reply-To=%3CBN6PR03MB2770674D54048191B4D67C30C2870%40BN6PR03MB2770.namprd03.prod.outlook.com%3E"
+       TITLE="[Mono-dev] [android-devel] Runtime crashes on Android">beurba at microsoft.com
+       </A><BR>
+    <I>Tue Dec 13 17:26:48 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="044094.html">[Mono-dev] ncurses console for mono and .net core that is xplat
+</A></li>
+        <LI>Next message (by thread): <A HREF="044086.html">[Mono-dev] [android-devel] Runtime crashes on Android
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#44085">[ date ]</a>
+              <a href="thread.html#44085">[ thread ]</a>
+              <a href="subject.html#44085">[ subject ]</a>
+              <a href="author.html#44085">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi all,
+
+thanks Jonathan for the right pointers.  After a lot of debugging and digging through source code I think I sort of understand what is happening.
+
+The audit message we see is indeed by SELinux. What happens is that we cause another SIGSEGV inside the handler. Unfortunately the kernel doesn't give us any further information. I managed to attach with lldb and the reason for the crash is that the stack pointer points into a text segment of some shared library.  WTF?
+
+Let me go back one step. In general the signal chain looks like this on Android:
+
+(1) SIGSEGV happens, the ART handler catches it and does some stuff (e.g. &quot;is it caused by my managed code&quot;?).
+(2) if ART doesn't know what to do, it will chain into remaining handlers. 
+(3) now it's the mono runtimes handler turn, we do our business, figure out it's a native crash, etc.
+(4) (in case we do *NOT* crash) we return to the ART handler
+(5) the ART handler now chains into the next SIGSEGV handler, which was setup by the linker of bionic.
+(6) the libc/bionic handler communicates with debuggerd which ptraces our process and delivers further information (e.g. register dump, native stack trace)
+
+So the interesting bit here is that the mono runtime doesn't register our handler to be executed on an alternative stack, but still our handler happens to run on one. Why? Because ART registers its handler to be executed on an altstack and then chains into our handler. The reason why this is relevant, is that the altstack is only 8k big on 32bit systems or 16k on 64bit systems. Some structures we need in libunwind or even things we do in mono are exceeding those limits on the stack.
+
+I did some changes here and there to reduce frame size requirements and included libunwind into mono (see relevant PRs at the end of this email). I re-ran my experiment on XTC:
+<A HREF="https://gist.github.com/lewurm/0b271b406b7e194cadaf1340172fc178">https://gist.github.com/lewurm/0b271b406b7e194cadaf1340172fc178</A>
+
+or here a crash where I sneaked in a segfault into the JIT:
+<A HREF="https://gist.github.com/lewurm/c96c6236fc1b79b3c30473de174b71dd">https://gist.github.com/lewurm/c96c6236fc1b79b3c30473de174b71dd</A>
+
+Looking at this, I have this conclusion: How about we do not even attempt to do a native stack trace in mono, but just let debuggerd do its business? The arguments to support that:
+
+(a) native stack trace by debuggerd is at least as good as the one we get via libunwind (most of the time the trace provided by libunwind is useless?)
+(b) we cannot screw up by accident (see example above with altstack mess)
+(c) we don't need to maintain the libunwind integration into mono (which we sort of had to do because of the upcoming dlopen limitation in Android 7.0 Nougat).
+(d) the libmonosgen-2.0.so had about one megabyte more footprint (16mb -&gt; 17mb). I'm talking about a debug build here though.
+
+Bonus: On *some* devices we even get an even nicer dump, e.g. check samsung_galaxy_note_5-5.1.1.txt.: 
+<A HREF="https://gist.github.com/lewurm/0b271b406b7e194cadaf1340172fc178#file-samsung_galaxy_note_5-5-1-1-txt">https://gist.github.com/lewurm/0b271b406b7e194cadaf1340172fc178#file-samsung_galaxy_note_5-5-1-1-txt</A>
+
+&quot;CrashAnrDetector&quot; seems to be yet another player in this whole story, so far I've only seen it on older Samsung devices.
+
+
+
+Any thoughts?
+
+-Bernhard
+
+
+Relevant pull requests:
+<A HREF="https://github.com/mono/mono/pull/4106">https://github.com/mono/mono/pull/4106</A>
+<A HREF="https://github.com/mono/mono/pull/4112">https://github.com/mono/mono/pull/4112</A>
+<A HREF="https://github.com/mono/mono/pull/4113">https://github.com/mono/mono/pull/4113</A>
+<A HREF="https://github.com/mono/mono/pull/4124">https://github.com/mono/mono/pull/4124</A>
+<A HREF="https://github.com/mono/mono/pull/4131">https://github.com/mono/mono/pull/4131</A>
+
+
+________________________________________
+From: Jonathan Pryor &lt;<A HREF="http://lists.dot.net/mailman/listinfo/mono-devel-list">jonpryor at vt.edu</A>&gt;
+Sent: Thursday, November 17, 2016 12:21:09 PM
+To: Bernhard Urban
+Cc: <A HREF="http://lists.dot.net/mailman/listinfo/mono-devel-list">Mono-devel-list at lists.dot.net</A>; <A HREF="http://lists.dot.net/mailman/listinfo/mono-devel-list">android-devel at lists.dot.net</A>; Alex Petersen
+Subject: Re: [android-devel] Runtime crashes on Android
+
+Reply inline…
+
+On Nov 16, 2016, at 4:29 PM, Bernhard Urban via android-devel &lt;<A HREF="http://lists.dot.net/mailman/listinfo/mono-devel-list">android-devel at lists.dot.net</A>&gt; wrote:
+&gt;<i> everytime I look at a runtime bug on Android, something doesn't feel right. Reports look different to each other. So I tried to get a better understanding on how we handle a SIGSEGV in the runtime and what the output is supposed to be. There are three basic steps [1]:
+</I>&gt;<i>
+</I>&gt;<i> (1) we print a managed stacktrace.
+</I>&gt;<i> (2) we print a native stacktrace: we do that either via libunwind or libcorkscrew depending on what is available. if neither is available, we do nothing.
+</I>&gt;<i> (3) we call `exit (-1)`, which might give us more information such as a register dump.
+</I>
+Unfortunately, there are (implicitly!) *more* than three basic steps, and I’m fairly sure I still don’t understand what all is going on. For more wonderful context:
+
+        <A HREF="https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fmono%2Fmono%2Fcommit%2F5d07b77a67f61576318a30e8b1c5f65f7f26b1cf&amp;data=02%7C01%7Cbeurba%40microsoft.com%7C322a7c4f6e02418796a808d40edbd606%7C72f988bf86f141af91ab2d7cd011db47%7C1%7C0%7C636149784734334208&amp;sdata=jKZXKeqsMrSlIZkut2OwUySlP36kEyEaUIMFvcugJaE%3D&amp;reserved=0">https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fmono%2Fmono%2Fcommit%2F5d07b77a67f61576318a30e8b1c5f65f7f26b1cf&amp;data=02%7C01%7Cbeurba%40microsoft.com%7C322a7c4f6e02418796a808d40edbd606%7C72f988bf86f141af91ab2d7cd011db47%7C1%7C0%7C636149784734334208&amp;sdata=jKZXKeqsMrSlIZkut2OwUySlP36kEyEaUIMFvcugJaE%3D&amp;reserved=0</A>
+&gt;<i> when a process crashes on Android, ideally:
+</I>&gt;<i>
+</I>&gt;<i> 1. The Android signal handler is executed,
+</I>&gt;<i> 2. Bionic will attempt to connect to /system/bin/debuggerd.
+</I>&gt;<i> 3. debuggerd will try to connect to the crashing process, then
+</I>&gt;<i>  retrieve &quot;useful&quot; information from the crashing process (stack
+</I>&gt;<i>  trace, register values, etc.)
+</I>
+
+The “fun” is in trying to intermix Mono’s SIGSEGV handling mechanism in with Android’s infrastructure, which involves having an extra process (`debuggerd`) connect to the process to dump process state.
+
+Additionally, I *believe* — but have not retested or reverified — that the `exit(-1)` within `mini-exceptions.c` won’t be executed, because of the Xamarin.Android calls `mono_set_crash_chaining(1)`, which sets `mono_do_crash_chaining` to 1:
+
+        <A HREF="https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fxamarin%2Fxamarin-android%2Fblob%2Ff862032%2Fsrc%2Fmonodroid%2Fjni%2Fmonodroid-glue.c%23L2802&amp;data=02%7C01%7Cbeurba%40microsoft.com%7C322a7c4f6e02418796a808d40edbd606%7C72f988bf86f141af91ab2d7cd011db47%7C1%7C0%7C636149784734334208&amp;sdata=hlzBXyioFEx6Kd8wW9swEakumP2Yua8shSo38BWHOE0%3D&amp;reserved=0">https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fxamarin%2Fxamarin-android%2Fblob%2Ff862032%2Fsrc%2Fmonodroid%2Fjni%2Fmonodroid-glue.c%23L2802&amp;data=02%7C01%7Cbeurba%40microsoft.com%7C322a7c4f6e02418796a808d40edbd606%7C72f988bf86f141af91ab2d7cd011db47%7C1%7C0%7C636149784734334208&amp;sdata=hlzBXyioFEx6Kd8wW9swEakumP2Yua8shSo38BWHOE0%3D&amp;reserved=0</A>
+
+Not that any of the above in any way helps further improve reliability…
+
+&gt;<i> That's the idea, unfortunately that is not always what we get.  In order to see the behaviour across different devices and versions of Android, I made this simple crashing app: [2]. As soon as you click the button the application segfaults. For that I wrote a UI test and sent it off to Xamarin Test Cloud and collected the logs: [3]. Note that every device ran the same APK.
+</I>&gt;<i>
+</I>&gt;<i> Out of 19 devices, there are really only two devices where the crash report looks like it should: samsung_google_nexus_10-4.4.txt and xiaomi_mi_4-4.4.4.txt.  On many devices we only get a managed stacktrace and then the fun is over.
+</I>&gt;<i>
+</I>&gt;<i> Why?
+</I>&gt;<i>
+</I>&gt;<i> Good question. Luckily I have a device on my desk where this is the case, so I did a bit of printf debugging. What I figured out is, that the call to `mono_exception_native_unwind ()` in [4] is where the fun stops. The message I see on adb logcat:
+</I>&gt;<i>
+</I>&gt;<i> 11-15 20:51:44.790  7093  7093 E audit   : type=1701 msg=audit(1479239504.790:1839): auid=4294967295 uid=10288 gid=10288 ses=4294967295 subj=u:r:untrusted_app:s0:c512,c768 pid=14937 comm=&quot;artup.lulzcrash&quot; exe=&quot;/system/bin/app_process32&quot; sig=11
+</I>
+Are there any other `adb logcat` messages? The above looks like an SELinux-related message. (I have no idea what it *means*, but that’s what it looks like…)
+
+&gt;<i> I see the text of a printf right before that call. printf at the beginning of the function doesn't happen. If I move `mono_exception_native_unwind ()` right before the managed stack unwinding, it crashes there, so it isn't a timeout mechanism. I have no idea why on earth this is the case. Unfortunately there is no clue from which PC the signal is coming from (maybe we cause another fault in the handler? maybe android interferes somehow?)
+</I>
+`debuggerd`?
+
+&gt;<i> Anyone has some idea?  Please tell me I overlook something obvious here.  (I haven't had success yet with gdb/lldb)
+</I>
+I’ve only had success with gdb when using 32-bit targets. 64-bit targets give me gdb protocol mismatch errors. :-(
+
+&gt;<i> Regardless, I want to suggest some things:
+</I>&gt;<i>
+</I>&gt;<i> (a) we should get rid of the dynamic loading of libunwind/libcorkscrew. Some devices don't ship it. Instead, we should include it in the runtime. I think it's worth the extra footprint (if that is the concern why it wasn't done in the first place).
+</I>
+This is *absolutely* something we should consider. This is even more important in the context of Android 7.0 Nougat, which won’t allow us to load those native libraries, even if they do exist.
+
+- Jon
+
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="044094.html">[Mono-dev] ncurses console for mono and .net core that is xplat
+</A></li>
+	<LI>Next message (by thread): <A HREF="044086.html">[Mono-dev] [android-devel] Runtime crashes on Android
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#44085">[ date ]</a>
+              <a href="thread.html#44085">[ thread ]</a>
+              <a href="subject.html#44085">[ subject ]</a>
+              <a href="author.html#44085">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.dot.net/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

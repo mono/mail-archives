@@ -1,0 +1,821 @@
+Index: class/System/System.Net.Sockets/Socket.cs
+===================================================================
+--- class/System/System.Net.Sockets/Socket.cs	(revision 41354)
++++ class/System/System.Net.Sockets/Socket.cs	(working copy)
+@@ -4,6 +4,7 @@
+ //	Phillip Pearson (pp@myelin.co.nz)
+ //	Dick Porter <dick@ximian.com>
+ //	Gonzalo Paniagua Javier (gonzalo@ximian.com)
++//	Ankit Jain (radical@corewars.org)
+ //
+ // Copyright (C) 2001, 2002 Phillip Pearson and Ximian, Inc.
+ //    http://www.myelin.co.nz
+@@ -53,6 +54,10 @@
+ 			object state;
+ 			AsyncCallback callback;
+ 			WaitHandle waithandle;
++			AsyncMethod method;
++			/* true when the async operation completes */
++			bool done;
++			public object locker = new object ();
+ 
+ 			Exception delayedException;
+ 
+@@ -71,12 +76,13 @@
+ 			AsyncCallback real_callback;
+ 			int error;
+ 
+-			public SocketAsyncResult (Socket sock, object state, AsyncCallback callback)
++			public SocketAsyncResult (Socket sock, object state, AsyncCallback callback, AsyncMethod method)
+ 			{
+ 				this.Sock = sock;
+ 				this.handle = sock.socket;
+ 				this.state = state;
+ 				this.real_callback = callback;
++				this.method = method;
+ 				SockFlags = SocketFlags.None;
+ 			}
+ 
+@@ -177,25 +183,110 @@
+ 					return total;
+ 				}
+ 			}
++			
++			public AsyncMethod Method {
++				get {
++					return method;
++				}
++			}
++
++			public bool Done {
++				get {
++					return done;
++				}
++				set {
++					done = value;
++				}
++			}
++
+ 		}
+ 
+-		private sealed class Worker 
++		enum AsyncMethod {
++			BeginConnect,
++			BeginAccept,
++			BeginReceive,
++			BeginReceiveFrom,
++			BeginSend,
++			BeginSendTo
++		}
++
++		enum WorkType {
++			Accept,
++			Connect,
++			Receive,
++			ReceiveFrom,
++			Send,
++			SendTo
++		}
++
++		sealed class Work
+ 		{
+ 			SocketAsyncResult result;
++			WorkType type;
++			Socket sock;
++			Exception delayedException;
+ 
+-			public Worker (SocketAsyncResult ares)
++			delegate void CompleteCall ();
++
++			CompleteCall CompleteWork ;
++
++			public Work (Socket sock, SocketAsyncResult ares, WorkType type)
+ 			{
++				this.sock = sock;
+ 				this.result = ares;
++				this.type = type;
++		
++				switch (type){
++					case WorkType.Accept:
++						CompleteWork= new CompleteCall (Accept);
++						break;
++					case WorkType.Connect:
++						CompleteWork= new CompleteCall (Connect);
++						break;
++					case WorkType.Receive:
++						CompleteWork= new CompleteCall (Receive);
++						break;
++					case WorkType.ReceiveFrom:
++						CompleteWork= new CompleteCall (ReceiveFrom);
++						break;
++					case WorkType.Send:
++						CompleteWork= new CompleteCall (Send);
++						break;
++					case WorkType.SendTo:
++						CompleteWork= new CompleteCall (SendTo);
++						break;
++				}
++				
+ 			}
+ 
++			public WorkType Type {
++				get { return type; }
++			}
++
++			public Socket Socket {
++				get { return sock; }
++			}
++
++			public SocketAsyncResult Result {
++				get { return result; }
++			}
++
++			public void Complete ()
++			{
++				CompleteWork ();
++			}
++			
++			public void Complete (Exception e)
++			{
++				delayedException = e;
++				CompleteWork ();
++			}
++
+ 			public void Accept ()
+ 			{
+-				lock (result) {
++				lock (result.locker) {
+ 					Socket acc_socket = null;
+ 					try {
+-						if (!result.Sock.blocking)
+-							result.Sock.Poll (-1, SelectMode.SelectRead);
+-
+ 						acc_socket = result.Sock.Accept ();
+ 					} catch (Exception e) {
+ 						result.Complete (e);
+@@ -208,39 +299,31 @@
+ 
+ 			public void Connect ()
+ 			{
+-				lock (result) {
++				lock (result.locker) {
++					int err = 0;
++					err = (int) result.Sock.GetSocketOption (SocketOptionLevel.Socket, SocketOptionName.Error);
++					if (err > 0) {
++						result.Sock.connected = false;
++						result.Complete (new SocketException (err));
++						return ;
++					}
++	
+ 					try {
+ 						result.Sock.Connect (result.EndPoint);
+-					} catch (SocketException se) {
+-						if (result.Sock.blocking || se.ErrorCode != 10036) {
+-							result.Complete (se);
+-							return;
+-						}
+-						
+-						try {
+-							result.Sock.Poll (-1, SelectMode.SelectWrite);
+-							result.Sock.Connect (result.EndPoint);
+-						} catch (Exception k) {
+-							result.Complete (k);
+-							return;
+-						}
+ 					} catch (Exception e) {
+ 						result.Complete (e);
+ 						return;
+ 					}
+-
++	
+ 					result.Complete ();
+ 				}
+ 			}
+ 
+ 			public void Receive ()
+ 			{
+-				lock (result) {
++				lock (result.locker) {
+ 					int total = 0;
+ 					try {
+-						if (!result.Sock.blocking)
+-							result.Sock.Poll (-1, SelectMode.SelectRead);
+-
+ 						total = result.Sock.Receive_nochecks (result.Buffer,
+ 									     result.Offset,
+ 									     result.Size,
+@@ -256,12 +339,9 @@
+ 
+ 			public void ReceiveFrom ()
+ 			{
+-				lock (result) {
++				lock (result.locker) {
+ 					int total = 0;
+ 					try {
+-						if (!result.Sock.blocking)
+-							result.Sock.Poll (-1, SelectMode.SelectRead);
+-
+ 						total = result.Sock.ReceiveFrom_nochecks (result.Buffer,
+ 										 result.Offset,
+ 										 result.Size,
+@@ -278,12 +358,9 @@
+ 
+ 			public void Send ()
+ 			{
+-				lock (result) {
++				lock (result.locker) {
+ 					int total = 0;
+ 					try {
+-						if (!result.Sock.blocking)
+-							result.Sock.Poll (-1, SelectMode.SelectWrite);
+-
+ 						total = result.Sock.Send_nochecks (result.Buffer,
+ 									  result.Offset,
+ 									  result.Size,
+@@ -297,13 +374,11 @@
+ 				}
+ 			}
+ 
+-			public void SendTo() {
+-				lock (result) {
++			public void SendTo ()
++			{
++				lock (result.locker) {
+ 					int total = 0;
+ 					try {
+-						if (!result.Sock.blocking)
+-							result.Sock.Poll (-1, SelectMode.SelectWrite);
+-
+ 						total = result.Sock.SendTo_nochecks (result.Buffer,
+ 									    result.Offset,
+ 									    result.Size,
+@@ -318,13 +393,14 @@
+ 				}
+ 			}
+ 		}
+-			
++
+ 		/* the field "socket" is looked up by name by the runtime */
+ 		private IntPtr socket;
+ 		private AddressFamily address_family;
+ 		private SocketType socket_type;
+ 		private ProtocolType protocol_type;
+ 		internal bool blocking=true;
++		private bool real_blocking = true;
+ 		private int pendingEnds;
+ 		private int closeDelayed;
+ 		static readonly bool supportsAsync = FakeGetSupportsAsync ();
+@@ -340,6 +416,8 @@
+ 		 * the last IO operation
+ 		 */
+ 		private bool connected=false;
++		/* When true, Connect operation is in progress */
++		private bool connecting = false;
+ 		/* true if we called Close_internal */
+ 		private bool closed;
+ 
+@@ -386,7 +464,7 @@
+ 								 "All the lists are null or empty.");
+ 			}
+ 
+-			int i;
++			int i = 0;
+ 
+ 			if (read_count != 0) {
+ 				i=0;
+@@ -554,14 +632,7 @@
+ 				return(blocking);
+ 			}
+ 			set {
+-				int error;
+-				
+-				Blocking_internal(socket, value, out error);
+-
+-				if (error != 0) {
+-					throw new SocketException (error);
+-				}
+-				
++				SetBlockingState (value);
+ 				blocking=value;
+ 			}
+ 		}
+@@ -753,10 +824,8 @@
+ 				throw new ObjectDisposedException (GetType ().ToString ());
+ 
+ 			Interlocked.Increment (ref pendingEnds);
+-			SocketAsyncResult req = new SocketAsyncResult (this, state, callback);
+-			Worker worker = new Worker (req);
+-			SocketAsyncCall sac = new SocketAsyncCall (worker.Accept);
+-			sac.BeginInvoke (null, null);
++			SocketAsyncResult req = new SocketAsyncResult (this, state, callback, AsyncMethod.BeginAccept);
++			QueueWorkItem (new Work (this, req, WorkType.Accept));
+ 			return(req);
+ 		}
+ 
+@@ -769,16 +838,278 @@
+ 
+ 			if (end_point == null)
+ 				throw new ArgumentNullException ("end_point");
++			
++			if (Connected)
++				throw new SocketException (10056); // WSAEISCONN
+ 
++			if (connecting)
++				throw new SocketException (10036); // WSAEINPROGRESS
++			
+ 			Interlocked.Increment (ref pendingEnds);
+-			SocketAsyncResult req = new SocketAsyncResult (this, state, callback);
++			SocketAsyncResult req = new SocketAsyncResult (this, state, callback, AsyncMethod.BeginConnect);
+ 			req.EndPoint = end_point;
+-			Worker worker = new Worker (req);
+-			SocketAsyncCall sac = new SocketAsyncCall (worker.Connect);
+-			sac.BeginInvoke (null, null);
++			
++			try {
++				if (Blocking)
++					SetBlockingState (false);
++					
++				connecting = true;
++				Connect (req.EndPoint);
++			} catch (SocketException se) {
++				if (se.ErrorCode != 10036) {
++					if (Blocking)
++						SetBlockingState (true);
++					req.Complete (se); 
++					connecting = false;
++					return req;
++				}
++				
++				//??? This will never get executed??
++				if (se.ErrorCode != 10036) {
++					throw se;
++				}	
++
++				QueueWorkItem (new Work (this, req, WorkType.Connect));
++				if (Blocking)
++					SetBlockingState (true);
++			}
++
+ 			return(req);
+ 		}
+ 
++		void SetBlockingState (bool state)
++		{
++			int error = 0;
++			Blocking_internal (socket, state, out error);
++
++			if (error != 0)
++				throw new SocketException (error);
++			
++			real_blocking = state;
++		}
++
++		private static void CompleteAndRemoveWork (ArrayList list, Hashtable table, Socket readSock, params WorkType[] workTypes)
++		{
++				Work w = null;
++				bool done = false;
++
++				IEnumerator enumerator = list.GetEnumerator ();
++				while (enumerator.MoveNext ()) {
++					Socket sock = (Socket) enumerator.Current;
++					if (sock == readSock)
++						continue;
++
++					object o = table [sock];	
++					if (o is Work) {
++						w = (Work) o;
++					}	else if (o is ArrayList) {
++						//Walk through the list and find the first
++						//work object with WorkType == Receive/ReceiveFrom/Accept
++						done = false;	
++						for (int i = 0; i < ((ArrayList)o).Count && !done; i ++) {
++							w = (Work) ((ArrayList)o) [i];
++							for (int j = 0; j < workTypes.Length; j++)
++								if (w.Type == workTypes [j]) {
++									done = true;
++									break;
++								}	
++
++							if (!done)
++								w = null;	
++						}
++					}
++					
++					if (w != null)
++						w.Complete ();
++				}
++
++				enumerator.Reset ();
++
++				lock (table) {
++					while (enumerator.MoveNext ()) {
++						Socket sock = (Socket) enumerator.Current;
++						if (sock == readSock)
++							continue;
++	
++						object o = table [sock];	
++						if (o is ArrayList) {
++							//Walk through the list and find the first
++							//work object with WorkType == Receive/ReceiveFrom/Accept
++							ArrayList al = (ArrayList) o;
++							done = false;
++							for (int i = 0; i < al.Count && !done ; i++) {
++								w = (Work) al [i];
++								/* This al is modified only in AddWorkItem, which does it with table/masterWrite locked */
++								for (int j = 0; j < workTypes.Length; j++) {
++									if (w.Type == workTypes [j]) {
++										//FIXME: is this lock ok?
++										lock (al) {
++											if (al.Count == 1) {
++												al.Clear ();
++												table.Remove (sock);
++											}	
++											else	
++												al.RemoveAt (i);
++										}
++										done = true;
++										break;
++									}	
++								}	
++								w = null;	
++							}
++							//FIXME: If work not found then throw exception?
++						} else {
++							table.Remove (sock);
++						}	
++					}
++				}
++
++		}
++		
++		static byte [] byteArray = new byte [4096];
++		static void SocketIO ()
++		{
++			Socket readSock = ReadSock;
++			ArrayList readList, writeList;
++			bool sleeping = false;
++
++			readList = new ArrayList ();
++			writeList = new ArrayList ();
++
++			while (true) {
++				lock (masterRead) {
++					foreach (Socket s in masterRead.Keys)
++						readList.Add (s);
++				}
++
++				readList.Add (readSock);
++				
++				lock (masterWrite) {
++					foreach (Socket s in masterWrite.Keys)
++						writeList.Add (s);
++				}
++				
++				if (readList.Count == 1 && writeList.Count == 0) {
++					sleeping = true;
++					Select (readList, null, null, 5000000);
++				} else {
++					Select (readList, writeList, null, -1);
++				}
++				
++				Work w = null;
++				if (readList.IndexOf (readSock) != -1) {
++					sleeping = false;
++					fs [0].Read (byteArray, 0, byteArray.Length);
++				}
++
++				CompleteAndRemoveWork (readList, masterRead, readSock, WorkType.Receive, WorkType.ReceiveFrom, WorkType.Accept);
++				CompleteAndRemoveWork (writeList, masterWrite, null, WorkType.Send, WorkType.SendTo);
++
++				if (sleeping == true && readList.Count == 0 && writeList.Count == 0)
++					break;
++		
++				readList.Clear ();
++				writeList.Clear ();
++			}
++
++			lock (typeof (Work))
++				asyncInited = false;
++		}
++
++		static bool asyncInited;
++		static Socket [] pipes;
++		static FileStream [] fs;
++
++		static Hashtable masterRead;
++		static Hashtable masterWrite;
++
++		static Socket ReadSock {
++			get { return pipes [0]; }
++		}
++		
++		static void InitAsyncThread ()
++		{
++			if (asyncInited)
++				return;
++
++			lock (typeof (Work)) {
++				if (asyncInited)
++					return;
++
++				object [] o = new object [] { IntPtr.Zero, IntPtr.Zero };
++				try {
++					Assembly assembly = Assembly.Load ("mscorlib");
++					Type type = assembly.GetType ("System.IO.MonoIO");
++					MethodInfo method = type.GetMethod ("CreatePipe");
++					method.Invoke (null, o);
++				} catch (Exception e) {
++					throw new SystemException ("Cannot create pipe.", e);
++				}
++
++				pipes = new Socket [2];
++				pipes [0] = new Socket (AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.IP, (IntPtr) o [0]);
++				pipes [1] = new Socket (AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.IP, (IntPtr) o [1]);
++
++				fs = new FileStream [2];
++				try {
++					fs [0] = new FileStream (pipes [0].Handle, FileAccess.Read, true); 
++					fs [1] = new FileStream (pipes [1].Handle, FileAccess.Write, true); 
++				} catch (Exception e){
++					throw new SystemException ("Error creating streams.", e);
++				}
++
++				masterRead = new Hashtable();
++				masterWrite = new Hashtable();
++				Thread socketThread = new Thread (new ThreadStart (SocketIO));
++				socketThread.IsBackground = true;
++				socketThread.Start ();
++				asyncInited = true;
++			}
++		}
++
++		void AddWorkItem (Hashtable ht, Work work)
++		{
++			lock (ht) {
++				object obj = ht [work.Socket];
++				if (obj == null) {
++					ht.Add (work.Socket, work);
++					return ;
++				}	
++
++				if (obj is Work) {
++						ArrayList al = new ArrayList ();
++						al.Add (obj);
++						al.Add (work);
++						ht.Remove (work.Socket);
++						ht.Add (work.Socket, al);
++				} else if (obj is ArrayList) 
++						((ArrayList) obj).Add (work);
++			}
++		}
++		
++		void QueueWorkItem (Work work)
++		{
++			InitAsyncThread ();
++			
++			switch (work.Type) {
++				case WorkType.Receive:
++				case WorkType.ReceiveFrom:
++				case WorkType.Accept:
++					AddWorkItem (masterRead, work); 
++					break;
++				case WorkType.Send:
++				case WorkType.SendTo:
++				case WorkType.Connect:	
++					AddWorkItem (masterWrite, work);
++					break;
++			}
++
++			lock (fs [1]) {
++				fs [1].WriteByte ((byte) work.Type);
++				fs [1].Flush ();
++			}
++		}
++
+ 		public IAsyncResult BeginReceive(byte[] buffer, int offset,
+ 						 int size,
+ 						 SocketFlags socket_flags,
+@@ -788,6 +1119,9 @@
+ 			if (disposed && closed)
+ 				throw new ObjectDisposedException (GetType ().ToString ());
+ 
++			if (!Connected)
++				throw new SocketException (10057); // WSAENOTCONN
++			
+ 			if (buffer == null)
+ 				throw new ArgumentNullException ("buffer");
+ 
+@@ -798,7 +1132,7 @@
+ 				throw new ArgumentOutOfRangeException ("size");
+ 
+ 			Interlocked.Increment (ref pendingEnds);
+-			SocketAsyncResult req = new SocketAsyncResult (this, state, callback);
++			SocketAsyncResult req = new SocketAsyncResult (this, state, callback, AsyncMethod.BeginReceive);
+ 			req.Buffer = buffer;
+ 			req.Offset = offset;
+ 			req.Size = size;
+@@ -811,9 +1145,7 @@
+ 				if (error != 0 && error != 10036) // WSAEINPROGRESS
+ 					throw new SocketException (error);
+ 			} else {
+-				Worker worker = new Worker (req);
+-				SocketAsyncCall sac = new SocketAsyncCall (worker.Receive);
+-				sac.BeginInvoke (null, null);
++				QueueWorkItem (new Work (this, req, WorkType.Receive));
+ 			}
+ 
+ 			return req;
+@@ -841,15 +1173,14 @@
+ 				throw new ArgumentOutOfRangeException ("offset + size exceeds the buffer length");
+ 
+ 			Interlocked.Increment (ref pendingEnds);
+-			SocketAsyncResult req = new SocketAsyncResult (this, state, callback);
++			SocketAsyncResult req = new SocketAsyncResult (this, state, callback, AsyncMethod.BeginReceiveFrom);
+ 			req.Buffer = buffer;
+ 			req.Offset = offset;
+ 			req.Size = size;
+ 			req.SockFlags = socket_flags;
+ 			req.EndPoint = remote_end;
+-			Worker worker = new Worker (req);
+-			SocketAsyncCall sac = new SocketAsyncCall (worker.ReceiveFrom);
+-			sac.BeginInvoke (null, null);
++			QueueWorkItem (new Work (this, req, WorkType.ReceiveFrom));
++
+ 			return req;
+ 		}
+ 
+@@ -859,6 +1190,9 @@
+ 			if (disposed && closed)
+ 				throw new ObjectDisposedException (GetType ().ToString ());
+ 
++			if (!Connected)
++				throw new SocketException (10057); // WSAENOTCONN
++			
+ 			if (buffer == null)
+ 				throw new ArgumentNullException ("buffer");
+ 
+@@ -872,7 +1206,7 @@
+ 				throw new ArgumentOutOfRangeException ("offset + size exceeds the buffer length");
+ 
+ 			Interlocked.Increment (ref pendingEnds);
+-			SocketAsyncResult req = new SocketAsyncResult (this, state, callback);
++			SocketAsyncResult req = new SocketAsyncResult (this, state, callback, AsyncMethod.BeginSend);
+ 			req.Buffer = buffer;
+ 			req.Offset = offset;
+ 			req.Size = size;
+@@ -885,9 +1219,7 @@
+ 				if (error != 0 && error != 10036) // WSAEINPROGRESS
+ 					throw new SocketException (error);
+ 			} else {
+-				Worker worker = new Worker (req);
+-				SocketAsyncCall sac = new SocketAsyncCall (worker.Send);
+-				sac.BeginInvoke (null, null);
++				QueueWorkItem (new Work (this, req, WorkType.Send));
+ 			}
+ 			return req;
+ 		}
+@@ -914,15 +1246,14 @@
+ 				throw new ArgumentOutOfRangeException ("offset + size exceeds the buffer length");
+ 
+ 			Interlocked.Increment (ref pendingEnds);
+-			SocketAsyncResult req = new SocketAsyncResult (this, state, callback);
++			SocketAsyncResult req = new SocketAsyncResult (this, state, callback, AsyncMethod.BeginSendTo);
+ 			req.Buffer = buffer;
+ 			req.Offset = offset;
+ 			req.Size = size;
+ 			req.SockFlags = socket_flags;
+ 			req.EndPoint = remote_end;
+-			Worker worker = new Worker(req);
+-			SocketAsyncCall sac = new SocketAsyncCall (worker.SendTo);
+-			sac.BeginInvoke (null, null);
++			QueueWorkItem (new Work (this, req, WorkType.SendTo));
++
+ 			return req;
+ 		}
+ 
+@@ -994,8 +1325,16 @@
+ 			if (req == null)
+ 				throw new ArgumentException ("Invalid IAsyncResult", "result");
+ 
++			if (req.Done)
++				throw new InvalidOperationException ("EndAccept can only be called once for each asynchronous operation.");
++
++			if (req.Method != AsyncMethod.BeginAccept)
++				throw new ArgumentException ("The IAsyncResult object was not returned by the corresponding asynchronous method of this class.");
++			
+ 			if (!result.IsCompleted)
+ 				result.AsyncWaitHandle.WaitOne();
++			
++			req.Done = true;
+ 
+ 			Interlocked.Decrement (ref pendingEnds);
+ 			CheckIfClose ();
+@@ -1014,9 +1353,18 @@
+ 			if (req == null)
+ 				throw new ArgumentException ("Invalid IAsyncResult", "result");
+ 
++			if (req.Done)
++				throw new InvalidOperationException ("EndConnect can only be called once for each asynchronous operation.");
++
++			if (req.Method != AsyncMethod.BeginConnect)
++				throw new ArgumentException ("The IAsyncResult object was not returned by the corresponding asynchronous method of this class.");
++
+ 			if (!result.IsCompleted)
+ 				result.AsyncWaitHandle.WaitOne();
+ 
++			req.Done = true;	
++			connecting = false;
++
+ 			Interlocked.Decrement (ref pendingEnds);
+ 			CheckIfClose ();
+ 			req.CheckIfThrowDelayedException();
+@@ -1031,14 +1379,22 @@
+ 
+ 			SocketAsyncResult req = result as SocketAsyncResult;
+ 			if (req == null)
+-				throw new ArgumentException ("Invalid IAsyncResult", "result");
++				throw new ArgumentException ("Invalid IAsyncResult", "result");			
++			
++			if (req.Done)
++				throw new InvalidOperationException ("EndReceive can only be called once for each asynchronous operation.");
+ 
++			if (req.Method != AsyncMethod.BeginReceive)
++				throw new ArgumentException ("The IAsyncResult object was not returned by the corresponding asynchronous method of this class.");
++
+ 			if (supportsAsync && socket_type == SocketType.Stream)
+ 				RemoveReference (req);
+ 
+ 			if (!result.IsCompleted)
+ 				result.AsyncWaitHandle.WaitOne();
+ 
++			req.Done = true;	
++
+ 			Interlocked.Decrement (ref pendingEnds);
+ 			CheckIfClose ();
+ 			req.CheckIfThrowDelayedException();
+@@ -1055,10 +1411,18 @@
+ 
+ 			SocketAsyncResult req = result as SocketAsyncResult;
+ 			if (req == null)
+-				throw new ArgumentException ("Invalid IAsyncResult", "result");
++				throw new ArgumentException ("Invalid IAsyncResult", "result");			
++			
++			if (req.Done)
++				throw new InvalidOperationException ("EndReceiveFrom can only be called once for each asynchronous operation.");
+ 
++			if (req.Method != AsyncMethod.BeginReceiveFrom)
++				throw new ArgumentException ("The IAsyncResult object was not returned by the corresponding asynchronous method of this class.");
++
+ 			if (!result.IsCompleted)
+ 				result.AsyncWaitHandle.WaitOne();
++	
++			req.Done = true;
+ 
+ 			Interlocked.Decrement (ref pendingEnds);
+ 			CheckIfClose ();
+@@ -1078,11 +1442,19 @@
+ 			if (req == null)
+ 				throw new ArgumentException ("Invalid IAsyncResult", "result");
+ 
++			if (req.Done)
++				throw new InvalidOperationException ("EndSend can only be called once for each asynchronous operation.");
++
++			if (req.Method != AsyncMethod.BeginSend)
++				throw new ArgumentException ("The IAsyncResult object was not returned by the corresponding asynchronous method of this class.");
++
+ 			if (supportsAsync && socket_type == SocketType.Stream)
+ 				RemoveReference (req);
+ 
+ 			if (!result.IsCompleted)
+ 				result.AsyncWaitHandle.WaitOne();
++			
++			req.Done = true;
+ 
+ 			Interlocked.Decrement (ref pendingEnds);
+ 			CheckIfClose ();
+@@ -1100,9 +1472,17 @@
+ 			SocketAsyncResult req = result as SocketAsyncResult;
+ 			if (req == null)
+ 				throw new ArgumentException ("Invalid IAsyncResult", "result");
++			
++			if (req.Done)
++				throw new InvalidOperationException ("EndSendTo can only be called once for each asynchronous operation.");
+ 
++			if (req.Method != AsyncMethod.BeginSendTo)
++				throw new ArgumentException ("The IAsyncResult object was not returned by the corresponding asynchronous method of this class.");
++
+ 			if (!result.IsCompleted)
+ 				result.AsyncWaitHandle.WaitOne();
++			
++			req.Done = true;
+ 
+ 			Interlocked.Decrement (ref pendingEnds);
+ 			CheckIfClose ();
+@@ -1307,7 +1687,6 @@
+ 		int Receive_nochecks (byte [] buf, int offset, int size, SocketFlags flags)
+ 		{
+ 			int ret, error;
+-			
+ 			ret = Receive_internal (socket, buf, offset, size, flags, out error);
+ 
+ 			if (error != 0) {

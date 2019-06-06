@@ -1,0 +1,206 @@
+Index: mono/mini/mini.c
+===================================================================
+--- mono/mini/mini.c	(revision 84274)
++++ mono/mini/mini.c	(working copy)
+@@ -8727,7 +8727,11 @@
+ 	/* handle_remove should be eventually called for this thread, too
+ 	g_free (jit_tls);*/
+ 
+-	mono_thread_exit ();
++	if (mono_runtime_uses_legacy_unhandled_exception_policy ()) {
++		mono_thread_exit ();
++	} else {
++		exit (mono_environment_exitcode_get ());
++	}
+ }
+ 
+ static void*
+Index: mono/metadata/object.c
+===================================================================
+--- mono/metadata/object.c	(revision 84274)
++++ mono/metadata/object.c	(working copy)
+@@ -2618,7 +2618,7 @@
+ 	return result;
+ }
+ 
+-/* Used in mono_unhandled_exception */
++/* Used in call_unhandled_exception_delegate */
+ static MonoObject *
+ create_unhandled_exception_eventargs (MonoObject *exc)
+ {
+@@ -2646,7 +2646,57 @@
+ 	return obj;
+ }
+ 
++/* Used in mono_unhandled_exception */
++static void
++call_unhandled_exception_delegate (MonoDomain *domain, MonoObject *delegate, MonoObject *exc) {
++	MonoObject *e = NULL;
++	gpointer pa [2];
++
++	pa [0] = domain->domain;
++	pa [1] = create_unhandled_exception_eventargs (exc);
++	mono_runtime_delegate_invoke (delegate, pa, &e);
++	
++	if (e) {
++		gchar *msg = mono_string_to_utf8 (((MonoException *) e)->message);
++		g_warning ("exception inside UnhandledException handler: %s\n", msg);
++		g_free (msg);
++	}
++}
++
++static gboolean use_legacy_unhandled_exception_policy = FALSE;
++
+ /**
++ * mono_runtime_force_legacy_unhandled_exception_policy:
++ *
++ * This is a VM internal routine.
++ *
++ * It must be called if <legacyUnhandledExceptionPolicy> is enabled in the
++ * config file, so that mono_runtime_uses_legacy_unhandled_exception_policy
++ * will always return true.
++ */
++void
++mono_runtime_force_legacy_unhandled_exception_policy (void) {
++	use_legacy_unhandled_exception_policy = TRUE;
++}
++
++/**
++ * mono_runtime_uses_legacy_unhandled_exception_policy:
++ *
++ * This is a VM internal routine.
++ *
++ * It returns TRUE if an unhandled exception does not cause the whole
++ * process to exit, unless it happens in the main thread (which is the
++ * legacy behavior of the 1.0 and 1.1 runtimes).
++ */
++gboolean
++mono_runtime_uses_legacy_unhandled_exception_policy (void) {
++	gboolean result = (use_legacy_unhandled_exception_policy ||
++			(mono_get_runtime_info ()->framework_version [0] < '2'));
++	//printf ("mono_runtime_uses_legacy_unhandled_exception_policy returns %d (framework_version [0] is %c\n", result, mono_get_runtime_info ()->framework_version [0]);
++	return result;
++}
++
++/**
+  * mono_unhandled_exception:
+  * @exc: exception thrown
+  *
+@@ -2661,35 +2711,38 @@
+ void
+ mono_unhandled_exception (MonoObject *exc)
+ {
+-	MonoDomain *domain = mono_domain_get ();
++	MonoDomain *current_domain = mono_domain_get ();
++	MonoDomain *root_domain = mono_get_root_domain ();
+ 	MonoClassField *field;
+-	MonoObject *delegate;
++	MonoObject *current_appdomain_delegate;
++	MonoObject *root_appdomain_delegate;
+ 
+ 	field=mono_class_get_field_from_name(mono_defaults.appdomain_class, 
+ 					     "UnhandledException");
+ 	g_assert (field);
+ 
+ 	if (exc->vtable->klass != mono_defaults.threadabortexception_class) {
+-		delegate = *(MonoObject **)(((char *)domain->domain) + field->offset); 
++		gboolean abort_process = (mono_thread_current () == main_thread) ||
++				!mono_runtime_uses_legacy_unhandled_exception_policy ();
++		root_appdomain_delegate = *(MonoObject **)(((char *)root_domain->domain) + field->offset);
++		if (current_domain != root_domain && (mono_get_runtime_info ()->framework_version [0] >= '2')) {
++			current_appdomain_delegate = *(MonoObject **)(((char *)current_domain->domain) + field->offset);
++		} else {
++			current_appdomain_delegate = NULL;
++		}
+ 
+-		/* set exitcode only in the main thread */
+-		if (mono_thread_current () == main_thread)
++		/* set exitcode only if we will abort the process */
++		if (abort_process)
+ 			mono_environment_exitcode_set (1);
+-		if (domain != mono_get_root_domain () || !delegate) {
++		if ((current_appdomain_delegate == NULL) && (root_appdomain_delegate == NULL)) {
+ 			mono_print_unhandled_exception (exc);
+ 		} else {
+-			MonoObject *e = NULL;
+-			gpointer pa [2];
+-
+-			pa [0] = domain->domain;
+-			pa [1] = create_unhandled_exception_eventargs (exc);
+-			mono_runtime_delegate_invoke (delegate, pa, &e);
+-			
+-			if (e) {
+-				gchar *msg = mono_string_to_utf8 (((MonoException *) e)->message);
+-				g_warning ("exception inside UnhandledException handler: %s\n", msg);
+-				g_free (msg);
++			if (root_appdomain_delegate) {
++				call_unhandled_exception_delegate (root_domain, root_appdomain_delegate, exc);
+ 			}
++			if (current_appdomain_delegate) {
++				call_unhandled_exception_delegate (current_domain, current_appdomain_delegate, exc);
++			}
+ 		}
+ 	}
+ }
+Index: mono/metadata/object.h
+===================================================================
+--- mono/metadata/object.h	(revision 84274)
++++ mono/metadata/object.h	(working copy)
+@@ -242,6 +242,11 @@
+ mono_runtime_exec_main	    (MonoMethod *method, MonoArray *args,
+ 			     MonoObject **exc);
+ 
++void
++mono_runtime_force_legacy_unhandled_exception_policy (void);
++gboolean
++mono_runtime_uses_legacy_unhandled_exception_policy (void);
++
+ gpointer
+ mono_load_remote_field (MonoObject *this_obj, MonoClass *klass, MonoClassField *field, gpointer *res);
+ 
+Index: mono/metadata/mono-config.c
+===================================================================
+--- mono/metadata/mono-config.c	(revision 84274)
++++ mono/metadata/mono-config.c	(working copy)
+@@ -289,6 +289,33 @@
+ 	dllmap_finish
+ };
+ 
++static void
++legacyUEP_start (gpointer user_data, 
++              const gchar         *element_name,
++              const gchar        **attribute_names,
++              const gchar        **attribute_values) {
++	if ((strcmp (element_name, "legacyUnhandledExceptionPolicy") == 0) &&
++			(attribute_names [0] != NULL) &&
++			(strcmp (attribute_names [0], "enabled") == 0)) {
++		if ((strcmp (attribute_values [0], "1") == 0) ||
++				(strcmp (attribute_values [0], "true") == 0) ||
++				(strcmp (attribute_values [0], "True") == 0) ||
++				(strcmp (attribute_values [0], "TRUE") == 0)) {
++			mono_runtime_force_legacy_unhandled_exception_policy ();
++		}
++	}
++}
++
++static const MonoParseHandler
++legacyUEP_handler = {
++	"legacyUnhandledExceptionPolicy",
++	NULL, /* init */
++	legacyUEP_start,
++	NULL, /* text */
++	NULL, /* end */
++	NULL, /* finish */
++};
++
+ static int inited = 0;
+ 
+ static void
+@@ -297,6 +324,7 @@
+ 	inited = 1;
+ 	config_handlers = g_hash_table_new (g_str_hash, g_str_equal);
+ 	g_hash_table_insert (config_handlers, (gpointer) dllmap_handler.element_name, (gpointer) &dllmap_handler);
++	g_hash_table_insert (config_handlers, (gpointer) legacyUEP_handler.element_name, (gpointer) &legacyUEP_handler);
+ }
+ 
+ /* FIXME: error handling */

@@ -1,0 +1,532 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] [PATCH] Key pair protection
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5BPATCH%5D%20Key%20pair%20protection&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="005072.html">
+   <LINK REL="Next"  HREF="005073.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] [PATCH] Key pair protection</H1>
+    <B>S&#233;bastien Pouliot</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5BPATCH%5D%20Key%20pair%20protection&In-Reply-To="
+       TITLE="[Mono-devel-list] [PATCH] Key pair protection">spouliot at videotron.ca
+       </A><BR>
+    <I>Tue Apr 20 17:30:10 EDT 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="005072.html">[Mono-devel-list] IL Regex First Release
+</A></li>
+        <LI>Next message: <A HREF="005073.html">[Mono-devel-list] FreeBSD 5.2.1 with Boehm GC build problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5063">[ date ]</a>
+              <a href="thread.html#5063">[ thread ]</a>
+              <a href="subject.html#5063">[ subject ]</a>
+              <a href="author.html#5063">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello all,
+
+Here's the patch for key pair protection. The model is similar to what ssh
+use to protect the user private key(s).
+
+*** Please note that this is _only_ used for key pairs (DSA or RSA) when the
+objects are created using a CspParameters object. This is (mostly) for
+compatibility with Windows (which use CryptoAPI to protect it's key
+container). Most of the time the application will want to protect itself
+it's own key pairs (e.g. password protected). ***
+
+
+Key pairs are kept under the directory [base]/.mono/keypairs/
+where [base] is either
+	Environment.SpecialFolder.ApplicationData for users key pairs
+	Environment.SpecialFolder.CommonApplicationData for machine key pairs
+The directories are created (when non-existant).
+
+The following access control are applied on files (key pairs) and
+directories:
+
+POSIX
+- User
+	- 0700 for directory
+	- 0600 for key pairs (files)
+- Machine:
+	- 0755 for directory
+	- 0644 for key pairs (files)
+
+Windows
+- User
+	- [Current User], Full Control
+- Machine
+	- BUILTIN\Administrators, Full Control
+	- BUILTIN\Everyone, Read
+note: No ACE are inherited from parent directories
+
+
+Files
+- keypair.diff
+	Runtime patch. File also contains the patch for Environment.GetFolderPath
+(windows).
+- KeyPersistence.cs
+	Entire file (not a patch) since the patch would be difficult to read.
+
+* The Environment.GetFolderPath patch (from yesterday) is pre-required.
+
+Sebastien Pouliot
+<A HREF="http://pages.infinit.net/ctech/poupou.html">http://pages.infinit.net/ctech/poupou.html</A>
+
+-------------- next part --------------
+//
+// KeyPairPersistence.cs: Keypair persistence
+//
+// Author:
+//	Sebastien Pouliot &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">sebastien at ximian.com</A>&gt;
+//
+// (C) 2004 Novell (<A HREF="http://www.novell.com">http://www.novell.com</A>)
+//
+
+using System;
+using System.IO;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Cryptography;
+using System.Security.Permissions;
+using System.Text;
+
+using Mono.Xml;
+
+namespace Mono.Security.Cryptography {
+
+	/* File name
+	 * [type][unique name][key number].xml
+	 * 
+	 * where
+	 *	type		CspParameters.ProviderType
+	 *	unique name	A unique name for the keypair, which is
+	 *			a. default (for a provider default keypair)
+	 *			b. a GUID derived from
+	 *				i. random if no container name was
+	 *				specified at generation time
+	 *				ii. the MD5 hash of the container
+	 *				name (CspParameters.KeyContainerName)
+	 *	key number	CspParameters.KeyNumber
+	 * 
+	 * File format
+	 * &lt;KeyPair&gt;
+	 *	&lt;Properties&gt;
+	 *		&lt;Provider Name=&quot;&quot; Type=&quot;&quot;/&gt;
+	 *		&lt;Container Name=&quot;&quot;/&gt;
+	 *	&lt;/Properties&gt;
+	 *	&lt;KeyValue Id=&quot;&quot;&gt;
+	 *		RSAKeyValue, DSAKeyValue ...
+	 *	&lt;/KeyValue&gt;
+	 * &lt;/KeyPair&gt;
+	 */
+
+	/* NOTES
+	 * 
+	 * - There's NO confidentiality / integrity built in this
+	 * persistance mechanism. The container directories (both user and
+	 * machine) are created with restrited ACL. The ACL is also checked
+	 * when a key is accessed (so totally public keys won't be used).
+	 * see /mono/mono/metadata/security.c for implementation
+	 * 
+	 * - As we do not use CSP we limit ourselves to provider types (not 
+	 * names). This means that for a same type and container type, but 
+	 * two different provider names) will return the same keypair. This
+	 * should work as CspParameters always requires a csp type in its
+	 * constructors.
+	 * 
+	 * - Assert (CAS) are used so only the OS permission will limit access
+	 * to the keypair files. I.e. this will work even in high-security 
+	 * scenarios where users do not have access to file system (e.g. web 
+	 * application). We can allow this because the filename used is 
+	 * TOTALLY under our control (no direct user input is used).
+	 * 
+	 * - You CAN'T changes properties of the keypair once it's been
+	 * created (saved). You must remove the container than save it 
+	 * back. This is the same behaviour as CSP under Windows.
+	 */
+
+#if INSIDE_CORLIB
+	internal
+#else
+	public 
+#endif
+	class KeyPairPersistence {
+	
+		private static bool _userPathExists = false; // check at 1st use
+		private static string _userPath;
+		
+		private static bool _machinePathExists = false; // check at 1st use
+		private static string _machinePath;
+
+		private CspParameters _params;
+		private string _keyvalue;
+		private string _filename;
+		private string _container;
+
+		// constructors
+
+		public KeyPairPersistence (CspParameters parameters) 
+			: this (parameters, null)
+		{
+		}
+
+		public KeyPairPersistence (CspParameters parameters, string keypair) 
+		{
+			if (parameters == null)
+				throw new ArgumentNullException (&quot;parameters&quot;);
+
+			_params = Copy (parameters);
+			_keyvalue = keypair;
+		}
+
+		// properties
+
+		public string Filename {
+			get { 
+				if (_filename == null) {
+					_filename = String.Format (&quot;[{0}][{1}][{2}].xml&quot;, 
+						_params.ProviderType, 
+						this.ContainerName, 
+						_params.KeyNumber);
+					if (UseMachineKeyStore)
+						_filename = Path.Combine (MachinePath, _filename);
+					else
+						_filename = Path.Combine (UserPath, _filename);
+				}
+				return _filename; 
+			}
+		}
+
+		public string KeyValue {
+			get { return _keyvalue; }
+			set { 
+				if (this.CanChange)
+					_keyvalue = value; 
+			}
+		}
+
+		// return a (read-only) copy
+		public CspParameters Parameters {
+			get { return Copy (_params); }
+		}
+
+		// methods
+
+		public bool Load () 
+		{
+			// see NOTES
+			new FileIOPermission (FileIOPermissionAccess.Read, this.Filename).Assert ();
+
+			bool result = File.Exists (this.Filename);
+			if (result) {
+				using (StreamReader sr = File.OpenText (this.Filename)) {
+					FromXml (sr.ReadToEnd ());
+				}
+			}
+			return result;
+		}
+
+		public void Save () 
+		{
+			// see NOTES
+			new FileIOPermission (FileIOPermissionAccess.Write, this.Filename).Assert ();
+
+			using (FileStream fs = File.Open (this.Filename, FileMode.Create)) {
+				StreamWriter sw = new StreamWriter (fs, Encoding.UTF8);
+				sw.Write (this.ToXml ());
+				sw.Close ();
+			}
+			// apply protection to newly created files
+			if (UseMachineKeyStore)
+				ProtectMachine (Filename);
+			else
+				ProtectUser (Filename);
+		}
+
+		public void Remove () 
+		{
+			// see NOTES
+			new FileIOPermission (FileIOPermissionAccess.Write, this.Filename).Assert ();
+
+			File.Delete (this.Filename);
+			// it's now possible to change the keypair un the container
+		}
+
+		// private static stuff
+
+		private static string UserPath {
+			get {
+				if ((_userPath == null) || (!_userPathExists)) {
+					lock (typeof (KeyPairPersistence)) {
+						_userPath = Path.Combine (
+							Environment.GetFolderPath (Environment.SpecialFolder.ApplicationData),
+							&quot;.mono&quot;);
+						_userPath = Path.Combine (_userPath, &quot;keypairs&quot;);
+
+						_userPathExists = Directory.Exists (_userPath);
+						if (!_userPathExists) {
+							try {
+								Directory.CreateDirectory (_userPath);
+								ProtectUser (_userPath);
+								_userPathExists = true;
+							}
+							catch (Exception e) {
+								throw new CryptographicException (&quot;Could not create key store.&quot;, e);
+							}
+						}
+					}
+				}
+				// is it properly protected ?
+				if (!IsUserProtected (_userPath)) {
+					throw new CryptographicException (&quot;Improperly protected key pairs.&quot;);
+				}
+				return _userPath;
+			}
+		}
+
+		private static string MachinePath {
+			get {
+				if ((_machinePath == null) || (!_machinePathExists)) {
+					lock (typeof (KeyPairPersistence)) {
+						_machinePath = Path.Combine (
+							Environment.GetFolderPath (Environment.SpecialFolder.CommonApplicationData),
+							&quot;.mono&quot;);
+						_machinePath = Path.Combine (_machinePath, &quot;keypairs&quot;);
+
+						_machinePathExists = Directory.Exists (_machinePath);
+						if (!_machinePathExists) {
+							try {
+								Directory.CreateDirectory (_machinePath);
+								ProtectMachine (_machinePath);
+								_machinePathExists = true;
+							}
+							catch (Exception e) {
+								throw new CryptographicException (&quot;Could not create key store.&quot;, e);
+							}
+						}
+					}
+				}
+				// is it properly protected ?
+				if (!IsMachineProtected (_machinePath)) {
+					throw new CryptographicException (&quot;Improperly protected key pairs.&quot;);
+				}
+				return _machinePath;
+			}
+		}
+
+#if INSIDE_CORLIB
+		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+		internal static extern bool _CanSecure (string root);
+
+		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+		internal static extern bool _ProtectUser (string path);
+
+		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+		internal static extern bool _ProtectMachine (string path);
+
+		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+		internal static extern bool _IsUserProtected (string path);
+
+		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+		internal static extern bool _IsMachineProtected (string path);
+#else
+		// Mono.Security.dll assembly can't use the internal 
+		// call (and still run with other runtimes)
+
+		// Note: Class is only available in Mono.Security.dll as
+		// a management helper (e.g. build a GUI app)
+
+		internal static bool _CanSecure (string root) 
+		{
+			return true;
+		}
+
+		internal static bool _ProtectUser (string path)
+		{
+			return true;
+		}
+
+		internal static bool _ProtectMachine (string path)
+		{
+			return true;
+		}
+
+		internal static bool _IsUserProtected (string path)
+		{
+			return true;
+		}
+
+		internal static bool _IsMachineProtected (string path)
+		{
+			return true;
+		}
+#endif
+		// private stuff
+
+		private static bool CanSecure (string path) 
+		{
+			// we assume POSIX filesystems can always be secured
+			if ((int) Environment.Platform == 128)
+				return true;
+			// while we ask the runtime for Windows OS
+			return _CanSecure (Path.GetPathRoot (path));
+		}
+
+		private static bool ProtectUser (string path)
+		{
+			// we cannot protect on some filsystem (like FAT)
+			if (CanSecure (path)) {
+				return _ProtectUser (path);
+			}
+			// but Mono still needs to run on them :(
+			return true;
+		}
+
+		private static bool ProtectMachine (string path)
+		{
+			// we cannot protect on some filsystem (like FAT)
+			if (CanSecure (path)) {
+				return _ProtectMachine (path);
+			}
+			// but Mono still needs to run on them :(
+			return true;
+		}
+
+		private static bool IsUserProtected (string path)
+		{
+			// we cannot protect on some filsystem (like FAT)
+			if (CanSecure (path)) {
+				return _IsUserProtected (path);
+			}
+			// but Mono still needs to run on them :(
+			return true;
+		}
+
+		private static bool IsMachineProtected (string path)
+		{
+			// we cannot protect on some filsystem (like FAT)
+			if (CanSecure (path)) {
+				return _IsMachineProtected (path);
+			}
+			// but Mono still needs to run on them :(
+			return true;
+		}
+		
+		private bool CanChange {
+			get { return (_keyvalue == null); }
+		}
+
+		private bool UseDefaultKeyContainer {
+			get { return ((_params.Flags &amp; CspProviderFlags.UseDefaultKeyContainer) == CspProviderFlags.UseDefaultKeyContainer); }
+		}
+
+		private bool UseMachineKeyStore {
+			get { return ((_params.Flags &amp; CspProviderFlags.UseMachineKeyStore) == CspProviderFlags.UseMachineKeyStore); }
+		}
+
+		private string ContainerName {
+			get {
+				if (_container == null) {
+					if (UseDefaultKeyContainer) {
+						// easy to spot
+						_container = &quot;default&quot;;
+					}
+					else if ((_params.KeyContainerName == null) || (_params.KeyContainerName == String.Empty)) {
+						_container = Guid.NewGuid ().ToString ();
+					}
+					else {
+						// we don't want to trust the key container name as we don't control it
+						// anyway some characters may not be compatible with the file system
+						byte[] data = Encoding.UTF8.GetBytes (_params.KeyContainerName);
+						MD5 hash = MD5.Create ();	// faster than SHA1, same length as GUID
+						byte[] result = hash.ComputeHash (data);
+						_container = new Guid (result).ToString ();
+					}
+				}
+				return _container;
+			}
+		}
+
+		// we do not want any changes after receiving the csp informations
+		private CspParameters Copy (CspParameters p) 
+		{
+			CspParameters copy = new CspParameters (p.ProviderType, p.ProviderName, p.KeyContainerName);
+			copy.KeyNumber = p.KeyNumber;
+			copy.Flags = p.Flags;
+			return copy;
+		}
+
+		private void FromXml (string xml) 
+		{
+			SecurityParser sp = new SecurityParser ();
+			sp.LoadXml (xml);
+
+			SecurityElement root = sp.ToXml ();
+			if (root.Tag == &quot;KeyPair&quot;) {
+				SecurityElement prop = root.SearchForChildByTag (&quot;Properties&quot;);
+				SecurityElement keyv = root.SearchForChildByTag (&quot;KeyValue&quot;);
+				if (keyv.Children.Count &gt; 0)
+					_keyvalue = keyv.Children [0].ToString ();
+				// Note: we do not read other stuff because 
+				// it can't be changed after key creation
+			}
+		}
+
+		private string ToXml () 
+		{
+			// note: we do not use SecurityElement here because the
+			// keypair is a XML string (requiring parsing)
+			StringBuilder xml = new StringBuilder ();
+			xml.AppendFormat (&quot;&lt;KeyPair&gt;{0}\t&lt;Properties&gt;{0}\t\t&lt;Provider &quot;, Environment.NewLine);
+			if ((_params.ProviderName != null) &amp;&amp; (_params.ProviderName != String.Empty)) {
+				xml.AppendFormat (&quot;Name=\&quot;{0}\&quot; &quot;, _params.ProviderName);
+			}
+			xml.AppendFormat (&quot;Type=\&quot;{0}\&quot; /&gt;{1}\t\t&lt;Container &quot;, _params.ProviderType, Environment.NewLine);
+			xml.AppendFormat (&quot;Name=\&quot;{0}\&quot; /&gt;{1}\t&lt;/Properties&gt;{1}\t&lt;KeyValue&quot;, this.ContainerName, Environment.NewLine);
+			if (_params.KeyNumber != -1) {
+				xml.AppendFormat (&quot; Id=\&quot;{0}\&quot; &quot;, _params.KeyNumber);
+			}
+			xml.AppendFormat (&quot;&gt;{1}\t\t{0}{1}\t&lt;/KeyValue&gt;{1}&lt;/KeyPair&gt;{1}&quot;, this.KeyValue, Environment.NewLine);
+			return xml.ToString ();
+		}
+	}
+}
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: keypair.diff
+Type: application/octet-stream
+Size: 12741 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20040420/1319b5f4/attachment.obj">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20040420/1319b5f4/attachment.obj</A> 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="005072.html">[Mono-devel-list] IL Regex First Release
+</A></li>
+	<LI>Next message: <A HREF="005073.html">[Mono-devel-list] FreeBSD 5.2.1 with Boehm GC build problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5063">[ date ]</a>
+              <a href="thread.html#5063">[ thread ]</a>
+              <a href="subject.html#5063">[ subject ]</a>
+              <a href="author.html#5063">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

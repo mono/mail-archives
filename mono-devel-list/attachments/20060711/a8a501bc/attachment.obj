@@ -1,0 +1,127 @@
+Index: mono/mono/metadata/icall.c
+===================================================================
+--- mono/mono/metadata/icall.c	(revision 62425)
++++ mono/mono/metadata/icall.c	(working copy)
+@@ -7072,9 +7072,9 @@
+ 	{".ctor(char,int)", ves_icall_System_String_ctor_char_int},
+ 	{".ctor(char[])", ves_icall_System_String_ctor_chara},
+ 	{".ctor(char[],int,int)", ves_icall_System_String_ctor_chara_int_int},
+-	{".ctor(sbyte*)", ves_icall_System_String_ctor_sbytep},
+-	{".ctor(sbyte*,int,int)", ves_icall_System_String_ctor_sbytep_int_int},
+-	{".ctor(sbyte*,int,int,System.Text.Encoding)", ves_icall_System_String_ctor_encoding},
++	{".ctor(sbyte*)", ICALL_REDIRECT_TO_CREATESTRING},
++	{".ctor(sbyte*,int,int)", ICALL_REDIRECT_TO_CREATESTRING},
++	{".ctor(sbyte*,int,int,System.Text.Encoding)", ICALL_REDIRECT_TO_CREATESTRING},
+ 	{"InternalAllocateStr", ves_icall_System_String_InternalAllocateStr},
+ 	{"InternalCharCopy", ves_icall_System_String_InternalCharCopy},
+ 	{"InternalCopyTo", ves_icall_System_String_InternalCopyTo},
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 62425)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -6804,6 +6804,7 @@
+ 	MonoMethod *res;
+ 	GHashTable *cache;
+ 	gboolean pinvoke = FALSE;
++	gpointer iter;
+ 	int i;
+ 	const char *exc_class = "MissingMethodException";
+ 	const char *exc_arg = NULL;
+@@ -6828,6 +6829,36 @@
+ 			piinfo->addr = mono_lookup_internal_call (method);
+ 	}
+ 
++	/* hack - redirect certain string constructors to CreateString */
++	if (piinfo->addr == ICALL_REDIRECT_TO_CREATESTRING) {
++		g_assert (!pinvoke);
++		g_assert (method->string_ctor);
++
++		/* CreateString returns a value */
++		csig = signature_dup (method->klass->image, sig);
++		csig->ret = &mono_defaults.string_class->byval_arg;
++
++		iter = NULL;
++		while ((res = mono_class_get_methods (mono_defaults.string_class, &iter))) {
++			if (!strcmp ("CreateString", res->name) &&
++				mono_metadata_signature_equal (csig, mono_method_signature (res))) {
++
++				mono_loader_lock ();
++				mono_marshal_lock ();
++				if (g_hash_table_lookup (cache, method))
++					g_hash_table_insert (cache, method, res);
++				mono_marshal_unlock ();
++				mono_loader_unlock ();
++
++				return res;
++			}
++		}
++
++		/* exception will be thrown */
++		piinfo->addr = NULL;
++		g_warning ("cannot find CreateString for .ctor");
++	}
++
+ 	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_MANAGED_TO_NATIVE);
+ 
+ 	mb->method->save_lmf = 1;
+Index: mono/mono/metadata/marshal.h
+===================================================================
+--- mono/mono/metadata/marshal.h	(revision 62425)
++++ mono/mono/metadata/marshal.h	(working copy)
+@@ -18,6 +18,8 @@
+ #include <mono/metadata/opcodes.h>
+ #include <mono/metadata/reflection.h>
+ 
++#define ICALL_REDIRECT_TO_CREATESTRING (-1)
++
+ G_BEGIN_DECLS
+ 
+ typedef struct _MonoMethodBuilder MonoMethodBuilder;
+Index: mcs/class/corlib/System/String.cs
+===================================================================
+--- mcs/class/corlib/System/String.cs	(revision 62425)
++++ mcs/class/corlib/System/String.cs	(working copy)
+@@ -1854,6 +1854,43 @@
+ 			}
+ 		}
+ 
++		private unsafe String CreateString (sbyte* value)
++		{
++			byte* bytes = (byte*) value;
++			int length = 0;
++
++			while (bytes++ [0] != 0)
++				length++;
++
++			return CreateString (value, 0, length, null);
++		}
++
++		private unsafe String CreateString (sbyte* value, int startIndex, int length)
++		{
++			return CreateString (value, startIndex, length, null);
++		}
++
++		private unsafe String CreateString (sbyte* value, int startIndex, int length, Encoding enc)
++		{
++			Console.WriteLine ("CreateString called");
++
++			if (length < 0)
++				throw new ArgumentOutOfRangeException ("length");
++			if (startIndex < 0 || (value + startIndex) < value)
++				throw new ArgumentOutOfRangeException ("startIndex");
++
++			if (enc == null)
++				enc = Encoding.Default;
++
++			byte [] bytes = new byte [length];
++
++			if (length != 0)
++				fixed (byte* bytePtr = bytes)
++					memcpy (bytePtr, (byte*) (value + startIndex), length);
++
++			return enc.GetString (bytes);
++		}
++		
+ 		/* helpers used by the runtime as well as above or eslewhere in corlib */
+ 		internal static unsafe void memset (byte *dest, int val, int len)
+ 		{

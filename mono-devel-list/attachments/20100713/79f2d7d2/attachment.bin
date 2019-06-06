@@ -1,0 +1,501 @@
+Index: mono-dl.c
+===================================================================
+--- mono-dl.c	(revision 160304)
++++ mono-dl.c	(working copy)
+@@ -29,11 +29,6 @@
+ 	".so",
+ 	".bundle"
+ };
+-#elif EMBEDDED_PINVOKE
+-#define SOPREFIX ""
+-static const char suffixes [][1] = {
+-	""
+-};
+ #else
+ #define SOPREFIX "lib"
+ static const char suffixes [][4] = {
+@@ -80,15 +75,6 @@
+ 	return lflags;
+ }
+ 
+-#elif EMBEDDED_PINVOKE
+-#define SO_HANDLE_TYPE void*
+-void *LL_SO_OPEN   (const char *file, int flags);
+-int   LL_SO_CLOSE  (void *handle);
+-#define LL_SO_SYMBOL(module,symbol) _LL_SO_SYMBOL((module)->handle, (symbol))
+-void *_LL_SO_SYMBOL (void *handle, const char *symbol);
+-char *LL_SO_ERROR();
+-#define LL_SO_TRFLAGS(flags)      0
+-
+ #else
+ /* no dynamic loader supported */
+ #define SO_HANDLE_TYPE void*
+@@ -100,11 +86,32 @@
+ 
+ #endif
+ 
++static GSList *fallback_handlers;
++
++struct MonoDlFallbackHandler {
++	MonoDlFallbackLoad load_func;
++	MonoDlFallbackSymbol symbol_func;
++	MonoDlFallbackClose close_func;
++	void *user_data;
++};
++	
+ struct _MonoDl {
+ 	SO_HANDLE_TYPE handle;
+ 	int main_module;
++
++	/* If not NULL, use the methods in MonoDlFallbackHandler instead of the LL_* methods */
++	MonoDlFallbackHandler *dl_fallback;
+ };
+ 
++MonoDlMapping *
++dl_mapping_open (const char *file);
++
++void *
++dl_mapping_symbol (void *handle, const char *symbol);
++
++char *
++dl_mapping_error (void);
++
+ #ifdef TARGET_WIN32
+ 
+ static char*
+@@ -314,6 +321,7 @@
+ {
+ 	MonoDl *module;
+ 	void *lib;
++	MonoDlFallbackHandler *dl_fallback = NULL;
+ 	int lflags = LL_SO_TRFLAGS (flags);
+ 
+ 	if (error_msg)
+@@ -328,6 +336,22 @@
+ 	module->main_module = name == NULL? TRUE: FALSE;
+ 	lib = LL_SO_OPEN (name, lflags);
+ 	if (!lib) {
++		GSList *node;
++		for (node = fallback_handlers; node != NULL; node = node->next){
++			MonoDlFallbackHandler *handler = (MonoDlFallbackHandler *) node->data;
++			*error_msg = NULL;
++			
++			lib = handler->load_func (name, lflags, error_msg, handler->user_data);
++			if (*error_msg != NULL)
++				g_free (*error_msg);
++			
++			if (lib != NULL){
++				dl_fallback = handler;
++				break;
++			}
++		}
++	}
++	if (!lib && !dl_fallback) {
+ 		char *lname;
+ 		char *llname;
+ 		const char *suff;
+@@ -358,6 +382,7 @@
+ 		}
+ 	}
+ 	module->handle = lib;
++	module->dl_fallback = dl_fallback;
+ 	return module;
+ }
+ 
+@@ -376,18 +401,24 @@
+ mono_dl_symbol (MonoDl *module, const char *name, void **symbol)
+ {
+ 	void *sym;
++	char *err = NULL;
+ 
++	if (module->dl_fallback) {
++		sym = module->dl_fallback->symbol_func (module->handle, name, &err, module->dl_fallback->user_data);
++	} else {
+ #if MONO_DL_NEED_USCORE
+-	{
+-		char *usname = malloc (strlen (name) + 2);
+-		*usname = '_';
+-		strcpy (usname + 1, name);
+-		sym = LL_SO_SYMBOL (module, usname);
+-		free (usname);
+-	}
++		{
++			char *usname = malloc (strlen (name) + 2);
++			*usname = '_';
++			strcpy (usname + 1, name);
++			sym = LL_SO_SYMBOL (module, usname);
++			free (usname);
++		}
+ #else
+-	sym = LL_SO_SYMBOL (module, name);
++		sym = LL_SO_SYMBOL (module, name);
+ #endif
++	}
++
+ 	if (sym) {
+ 		if (symbol)
+ 			*symbol = sym;
+@@ -395,7 +426,7 @@
+ 	}
+ 	if (symbol)
+ 		*symbol = NULL;
+-	return LL_SO_ERROR ();
++	return (module->dl_fallback != NULL) ? err :  LL_SO_ERROR ();
+ }
+ 
+ /**
+@@ -409,7 +440,14 @@
+ void
+ mono_dl_close (MonoDl *module)
+ {
+-	LL_SO_CLOSE (module);
++	MonoDlFallbackHandler *dl_fallback = module->dl_fallback;
++	
++	if (dl_fallback){
++		if (dl_fallback->close_func != NULL)
++			dl_fallback->close_func (module->handle, dl_fallback->user_data);
++	} else
++		LL_SO_CLOSE (module);
++	
+ 	free (module);
+ }
+ 
+@@ -485,92 +523,34 @@
+ 	return res;
+ }
+ 
+-#if EMBEDDED_PINVOKE
+-static GHashTable *mono_dls;
+-static char *ll_last_error = "";
+-
+-/**
+- * mono_dl_register_library:
+- * @name: Library name, this is the name used by the DllImport as the external library name
+- * @mappings: the mappings to register for P/Invoke.
+- *
+- * This function is only available on builds that define
+- * EMBEDDED_PINVOKE, this is available for systems that do not provide
+- * a dynamic linker but still want to use DllImport to easily invoke
+- * code from the managed side into the unmanaged world.
+- *
+- * Mappings is a pointer to the first element of an array of
+- * MonoDlMapping values.  The list must be terminated with both 
+- * the name and addr fields set to NULL.
+- *
+- * This is typically used like this:
+- * MonoDlMapping sample_library_mappings [] = {
+- *   { "CallMe", CallMe },
+- *   { NULL, NULL }
+- * };
+- *
+- * ...
+- * main ()
+- * {
+- *    ...
+- *    mono_dl_register_library ("sample", sample_library_mappings);
+- *    ...
+- * }
+- *
+- * Then the C# code can use this P/Invoke signature:
+- *
+- * 	[DllImport ("sample")]
+- *	extern static int CallMe (int f);
+- */
+-void
+-mono_dl_register_library (const char *name, MonoDlMapping *mappings)
++MonoDlFallbackHandler *
++mono_dl_fallback_register (MonoDlFallbackLoad load_func, MonoDlFallbackSymbol symbol_func, MonoDlFallbackClose close_func, void *user_data)
+ {
+-	if (mono_dls == NULL)
+-		mono_dls = g_hash_table_new (g_str_hash, g_str_equal);
++	MonoDlFallbackHandler *handler;
+ 	
+-	printf ("Inserting: 0x%p\n", mappings);
+-	g_hash_table_insert (mono_dls, g_strdup (name), mappings);
+-}
++	g_return_val_if_fail (load_func != NULL, NULL);
++	g_return_val_if_fail (symbol_func != NULL, NULL);
+ 
+-void *
+-LL_SO_OPEN (const char *file, int flag)
+-{
+-	void *mappings;
++	handler = g_new (MonoDlFallbackHandler, 1);
++	handler->load_func = load_func;
++	handler->symbol_func = symbol_func;
++	handler->close_func = close_func;
++	handler->user_data = user_data;
++
++	fallback_handlers = g_slist_prepend (fallback_handlers, handler);
+ 	
+-	if (mono_dls == NULL){
+-		ll_last_error = "Library not registered";
+-		return NULL;
+-	}
+-		
+-	mappings = g_hash_table_lookup (mono_dls, file);
+-	ll_last_error = mappings == NULL ? "File not registered" : "";
+-	return mappings;
++	return handler;
+ }
+ 
+-int LL_SO_CLOSE (void *handle)
++void
++mono_dl_fallback_unregister (MonoDlFallbackHandler *handler)
+ {
+-	// No-op
+-	return 0;
+-}
++	GSList *found;
+ 
+-void *
+-_LL_SO_SYMBOL (void *handle, const char *symbol)
+-{
+-	MonoDlMapping *mappings = (MonoDlMapping *) handle;
+-	
+-	for (;mappings->name; mappings++){
+-		if (strcmp (symbol, mappings->name) == 0){
+-			ll_last_error = "";
+-			return mappings->addr;
+-		}
+-	}
+-	ll_last_error = "Symbol not found";
+-	return NULL;
+-}
++	found = g_slist_find (fallback_handlers, handler);
++	if (found == NULL)
++		return;
+ 
+-char *
+-LL_SO_ERROR (void)
+-{
+-	return g_strdup (ll_last_error);
++	g_slist_remove (fallback_handlers, handler);
++	g_free (handler);
+ }
+-#endif
+Index: mono-dl.h
+===================================================================
+--- mono-dl.h	(revision 160304)
++++ mono-dl.h	(working copy)
+@@ -2,13 +2,8 @@
+ #define __MONO_UTILS_DL_H__
+ 
+ #include "mono/utils/mono-compiler.h"
++#include "mono/utils/mono-dl-fallback.h"
+ 
+-enum {
+-	MONO_DL_LAZY  = 1,
+-	MONO_DL_LOCAL = 2,
+-	MONO_DL_MASK  = 3
+-};
+-
+ typedef struct _MonoDl MonoDl;
+ 
+ MonoDl*     mono_dl_open       (const char *name, int flags, char **error_msg) MONO_INTERNAL;
+@@ -17,6 +12,5 @@
+ 
+ char*       mono_dl_build_path (const char *directory, const char *name, void **iter) MONO_INTERNAL;
+ 
+-
+ #endif /* __MONO_UTILS_DL_H__ */
+ 
+Index: mono-embed.c
+===================================================================
+--- mono-embed.c	(revision 0)
++++ mono-embed.c	(revision 0)
+@@ -0,0 +1,93 @@
++/*
++ * mono-embed.c: Simple APIs to register a bunch of libraries
++ *
++ * Author:
++ *    Mono Team (http://www.mono-project.com)
++ *
++ * Copyright 2001-2004 Ximian, Inc.
++ * Copyright 2004-2009 Novell, Inc.
++ */
++#include "config.h"
++#include "mono/utils/mono-dl.h"
++#include "mono/utils/mono-embed.h"
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <ctype.h>
++#include <string.h>
++#include <glib.h>
++
++static GHashTable *mono_dls;
++
++static void *
++dl_mapping_open (const char *file, int flags, char **err, void *user_data)
++{
++	MonoDlMapping *mappings;
++	
++	if (mono_dls == NULL){
++		*err = g_strdup ("Library not registered");
++		return NULL;
++	}
++		
++	mappings = (MonoDlMapping *) g_hash_table_lookup (mono_dls, file);
++	*err = g_strdup (mappings == NULL ? "File not registered" : "");
++	return mappings;
++}
++
++static void *
++dl_mapping_symbol (void *handle, const char *symbol, char **err, void *user_data)
++{
++	MonoDlMapping *mappings = (MonoDlMapping *) handle;
++	
++	for (;mappings->name; mappings++){
++		if (strcmp (symbol, mappings->name) == 0){
++			*err = g_strdup ("");
++			return mappings->addr;
++		}
++	}
++	*err = g_strdup ("Symbol not found");
++	return NULL;
++}
++
++/**
++ * mono_dl_register_library:
++ * @name: Library name, this is the name used by the DllImport as the external library name
++ * @mappings: the mappings to register for P/Invoke.
++ *
++ * The mappings registered using this function are used as fallbacks if the dynamic linker 
++ * fails, or if the platform doesn't have a dynamic linker.
++ *
++ * Mappings is a pointer to the first element of an array of
++ * MonoDlMapping values.  The list must be terminated with both 
++ * the name and addr fields set to NULL.
++ *
++ * This is typically used like this:
++ * MonoDlMapping sample_library_mappings [] = {
++ *   { "CallMe", CallMe },
++ *   { NULL, NULL }
++ * };
++ *
++ * ...
++ * main ()
++ * {
++ *    ...
++ *    mono_dl_register_library ("sample", sample_library_mappings);
++ *    ...
++ * }
++ *
++ * Then the C# code can use this P/Invoke signature:
++ *
++ * 	[DllImport ("sample")]
++ *	extern static int CallMe (int f);
++ */
++void
++mono_dl_register_library (const char *name, MonoDlMapping *mappings)
++{
++	if (mono_dls == NULL){
++		mono_dls = g_hash_table_new (g_str_hash, g_str_equal);
++		mono_dl_fallback_register (dl_mapping_open, dl_mapping_symbol, NULL, NULL);
++	}
++	
++	g_hash_table_insert (mono_dls, g_strdup (name), mappings);
++}
++
+
+Property changes on: mono-embed.c
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: mono-embed.h
+===================================================================
+--- mono-embed.h	(revision 160304)
++++ mono-embed.h	(working copy)
+@@ -1,10 +1,12 @@
+ #ifndef __MONO_EMBED_H__
+ #define __MONO_EMBED_H__
+ 
++#include <mono/utils/mono-publib.h>
++
++MONO_BEGIN_DECLS
++
+ /* 
+- * These are only used and available on embedded systems, the
+- * EMBEDDED_PINVOKE configuration option must be set, and it
+- * overrides any platform symbol loading functionality 
++ * This is a fallback for platform symbol loading functionality.
+  */
+ typedef struct {
+ 	const char *name;	
+@@ -13,4 +15,6 @@
+ 
+ void mono_dl_register_library (const char *name, MonoDlMapping *mappings);
+ 
++MONO_END_DECLS
++
+ #endif /* __MONO_EMBED_H__ */
+Index: mono-dl-fallback.h
+===================================================================
+--- mono-dl-fallback.h	(revision 0)
++++ mono-dl-fallback.h	(revision 0)
+@@ -0,0 +1,29 @@
++#ifndef __MONO_UTILS_DL_FALLBACK_H__
++#define __MONO_UTILS_DL_FALLBACK_H__
++
++enum {
++	MONO_DL_LAZY  = 1,
++	MONO_DL_LOCAL = 2,
++	MONO_DL_MASK  = 3
++};
++
++/*
++ * This is the dynamic loader fallback API
++ */
++typedef struct MonoDlFallbackHandler MonoDlFallbackHandler;
++
++/*
++ * The "err" variable contents must be allocated using g_malloc or g_strdup
++ */
++typedef void* (*MonoDlFallbackLoad) (const char *name, int flags, char **err, void *user_data);
++typedef void* (*MonoDlFallbackSymbol) (void *handle, const char *name, char **err, void *user_data);
++typedef void* (*MonoDlFallbackClose) (void *handle, void *user_data);
++
++MonoDlFallbackHandler *mono_dl_fallback_register (MonoDlFallbackLoad load_func, MonoDlFallbackSymbol symbol_func,
++						  MonoDlFallbackClose close_func, void *user_data);
++
++void                   mono_dl_fallback_unregister (MonoDlFallbackHandler *handler);
++
++
++#endif /* __MONO_UTILS_DL_FALLBACK_H__ */
++
+
+Property changes on: mono-dl-fallback.h
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: Makefile.am
+===================================================================
+--- Makefile.am	(revision 160304)
++++ Makefile.am	(working copy)
+@@ -67,6 +67,7 @@
+ 	mono-codeman.h	\
+ 	mono-counters.h	\
+ 	mono-digest.h	\
++	mono-embed.c	\
+ 	mono-embed.h	\
+ 	mono-error.h	\
+ 	mono-math.h	\
+@@ -97,9 +98,11 @@
+ libmonoutils_la_SOURCES = $(monoutils_sources) $(arch_sources)
+ libmonoutilsincludedir = $(includedir)/mono-$(API_VER)/mono/utils
+ 
+-libmonoutilsinclude_HEADERS = \
+-	mono-logger.h	\
+-	mono-error.h	\
+-	mono-publib.h
++libmonoutilsinclude_HEADERS = 	\
++	mono-logger.h		\
++	mono-embed.h		\
++	mono-error.h		\
++	mono-publib.h		\
++	mono-dl-fallback.h
+ 
+ EXTRA_DIST = ChangeLog

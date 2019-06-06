@@ -1,0 +1,156 @@
+Index: mono/mono/mini/mini.c
+===================================================================
+--- mono/mono/mini/mini.c	(revision 51260)
++++ mono/mono/mini/mini.c	(working copy)
+@@ -646,7 +646,11 @@
+ 		(dest)->inst_left = (sp) [0];	\
+ 		(dest)->inst_right = (sp) [1];	\
+ 		(dest)->type = STACK_MP;	\
+-		(dest)->klass = (k);	\
++		if ((k) == mono_defaults.object_class) {	\
++			(dest)->klass = (dest)->inst_left->klass->element_class;	\
++		} else {	\
++			(dest)->klass = (k);	\
++		}	\
+ 		(cfg)->flags |= MONO_CFG_HAS_LDELEMA; \
+ 	} while (0)
+ 
+@@ -1130,6 +1134,7 @@
+ 	case MONO_TYPE_SZARRAY:
+ 	case MONO_TYPE_ARRAY:    
+ 		inst->type = STACK_OBJ;
++		inst->klass = klass;
+ 		return;
+ 	case MONO_TYPE_I8:
+ 	case MONO_TYPE_U8:
+@@ -1627,6 +1632,28 @@
+ 	case STACK_PTR: return &mono_defaults.int_class->byval_arg;
+ 	case STACK_R8: return &mono_defaults.double_class->byval_arg;
+ 	case STACK_MP: return &mono_defaults.int_class->byval_arg;
++	case STACK_OBJ:
++		if (ins->klass != NULL) {
++			//FIXMEMASSI: This gives troubles with inlining!!!
++			return &ins->klass->byval_arg;
++		} else {
++			return &mono_defaults.object_class->byval_arg;
++		}
++	case STACK_VTYPE: return &ins->klass->byval_arg;
++	default:
++		g_error ("stack type %d to montype not handled\n", ins->type);
++	}
++	return NULL;
++}
++
++static MonoType*
++type_from_stack_type_safe (MonoInst *ins) {
++	switch (ins->type) {
++	case STACK_I4: return &mono_defaults.int32_class->byval_arg;
++	case STACK_I8: return &mono_defaults.int64_class->byval_arg;
++	case STACK_PTR: return &mono_defaults.int_class->byval_arg;
++	case STACK_R8: return &mono_defaults.double_class->byval_arg;
++	case STACK_MP: return &mono_defaults.int_class->byval_arg;
+ 	case STACK_OBJ: return &mono_defaults.object_class->byval_arg;
+ 	case STACK_VTYPE: return &ins->klass->byval_arg;
+ 	default:
+@@ -1765,7 +1792,7 @@
+ 	case STACK_OBJ:
+ 		if ((vnum = cfg->intvars [pos]))
+ 			return cfg->varinfo [vnum];
+-		res = mono_compile_create_var (cfg, type_from_stack_type (ins), OP_LOCAL);
++		res = mono_compile_create_var (cfg, type_from_stack_type_safe (ins), OP_LOCAL);
+ 		cfg->intvars [pos] = res->inst_c0;
+ 		break;
+ 	default:
+@@ -2537,6 +2564,7 @@
+ {
+ 	MonoInst *iargs [2];
+ 	void *alloc_ftn;
++	int result;
+ 
+ 	if (cfg->opt & MONO_OPT_SHARED) {
+ 		NEW_DOMAINCONST (cfg, iargs [0]);
+@@ -2558,7 +2586,13 @@
+ 			NEW_VTABLECONST (cfg, iargs [0], vtable);
+ 	}
+ 
+-	return mono_emit_jit_icall (cfg, bblock, alloc_ftn, iargs, ip);
++	result = mono_emit_jit_icall (cfg, bblock, alloc_ftn, iargs, ip);
++	g_assert (bblock->last_ins->opcode == CEE_STIND_REF);
++	g_assert (bblock->last_ins->inst_i0->opcode == OP_LOCAL);
++	g_assert (bblock->last_ins->inst_i1->opcode == CEE_CALL);
++	bblock->last_ins->inst_i0->klass = klass;
++	bblock->last_ins->inst_i1->klass = klass;
++	return result;
+ }
+ 	
+ static MonoInst *
+@@ -2936,7 +2970,7 @@
+ 		if (sp [0]->opcode == OP_ICONST) {
+ 			*args++ = sp [0];
+ 		} else {
+-			temp = mono_compile_create_var (cfg, type_from_stack_type (*sp), OP_LOCAL);
++			temp = mono_compile_create_var (cfg, type_from_stack_type_safe (*sp), OP_LOCAL);
+ 			*args++ = temp;
+ 			NEW_TEMPSTORE (cfg, store, temp->inst_c0, *sp);
+ 			store->cil_code = sp [0]->cil_code;
+@@ -4471,6 +4505,13 @@
+ 			ins->inst_i0 = *sp;
+ 			*sp++ = ins;
+ 			ins->type = ldind_type [*ip - CEE_LDIND_I1];
++			/* FIXMEMASSI This 'if' probably is not needed */
++			if ((ins->opcode == CEE_LDIND_I) && ((ins->inst_i0->opcode == OP_LOCAL) || (ins->inst_i0->opcode == OP_ARG))) {
++				ins->klass = ins->inst_i0->klass;
++			}
++			if ((ins->type == STACK_OBJ) && (ins->inst_i0->klass != NULL)) {
++				ins->klass = ins->inst_i0->klass;
++			}
+ 			ins->flags |= ins_flag;
+ 			ins_flag = 0;
+ 			++ip;
+@@ -4852,6 +4893,12 @@
+ 				NEW_PCONST (cfg, *sp, NULL); 
+ 				/* now call the string ctor */
+ 				temp = mono_emit_method_call_spilled (cfg, bblock, cmethod, fsig, sp, ip, NULL);
++				
++				g_assert (bblock->last_ins->opcode == CEE_STIND_REF);
++				g_assert (bblock->last_ins->inst_i0->opcode == OP_LOCAL);
++				g_assert (bblock->last_ins->inst_i1->opcode == CEE_CALL);
++				bblock->last_ins->inst_i0->klass = mono_defaults.string_class;
++				bblock->last_ins->inst_i1->klass = mono_defaults.string_class;
+ 			} else {
+ 				MonoInst* callvirt_this_arg = NULL;
+ 				
+@@ -5390,6 +5437,15 @@
+ 						NEW_SFLDACONST (cfg, ins, field);
+ 					else
+ 						NEW_PCONST (cfg, ins, addr);
++					
++					/* FIXMEMASSI This if actually is never true...*/
++					
++					if (ins->type == STACK_OBJ) {
++						printf ("    --- Inst has klass %s: ", (ins->klass->name)!=NULL?(ins->klass->name):"<NULL>");
++						mono_print_tree_nl (ins);
++					}
++					
++					
+ 					ins->cil_code = ip;
+ 				} else {
+ 					/* 
+@@ -5580,6 +5636,7 @@
+ 			ins->inst_newa_class = klass;
+ 			ins->inst_newa_len = *sp;
+ 			ins->type = STACK_OBJ;
++			ins->klass = mono_array_class_get (klass, 1);
+ 			ip += 5;
+ 			*sp++ = ins;
+ 			/* 
+@@ -5683,6 +5740,9 @@
+ 			ins->inst_left = load;
+ 			*sp++ = ins;
+ 			ins->type = ldind_type [ins->opcode - CEE_LDIND_I1];
++			if (ins->type == STACK_OBJ) {
++				ins->klass = load->klass;
++			}
+ 			++ip;
+ 			break;
+ 		}

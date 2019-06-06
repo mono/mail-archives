@@ -1,0 +1,366 @@
+Index: ModuleBuilder.cs
+===================================================================
+--- ModuleBuilder.cs	(revision 44494)
++++ ModuleBuilder.cs	(working copy)
+@@ -64,6 +64,7 @@
+ 		bool transient;
+ 		ModuleBuilderTokenGenerator token_gen;
+ 		ArrayList resource_writers = null;
++		ISymbolWriter symbolWriter;
+ 
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+ 		private static extern void basic_init (ModuleBuilder ab);
+@@ -82,6 +83,18 @@
+ 			basic_init (this);
+ 
+ 			CreateGlobalType ();
++			
++			if (emitSymbolInfo) {
++				Assembly asm = Assembly.LoadWithPartialName ("Mono.CompilerServices.SymbolWriter");
++				Type t = asm.GetType ("Mono.CompilerServices.SymbolWriter.SymbolWriterImpl");
++				if (t != null) {
++					symbolWriter = (ISymbolWriter) Activator.CreateInstance (t, new object[] { this });
++					string fileName = fqname;
++					if (assemblyb.AssemblyDir != null)
++						fileName = Path.Combine (assemblyb.AssemblyDir, fileName);
++					symbolWriter.Initialize (IntPtr.Zero, fileName, true);
++				}
++			}
+ 		}
+ 
+ 		public override string FullyQualifiedName {get { return fqname;}}
+@@ -396,11 +409,15 @@
+ 		}
+ 
+ 		public ISymbolWriter GetSymWriter () {
+-			return null;
++			return symbolWriter;
+ 		}
+ 
+-		public ISymbolDocumentWriter DefineDocument (string url, Guid language, Guid languageVendor, Guid documentType) {
+-			return null;
++		public ISymbolDocumentWriter DefineDocument (string url, Guid language, Guid languageVendor, Guid documentType)
++		{
++			if (symbolWriter != null)
++				return symbolWriter.DefineDocument (url, language, languageVendor, documentType);
++			else
++				return null;
+ 		}
+ 
+ 		public override Type [] GetTypes ()
+@@ -635,6 +652,12 @@
+ 			// The constant 0x80000000 is internal to Mono, it means `make executable'
+ 			//
+ 			File.SetAttributes (fileName, (FileAttributes) (unchecked ((int) 0x80000000)));
++			
++			if (types != null && symbolWriter != null) {
++				for (int i = 0; i < num_types; ++i)
++					types [i].GenerateDebugInfo (symbolWriter);
++				symbolWriter.Close ();
++			}
+ 		}
+ 
+ 		internal string FileName {
+@@ -685,3 +708,4 @@
+ 		}
+ 	}
+ }
++
+Index: ILGenerator.cs
+===================================================================
+--- ILGenerator.cs	(revision 44494)
++++ ILGenerator.cs	(working copy)
+@@ -203,6 +203,8 @@
+ 		
+ 		const int defaultFixupSize = 8;
+ 		const int defaultLabelsSize = 8;
++		ArrayList sequencePointLists;
++		SequencePointList currentSequence;
+ 
+ 		internal ILGenerator (Module m, TokenGenerator token_gen, int size)
+ 		{
+@@ -218,7 +220,7 @@
+ 			open_blocks = new Stack ();
+ 			this.token_gen = token_gen;
+ 		}
+-
++		
+ 		private void add_token_fixup (MemberInfo mi)
+ 		{
+ 			if (num_token_fixups == token_fixups.Length) {
+@@ -840,7 +842,44 @@
+ 
+ 		public virtual void MarkSequencePoint (ISymbolDocumentWriter document, int startLine,
+ 						       int startColumn, int endLine, int endColumn)
+-		{ }
++		{
++			if (currentSequence == null || currentSequence.Document != document) {
++				if (sequencePointLists == null)
++					sequencePointLists = new ArrayList ();
++				currentSequence = new SequencePointList (document);
++				sequencePointLists.Add (currentSequence);
++			}
++			
++			currentSequence.AddSequencePoint (code_len, startLine, startColumn, endLine, endColumn);
++		}
++		
++		internal void GenerateDebugInfo (ISymbolWriter symbolWriter)
++		{
++			if (sequencePointLists != null) {
++				SequencePointList first = (SequencePointList) sequencePointLists [0];
++				SequencePointList last = (SequencePointList) sequencePointLists [sequencePointLists.Count - 1];
++				symbolWriter.SetMethodSourceRange (first.Document, first.StartLine, first.StartColumn, last.Document, last.EndLine, last.EndColumn);
++				
++				foreach (SequencePointList list in sequencePointLists)
++					symbolWriter.DefineSequencePoints (list.Document, list.Offsets, list.Lines, list.Columns, list.EndLines, list.EndColumns);
++				
++				if (locals != null) {
++					foreach (LocalBuilder local in locals) {
++						if (local.Name != null && local.Name.Length > 0) {
++							SignatureHelper sighelper = SignatureHelper.GetLocalVarSigHelper (module);
++							sighelper.AddArgument (local.LocalType);
++							byte[] signature = sighelper.GetSignature ();
++							symbolWriter.DefineLocalVariable (local.Name, FieldAttributes.Public, signature, SymAddressKind.ILOffset, local.position, 0, 0, local.StartOffset, local.EndOffset);
++						}
++					}
++				}
++			}
++		}
++		
++		internal bool HasDebugInfo
++		{
++			get { return sequencePointLists != null; }
++		}
+ 
+ 		public virtual void ThrowException (Type exceptionType)
+ 		{
+@@ -884,4 +923,60 @@
+ 			return ig.code_len;
+ 		}
+ 	}
++	
++	internal class SequencePointList
++	{
++		ArrayList offsets = new ArrayList ();
++		ArrayList lines = new ArrayList ();
++		ArrayList columns = new ArrayList ();
++		ArrayList endLines = new ArrayList ();
++		ArrayList endColumns = new ArrayList ();
++		ISymbolDocumentWriter doc;
++		
++		public SequencePointList (ISymbolDocumentWriter doc)
++		{
++			this.doc = doc;
++		}
++		
++		public ISymbolDocumentWriter Document {
++			get { return doc; }
++		}
++		
++		public int[] Offsets {
++			get { return (int[]) offsets.ToArray (typeof(int)); }
++		}
++		public int[] Lines {
++			get { return (int[]) lines.ToArray (typeof(int)); }
++		}
++		public int[] Columns {
++			get { return (int[]) columns.ToArray (typeof(int)); }
++		}
++		public int[] EndLines {
++			get { return (int[]) endLines.ToArray (typeof(int)); }
++		}
++		public int[] EndColumns {
++			get { return (int[]) endColumns.ToArray (typeof(int)); }
++		}
++		public int StartLine {
++			get { return (int) lines[0]; }
++		}
++		public int EndLine {
++			get { return (int) lines[lines.Count - 1]; }
++		}
++		public int StartColumn {
++			get { return (int) columns[0]; }
++		}
++		public int EndColumn {
++			get { return (int) columns[columns.Count - 1]; }
++		}
++		
++		public void AddSequencePoint (int offset, int line, int col, int endLine, int endCol)
++		{
++			offsets.Add (offset);
++			lines.Add (line);
++			columns.Add (col);
++			endLines.Add (endLine);
++			endColumns.Add (endCol);
++		}
++	}
+ }
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 44494)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,15 @@
++2005-05-17  Lluis Sanchez Gual  <lluis@novell.com>
++
++	* ModuleBuilder.cs: Implemented DefineDocument(). Generate debug
++	info when saving the module.
++	* ILGenerator.cs: Keep marked sequence points in a list.
++	Added a GenerateDebugInfo method, which dumps the info collected
++	during code generation.
++	* TypeBuilder.cs:
++	* ConstructorBuilder.cs:
++	* MethodBuilder.cs: Added method for generating debug info.
++	* LocalBuilder.cs: Added StartOffset and EndOffset properties.
++
+ 2005-05-13  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* MethodBuilder.cs (fixup): Take into account CreateMethodBody as
+Index: MethodBuilder.cs
+===================================================================
+--- MethodBuilder.cs	(revision 44494)
++++ MethodBuilder.cs	(working copy)
+@@ -38,6 +38,7 @@
+ using System.Security.Permissions;
+ using System.Runtime.CompilerServices;
+ using System.Runtime.InteropServices;
++using System.Diagnostics.SymbolStore;
+ 
+ namespace System.Reflection.Emit {
+ 
+@@ -261,6 +262,17 @@
+ 			if (ilgen != null)
+ 				ilgen.label_fixup ();
+ 		}
++		
++		internal void GenerateDebugInfo (ISymbolWriter symbolWriter)
++		{
++			if (ilgen != null && ilgen.HasDebugInfo) {
++				SymbolToken token = new SymbolToken (GetToken().Token);
++				symbolWriter.OpenMethod (token);
++				symbolWriter.SetSymAttribute (token, "__name", System.Text.Encoding.UTF8.GetBytes (Name));
++				ilgen.GenerateDebugInfo (symbolWriter);
++				symbolWriter.CloseMethod ();
++			}
++		}
+ 
+ 		public void SetCustomAttribute( CustomAttributeBuilder customBuilder) {
+ 			if (customBuilder == null)
+Index: TypeBuilder.cs
+===================================================================
+--- TypeBuilder.cs	(revision 44494)
++++ TypeBuilder.cs	(working copy)
+@@ -40,6 +40,7 @@
+ using System.Collections;
+ using System.Security;
+ using System.Security.Permissions;
++using System.Diagnostics.SymbolStore;
+ 
+ namespace System.Reflection.Emit {
+ 
+@@ -666,13 +667,32 @@
+ 				foreach (ConstructorBuilder ctor in ctors) 
+ 					ctor.fixup ();
+ 			}
+-
++			
+ 			created = create_runtime_class (this);
+ 			if (created != null)
+ 				return created;
+ 			return this;
+ 		}
+ 
++		internal void GenerateDebugInfo (ISymbolWriter symbolWriter)
++		{
++			symbolWriter.OpenNamespace (this.Namespace);
++
++			if (methods != null) {
++				for (int i = 0; i < num_methods; ++i) {
++					MethodBuilder metb = (MethodBuilder) methods[i]; 
++					metb.GenerateDebugInfo (symbolWriter);
++				}
++			}
++
++			if (ctors != null) {
++				foreach (ConstructorBuilder ctor in ctors)
++					ctor.GenerateDebugInfo (symbolWriter);
++			}
++			
++			symbolWriter.CloseNamespace ();
++		}
++
+ 		public override ConstructorInfo[] GetConstructors (BindingFlags bindingAttr)
+ 		{
+ 			if (ctors == null)
+Index: ConstructorBuilder.cs
+===================================================================
+--- ConstructorBuilder.cs	(revision 44494)
++++ ConstructorBuilder.cs	(working copy)
+@@ -37,6 +37,7 @@
+ using System.Security;
+ using System.Security.Permissions;
+ using System.Runtime.InteropServices;
++using System.Diagnostics.SymbolStore;
+ 
+ namespace System.Reflection.Emit {
+ 
+@@ -274,6 +275,18 @@
+ 			if (ilgen != null)
+ 				ilgen.label_fixup ();
+ 		}
++		
++		internal void GenerateDebugInfo (ISymbolWriter symbolWriter)
++		{
++			if (ilgen != null && ilgen.HasDebugInfo) {
++				SymbolToken token = new SymbolToken (GetToken().Token);
++				symbolWriter.OpenMethod (token);
++				symbolWriter.SetSymAttribute (token, "__name", System.Text.Encoding.UTF8.GetBytes (Name));
++				ilgen.GenerateDebugInfo (symbolWriter);
++				symbolWriter.CloseMethod ();
++			}
++		}
++
+ 		internal override int get_next_table_index (object obj, int table, bool inc) {
+ 			return type.get_next_table_index (obj, table, inc);
+ 		}
+Index: LocalBuilder.cs
+===================================================================
+--- LocalBuilder.cs	(revision 44494)
++++ LocalBuilder.cs	(working copy)
+@@ -62,6 +62,8 @@
+ #endif
+ 		
+ 		internal ILGenerator ilgen;
++		int startOffset;
++		int endOffset;
+ 
+ 		internal LocalBuilder (Type t, ILGenerator ilgen)
+ 		{
+@@ -71,7 +73,9 @@
+ 
+ 		public void SetLocalSymInfo (string lname, int startOffset, int endOffset)
+ 		{
+-			// nop
++			name = lname;
++			this.startOffset = startOffset;
++			this.endOffset = endOffset;
+ 		}
+ 
+ 		public void SetLocalSymInfo (string lname)
+@@ -104,5 +108,17 @@
+ 			}
+ 		}
+ #endif
++
++		internal string Name {
++			get { return name; }
++		}
++		
++		internal int StartOffset {
++			get { return startOffset; }
++		}
++		
++		internal int EndOffset {
++			get { return endOffset; }
++		}
+ 	}
+ }

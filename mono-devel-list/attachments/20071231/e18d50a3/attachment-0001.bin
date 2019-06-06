@@ -1,0 +1,170 @@
+Index: metadata/assembly.c
+===================================================================
+--- metadata/assembly.c	(revision 92059)
++++ metadata/assembly.c	(working copy)
+@@ -1602,6 +1602,9 @@
+ 	}
+ 	
+ 	if (token && strncmp (token, "null", 4) != 0) {
++		if (strlen (token) != 16) {
++				return FALSE;
++		}
+ 		char *lower = g_ascii_strdown (token, MONO_PUBLIC_KEY_TOKEN_LENGTH);
+ 		g_strlcpy ((char*)aname->public_key_token, lower, MONO_PUBLIC_KEY_TOKEN_LENGTH);
+ 		g_free (lower);
+@@ -1625,7 +1628,7 @@
+ 		else
+ 			g_free (pkey);
+ 	}
+-	
++
+ 	return TRUE;
+ }
+ 
+@@ -1679,24 +1682,37 @@
+ 		if (!g_ascii_strncasecmp (value, "Version=", 8)) {
+ 			*is_version_defined = TRUE;
+ 			version = g_strstrip (value + 8);
++			if (strlen (version) == 0) {
++				return FALSE;
++			}
++
+ 			tmp++;
+ 			continue;
+ 		}
+ 
+ 		if (!g_ascii_strncasecmp (value, "Culture=", 8)) {
+ 			culture = g_strstrip (value + 8);
++			if (strlen (culture) == 0) {
++				return FALSE;
++			}
+ 			tmp++;
+ 			continue;
+ 		}
+ 
+ 		if (!g_ascii_strncasecmp (value, "PublicKeyToken=", 15)) {
+ 			token = g_strstrip (value + 15);
++			if (strlen (token) == 0) {
++				return FALSE;
++			}
+ 			tmp++;
+ 			continue;
+ 		}
+ 
+ 		if (!g_ascii_strncasecmp (value, "PublicKey=", 10)) {
+ 			key = g_strstrip (value + 10);
++			if (strlen (key) == 0) {
++				return FALSE;
++			}
+ 			tmp++;
+ 			continue;
+ 		}
+Index: metadata/ChangeLog
+===================================================================
+--- metadata/ChangeLog	(revision 92059)
++++ metadata/ChangeLog	(working copy)
+@@ -1,3 +1,23 @@
++2007-12-31  Gert Driesen  <drieseng@users.sourceforge.net>
++
++	* assembly.c (build_assembly_name): return FALSE if length of token is
++	not 16 (if not "null").
++	(mono_assembly_name_parse_full): return FALSE if value of version,
++	culture, token or key is 0.
++	(fill_reflection_assembly_name): add boolean arguments to specify
++	whether public key and public key token must be set to default value
++	(zero-length byte array) if not available. Set versioncompat to
++	SameMachine. If public key is available or the default is set, then
++	set PublicKey flag.
++	(ves_icall_System_Reflection_Assembly_FillName): if no public key
++	is available, use empty byte array as default value. On the 2.0
++	profile, use default value for public key token if not set.
++	(ves_icall_System_Reflection_InternalGetAssemblyName): on the 1.0
++	profile, use default value for public key if not set. On the 2.0
++	profile, use default value for public key token if not set.
++	(ves_icall_System_Reflection_AssemblyName_ParseName): do not set
++	default values for public key and public key token.
++
+ 2007-12-29  Miguel de Icaza  <miguel@novell.com>
+ 
+ 	* icall.c
+Index: metadata/icall.c
+===================================================================
+--- metadata/icall.c	(revision 92059)
++++ metadata/icall.c	(working copy)
+@@ -4713,7 +4713,7 @@
+ }
+ 
+ static void
+-fill_reflection_assembly_name (MonoDomain *domain, MonoReflectionAssemblyName *aname, MonoAssemblyName *name, const char *absolute, gboolean by_default_version)
++fill_reflection_assembly_name (MonoDomain *domain, MonoReflectionAssemblyName *aname, MonoAssemblyName *name, const char *absolute, gboolean by_default_version, gboolean default_publickey, gboolean default_token)
+ {
+ 	static MonoMethod *create_culture = NULL;
+ 	gpointer args [2];
+@@ -4730,6 +4730,8 @@
+ 	aname->build = name->build;
+ 	aname->revision = name->revision;
+ 	aname->hashalg = name->hash_alg;
++	aname->versioncompat = 1; /* SameMachine (default) */
++
+ 	if (by_default_version)
+ 		MONO_OBJECT_SETREF (aname, version, create_version (domain, name->major, name->minor, name->build, name->revision));
+ 	
+@@ -4758,6 +4760,10 @@
+ 
+ 		MONO_OBJECT_SETREF (aname, publicKey, mono_array_new (domain, mono_defaults.byte_class, pkey_len));
+ 		memcpy (mono_array_addr (aname->publicKey, guint8, 0), pkey_ptr, pkey_len);
++		aname->flags |= ASSEMBLYREF_FULL_PUBLIC_KEY_FLAG;
++	} else if (default_publickey) {
++		MONO_OBJECT_SETREF (aname, publicKey, mono_array_new (domain, mono_defaults.byte_class, 0));
++		aname->flags |= ASSEMBLYREF_FULL_PUBLIC_KEY_FLAG;
+ 	}
+ 
+ 	/* MonoAssemblyName keeps the public key token as an hexadecimal string */
+@@ -4773,6 +4779,8 @@
+ 			*p |= g_ascii_xdigit_value (name->public_key_token [j++]);
+ 			p++;
+ 		}
++	} else if (default_token) {
++		MONO_OBJECT_SETREF (aname, keyToken, mono_array_new (domain, mono_defaults.byte_class, 0));
+ 	}
+ }
+ 
+@@ -4786,13 +4794,15 @@
+ 
+ 	if (g_path_is_absolute (mass->image->name)) {
+ 		fill_reflection_assembly_name (mono_object_domain (assembly),
+-			aname, &mass->aname, mass->image->name, TRUE);
++			aname, &mass->aname, mass->image->name, TRUE,
++			TRUE, mono_defaults.generic_ilist_class != 0);
+ 		return;
+ 	}
+ 	absolute = g_build_filename (mass->basedir, mass->image->name, NULL);
+ 
+ 	fill_reflection_assembly_name (mono_object_domain (assembly),
+-		aname, &mass->aname, absolute, TRUE);
++		aname, &mass->aname, absolute, TRUE, TRUE,
++		mono_defaults.generic_ilist_class != 0);
+ 
+ 	g_free (absolute);
+ }
+@@ -4830,7 +4840,9 @@
+ 		mono_raise_exception (mono_get_exception_argument ("assemblyFile", "The file does not contain a manifest"));
+ 	}
+ 
+-	fill_reflection_assembly_name (mono_domain_get (), aname, &name, filename, TRUE);
++	fill_reflection_assembly_name (mono_domain_get (), aname, &name, filename,
++		TRUE, mono_defaults.generic_ilist_class == 0,
++		mono_defaults.generic_ilist_class != 0);
+ 
+ 	g_free (filename);
+ 	mono_image_close (image);
+@@ -5051,7 +5063,8 @@
+ 	if (!mono_assembly_name_parse_full (val, &aname, TRUE, &is_version_defined))
+ 		return FALSE;
+ 	
+-	fill_reflection_assembly_name (domain, name, &aname, "", is_version_defined);
++	fill_reflection_assembly_name (domain, name, &aname, "", is_version_defined,
++		FALSE, FALSE);
+ 
+ 	mono_assembly_name_free (&aname);
+ 	g_free ((guint8*) aname.public_key);

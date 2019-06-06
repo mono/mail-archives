@@ -1,0 +1,223 @@
+diff -urNp ../mono-1.2.3.1-orig/mono/metadata/icall.c mono/metadata/icall.c
+--- ../mono-1.2.3.1-orig/mono/metadata/icall.c	2007-03-29 00:02:37.000000000 +0200
++++ mono/metadata/icall.c	2007-03-29 00:03:25.000000000 +0200
+@@ -6682,6 +6682,7 @@ icall_functions [] = {
+ };
+ 
+ static GHashTable *icall_hash = NULL;
++static GHashTable *icall_param_hash = NULL;
+ static GHashTable *jit_icall_hash_name = NULL;
+ static GHashTable *jit_icall_hash_addr = NULL;
+ 
+@@ -6716,12 +6717,14 @@ mono_icall_init (void)
+ 	}
+ 
+ 	icall_hash = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++	icall_param_hash = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+ }
+ 
+ void
+ mono_icall_cleanup (void)
+ {
+ 	g_hash_table_destroy (icall_hash);
++	g_hash_table_destroy (icall_param_hash);
+ 	g_hash_table_destroy (jit_icall_hash_name);
+ 	g_hash_table_destroy (jit_icall_hash_addr);
+ }
+@@ -6736,6 +6739,16 @@ mono_add_internal_call (const char *name
+ 	mono_loader_unlock ();
+ }
+ 
++void
++mono_add_internal_call_param (const char *name, gconstpointer param)
++{
++	mono_loader_lock ();
++
++	g_hash_table_insert (icall_param_hash, g_strdup (name), (gpointer) param);
++
++	mono_loader_unlock ();
++}
++
+ #ifdef HAVE_ARRAY_ELEM_INIT
+ static int
+ compare_method_imap (const void *key, const void *elem)
+@@ -6925,6 +6938,77 @@ mono_lookup_internal_call (MonoMethod *m
+ 	return NULL;
+ }
+ 
++gpointer
++mono_lookup_internal_call_param (MonoMethod *method)
++{
++	char *sigstart;
++	char *tmpsig;
++	char mname [2048];
++	int typelen = 0, mlen, siglen;
++	gpointer res;
++
++	g_assert (method != NULL);
++
++	if (method->is_inflated)
++		method = ((MonoMethodInflated *) method)->declaring;
++
++	if (method->klass->nested_in) {
++		int pos = concat_class_name (mname, sizeof (mname)-2, method->klass->nested_in);
++		if (!pos)
++			return NULL;
++
++		mname [pos++] = '/';
++		mname [pos] = 0;
++
++		typelen = concat_class_name (mname+pos, sizeof (mname)-pos-1, method->klass);
++		if (!typelen)
++			return NULL;
++
++		typelen += pos;
++	} else {
++		typelen = concat_class_name (mname, sizeof (mname), method->klass);
++		if (!typelen)
++			return NULL;
++	}
++
++	mname [typelen] = ':';
++	mname [typelen + 1] = ':';
++
++	mlen = strlen (method->name);
++	memcpy (mname + typelen + 2, method->name, mlen);
++	sigstart = mname + typelen + 2 + mlen;
++	*sigstart = 0;
++
++	tmpsig = mono_signature_get_desc (mono_method_signature (method), TRUE);
++	siglen = strlen (tmpsig);
++	if (typelen + mlen + siglen + 6 > sizeof (mname))
++		return NULL;
++	sigstart [0] = '(';
++	memcpy (sigstart + 1, tmpsig, siglen);
++	sigstart [siglen + 1] = ')';
++	sigstart [siglen + 2] = 0;
++	g_free (tmpsig);
++	
++	mono_loader_lock ();
++
++	res = g_hash_table_lookup (icall_param_hash, mname);
++	if (res) {
++		mono_loader_unlock ();
++		return res;
++	}
++	/* try without signature */
++	*sigstart = 0;
++	res = g_hash_table_lookup (icall_param_hash, mname);
++	if (res) {
++		mono_loader_unlock ();
++		return res;
++	}
++
++	mono_loader_unlock ();
++
++	return NULL;
++}
++
+ static MonoType*
+ type_from_typename (char *typename)
+ {
+diff -urNp ../mono-1.2.3.1-orig/mono/metadata/loader.h mono/metadata/loader.h
+--- ../mono-1.2.3.1-orig/mono/metadata/loader.h	2007-03-29 00:02:37.000000000 +0200
++++ mono/metadata/loader.h	2007-03-29 00:03:28.000000000 +0200
+@@ -56,9 +56,15 @@ mono_load_image            (const char *
+ void
+ mono_add_internal_call     (const char *name, gconstpointer method);
+ 
++void
++mono_add_internal_call_param     (const char *name, gconstpointer param);
++
+ gpointer
+ mono_lookup_internal_call (MonoMethod *method);
+ 
++gpointer
++mono_lookup_internal_call_param (MonoMethod *method);
++
+ void
+ mono_dllmap_insert (MonoImage *assembly, const char *dll, const char *func, const char *tdll, const char *tfunc);
+ 
+diff -urNp ../mono-1.2.3.1-orig/mono/metadata/marshal.c mono/metadata/marshal.c
+--- ../mono-1.2.3.1-orig/mono/metadata/marshal.c	2007-03-29 00:02:38.000000000 +0200
++++ mono/metadata/marshal.c	2007-03-29 00:03:25.000000000 +0200
+@@ -194,6 +194,24 @@ signature_dup (MonoImage *image, MonoMet
+ }
+ 
+ static MonoMethodSignature*
++signature_param (MonoImage *image, MonoMethodSignature *sig)
++{
++	MonoMethodSignature *res;
++	int sigsize;
++
++	sigsize = sizeof (MonoMethodSignature) + ((sig->param_count + 1 - MONO_ZERO_LEN_ARRAY) * sizeof (MonoType *));
++	mono_loader_lock ();
++	res = mono_mempool_alloc (image->mempool, sigsize);
++	mono_loader_unlock ();
++	memcpy( res, sig, sizeof (MonoMethodSignature) );
++	memcpy( &res->params[1], &sig->params[0], (sig->param_count * sizeof (MonoType *)) );
++	res->params[0] = &mono_defaults.int_class->byval_arg;
++	res->param_count++;
++
++	return res;
++}
++
++static MonoMethodSignature*
+ signature_no_pinvoke (MonoMethod *method)
+ {
+ 	MonoMethodSignature *sig = mono_method_signature (method);
+@@ -7987,7 +8005,7 @@ mono_marshal_emit_native_wrapper (MonoIm
+ MonoMethod *
+ mono_marshal_get_native_wrapper (MonoMethod *method)
+ {
+-	MonoMethodSignature *sig, *csig;
++	MonoMethodSignature *sig, *csig, *internalsig;
+ 	MonoMethodPInvoke *piinfo = (MonoMethodPInvoke *) method;
+ 	MonoMethodBuilder *mb;
+ 	MonoMarshalSpec **mspecs;
+@@ -7995,6 +8013,7 @@ mono_marshal_get_native_wrapper (MonoMet
+ 	GHashTable *cache;
+ 	gboolean pinvoke = FALSE;
+ 	gpointer iter;
++	gpointer param;
+ 	int i;
+ 	const char *exc_class = "MissingMethodException";
+ 	const char *exc_arg = NULL;
+@@ -8082,6 +8101,7 @@ mono_marshal_get_native_wrapper (MonoMet
+ 	/* internal calls: we simply push all arguments and call the method (no conversions) */
+ 	if (method->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_RUNTIME)) {
+ 
++		param = mono_lookup_internal_call_param (method);
+ 		/* hack - string constructors returns a value */
+ 		if (method->string_ctor) {
+ 			csig = signature_dup (method->klass->image, sig);
+@@ -8092,11 +8112,28 @@ mono_marshal_get_native_wrapper (MonoMet
+ 		if (sig->hasthis)
+ 			mono_mb_emit_byte (mb, CEE_LDARG_0);
+ 
++		if (param) {
++			internalsig = signature_param (method->klass->image, csig);
++			mono_mb_emit_ptr (mb, param);
++			 // need to check on 64 bits platform !
++			/*if (sizeof (param) == 8) {
++				mono_mb_emit_byte (mb, CEE_LDC_I8);
++				mono_mb_emit_i8 (mb, param);
++			}
++			else {
++				mono_mb_emit_byte (mb, CEE_LDC_I4);
++				mono_mb_emit_i4 (mb, param);
++			}*/
++		}
++		else {
++			internalsig = csig;
++		}
++
+ 		for (i = 0; i < sig->param_count; i++)
+ 			mono_mb_emit_ldarg (mb, i + sig->hasthis);
+ 
+ 		g_assert (piinfo->addr);
+-		mono_mb_emit_native_call (mb, csig, piinfo->addr);
++		mono_mb_emit_native_call (mb, internalsig, piinfo->addr);
+ 		emit_thread_interrupt_checkpoint (mb);
+ 		mono_mb_emit_byte (mb, CEE_RET);
+ 

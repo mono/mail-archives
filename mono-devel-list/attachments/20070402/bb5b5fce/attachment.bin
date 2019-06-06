@@ -1,0 +1,437 @@
+Index: mono/mono/metadata/domain.c
+===================================================================
+--- mono/mono/metadata/domain.c	(revision 75279)
++++ mono/mono/metadata/domain.c	(working copy)
+@@ -817,11 +817,14 @@
+ 
+ 	mono_defaults.handleref_class = mono_class_from_name (
+ 		mono_defaults.corlib, "System.Runtime.InteropServices", "HandleRef");
++
++	mono_defaults.com_interop_proxy_class = mono_class_from_name (
++	        mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
++	g_assert (mono_defaults.com_interop_proxy_class != 0);
+ 	
+ 	/* these are initialized lazily when COM features are used */
+ 	mono_defaults.variant_class = NULL;
+ 	mono_defaults.com_object_class = NULL;
+-	mono_defaults.com_interop_proxy_class = NULL;
+ 	mono_defaults.iunknown_class = NULL;
+ 	mono_defaults.idispatch_class = NULL;
+ 
+@@ -915,10 +918,6 @@
+ 	        mono_defaults.corlib, "System", "__ComObject");
+ 	g_assert (mono_defaults.com_object_class != 0);
+ 
+-	mono_defaults.com_interop_proxy_class = mono_class_from_name (
+-	        mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
+-	g_assert (mono_defaults.com_interop_proxy_class != 0);
+-
+ 	mono_defaults.iunknown_class = mono_class_from_name (
+ 	        mono_defaults.corlib, "Mono.Interop", "IUnknown");
+ 	g_assert (mono_defaults.iunknown_class != 0);
+Index: mono/mono/metadata/class.h
+===================================================================
+--- mono/mono/metadata/class.h	(revision 75279)
++++ mono/mono/metadata/class.h	(working copy)
+@@ -16,6 +16,7 @@
+ typedef struct {
+ 	MonoVTable *default_vtable;
+ 	MonoVTable *xdomain_vtable;
++	MonoVTable *cominterop_vtable;
+ 	MonoClass *proxy_class;
+ 	char* proxy_class_name;
+ 	guint interface_count;
+Index: mono/mono/metadata/ChangeLog
+===================================================================
+--- mono/mono/metadata/ChangeLog	(revision 75279)
++++ mono/mono/metadata/ChangeLog	(working copy)
+@@ -1,3 +1,21 @@
++2007-04-02  Jonathan Chambers  <joncham@gmail.com>
++
++	* domain.c: Load Mono.Interop.ComInteropProxy into MonoDefaults
++	struct at initialization since we need it for remoting checks.
++	* class.h: Add cominterop_vtable entry to MonoRemoteClass struct.
++	* object.c: Use cominterop_vtable for COM Interop proxy rather
++	than default_vtable. Add checks for COM Interop Proxy when handling
++	transparent proxies.
++	* marshal.c: Add mono_mb_emit_com_proxy_check to check if transparent
++	proxy is for COM Interop. Change cominterop_get_invoke to 
++	mono_marshal_get_cominterop_invoke for uniformity. Remove old COM Interop
++	hacks in remoting code.
++	* marshal.h: Add mono_marshal_get_cominterop_invoke.
++	* icall.c: Only return true for ves_icall_IsTransparentProxy if 
++	transparent proxy is not used for COM Interop.
++		
++	Code is contributed under MIT/X11 license.
++	
+ 2007-04-02  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* marshal.c (cominterop_get_managed_wrapper_adjusted): Fix warnings.
+Index: mono/mono/metadata/object.c
+===================================================================
+--- mono/mono/metadata/object.c	(revision 75279)
++++ mono/mono/metadata/object.c	(working copy)
+@@ -1426,6 +1426,7 @@
+ 	
+ 	rc->default_vtable = NULL;
+ 	rc->xdomain_vtable = NULL;
++	rc->cominterop_vtable = NULL;
+ 	rc->proxy_class_name = mono_string_to_utf8_mp (domain->mp, class_name);
+ 
+ 	g_hash_table_insert (domain->proxy_vtable_hash, key, rc);
+@@ -1481,6 +1482,7 @@
+ 	
+ 	rc->default_vtable = NULL;
+ 	rc->xdomain_vtable = NULL;
++	rc->cominterop_vtable = NULL;
+ 	rc->proxy_class_name = remote_class->proxy_class_name;
+ 
+ 	g_hash_table_insert (domain->proxy_vtable_hash, key, rc);
+@@ -1498,17 +1500,16 @@
+ 		mono_domain_unlock (domain);
+ 		return remote_class->xdomain_vtable;
+ 	}
+-	if (remote_class->default_vtable == NULL) {
+-		MonoType *type;
+-		MonoClass *klass;
+-		type = ((MonoReflectionType *)rp->class_to_proxy)->type;
+-		klass = mono_class_from_mono_type (type);
+-		if ((klass->is_com_object || (mono_defaults.com_object_class && klass == mono_defaults.com_object_class)) && !mono_class_vtable (mono_domain_get (), klass)->remote)
+-			remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_COMINTEROP);
+-		else
+-			remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_UNKNOWN);
++
++	if (rp->object.vtable->klass == mono_defaults.com_interop_proxy_class) {
++		if (remote_class->cominterop_vtable == NULL)
++			remote_class->cominterop_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_COMINTEROP);
++		mono_domain_unlock (domain);
++		return remote_class->cominterop_vtable;
+ 	}
+-	
++
++	if (remote_class->default_vtable == NULL)
++		remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_UNKNOWN);
+ 	mono_domain_unlock (domain);
+ 	return remote_class->default_vtable;
+ }
+@@ -1596,7 +1597,11 @@
+ 
+ 	if (is_proxy) {
+ 		if (!res) res = method;   /* It may be an interface or abstract class method */
+-		res = mono_marshal_get_remoting_invoke (res);
++		/* check to see if com proxy */
++		if (((MonoTransparentProxy *)obj)->rp->object.vtable->klass == mono_defaults.com_interop_proxy_class)
++			res = mono_marshal_get_cominterop_invoke (res);
++		else
++			res = mono_marshal_get_remoting_invoke (res);
+ 	}
+ 
+ 	g_assert (res);
+@@ -2575,7 +2580,11 @@
+ 		if (!obj) {
+ 			obj = mono_object_new (mono_domain_get (), method->klass);
+ 			if (mono_object_class(obj) == mono_defaults.transparent_proxy_class) {
+-				method = mono_marshal_get_remoting_invoke (method->slot == -1 ? method : method->klass->vtable [method->slot]);
++				MonoTransparentProxy* transparent_proxy = (MonoTransparentProxy*)obj;
++				if (transparent_proxy->rp->object.vtable->klass == mono_defaults.com_interop_proxy_class)
++					method = mono_marshal_get_cominterop_invoke (method->slot == -1 ? method : method->klass->vtable [method->slot]);
++				else
++					method = mono_marshal_get_remoting_invoke (method->slot == -1 ? method : method->klass->vtable [method->slot]);
+ 			}
+ 			if (method->klass->valuetype)
+ 				o = mono_object_unbox (obj);
+@@ -2589,6 +2598,15 @@
+ 		return obj;
+ 	} else {
+ 		/* obj must be already unboxed if needed */
++		if (obj && mono_object_class(obj) == mono_defaults.transparent_proxy_class) {
++			/* Get wrapper method if object is a transparent proxy for com interop. 
++			 * There was no check here for a remoting transparent proxy, so I assume that case does
++			 * not happen... 
++			 */
++			MonoTransparentProxy* transparent_proxy = (MonoTransparentProxy*)obj;
++			if (transparent_proxy->rp->object.vtable->klass == mono_defaults.com_interop_proxy_class)
++				method = mono_marshal_get_cominterop_invoke (method->slot == -1 ? method : method->klass->vtable [method->slot]);
++		}
+ 		return mono_runtime_invoke (method, obj, pa, exc);
+ 	}
+ }
+@@ -4103,8 +4121,12 @@
+ 	}
+ 
+ 	if (target && target->vtable->klass == mono_defaults.transparent_proxy_class) {
++		MonoTransparentProxy* transparent_proxy = (MonoTransparentProxy*)target;
+ 		g_assert (method);
+-		method = mono_marshal_get_remoting_invoke (method);
++		if (transparent_proxy->rp->object.vtable->klass == mono_defaults.com_interop_proxy_class)
++			method = mono_marshal_get_cominterop_invoke (method);
++		else
++			method = mono_marshal_get_remoting_invoke (method);
+ 		delegate->method_ptr = mono_compile_method (method);
+ 		MONO_OBJECT_SETREF (delegate, target, target);
+ 	} else if (mono_method_signature (method)->hasthis && method->klass->valuetype) {
+@@ -4284,6 +4306,12 @@
+ 	g_assert (this->vtable->klass == mono_defaults.transparent_proxy_class);
+ 	g_assert (res != NULL);
+ 
++	if (tp->rp->object.vtable->klass == mono_defaults.com_interop_proxy_class) {
++		MonoObject* com_object = (MonoObject*)((MonoComInteropProxy*)tp->rp)->com_object;
++		mono_field_get_value (com_object, field, res);
++		return res;
++	}
++
+ 	if (tp->remote_class->proxy_class->contextbound && tp->rp->context == (MonoObject *) mono_context_get ()) {
+ 		mono_field_get_value (tp->rp->unwrapped_server, field, res);
+ 		return res;
+@@ -4344,6 +4372,19 @@
+ 
+ 	field_class = mono_class_from_mono_type (field->type);
+ 
++	if (tp->rp->object.vtable->klass == mono_defaults.com_interop_proxy_class) {
++		MonoObject* com_object = (MonoObject*)((MonoComInteropProxy*)tp->rp)->com_object;
++		gpointer val;
++		if (field_class->valuetype) {
++			res = mono_object_new (domain, field_class);
++			val = ((gchar *) res) + sizeof (MonoObject);
++		} else {
++			val = &res;
++		}
++		mono_field_get_value (com_object, field, val);
++		return res;
++	}
++
+ 	if (tp->remote_class->proxy_class->contextbound && tp->rp->context == (MonoObject *) mono_context_get ()) {
+ 		gpointer val;
+ 		if (field_class->valuetype) {
+@@ -4411,6 +4452,13 @@
+ 
+ 	field_class = mono_class_from_mono_type (field->type);
+ 
++	if (tp->rp->object.vtable->klass == mono_defaults.com_interop_proxy_class) {
++		MonoObject* com_object = (MonoObject*)((MonoComInteropProxy*)tp->rp)->com_object;
++		if (field_class->valuetype) mono_field_set_value (com_object, field, val);
++		else mono_field_set_value (com_object, field, *((MonoObject **)val));
++		return;
++	}
++
+ 	if (tp->remote_class->proxy_class->contextbound && tp->rp->context == (MonoObject *) mono_context_get ()) {
+ 		if (field_class->valuetype) mono_field_set_value (tp->rp->unwrapped_server, field, val);
+ 		else mono_field_set_value (tp->rp->unwrapped_server, field, *((MonoObject **)val));
+@@ -4467,6 +4515,13 @@
+ 
+ 	field_class = mono_class_from_mono_type (field->type);
+ 
++	if (tp->rp->object.vtable->klass == mono_defaults.com_interop_proxy_class) {
++		MonoObject* com_object = (MonoObject*)((MonoComInteropProxy*)tp->rp)->com_object;
++		if (field_class->valuetype) mono_field_set_value (com_object, field, ((gchar *) arg) + sizeof (MonoObject));
++		else mono_field_set_value (com_object, field, arg);
++		return;
++	}
++
+ 	if (tp->remote_class->proxy_class->contextbound && tp->rp->context == (MonoObject *) mono_context_get ()) {
+ 		if (field_class->valuetype) mono_field_set_value (tp->rp->unwrapped_server, field, ((gchar *) arg) + sizeof (MonoObject));
+ 		else mono_field_set_value (tp->rp->unwrapped_server, field, arg);
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 75279)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -1355,7 +1355,31 @@
+ 	return pos;
+ }
+ 
++/* assumes mono_mb_emit_proxy_check already called and succeed
++ * and that we are dealing with a transparent proxy object */
+ static int
++mono_mb_emit_com_proxy_check (MonoMethodBuilder *mb, int branch_code)
++{
++	int pos;
++	mono_mb_emit_byte (mb, CEE_CASTCLASS);
++	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_defaults.transparent_proxy_class));
++	mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++	mono_mb_emit_byte (mb, CEE_LDIND_REF);
++	mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoObject, vtable));
++	mono_mb_emit_byte (mb, CEE_LDIND_I);
++	mono_mb_emit_icon (mb, G_STRUCT_OFFSET (MonoVTable, klass));
++	mono_mb_emit_byte (mb, CEE_ADD);
++	mono_mb_emit_byte (mb, CEE_LDIND_I);
++	mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
++	mono_mb_emit_byte (mb, CEE_MONO_CLASSCONST);
++	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_defaults.com_interop_proxy_class));
++	mono_mb_emit_byte (mb, branch_code);
++	pos = mb->pos;
++	mono_mb_emit_i4 (mb, 0);
++	return pos;
++}
++
++static int
+ mono_mb_emit_xdomain_check (MonoMethodBuilder *mb, int branch_code)
+ {
+ 	int pos;
+@@ -3517,20 +3541,21 @@
+ }
+ 
+ /**
+- * cominterop_get_invoke:
++ * mono_marshal_get_cominterop_invoke:
+  * @method: managed method
+  *
+  * Returns: the generated method that calls the underlying __ComObject
+  * rather than the proxy object.
+  */
+-static MonoMethod *
+-cominterop_get_invoke (MonoMethod *method)
++MonoMethod *
++mono_marshal_get_cominterop_invoke (MonoMethod *method)
+ {
+ 	MonoMethodSignature *sig;
+ 	MonoMethodBuilder *mb;
+ 	MonoMethod *res;
+ 	int i, temp_obj;
+ 	GHashTable* cache = method->klass->image->cominterop_invoke_cache;
++	gboolean is_com_class = FALSE;
+ 
+ 	g_assert (method);
+ 
+@@ -3543,6 +3568,8 @@
+ 	if (!sig->hasthis)
+ 		return method;
+ 
++	mono_init_com_types ();
++
+ 	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_COMINTEROP_INVOKE);
+ 
+ 	/* get real proxy object, which is a ComInteropProxy in this case*/
+@@ -3559,7 +3586,11 @@
+ 	for (i = 1; i <= sig->param_count; i++)
+ 		mono_mb_emit_ldarg (mb, i);
+ 
+-	if (method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) {
++	is_com_class = method->klass->is_com_object || 
++		(MONO_CLASS_IS_INTERFACE (method->klass) && MONO_CLASS_IS_IMPORT (method->klass));
++
++	/* only do COM Interop for internal call methods on COM types */
++	if (is_com_class && (method->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_RUNTIME))) {
+ 		MonoMethod * native_wrapper = cominterop_get_native_wrapper(method);
+ 		mono_mb_emit_managed_call (mb, native_wrapper, NULL);
+ 	}
+@@ -3571,13 +3602,10 @@
+ 	}
+ 
+ 	if (!strcmp(method->name, ".ctor"))	{
+-		static MonoClass *com_interop_proxy_class = NULL;
+ 		static MonoMethod *cache_proxy = NULL;
+ 
+-		if (!com_interop_proxy_class)
+-			com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
+ 		if (!cache_proxy)
+-			cache_proxy = mono_class_get_method_from_name (com_interop_proxy_class, "CacheProxy", 0);
++			cache_proxy = mono_class_get_method_from_name (mono_defaults.com_interop_proxy_class, "CacheProxy", 0);
+ 
+ 		mono_mb_emit_ldarg (mb, 0);
+ 		mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
+@@ -3628,10 +3656,6 @@
+ 	if (method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE || method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE)
+ 		return method;
+ 
+-	/* this seems to be the best plase to put this, as all remoting invokes seem to get filtered through here */
+-	if ((method->klass->is_com_object || method->klass == mono_defaults.com_object_class) && !mono_class_vtable (mono_domain_get (), method->klass)->remote)
+-		return cominterop_get_invoke(method);
+-
+ 	sig = signature_no_pinvoke (method);
+ 
+ 	/* we cant remote methods without this pointer */
+@@ -4477,7 +4501,7 @@
+ 	if (target_type == MONO_REMOTING_TARGET_APPDOMAIN)
+ 		return mono_marshal_get_xappdomain_invoke (method);
+ 	else if (target_type == MONO_REMOTING_TARGET_COMINTEROP)
+-		return cominterop_get_invoke (method);
++		return mono_marshal_get_cominterop_invoke (method);
+ 	else
+ 		return mono_marshal_get_remoting_invoke (method);
+ }
+@@ -4497,7 +4521,7 @@
+ 	MonoMethodSignature *sig;
+ 	MonoMethodBuilder *mb;
+ 	MonoMethod *res, *native;
+-	int i, pos, pos_rem;
++	int i, pos, pos_rem, pos_com;
+ 
+ 	g_assert (method);
+ 
+@@ -4520,6 +4544,9 @@
+ 	mono_mb_emit_ldarg (mb, 0);
+ 	pos = mono_mb_emit_proxy_check (mb, CEE_BNE_UN);
+ 
++	mono_mb_emit_ldarg (mb, 0);
++	pos_com = mono_mb_emit_com_proxy_check (mb, CEE_BEQ);
++
+ 	if (mono_marshal_supports_fast_xdomain (method)) {
+ 		mono_mb_emit_ldarg (mb, 0);
+ 		pos_rem = mono_mb_emit_xdomain_check (mb, CEE_BEQ);
+@@ -4536,6 +4563,12 @@
+ 	mono_mb_emit_managed_call (mb, native, mono_method_signature (native));
+ 	mono_mb_emit_byte (mb, CEE_RET);
+ 
++	/* is com a proxy */
++	mono_mb_patch_branch (mb, pos_com);
++	native = mono_marshal_get_cominterop_invoke(method);
++	mono_mb_emit_managed_call (mb, native, mono_method_signature (native));
++	mono_mb_emit_byte (mb, CEE_RET);
++
+ 	/* not a proxy */
+ 	mono_mb_patch_branch (mb, pos);
+ 	mono_mb_emit_managed_call (mb, method, mono_method_signature (method));
+@@ -8391,6 +8424,7 @@
+ 	int i;
+ 	const char *exc_class = "MissingMethodException";
+ 	const char *exc_arg = NULL;
++	gboolean is_com_class = FALSE;
+ 
+ 	g_assert (method != NULL);
+ 	g_assert (mono_method_signature (method)->pinvoke);
+@@ -8398,8 +8432,12 @@
+ 	cache = method->klass->image->native_wrapper_cache;
+ 	if ((res = mono_marshal_find_in_cache (cache, method)))
+ 		return res;
++	
++	is_com_class = method->klass->is_com_object || 
++		(MONO_CLASS_IS_INTERFACE (method->klass) && MONO_CLASS_IS_IMPORT (method->klass));
+ 
+-	if (MONO_CLASS_IS_IMPORT (method->klass))
++	/* only do COM Interop for internal call methods on COM types */
++	if (is_com_class && (method->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_RUNTIME)))
+ 		return cominterop_get_native_wrapper (method);
+ 
+ 	sig = mono_method_signature (method);
+Index: mono/mono/metadata/marshal.h
+===================================================================
+--- mono/mono/metadata/marshal.h	(revision 75279)
++++ mono/mono/metadata/marshal.h	(working copy)
+@@ -93,6 +93,9 @@
+ MonoMethod*
+ mono_marshal_get_write_barrier (void) MONO_INTERNAL;
+ 
++MonoMethod *
++mono_marshal_get_cominterop_invoke (MonoMethod *method) MONO_INTERNAL;
++
+ /* method builder functions */
+ 
+ void
+Index: mono/mono/metadata/icall.c
+===================================================================
+--- mono/mono/metadata/icall.c	(revision 75279)
++++ mono/mono/metadata/icall.c	(working copy)
+@@ -5969,8 +5969,11 @@
+ 	if (!proxy)
+ 		return 0;
+ 
+-	if (proxy->vtable->klass == mono_defaults.transparent_proxy_class)
+-		return 1;
++	if (proxy->vtable->klass == mono_defaults.transparent_proxy_class) {
++		MonoTransparentProxy* transparent_proxy = (MonoTransparentProxy*)proxy;
++		if (transparent_proxy->rp->object.vtable->klass != mono_defaults.com_interop_proxy_class)
++			return 1;
++	}
+ 
+ 	return 0;
+ }

@@ -1,0 +1,173 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] A clarification on the purpose of alias analysis.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20A%20clarification%20on%20the%20purpose%20of%20alias%20analysis.&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010667.html">
+   <LINK REL="Next"  HREF="010656.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] A clarification on the purpose of alias analysis.</H1>
+    <B>Massimiliano Mantione</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20A%20clarification%20on%20the%20purpose%20of%20alias%20analysis.&In-Reply-To="
+       TITLE="[Mono-devel-list] A clarification on the purpose of alias analysis.">massi at ximian.com
+       </A><BR>
+    <I>Thu Feb 24 07:21:47 EST 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010667.html">[Mono-devel-list] Re: [Mono-list] Mono.Data.ProvidersFactory
+</A></li>
+        <LI>Next message: <A HREF="010656.html">[Mono-devel-list] A clarification on the purpose of alias analysis.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10655">[ date ]</a>
+              <a href="thread.html#10655">[ thread ]</a>
+              <a href="subject.html#10655">[ subject ]</a>
+              <a href="author.html#10655">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>As the subject says, I'd need a clarification on the purpose of
+alias analysis in our JIT.
+As usual, &quot;locals&quot; and &quot;local variables&quot; include method arguments
+in the text that follows.
+
+Initially I started this thing because I needed accurate liveness
+data. These kind of aliasing info can then be used to correctly
+build the SSA form even with pointers, and other things... but
+in the end it boils down to this:
+
+[1] For each MonoInst, knowing exactly which locals are affected
+    (read/written) by that instruction.
+    Sometimes the information is not certain (some local *might*
+    be affected by that statement), but this is all we can have.
+    The more the alias propagator is accurate, the more those
+    info are precise.
+
+In another sense, the code I'm writing could also take care of
+values that are not local variables.
+A &quot;classical&quot; example of aliasing, a function that receives two
+pointers that might point to the same location, is of this kind.
+In fact the two pointers are aliases, but not of any local.
+Considering also these cases, the goal of alias analysis would
+be defined as:
+
+[2] For each pointer value, knowing as accurately as possible
+    where it is pointing to, so that we can optimize also accesses
+    performed through pointers.
+
+I hope I've been clear in explaining the difference between goals
+[1] and [2]. Goal [2] is obviously more general.
+
+Actually, solving [1] would allow us to correctly optimize all
+uses of local variables (deadce, copyprop, any form of redundancy
+elimination...).
+In this case, however, all values obtained through pointers would
+be generally unknown, because we would not care to track references
+pointing outside of local variables.
+This would mean that in case [1] it is impossible to optimize any
+access performed through a pointer.
+We would know when these accesses interfere with local variables
+(read or write them), but nothing more.
+Particularly, we could not do any elimination of redundant accesses
+through pointers, because we would know nothing about the pointed
+values.
+
+I do a simple concrete example.
+As I was saying, one classical example of aliasing is a method
+that receives two pointers, like &quot;void Test (int* a, int* b)&quot;.
+This is an issue only in case [2].
+In fact (in CIL) if whenever the address of a local of this method
+is taken it is used as a managed pointer, we know that a and b will
+never alias any local variable, and this is by far the most common
+case.
+Obviously this makes sense if we don't care about optimizing also
+accesses through a and b.
+Suppose Test contains this code sequence:
+
+*a = x;
+*b = y;
+z = *a + k;
+
+What I mean is that we must not attempt to replace '*a' with 'x'
+on the 3rd line, because *a is aliased by *b.
+By the way, the example works the same way if a and b are byref
+parameters instead of pointers (the CIL method body would be just
+the same, only the C# syntax would be different).
+
+Now, the question is, do we aim for [1] or [2]?
+Which really means: is it worth to implement [2]?
+
+I ask this because [1] is relatively easy, but turning it to [2]
+afterwords could be really messy.
+
+To see this, let's think at *how* the JIT code should access
+aliasing information.
+
+Now (without aliasing) we just check if the MonoInst is flagged
+as MONO_SSA_LOAD or MONO_SSA_STORE, and know that the affected
+local is &quot;inst-&gt;inst_i0-&gt;inst_c0&quot;.
+
+In case [1], accessing the aliasing information means *only*
+understanding for each MonoInst which are the affected locals,
+and this can be represented by data structures that track the set
+of locals that are potentially aliased by each pointer value (each
+local is easily identified by its index in cfg-&gt;vars).
+
+In case [2], on the other hand, the center of everything are the
+aliases themselves, so the data structures to relate the aliases
+to the instructions where they are used are more complex.
+In practice I should build some ad hoc sets, which are sort of
+&quot;aliasing classes&quot;, and see which aliases belong to the same class,
+and which variables are (potentially) aliased by each alias class...
+a much more complex thing.
+This is needed because there would be aliases that do not point
+to any local. In the example above, '*a' and '*b' would be in the
+same &quot;aliasing class&quot;, but their set of locals would be empty.
+
+I'd like to get it right the 1st time, because the potential users
+of aliasing information are liveness, deadce, local copyprop, SSA
+construction... all that JIT code will be modified to take advantage
+from that info.
+The code to access data structures in cases [1] and [2] is really
+different. I could hide the difference behind an interface, but it
+would not be so simple anyway.
+This is why I'd like to get it right the 1st time.
+
+So, I repeat the simple question: is case [2] important?
+If yes, could you show me some example of optimization that is
+really important and that is possible only implementing [2]?
+
+Thanks to anybody who answers...
+
+Ciao,
+  Massimiliano
+
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010667.html">[Mono-devel-list] Re: [Mono-list] Mono.Data.ProvidersFactory
+</A></li>
+	<LI>Next message: <A HREF="010656.html">[Mono-devel-list] A clarification on the purpose of alias analysis.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10655">[ date ]</a>
+              <a href="thread.html#10655">[ thread ]</a>
+              <a href="subject.html#10655">[ subject ]</a>
+              <a href="author.html#10655">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

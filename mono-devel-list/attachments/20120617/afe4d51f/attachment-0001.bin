@@ -1,0 +1,428 @@
+diff --git a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/DataGrid.cs b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/DataGrid.cs
+index 29fbae3..e7dde39 100644
+--- a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/DataGrid.cs
++++ b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/DataGrid.cs
+@@ -269,6 +269,8 @@ namespace System.Windows.Forms
+ 		bool adding_new_row;			// Used to temporary ignore the new row added by CurrencyManager.AddNew in CurrentCell
+ 
+ 		internal Stack data_source_stack;
++		internal Stack data_grid_table_style_stack;
++		internal Stack grid_style_stack;
+ 
+ 		#endregion // Local Variables
+ 
+@@ -292,6 +294,8 @@ namespace System.Windows.Forms
+ 			selection_start = -1;
+ 			rows = new DataGridRelationshipRow [0];
+ 
++			grid_style_stack = new Stack ();
++			data_grid_table_style_stack = new Stack ();
+ 			default_style = new DataGridTableStyle (true);
+ 			grid_style = new DataGridTableStyle ();
+ 
+@@ -1304,8 +1308,15 @@ namespace System.Windows.Forms
+ 		{
+ 			if (data_source_stack.Count == 0)
+ 				return;
++		
++			EndEdit ();
++
++			DataGridDataSource source = 
++				(DataGridDataSource) data_source_stack.Pop ();
++			CurrentTableStyle = 
++				(DataGridTableStyle) data_grid_table_style_stack.Pop ();
++			grid_style = (DataGridTableStyle) grid_style_stack.Pop ();
+ 
+-			DataGridDataSource source = (DataGridDataSource)data_source_stack.Pop ();
+ 			list_manager = source.list_manager;
+ 			rows = source.Rows;
+ 			selected_rows = source.SelectedRows;
+@@ -1320,12 +1331,19 @@ namespace System.Windows.Forms
+ 			if (allow_navigation == false)
+ 				return;
+ 
++			EndEdit ();
++
+ 			DataGridDataSource previous_source = new DataGridDataSource (this, list_manager, datasource, datamember, list_manager.Current, CurrentCell);
+ 			previous_source.Rows = rows;
+ 			previous_source.SelectedRows = selected_rows;
+ 			previous_source.SelectionStart = selection_start;
+ 
+ 			data_source_stack.Push (previous_source);
++			
++			data_grid_table_style_stack.Push (CurrentTableStyle);
++			grid_style_stack.Push (grid_style);
++			grid_style = new DataGridTableStyle ();
++			CurrentTableStyle = grid_style;
+ 
+ 			rows = null;
+ 			selected_rows = new Hashtable ();
+@@ -2523,7 +2541,11 @@ namespace System.Windows.Forms
+ 			if (e.Index == -1) {
+ 				ResetSelection ();
+ 				if (rows == null || RowsCount != rows.Length - (ShowEditRow ? 1 : 0))
++				{
++					if (is_editing)
++						CancelEditing ();
+ 					RecreateDataGridRows (true);
++				}
+ 			} else {
+ 				InvalidateRow (e.Index);
+ 			}
+@@ -2654,7 +2676,13 @@ namespace System.Windows.Forms
+ 			XplatUI.ScrollWindow (Handle, area, pixels, 0, false);
+ 
+ 			int pixel_offset = GetColumnStartingPixel (CurrentColumn);
+-			int next_pixel_offset = pixel_offset + CurrentTableStyle.GridColumnStyles[CurrentColumn].Width;
++
++			int next_pixel_offset = 0;
++
++			if (CurrentColumn < CurrentTableStyle.GridColumnStyles.Count)	
++			{
++				next_pixel_offset = pixel_offset + CurrentTableStyle.GridColumnStyles[CurrentColumn].Width;
++			}
+ 
+ 			if (pixel_offset >= horiz_pixeloffset
+ 			    && next_pixel_offset < horiz_pixeloffset + cells_area.Width)
+diff --git a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/DataGridTableStyle.cs b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/DataGridTableStyle.cs
+index 3f1f9af..8166e26 100644
+--- a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/DataGridTableStyle.cs
++++ b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/DataGridTableStyle.cs
+@@ -856,13 +856,15 @@ namespace System.Windows.Forms
+ 				if (typeof (IBindingList).IsAssignableFrom (propcol[i].PropertyType)) {
+ 					table_relations.Add (propcol[i].Name);
+ 				} else {
+-					st = CreateGridColumn (propcol[i],  true);
+-					st.bound = true;
+-					st.grid = datagrid;
+-					st.MappingName = propcol[i].Name;
+-					st.HeaderText = propcol[i].Name;
+-					st.Width = CurrentPreferredColumnWidth;
+-					column_styles.Add (st);
++					if (propcol[i].IsBrowsable) {
++						st = CreateGridColumn (propcol[i],  true);
++						st.bound = true;
++						st.grid = datagrid;
++						st.MappingName = propcol[i].Name;
++						st.HeaderText = propcol[i].Name;
++						st.Width = CurrentPreferredColumnWidth;
++						column_styles.Add (st);
++					}
+ 				}
+ 			}
+ 
+diff --git a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUICarbon.cs b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUICarbon.cs
+index 18afe41..fd8a9dd 100644
+--- a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUICarbon.cs
++++ b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUICarbon.cs
+@@ -94,7 +94,6 @@ namespace System.Windows.Forms {
+ 		static readonly object queuelock = new object ();
+ 		
+ 		// Event Handlers
+-		internal override event EventHandler Idle;
+ 		#endregion
+ 		
+ 		#region Constructors
+@@ -769,8 +768,12 @@ namespace System.Windows.Forms {
+ 
+ 		internal override void RaiseIdle (EventArgs e)
+ 		{
+-			if (Idle != null)
+-				Idle (this, e);
++			int id = Thread.CurrentThread.ManagedThreadId;
++			if (Idle_Threads != null && 
++				Idle_Threads.ContainsKey (id) 
++				&& Idle_Threads[id] != null){
++                               Idle_Threads[id] (this, e);
++			}
+ 		}
+ 
+ 		internal override IntPtr InitializeDriver() {
+@@ -1366,9 +1369,13 @@ namespace System.Windows.Forms {
+ 			lock (queuelock) {
+ 
+ 				if (MessageQueue.Count <= 0) {
+-					if (Idle != null) 
+-						Idle (this, EventArgs.Empty);
+-					else if (TimerList.Count == 0) {
++					int id = Thread.CurrentThread.ManagedThreadId;	
++					if (Idle_Threads != null && 
++					   Idle_Threads.ContainsKey (id) && 
++					   Idle_Threads[id] != null)
++					{
++						Idle_Threads[id] (this, EventArgs.Empty);
++					} else if (TimerList.Count == 0) {
+ 						ReceiveNextEvent (0, IntPtr.Zero, 0.15, true, ref evtRef);
+ 						if (evtRef != IntPtr.Zero && target != IntPtr.Zero) {
+ 							SendEventToEventTarget (evtRef, target);
+diff --git a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIDriver.cs b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIDriver.cs
+index b79b967..003ec4c 100644
+--- a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIDriver.cs
++++ b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIDriver.cs
+@@ -29,6 +29,7 @@
+ using System.Drawing;
+ using System.Threading;
+ using System.Runtime.InteropServices;
++using System.Collections.Generic;
+ 
+ namespace System.Windows.Forms {
+ 	internal abstract class XplatUIDriver {
+@@ -269,7 +270,37 @@ namespace System.Windows.Forms {
+ 		}
+ 		#endregion	// XplatUI Driver Properties
+ 
+-		internal abstract event EventHandler Idle;
++		internal Dictionary<int, EventHandler> Idle_Threads = null;
++		internal virtual event EventHandler Idle {
++			add {
++				lock (this) {
++					if (Idle_Threads == null) {
++						Idle_Threads = 
++						  new Dictionary<int, EventHandler> ();
++					}
++				}
++				int id = Thread.CurrentThread.ManagedThreadId;
++				if (!Idle_Threads.ContainsKey (id)) {
++					EventHandler hnd = null;
++					hnd+=value;
++					Idle_Threads.Add (id, hnd);
++				} else {
++					Idle_Threads[id] += value;
++				}
++			}
++			remove {
++				if (Idle_Threads != null){
++					int id = 
++					  Thread.CurrentThread.ManagedThreadId;
++					if (Idle_Threads.ContainsKey (id)) {
++						Idle_Threads[id] -= value;
++						if (Idle_Threads[id] == null) {
++							Idle_Threads.Remove (id);
++						}
++					}
++				}
++			}
++		}
+ 
+ 		#region XplatUI Driver Methods
+ 		internal abstract void AudibleAlert(AlertType alert);
+diff --git a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIWin32.cs b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIWin32.cs
+index efc464d..60cb62f 100644
+--- a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIWin32.cs
++++ b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIWin32.cs
+@@ -1239,9 +1239,14 @@ namespace System.Windows.Forms {
+ 		}
+ 
+ 		internal override void RaiseIdle (EventArgs e)
+-		{
+-			if (Idle != null)
+-				Idle (this, e);
++		{	
++			int id = Thread.CurrentThread.ManagedThreadId;
++			if (Idle_Threads != null && 
++				Idle_Threads.ContainsKey (id) && 
++				Idle_Threads[id] != null)
++			{
++				Idle_Threads[id] (this, e);
++			}
+ 		}
+ 
+ 		internal override Keys ModifierKeys {
+@@ -2021,18 +2026,30 @@ namespace System.Windows.Forms {
+ 
+ 		private bool GetMessage(ref MSG msg, IntPtr hWnd, int wFilterMin, int wFilterMax, bool blocking) {
+ 			bool		result;
++			bool		CheckIdle = false;
++
++			if (blocking) {
++				CheckIdle = true;
++			}
++			ProcessNextMessage:
+ 
+ 			msg.refobject = 0;
+ 			if (RetrieveMessage(ref msg)) {
+ 				return true;
+ 			}
+ 
+-			if (blocking) {
++			if (blocking && !CheckIdle) {
+ 				result = Win32GetMessage(ref msg, hWnd, wFilterMin, wFilterMax);
+ 			} else {
+ 				result = Win32PeekMessage(ref msg, hWnd, wFilterMin, wFilterMax, (uint)PeekMessageFlags.PM_REMOVE);
+ 				if (!result) {
+-					return false;
++					if (CheckIdle) {
++						RaiseIdle (null);
++						CheckIdle = false;
++						goto ProcessNextMessage;
++					} else {
++						return false;
++					}
+ 				}
+ 			}
+ 
+@@ -3323,7 +3340,6 @@ namespace System.Windows.Forms {
+ 			Win32SetForegroundWindow(handle);
+ 		}
+ 
+-		internal override event EventHandler Idle;
+ 		#endregion	// Public Static Methods
+ 
+ 		#region Win32 Imports
+diff --git a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIX11.cs b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIX11.cs
+index 9b6c130..275ee47 100644
+--- a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIX11.cs
++++ b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIX11.cs
+@@ -1697,8 +1697,13 @@ namespace System.Windows.Forms {
+ 			}
+ 
+ 			if (pending == 0 && allowIdle) {
+-				if ((queue == null || queue.DispatchIdle) && Idle != null) {
+-					Idle (this, EventArgs.Empty);
++				int id = Thread.CurrentThread.ManagedThreadId;
++				if ((queue == null || queue.DispatchIdle) && 
++					Idle_Threads != null && 	
++					Idle_Threads.ContainsKey (id) && 
++					Idle_Threads[id] != null) 
++				{
++					Idle_Threads[id] (this, EventArgs.Empty);
+ 				}
+ 
+ 				lock (XlibLock) {
+@@ -2594,8 +2599,13 @@ namespace System.Windows.Forms {
+ 		#region Public Static Methods
+ 		internal override void RaiseIdle (EventArgs e)
+ 		{
+-			if (Idle != null)
+-				Idle (this, e);
++			int id = Thread.CurrentThread.ManagedThreadId;
++			if (Idle_Threads != null && 
++			    Idle_Threads.ContainsKey (id) && 
++			    Idle_Threads[id] != null) 
++			{
++				Idle_Threads[id] (this, e);
++			}
+ 		}
+ 		
+ 		internal override IntPtr InitializeDriver()
+@@ -6350,7 +6360,6 @@ namespace System.Windows.Forms {
+ 		#endregion	// Public Static Methods
+ 
+ 		#region Events
+-		internal override event EventHandler Idle;
+ 		#endregion	// Events
+ 
+ 		
+diff --git a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIX11GTK.cs b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIX11GTK.cs
+index 77e89c4..1e52345 100644
+--- a/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIX11GTK.cs
++++ b/mcs/class/Managed.Windows.Forms/System.Windows.Forms/XplatUIX11GTK.cs
+@@ -1199,8 +1199,12 @@ namespace System.Windows.Forms {
+ 			}
+ 			
+ 			if (pending == 0) {
+-				if (Idle != null) {
+-					Idle (this, EventArgs.Empty);
++				int id = Thread.CurrentThread.ManagedThreadId;
++				if (Idle_Threads != null && 
++				    Idle_Threads.ContainsKey (id) && 
++				    Idle_Threads[id] != null){
++				{
++					Idle_Threads[id] (this, EventArgs.Empty);
+ 				}
+ 				
+ 				lock (XlibLock) {
+@@ -4352,7 +4356,6 @@ namespace System.Windows.Forms {
+ 		#endregion	// Public Static Methods
+ 		
+ 		#region Events
+-		internal override event EventHandler Idle;
+ 		#endregion	// Events
+ 		
+ 		#region X11 Imports
+diff --git a/mcs/class/Managed.Windows.Forms/Test/System.Windows.Forms/FormEventTest.cs b/mcs/class/Managed.Windows.Forms/Test/System.Windows.Forms/FormEventTest.cs
+index c2f3c37..0d1db6c 100644
+--- a/mcs/class/Managed.Windows.Forms/Test/System.Windows.Forms/FormEventTest.cs
++++ b/mcs/class/Managed.Windows.Forms/Test/System.Windows.Forms/FormEventTest.cs
+@@ -624,6 +624,81 @@ namespace MonoTests.System.Windows.Forms
+ 			_form.MinimumSize = new Size(100, 100);
+ 			Assert.AreEqual (true, eventhandled, "#A10");
+ 		}
++
++		/**
++		 ** This next test is in response to a bug report
++		 ** which pointed out that the idle events were being
++		 ** sent to every thread rather than just the thread
++		 ** they were assigned on.
++		 **
++		 ** Report: https://bugzilla.novell.com/show_bug.cgi?id=321541
++		 **/
++		private static Form form1_OneIdlePerThread = null;
++		private static Form form2_OneIdlePerThread = null;
++		private static int count1_OIPT = 0;
++		private static int count2_OIPT = 0; 
++		private static ThreadStart OIPT_ThreadStart2;
++		private static Thread OIPT_Thread2;
++		private static int oipt_t1 = 0;
++		private static int oipt_t2 = 0;
++		[Test]
++		public void OneIdlePerThread () {
++			Thread t = Thread.CurrentThread;
++			oipt_t1 = t.ManagedThreadId;
++			count1_OIPT = 0;
++			count2_OIPT = 0;
++			form1_OneIdlePerThread = new Form ();
++			form2_OneIdlePerThread = new Form ();
++			form1_OneIdlePerThread.Show(); 
++			//form2_OneIdlePerThread.Show();
++
++			OIPT_ThreadStart2 = new ThreadStart (TIPT_Two);
++			OIPT_Thread2=new Thread (OIPT_ThreadStart2);
++			OIPT_Thread2.IsBackground = true;
++			OIPT_Thread2.SetApartmentState(ApartmentState.STA);
++			OIPT_Thread2.Start ();
++			Application.Idle += new EventHandler(TestIdlePerThread);
++			Application.Run (form1_OneIdlePerThread);
++			if (!OIPT_Thread2.Join(1000)){
++				OIPT_Thread2.Abort();
++			}
++
++			Assert.AreEqual (true, count1_OIPT == 1, 
++				"#Idle: idle #1 hit too many times");
++			Assert.AreEqual (true, count2_OIPT == 1, 	
++				"#Idle: idle #2 hit too many times");
++		}
++		public static void TIPT_Two (){
++			Thread t = Thread.CurrentThread;
++			oipt_t2 = t.ManagedThreadId;
++			Application.Idle += 	
++				new EventHandler (TestIdlePerThread2);
++			Application.Run (form2_OneIdlePerThread);
++		}
++		public static void TestIdlePerThread (object o, EventArgs e) {
++			Thread t = Thread.CurrentThread;
++			count1_OIPT++;
++			Application.Idle -= 
++				new EventHandler (TestIdlePerThread);
++			/* Give thread2 time to finish before we close */
++			Thread.Sleep(100);
++			if (form1_OneIdlePerThread != null)
++				form1_OneIdlePerThread.Close ();
++			Assert.AreEqual (true, oipt_t1 == t.ManagedThreadId, 
++				"#Idle:Wrong Thread-t1");
++		}
++		public static void TestIdlePerThread2 (object o, EventArgs e) {
++			Thread t = Thread.CurrentThread;
++			count2_OIPT++;
++			Application.Idle -= 
++				new EventHandler(TestIdlePerThread2);
++			if (form2_OneIdlePerThread != null)
++				form2_OneIdlePerThread.Invoke 	
++				  (new MethodInvoker(form2_OneIdlePerThread.Close));
++			Assert.AreEqual (true, oipt_t2 == t.ManagedThreadId, 
++				"#Idle:Wrong Thread-t2");
++		}
++		
+ 	}
+ 
+ 	[TestFixture]

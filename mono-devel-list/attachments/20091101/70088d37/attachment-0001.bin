@@ -1,0 +1,323 @@
+diff --git a/mono/profiler/mono-profiler-logging.c b/mono/profiler/mono-profiler-logging.c
+index 404a951..6f05840 100644
+--- a/mono/profiler/mono-profiler-logging.c
++++ b/mono/profiler/mono-profiler-logging.c
+@@ -362,27 +362,34 @@ typedef struct _ProfilerCodeChunks {
+ #define PROFILER_HEAP_SHOT_HEAP_BUFFER_SIZE 4096
+ #define PROFILER_HEAP_SHOT_WRITE_BUFFER_SIZE 4096
+ 
++typedef struct _ProfilerHeapShotObject {
++	MonoObject *address;
++	MonoClass *klass;
++	guint32 size;
++	guint32 gc_handle;
++} ProfilerHeapShotObject;
++
+ typedef struct _ProfilerHeapShotObjectBuffer {
+ 	struct _ProfilerHeapShotObjectBuffer *next;
+-	MonoObject **next_free_slot;
+-	MonoObject **end;
+-	MonoObject **first_unprocessed_slot;
+-	MonoObject *buffer [PROFILER_HEAP_SHOT_OBJECT_BUFFER_SIZE];
++	ProfilerHeapShotObject *next_free_slot;
++	ProfilerHeapShotObject *end;
++	ProfilerHeapShotObject *first_unprocessed_slot;
++	ProfilerHeapShotObject buffer [PROFILER_HEAP_SHOT_OBJECT_BUFFER_SIZE];
+ } ProfilerHeapShotObjectBuffer;
+ 
+ typedef struct _ProfilerHeapShotHeapBuffer {
+ 	struct _ProfilerHeapShotHeapBuffer *next;
+ 	struct _ProfilerHeapShotHeapBuffer *previous;
+-	MonoObject **start_slot;
+-	MonoObject **end_slot;
+-	MonoObject *buffer [PROFILER_HEAP_SHOT_HEAP_BUFFER_SIZE];
++	ProfilerHeapShotObject *start_slot;
++	ProfilerHeapShotObject *end_slot;
++	ProfilerHeapShotObject buffer [PROFILER_HEAP_SHOT_HEAP_BUFFER_SIZE];
+ } ProfilerHeapShotHeapBuffer;
+ 
+ typedef struct _ProfilerHeapShotHeapBuffers {
+ 	ProfilerHeapShotHeapBuffer *buffers;
+ 	ProfilerHeapShotHeapBuffer *last;
+ 	ProfilerHeapShotHeapBuffer *current;
+-	MonoObject **first_free_slot;
++	ProfilerHeapShotObject *first_free_slot;
+ } ProfilerHeapShotHeapBuffers;
+ 
+ 
+@@ -1822,12 +1829,18 @@ profiler_add_heap_shot_write_job (ProfilerHeapShotWriteJob *job) {
+ #define STORE_ALLOCATED_OBJECT(d,o) do {\
+ 	if ((d)->heap_shot_object_buffers->next_free_slot < (d)->heap_shot_object_buffers->end) {\
+ 		STORE_ALLOCATED_OBJECT_MESSAGE1 ((d), (o));\
+-		*((d)->heap_shot_object_buffers->next_free_slot) = (o);\
++		(d)->heap_shot_object_buffers->next_free_slot->address = (o);\
++		(d)->heap_shot_object_buffers->next_free_slot->klass = mono_object_get_class (o);\
++		(d)->heap_shot_object_buffers->next_free_slot->size = mono_object_get_size (o);\
++		(d)->heap_shot_object_buffers->next_free_slot->gc_handle = mono_gchandle_new_weakref ((o), TRUE);\
+ 		(d)->heap_shot_object_buffers->next_free_slot ++;\
+ 	} else {\
+ 		ProfilerHeapShotObjectBuffer *buffer = profiler_heap_shot_object_buffer_new (d);\
+ 		STORE_ALLOCATED_OBJECT_MESSAGE2 ((d), (o));\
+-		*((buffer)->next_free_slot) = (o);\
++		(buffer)->next_free_slot->address = (o);\
++		(buffer)->next_free_slot->klass = mono_object_get_class (o);\
++		(buffer)->next_free_slot->size = mono_object_get_size (o);\
++		(buffer)->next_free_slot->gc_handle = mono_gchandle_new_weakref ((o), TRUE);\
+ 		(buffer)->next_free_slot ++;\
+ 	}\
+ } while (0)
+@@ -2423,7 +2436,7 @@ profiler_heap_shot_write_data_block (ProfilerHeapShotWriteJob *job) {
+ 			
+ 			class_id = class_id_mapping_element_get (klass);
+ 			if (class_id == NULL) {
+-				printf ("profiler_heap_shot_write_data_block: unknown class %p", klass);
++				printf ("profiler_heap_shot_write_data_block: unknown class %p\n", klass);
+ 			}
+ 			g_assert (class_id != NULL);
+ 			write_uint32 ((class_id->id << 2) | HEAP_CODE_FREE_OBJECT_CLASS);
+@@ -2435,20 +2448,21 @@ profiler_heap_shot_write_data_block (ProfilerHeapShotWriteJob *job) {
+ 			printf ("profiler_heap_shot_write_data_block: wrote unreachable object of class %p (id %d, size %d)\n", klass, class_id->id, size);
+ #endif
+ 		} else if (code == HEAP_CODE_OBJECT) {
+-			MonoObject *object = GUINT_TO_POINTER (GPOINTER_TO_UINT (value) & (~ (guint64) HEAP_CODE_MASK));
+-			MonoClass *klass = mono_object_get_class (object);
+-			ClassIdMappingElement *class_id = class_id_mapping_element_get (klass);
+-			guint32 size = mono_object_get_size (object);
+-			guint32 references = GPOINTER_TO_UINT (*cursor);
++			//MonoObject *object = GUINT_TO_POINTER (GPOINTER_TO_UINT (value) & (~ (guint64) HEAP_CODE_MASK));
++			guint32 class_id;
++			guint32 size;
++			guint32 references;
++			
++			class_id = GPOINTER_TO_UINT (*cursor);
+ 			UPDATE_JOB_BUFFER_CURSOR ();
+ 			
+-			if (class_id == NULL) {
+-				printf ("profiler_heap_shot_write_data_block: unknown class %p", klass);
+-			}
+-			g_assert (class_id != NULL);
++			size = GPOINTER_TO_UINT (*cursor);
++			UPDATE_JOB_BUFFER_CURSOR ();
++			references = GPOINTER_TO_UINT (*cursor);
++			UPDATE_JOB_BUFFER_CURSOR ();
+ 			
+ 			write_uint64 (GPOINTER_TO_UINT (value));
+-			write_uint32 (class_id->id);
++			write_uint32 (class_id);
+ 			write_uint32 (size);
+ 			write_uint32 (references);
+ #if DEBUG_HEAP_PROFILER
+@@ -4529,9 +4543,9 @@ object_allocated (MonoProfiler *profiler, MonoObject *obj, MonoClass *klass) {
+ 	}
+ 	
+ 	STORE_EVENT_ITEM_VALUE (events, profiler, klass, MONO_PROFILER_EVENT_DATA_TYPE_CLASS, MONO_PROFILER_EVENT_CLASS_ALLOCATION, 0, (guint64) mono_object_get_size (obj));
+-	if (profiler->action_flags.unreachable_objects || profiler->action_flags.heap_shot || profiler->action_flags.collection_summary) {
+-		STORE_ALLOCATED_OBJECT (data, obj);
+-	}
++//	if (profiler->action_flags.unreachable_objects || profiler->action_flags.heap_shot || profiler->action_flags.collection_summary) {
++//		STORE_ALLOCATED_OBJECT (data, obj);
++//	}
+ 	
+ 	if (profiler->action_flags.save_allocation_caller) {
+ 		MonoMethod *caller = thread_stack_top (&(data->stack));
+@@ -4557,6 +4571,9 @@ object_allocated (MonoProfiler *profiler, MonoObject *obj, MonoClass *klass) {
+ 	}
+ 	
+ 	COMMIT_RESERVED_EVENTS (data);
++	if (profiler->action_flags.unreachable_objects || profiler->action_flags.heap_shot || profiler->action_flags.collection_summary) {
++		STORE_ALLOCATED_OBJECT (data, obj);
++	}
+ }
+ 
+ static void
+@@ -4818,9 +4835,10 @@ report_object_references (gpointer *start, ClassIdMappingElement *layout, Profil
+ }
+ 
+ static void
+-profiler_heap_report_object_reachable (ProfilerHeapShotWriteJob *job, MonoObject *obj) {
++profiler_heap_report_object_reachable (ProfilerHeapShotWriteJob *job, ProfilerHeapShotObject *obj) {
+ 	if (job != NULL) {
+-		MonoClass *klass = mono_object_get_class (obj);
++		guint32 size = obj->size;
++		MonoClass *klass = obj->klass;
+ 		ClassIdMappingElement *class_id = class_id_mapping_element_get (klass);
+ 		if (class_id == NULL) {
+ 			printf ("profiler_heap_report_object_reachable: class %p (%s.%s) has no id\n", klass, mono_class_get_namespace (klass), mono_class_get_name (klass));
+@@ -4832,7 +4850,7 @@ profiler_heap_report_object_reachable (ProfilerHeapShotWriteJob *job, MonoObject
+ 			g_assert (id < job->summary.capacity);
+ 			
+ 			job->summary.per_class_data [id].reachable.instances ++;
+-			job->summary.per_class_data [id].reachable.bytes += mono_object_get_size (obj);
++			job->summary.per_class_data [id].reachable.bytes += mono_object_get_size (obj->address);
+ 		}
+ 		if (profiler->action_flags.heap_shot && job->dump_heap_data) {
+ 			int reference_counter = 0;
+@@ -4842,11 +4860,13 @@ profiler_heap_report_object_reachable (ProfilerHeapShotWriteJob *job, MonoObject
+ #if DEBUG_HEAP_PROFILER
+ 			printf ("profiler_heap_report_object_reachable: reported object %p at cursor %p\n", obj, (job->cursor - 1));
+ #endif
++			WRITE_HEAP_SHOT_JOB_VALUE (job, GUINT_TO_POINTER (class_id->id));
++			WRITE_HEAP_SHOT_JOB_VALUE (job, GUINT_TO_POINTER (size));
+ 			WRITE_HEAP_SHOT_JOB_VALUE (job, NULL);
+ 			reference_counter_location = job->cursor - 1;
+ 			
+ 			if (mono_class_get_rank (klass)) {
+-				MonoArray *array = (MonoArray *) obj;
++				MonoArray *array = (MonoArray *) obj->address;
+ 				MonoClass *element_class = mono_class_get_element_class (klass);
+ 				ClassIdMappingElement *element_id = class_id_mapping_element_get (element_class);
+ 				
+@@ -4859,7 +4879,7 @@ profiler_heap_report_object_reachable (ProfilerHeapShotWriteJob *job, MonoObject
+ 					int i;
+ 					for (i = 0; i < length; i++) {
+ 						MonoObject *array_element = mono_array_get (array, MonoObject*, i);
+-						if ((array_element != NULL) && mono_object_is_alive (array_element)) {
++						if (array_element != NULL) {
+ 							reference_counter ++;
+ 							WRITE_HEAP_SHOT_JOB_VALUE (job, array_element);
+ 						}
+@@ -4878,7 +4898,7 @@ profiler_heap_report_object_reachable (ProfilerHeapShotWriteJob *job, MonoObject
+ 					class_id_mapping_element_build_layout_bitmap (klass, class_id);
+ 				}
+ 				if (class_id->data.layout.references > 0) {
+-					reference_counter += report_object_references ((gpointer)(((char*)obj) + sizeof (MonoObject)), class_id, job);
++					reference_counter += report_object_references ((gpointer)(((char*)(obj->address)) + sizeof (MonoObject)), class_id, job);
+ 				}
+ 			}
+ 			
+@@ -4890,10 +4910,10 @@ profiler_heap_report_object_reachable (ProfilerHeapShotWriteJob *job, MonoObject
+ 	}
+ }
+ static void
+-profiler_heap_report_object_unreachable (ProfilerHeapShotWriteJob *job, MonoObject *obj) {
++profiler_heap_report_object_unreachable (ProfilerHeapShotWriteJob *job, ProfilerHeapShotObject *obj) {
+ 	if (job != NULL) {
+-		MonoClass *klass = mono_object_get_class (obj);
+-		guint32 size = mono_object_get_size (obj);
++		MonoClass *klass = obj->klass;
++		guint32 size = obj->size;
+ 		
+ 		if (job->summary.capacity > 0) {
+ 			ClassIdMappingElement *class_id = class_id_mapping_element_get (klass);
+@@ -4921,10 +4941,29 @@ profiler_heap_report_object_unreachable (ProfilerHeapShotWriteJob *job, MonoObje
+ 			WRITE_HEAP_SHOT_JOB_VALUE (job, GUINT_TO_POINTER (size));
+ 		}
+ 	}
++//	mono_gchandle_free (obj->gc_handle);
++	obj->address = NULL;
++	obj->gc_handle = 0;
++}
++
++static MonoObject*
++heap_object_is_live (ProfilerHeapShotObject *obj) {
++	MonoObject *result = mono_gchandle_get_target (obj->gc_handle);
++#if 1	
++	if (result != NULL) {
++		if (! mono_object_is_alive (obj->address)) {
++			
++			printf ("Dead object is alive according to handle: %ld\n", (guint64) (obj->address));
++			
++			result = NULL;
++		}
++	}
++#endif
++	return result;
+ }
+ 
+ static void
+-profiler_heap_add_object (ProfilerHeapShotHeapBuffers *heap, ProfilerHeapShotWriteJob *job, MonoObject *obj) {
++profiler_heap_add_object (ProfilerHeapShotHeapBuffers *heap, ProfilerHeapShotWriteJob *job, ProfilerHeapShotObject *obj) {
+ 	if (heap->first_free_slot >= heap->current->end_slot) {
+ 		if (heap->current->next != NULL) {
+ 			heap->current = heap->current->next;
+@@ -4941,15 +4980,15 @@ profiler_heap_add_object (ProfilerHeapShotHeapBuffers *heap, ProfilerHeapShotWri
+ 		heap->first_free_slot = &(heap->current->buffer [0]);
+ 	}
+ 	
+-	*(heap->first_free_slot) = obj;
++	*(heap->first_free_slot) = *obj;
+ 	heap->first_free_slot ++;
+ 	profiler_heap_report_object_reachable (job, obj);
+ }
+ 
+-static MonoObject*
+-profiler_heap_pop_object_from_end (ProfilerHeapShotHeapBuffers *heap, ProfilerHeapShotWriteJob *job, MonoObject** current_slot) {
++static ProfilerHeapShotObject*
++profiler_heap_pop_object_from_end (ProfilerHeapShotHeapBuffers *heap, ProfilerHeapShotWriteJob *job, ProfilerHeapShotObject* current_slot) {
+ 	while (heap->first_free_slot != current_slot) {
+-		MonoObject* obj;
++		ProfilerHeapShotObject* obj;
+ 		
+ 		if (heap->first_free_slot > heap->current->start_slot) {
+ 			heap->first_free_slot --;
+@@ -4959,9 +4998,9 @@ profiler_heap_pop_object_from_end (ProfilerHeapShotHeapBuffers *heap, ProfilerHe
+ 			heap->first_free_slot = heap->current->end_slot - 1;
+ 		}
+ 		
+-		obj = *(heap->first_free_slot);
++		obj = heap->first_free_slot;
+ 		
+-		if (mono_object_is_alive (obj)) {
++		if (heap_object_is_live (obj) != NULL) {
+ 			profiler_heap_report_object_reachable (job, obj);
+ 			return obj;
+ 		} else {
+@@ -4974,18 +5013,24 @@ profiler_heap_pop_object_from_end (ProfilerHeapShotHeapBuffers *heap, ProfilerHe
+ static void
+ profiler_heap_scan (ProfilerHeapShotHeapBuffers *heap, ProfilerHeapShotWriteJob *job) {
+ 	ProfilerHeapShotHeapBuffer *current_buffer = heap->buffers;
+-	MonoObject** current_slot = current_buffer->start_slot;
++	ProfilerHeapShotObject* current_slot = current_buffer->start_slot;
+ 	
+ 	while (current_slot != heap->first_free_slot) {
+-		MonoObject *obj = *current_slot;
+-		if (mono_object_is_alive (obj)) {
++		ProfilerHeapShotObject *obj = current_slot;
++		if (heap_object_is_live (obj) != NULL) {
+ 			profiler_heap_report_object_reachable (job, obj);
+ 		} else {
++			ProfilerHeapShotObject *end_obj = profiler_heap_pop_object_from_end (heap, job, current_slot);
+ 			profiler_heap_report_object_unreachable (job, obj);
+-			*current_slot = profiler_heap_pop_object_from_end (heap, job, current_slot);
++			if (end_obj != NULL) {
++				*current_slot = *end_obj;
++			} else {
++				current_slot->address = NULL;
++				current_slot->gc_handle = 0;
++			}
+ 		}
+ 		
+-		if (*current_slot != NULL) {
++		if (current_slot->address != NULL) {
+ 			current_slot ++;
+ 			
+ 			if (current_slot == current_buffer->end_slot) {
+@@ -5050,22 +5095,22 @@ process_gc_event (MonoProfiler *profiler, gboolean do_heap_profiling, MonoGCEven
+ 			for (data = profiler->per_thread_data; data != NULL; data = data->next) {
+ 				ProfilerHeapShotObjectBuffer *buffer;
+ 				for (buffer = data->heap_shot_object_buffers; buffer != NULL; buffer = buffer->next) {
+-					MonoObject **cursor;
++					ProfilerHeapShotObject *cursor;
+ 					for (cursor = buffer->first_unprocessed_slot; cursor < buffer->next_free_slot; cursor ++) {
+-						MonoObject *obj = *cursor;
++						MonoObject *address = heap_object_is_live (cursor);
+ #if DEBUG_HEAP_PROFILER
+-						printf ("gc_event: in object buffer %p(%p-%p) cursor at %p has object %p ", buffer, &(buffer->buffer [0]), buffer->end, cursor, obj);
++						printf ("gc_event: in object buffer %p(%p-%p) cursor at %p has object %p ", buffer, &(buffer->buffer [0]), buffer->end, cursor, address);
+ #endif
+-						if (mono_object_is_alive (obj)) {
++						if (address != NULL) {
+ #if DEBUG_HEAP_PROFILER
+ 							printf ("(object is alive, adding to heap)\n");
+ #endif
+-							profiler_heap_add_object (&(profiler->heap), job, obj);
++							profiler_heap_add_object (&(profiler->heap), job, cursor);
+ 						} else {
+ #if DEBUG_HEAP_PROFILER
+ 							printf ("(object is unreachable, reporting in job)\n");
+ #endif
+-							profiler_heap_report_object_unreachable (job, obj);
++							profiler_heap_report_object_unreachable (job, cursor);
+ 						}
+ 					}
+ 					buffer->first_unprocessed_slot = cursor;

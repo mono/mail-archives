@@ -1,0 +1,166 @@
+diff --git a/mono/metadata/monitor.c b/mono/metadata/monitor.c
+index 022495a..0830645 100644
+--- a/mono/metadata/monitor.c
++++ b/mono/metadata/monitor.c
+@@ -23,6 +23,7 @@
+ #include <mono/metadata/debug-helpers.h>
+ #include <mono/metadata/tabledefs.h>
+ #include <mono/metadata/marshal.h>
++#include <mono/metadata/profiler-private.h>
+ #include <mono/utils/mono-time.h>
+ 
+ /*
+@@ -511,6 +512,8 @@ retry:
+ 		return 0;
+ 	}
+ 
++	mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_BEGIN);
++	
+ 	/* The slow path begins here.  We need to make sure theres a
+ 	 * semaphore handle (creating it if necessary), and block on
+ 	 * it
+@@ -565,6 +568,8 @@ retry:
+ 	InterlockedDecrement (&mon->entry_count);
+ 	mono_perfcounters->thread_queue_len--;
+ 
++	mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_END);
++	
+ 	if (ms != INFINITE) {
+ 		now = mono_msec_ticks ();
+ 		
+@@ -588,6 +593,7 @@ retry:
+ 
+ 		if ((ret == WAIT_TIMEOUT || (ret == WAIT_IO_COMPLETION && !allow_interruption)) && ms > 0) {
+ 			/* More time left */
++			mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_RETRY|MONO_PROFILER_MONITOR_RETRY_MORE_TIME);
+ 			goto retry;
+ 		}
+ 	} else {
+@@ -597,21 +603,26 @@ retry:
+ 				 * We have to obey a stop request even if allow_interruption is
+ 				 * FALSE to avoid hangs at shutdown.
+ 				 */
++				mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_DONE|MONO_PROFILER_MONITOR_DONE_SHUTDOWN);
+ 				return -1;
+ 			}
+ 			/* Infinite wait, so just try again */
++			mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_RETRY|MONO_PROFILER_MONITOR_RETRY_INFINITE_WAIT);
+ 			goto retry;
+ 		}
+ 	}
+ 	
+ 	if (ret == WAIT_OBJECT_0) {
+ 		/* retry from the top */
++		mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_RETRY|MONO_PROFILER_MONITOR_RETRY_CONTENTION_LOOP);
+ 		goto retry;
+ 	}
+ 	
+ 	/* We must have timed out */
+ 	LOCK_DEBUG (g_message (G_GNUC_PRETTY_FUNCTION ": (%d) timed out waiting, returning FALSE", id));
+ 
++	mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_DONE|MONO_PROFILER_MONITOR_DONE_TIMEOUT);
++	
+ 	if (ret == WAIT_IO_COMPLETION)
+ 		return -1;
+ 	else 
+diff --git a/mono/metadata/profiler.c b/mono/metadata/profiler.c
+index 0194693..34120fa 100644
+--- a/mono/metadata/profiler.c
++++ b/mono/metadata/profiler.c
+@@ -58,6 +58,7 @@ static MonoProfileJitResult    jit_end2;
+ static MonoProfileMethodFunc   method_free;
+ static MonoProfileMethodResult man_unman_transition;
+ static MonoProfileAllocFunc    allocation_cb;
++static MonoProfileMonitorFunc  monitor_event_cb;
+ static MonoProfileStatFunc     statistical_cb;
+ static MonoProfileStatCallChainFunc statistical_call_chain_cb;
+ static int                     statistical_call_chain_depth;
+@@ -201,6 +202,12 @@ mono_profiler_install_allocation (MonoProfileAllocFunc callback)
+ 	allocation_cb = callback;
+ }
+ 
++void
++mono_profiler_install_monitor  (MonoProfileMonitorFunc callback)
++{
++	monitor_event_cb = callback;
++}
++
+ void 
+ mono_profiler_install_statistical (MonoProfileStatFunc callback)
+ {
+@@ -333,6 +340,13 @@ mono_profiler_allocation (MonoObject *obj, MonoClass *klass)
+ }
+ 
+ void
++mono_profiler_monitor_event      (MonoObject *obj, MonoProfilerMonitorEvent event) {
++	if ((mono_profiler_events & MONO_PROFILE_MONITOR_EVENTS) && monitor_event_cb) {
++		monitor_event_cb (current_profiler, obj, event);
++	}
++}
++
++void
+ mono_profiler_stat_hit (guchar *ip, void *context)
+ {
+ 	if ((mono_profiler_events & MONO_PROFILE_STATISTICAL) && statistical_cb)
+diff --git a/mono/metadata/profiler.h b/mono/metadata/profiler.h
+index dafbb17..86d8fc4 100644
+--- a/mono/metadata/profiler.h
++++ b/mono/metadata/profiler.h
+@@ -24,7 +24,8 @@ typedef enum {
+ 	MONO_PROFILE_COVERAGE         = 1 << 13,
+ 	MONO_PROFILE_INS_COVERAGE     = 1 << 14,
+ 	MONO_PROFILE_STATISTICAL      = 1 << 15,
+-	MONO_PROFILE_METHOD_EVENTS    = 1 << 16
++	MONO_PROFILE_METHOD_EVENTS    = 1 << 16,
++	MONO_PROFILE_MONITOR_EVENTS   = 1 << 17
+ } MonoProfileFlags;
+ 
+ typedef enum {
+@@ -57,6 +58,31 @@ typedef struct {
+ 
+ typedef struct _MonoProfiler MonoProfiler;
+ 
++/* The values are organized as flags to eventually allow fast filtering of unwanted events. */
++typedef enum {
++	/* The first two bits are the main code (one of BEGIN, END, DONE or RETRY) */
++	/* "BEGIN" means the slow path is starting (or restarting) */
++	MONO_PROFILER_MONITOR_BEGIN = 0,
++	/* "END" means we have finished waiting on the semaphore */
++	MONO_PROFILER_MONITOR_END = 1,
++	/* "DONE" means have finished, but from the slow path */
++	MONO_PROFILER_MONITOR_DONE = 2,
++	/* "RETRY" means we restart from the beginning (we expect a new BEGIN if we fail taking the lock) */
++	MONO_PROFILER_MONITOR_RETRY = 3,
++	
++	/* All the following flags are just "descriptive": */
++	/* They are not needed to measure the time spent inside locks, */
++	/* but they explain what was going on (or the reason of the event). */
++	
++	/* The following codes are always combined with "RETRY": */
++	MONO_PROFILER_MONITOR_RETRY_MORE_TIME = 4,
++	MONO_PROFILER_MONITOR_RETRY_INFINITE_WAIT = 8,
++	MONO_PROFILER_MONITOR_RETRY_CONTENTION_LOOP = 12,
++	
++	/* The following codes are always combined with "DONE": */
++	MONO_PROFILER_MONITOR_DONE_SHUTDOWN = 4,
++	MONO_PROFILER_MONITOR_DONE_TIMEOUT = 8
++} MonoProfilerMonitorEvent;
+ 
+ /*
+  * Functions that the runtime will call on the profiler.
+@@ -69,6 +95,7 @@ typedef void (*MonoProfileMethodFunc)   (MonoProfiler *prof, MonoMethod   *metho
+ typedef void (*MonoProfileClassFunc)    (MonoProfiler *prof, MonoClass    *klass);
+ typedef void (*MonoProfileModuleFunc)   (MonoProfiler *prof, MonoImage    *module);
+ typedef void (*MonoProfileAssemblyFunc) (MonoProfiler *prof, MonoAssembly *assembly);
++typedef void (*MonoProfileMonitorFunc)  (MonoProfiler *prof, MonoObject *obj, MonoProfilerMonitorEvent event);
+ 
+ typedef void (*MonoProfileExceptionFunc) (MonoProfiler *prof, MonoObject *object);
+ typedef void (*MonoProfileExceptionClauseFunc) (MonoProfiler *prof, MonoMethod *method, int clause_type, int clause_num);
+@@ -117,6 +144,7 @@ void mono_profiler_install_enter_leave (MonoProfileMethodFunc enter, MonoProfile
+ void mono_profiler_install_thread      (MonoProfileThreadFunc start, MonoProfileThreadFunc end);
+ void mono_profiler_install_transition  (MonoProfileMethodResult callback);
+ void mono_profiler_install_allocation  (MonoProfileAllocFunc callback);
++void mono_profiler_install_monitor     (MonoProfileMonitorFunc callback);
+ void mono_profiler_install_statistical (MonoProfileStatFunc callback);
+ void mono_profiler_install_statistical_call_chain (MonoProfileStatCallChainFunc callback, int call_chain_depth);
+ void mono_profiler_install_exception   (MonoProfileExceptionFunc throw_callback, MonoProfileMethodFunc exc_method_leave, MonoProfileExceptionClauseFunc clause_callback);

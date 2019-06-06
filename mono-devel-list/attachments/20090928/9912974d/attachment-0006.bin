@@ -1,0 +1,118 @@
+diff -urBbw gc6.6-orig/include/gc.h gc6.6/include/gc.h
+--- gc6.6-orig/include/gc.h	2005-05-20 18:50:58.000000000 +0100
++++ gc6.6/include/gc.h	2009-09-28 11:17:45.000000000 +0100
+@@ -859,6 +859,20 @@
+ #   define GC_PTR_STORE(p, q) *((p) = (q))
+ #endif
+ 
++#ifdef GC_PRECISE_STACK
++/* Keep the least significant bit set so these don't look like pointers */
++#   define GC_PRECISE_STACK_BEGIN_MARKER 0xF00FF00F
++#   define GC_PRECISE_STACK_END_MARKER 0xD00DD00D
++/* This macro is very gcc specific, with the 'unused' attribute to
++ * shut up the unused-variable warning, the volatile placement to foil the
++ * optimiser, and the '##vars' to suppress the leading comma when the args
++ * list is empty
++ */
++#   define GC_STACK_REFERENCE(x, vars...) __attribute__((unused)) void * volatile __GC_stack_references_ ## x[] = {(void *)GC_PRECISE_STACK_BEGIN_MARKER, ##vars, (void *)GC_PRECISE_STACK_END_MARKER};
++#else
++#   define GC_STACK_REFERENCE(x, vars...)
++#endif
++
+ /* Functions called to report pointer checking errors */
+ GC_API void (*GC_same_obj_print_proc) GC_PROTO((GC_PTR p, GC_PTR q));
+ 
+diff -urBbw gc6.6-orig/pthread_stop_world.c gc6.6/pthread_stop_world.c
+--- gc6.6-orig/pthread_stop_world.c	2005-09-09 18:54:32.000000000 +0100
++++ gc6.6/pthread_stop_world.c	2009-09-28 11:11:48.000000000 +0100
+@@ -256,6 +256,10 @@
+     /* On IA64, we also need to scan the register backing store. */
+     IF_IA64(ptr_t bs_lo; ptr_t bs_hi;)
+     pthread_t me = pthread_self();
++    #if GC_PRECISE_STACK
++    ptr_t stack_ptr;
++    int found_markers;
++    #endif
+     
+     if (!GC_thr_initialized) GC_thr_init();
+     #if DEBUG_THREADS
+@@ -284,7 +288,7 @@
+             hi = GC_stackbottom;
+ 	    IF_IA64(bs_lo = BACKING_STORE_BASE;)
+         }
+-        #if DEBUG_THREADS
++        #if defined(DEBUG_THREADS) || defined(DEBUG_PRECISE_STACK)
+             GC_printf3("Stack for thread 0x%lx = [%lx,%lx)\n",
+     	        (unsigned long) p -> id,
+ 		(unsigned long) lo, (unsigned long) hi);
+@@ -292,10 +296,70 @@
+ 	if (0 == lo) ABORT("GC_push_all_stacks: sp not set!\n");
+ #       ifdef STACK_GROWS_UP
+ 	  /* We got them backwards! */
++#	  ifdef GC_PRECISE_STACK
++	  found_markers = 0;
++
++	  for (stack_ptr = hi; stack_ptr <= lo; stack_ptr += sizeof(ptr_t)) {
++		word content = *(word *)stack_ptr;
++	  	if (content == GC_PRECISE_STACK_BEGIN_MARKER) {
++			ptr_t stack_ptr_end = stack_ptr;
++#			ifdef DEBUG_PRECISE_STACK
++			GC_printf1("Found precise begin marker at 0x%lx\n", stack_ptr);
++#			endif
++			found_markers = 1;
++			do {
++				stack_ptr_end += sizeof(ptr_t);
++				content = *(word *)stack_ptr_end;
++				if (content != GC_PRECISE_STACK_END_MARKER) {
++					GC_push_all_stack ((ptr_t)content, (ptr_t)(content + sizeof(ptr_t)));
++				}
++			} while (content != GC_PRECISE_STACK_END_MARKER &&
++				stack_ptr_end < lo);
++			stack_ptr = stack_ptr_end;
++		}
++	  }
++
++#	  ifdef GC_PRECISE_STACK_FAILSAFE
++	  if (!found_markers) {
++		  GC_push_all_stack(hi, lo);
++	  }
++#	  endif
++#	  else
+           GC_push_all_stack(hi, lo);
++#	  endif
++#       else
++#	  ifdef GC_PRECISE_STACK
++	  found_markers = 0;
++
++	  for (stack_ptr = lo; stack_ptr <= hi; stack_ptr += sizeof(ptr_t)) {
++		word content = *(word *)stack_ptr;
++	  	if (content == GC_PRECISE_STACK_BEGIN_MARKER) {
++			ptr_t stack_ptr_end = stack_ptr;
++#			ifdef DEBUG_PRECISE_STACK
++			GC_printf1("Found precise begin marker at 0x%lx\n", stack_ptr);
++#			endif
++			found_markers = 1;
++			do {
++				stack_ptr_end += sizeof(ptr_t);
++				content = *(word *)stack_ptr_end;
++				if (content != GC_PRECISE_STACK_END_MARKER) {
++					GC_push_all_stack ((ptr_t)content, (ptr_t)(content + sizeof(ptr_t)));
++				}
++			} while (content != GC_PRECISE_STACK_END_MARKER &&
++				stack_ptr_end < hi);
++			stack_ptr = stack_ptr_end;
++		}
++	  }
++
++#	  ifdef GC_PRECISE_STACK_FAILSAFE
++	  if (!found_markers) {
++		  GC_push_all_stack(lo, hi);
++	  }
++#	  endif
+ #       else
+           GC_push_all_stack(lo, hi);
+ #	endif
++#	endif
+ #	ifdef IA64
+ #         if DEBUG_THREADS
+             GC_printf3("Reg stack for thread 0x%lx = [%lx,%lx)\n",

@@ -1,0 +1,146 @@
+Index: mcs/class/System/System.Net.Sockets/Socket.cs
+===================================================================
+--- mcs/class/System/System.Net.Sockets/Socket.cs	(revision 121718)
++++ mcs/class/System/System.Net.Sockets/Socket.cs	(working copy)
+@@ -1381,7 +1381,7 @@
+ 		
+ 		// Creates a new system socket, returning the handle
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+-		private extern static IntPtr Accept_internal(IntPtr sock, out int error);
++		private extern static IntPtr Accept_internal(IntPtr sock, out int error, bool blocking);
+ 
+ 		Thread blocking_thread;
+ 		public Socket Accept() {
+@@ -1392,7 +1392,7 @@
+ 			IntPtr sock = (IntPtr) (-1);
+ 			blocking_thread = Thread.CurrentThread;
+ 			try {
+-				sock = Accept_internal(socket, out error);
++				sock = Accept_internal(socket, out error, blocking);
+ 			} catch (ThreadAbortException) {
+ 				if (disposed) {
+ #if !NET_2_1
+@@ -1425,7 +1425,7 @@
+ 			blocking_thread = Thread.CurrentThread;
+ 			
+ 			try {
+-				sock = Accept_internal (socket, out error);
++				sock = Accept_internal (socket, out error, blocking);
+ 			} catch (ThreadAbortException) {
+ 				if (disposed) {
+ #if !NET_2_1
+Index: mcs/class/System/System.Net.Sockets/ChangeLog
+===================================================================
+--- mcs/class/System/System.Net.Sockets/ChangeLog	(revision 121718)
++++ mcs/class/System/System.Net.Sockets/ChangeLog	(working copy)
+@@ -1,4 +1,11 @@
+ 
++2008-12-17  Bill Holmes  <billholmes54@gmail.com>
++
++	* Socket.cs (Accept_internal) :  Changing the signature to pass 
++	  the blocking state.
++
++	Code is contributed under MIT/X11 license.
++
+ 2008-12-03 Gonzalo Paniagua Javier <gonzalo@novell.com>
+ 
+ 	* UdpClient.cs: don't Poll() in Receive(), the call to ReceiveFrom
+Index: mono/mono/metadata/socket-io.h
+===================================================================
+--- mono/mono/metadata/socket-io.h	(revision 121718)
++++ mono/mono/metadata/socket-io.h	(working copy)
+@@ -194,7 +194,7 @@
+ extern gint32 ves_icall_System_Net_Sockets_SocketException_WSAGetLastError_internal(void) MONO_INTERNAL;
+ extern gint32 ves_icall_System_Net_Sockets_Socket_Available_internal(SOCKET sock, gint32 *error) MONO_INTERNAL;
+ extern void ves_icall_System_Net_Sockets_Socket_Blocking_internal(SOCKET sock, gboolean block, gint32 *error) MONO_INTERNAL;
+-extern gpointer ves_icall_System_Net_Sockets_Socket_Accept_internal(SOCKET sock, gint32 *error) MONO_INTERNAL;
++extern gpointer ves_icall_System_Net_Sockets_Socket_Accept_internal(SOCKET sock, gint32 *error, gboolean blocking) MONO_INTERNAL;
+ extern void ves_icall_System_Net_Sockets_Socket_Listen_internal(SOCKET sock, guint32 backlog, gint32 *error) MONO_INTERNAL;
+ extern MonoObject *ves_icall_System_Net_Sockets_Socket_LocalEndPoint_internal(SOCKET sock, gint32 *error) MONO_INTERNAL;
+ extern MonoObject *ves_icall_System_Net_Sockets_Socket_RemoteEndPoint_internal(SOCKET sock, gint32 *error) MONO_INTERNAL;
+Index: mono/mono/metadata/ChangeLog
+===================================================================
+--- mono/mono/metadata/ChangeLog	(revision 121718)
++++ mono/mono/metadata/ChangeLog	(working copy)
+@@ -1,3 +1,21 @@
++2008-12-17  Bill Holmes  <billholmes54@gmail.com>
++
++	* socket-io.h : Changing the signature of 
++	  ves_icall_System_Net_Sockets_Socket_Accept_internal to pass 
++	  the blocking state. 
++
++	* icall-def.h :  Changing the signature of 
++	  System.Net.Sockets.Socket.Accept_internal to pass the blocking state.
++
++	* socket-io.c (ves_icall_System_Net_Sockets_Socket_Accept_internal) : 
++	  For Windows only.  Avoid blocking when calling accept by 
++	  querying for a connection via select.  The loop also queries 
++	  the thread state every 1000 micro seconds for the thread 
++	  stop state.  This will avoid the process hanging on shutdown 
++	  when using a TcpChannel that is never connected to.
++
++	Code is contributed under MIT/X11 license.
++
+ 2008-12-17  Miguel de Icaza  <miguel@novell.com>
+ 
+ 	* icall.c (ves_icall_System_Environment_get_Platform): For
+Index: mono/mono/metadata/icall-def.h
+===================================================================
+--- mono/mono/metadata/icall-def.h	(revision 121718)
++++ mono/mono/metadata/icall-def.h	(working copy)
+@@ -401,7 +401,7 @@
+ ICALL(NDNS_3, "GetHostName_internal(string&)", ves_icall_System_Net_Dns_GetHostName_internal)
+ 
+ ICALL_TYPE(SOCK, "System.Net.Sockets.Socket", SOCK_1)
+-ICALL(SOCK_1, "Accept_internal(intptr,int&)", ves_icall_System_Net_Sockets_Socket_Accept_internal)
++ICALL(SOCK_1, "Accept_internal(intptr,int&,bool)", ves_icall_System_Net_Sockets_Socket_Accept_internal)
+ ICALL(SOCK_2, "Available_internal(intptr,int&)", ves_icall_System_Net_Sockets_Socket_Available_internal)
+ ICALL(SOCK_3, "Bind_internal(intptr,System.Net.SocketAddress,int&)", ves_icall_System_Net_Sockets_Socket_Bind_internal)
+ ICALL(SOCK_4, "Blocking_internal(intptr,bool,int&)", ves_icall_System_Net_Sockets_Socket_Blocking_internal)
+Index: mono/mono/metadata/socket-io.c
+===================================================================
+--- mono/mono/metadata/socket-io.c	(revision 121718)
++++ mono/mono/metadata/socket-io.c	(working copy)
+@@ -811,13 +811,41 @@
+ }
+ 
+ gpointer ves_icall_System_Net_Sockets_Socket_Accept_internal(SOCKET sock,
+-							     gint32 *error)
++							     gint32 *error,
++							     gboolean blocking)
+ {
+ 	SOCKET newsock;
+ 	
+ 	MONO_ARCH_SAVE_REGS;
+ 
+ 	*error = 0;
++
++#ifdef PLATFORM_WIN32
++	/* Several applications are getting stuck during shutdown on Windows 
++	 * when an accept call is on a background thread.
++	 * 
++	 */
++	if (blocking) {
++		MonoThread* curthread = mono_thread_current ();
++
++		if (curthread) {
++			for (;;) {
++				int selectret;
++				TIMEVAL timeout; 
++				fd_set readfds;
++				FD_ZERO (&readfds);
++				FD_SET(sock, &readfds);
++				timeout.tv_sec = 0;
++				timeout.tv_usec = 1000;
++				selectret = select (0, &readfds, NULL, NULL, &timeout);
++				if (selectret > 0)
++					break;
++				if (curthread->state & ThreadState_StopRequested)
++					return NULL;
++			}
++		}
++	}
++#endif
+ 	
+ 	newsock = _wapi_accept (sock, NULL, 0);
+ 	if(newsock==INVALID_SOCKET) {

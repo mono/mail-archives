@@ -1,0 +1,861 @@
+Index: mono/mono/metadata/domain.c
+===================================================================
+--- mono/mono/metadata/domain.c	(revision 61474)
++++ mono/mono/metadata/domain.c	(working copy)
+@@ -797,6 +797,9 @@
+ 	mono_defaults.internals_visible_class = mono_class_from_name (
+ 	        mono_defaults.corlib, "System.Runtime.CompilerServices", "InternalsVisibleToAttribute");
+ 
++	mono_defaults.variant_class = mono_class_from_name (
++	        mono_defaults.corlib, "System", "Variant");
++
+ 	/*
+ 	 * Note that mono_defaults.generic_*_class is only non-NULL if we're
+ 	 * using the 2.0 corlib.
+Index: mono/mono/metadata/appdomain.c
+===================================================================
+--- mono/mono/metadata/appdomain.c	(revision 61474)
++++ mono/mono/metadata/appdomain.c	(working copy)
+@@ -31,7 +31,7 @@
+ #include <mono/utils/mono-uri.h>
+ #include <mono/utils/mono-logger.h>
+ 
+-#define MONO_CORLIB_VERSION 52
++#define MONO_CORLIB_VERSION 53
+ 
+ CRITICAL_SECTION mono_delegate_section;
+ 
+Index: mono/mono/metadata/ChangeLog
+===================================================================
+--- mono/mono/metadata/ChangeLog	(revision 61474)
++++ mono/mono/metadata/ChangeLog	(working copy)
+@@ -1,3 +1,9 @@
++2006-06-05  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
++	* domain.c appdomain.c class-internals.h marshal.c: Add support 
++	for VARIANT marshalling on windows and increment corlib version
++	since Variant struct was added.
++
+ 2006-06-03  Miguel de Icaza  <miguel@novell.com>
+ 
+ 	* debug-mono-symfile.c: Revert Martin's previous patch which broke
+Index: mono/mono/metadata/class-internals.h
+===================================================================
+--- mono/mono/metadata/class-internals.h	(revision 61474)
++++ mono/mono/metadata/class-internals.h	(working copy)
+@@ -688,6 +688,7 @@
+ 	MonoClass *internals_visible_class;
+ 	MonoClass *generic_array_class;
+ 	MonoClass *generic_nullable_class;
++	MonoClass *variant_class;
+ } MonoDefaults;
+ 
+ extern MonoDefaults mono_defaults MONO_INTERNAL;
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 61474)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -5262,7 +5262,8 @@
+ 	MonoClass *klass = t->data.klass;
+ 	int pos, pos2, loc;
+ 
+-	if (mono_class_from_mono_type (t) == mono_defaults.object_class) {
++	if (mono_class_from_mono_type (t) == mono_defaults.object_class && 
++		(!spec || (spec && spec->native != MONO_NATIVE_STRUCT))) {
+ 		mono_raise_exception (mono_get_exception_not_implemented ("Marshalling of type object is not implemented"));
+ 	}
+ 
+@@ -5273,7 +5274,24 @@
+ 
+ 		m->orig_conv_args [argnum] = 0;
+ 
+-		if (klass->delegate) {
++		if (spec && spec->native == MONO_NATIVE_STRUCT)
++		{
++			static MonoMethod *get_native_variant_for_object = NULL;
++			int local_variant;
++			if (!get_native_variant_for_object)
++				get_native_variant_for_object = mono_class_get_method_from_name (mono_defaults.marshal_class, "GetNativeVariantForObject", 2);
++
++			*conv_arg_type = &mono_defaults.variant_class->byval_arg;
++
++			local_variant = mono_mb_add_local (mb, &mono_defaults.variant_class->byval_arg);
++			conv_arg = local_variant;
++			mono_mb_emit_ldarg (mb, argnum);
++			if (t->byref)
++				mono_mb_emit_byte(mb, CEE_LDIND_REF);
++			mono_mb_emit_ldloc_addr (mb, local_variant);
++			mono_mb_emit_managed_call (mb, get_native_variant_for_object, NULL);
++		}
++		else if (klass->delegate) {
+ 			g_assert (!t->byref);
+ 			mono_mb_emit_ldarg (mb, argnum);
+ 			mono_mb_emit_icall (mb, conv_to_icall (MONO_MARSHAL_CONV_DEL_FTN));
+@@ -5362,6 +5380,24 @@
+ 		break;
+ 
+ 	case MARSHAL_ACTION_CONV_OUT:
++		if (spec && spec->native == MONO_NATIVE_STRUCT)	{
++			static MonoMethod *variant_clear = NULL;
++			static MonoMethod *get_object_for_native_variant = NULL;
++			if (!variant_clear)
++				variant_clear = mono_class_get_method_from_name (mono_defaults.variant_class, "Clear", 0);
++			if (!get_object_for_native_variant)
++				get_object_for_native_variant = mono_class_get_method_from_name (mono_defaults.marshal_class, "GetObjectForNativeVariant", 1);
++			if (t->byref) {
++				mono_mb_emit_ldarg (mb, argnum);
++				mono_mb_emit_ldloc_addr (mb, conv_arg);
++				mono_mb_emit_managed_call (mb, get_object_for_native_variant, NULL);
++				mono_mb_emit_byte (mb, CEE_STIND_REF);
++			}
++
++			mono_mb_emit_ldloc_addr (mb, conv_arg);
++			mono_mb_emit_managed_call (mb, variant_clear, NULL);
++			break;
++		}
+ 		if (klass == mono_defaults.stringbuilder_class) {
+ 			gboolean need_free;
+ 			MonoMarshalNative encoding;
+Index: mono/mono/tests/ChangeLog
+===================================================================
+--- mono/mono/tests/ChangeLog	(revision 61474)
++++ mono/mono/tests/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-06-05  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
++	* libtest.c cominterop.cs Makefile.am: Add BSTR and VARIANT marshalling tests
++	
+ 2006-06-05  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* libtest.c pinvoke17.cs: Rename definitions which conflict with win32 API names.
+Index: mono/mono/tests/Makefile.am
+===================================================================
+--- mono/mono/tests/Makefile.am	(revision 61474)
++++ mono/mono/tests/Makefile.am	(working copy)
+@@ -213,7 +213,8 @@
+ 	main-returns-background-change.cs	\
+ 	main-returns.cs	\
+ 	subthread-exit.cs	\
+-	desweak.cs
++	desweak.cs	\
++	cominterop.cs
+ 
+ if X86
+ # bug #71274
+Index: mono/mono/tests/cominterop.cs
+===================================================================
+--- mono/mono/tests/cominterop.cs	(revision 0)
++++ mono/mono/tests/cominterop.cs	(revision 0)
+@@ -0,0 +1,152 @@
++//
++// cominterop.cs:
++//
++//  Tests for COM Interop related features
++//
++
++using System;
++using System.Runtime.InteropServices;
++
++public class Tests
++{
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_bstr_in([MarshalAs(UnmanagedType.BStr)]string str);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_bstr_out([MarshalAs(UnmanagedType.BStr)] out string str);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_sbyte([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_byte([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_short([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_ushort([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_int([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_uint([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_long([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_ulong([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_float([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_double([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_in_bstr([MarshalAs(UnmanagedType.Struct)]object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_sbyte([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_byte([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_short([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_ushort([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_int([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_uint([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_long([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_ulong([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_float([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_double([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	[DllImport("libtest")]
++	public static extern int mono_test_marshal_variant_out_bstr([MarshalAs(UnmanagedType.Struct)]out object obj);
++
++	public static int Main() {
++
++		if (((int)Environment.OSVersion.Platform == 4) || ((int)Environment.OSVersion.Platform == 128))
++			return 0;
++
++		#region BSTR Tests
++
++		string str;
++		if (mono_test_marshal_bstr_in("mono_test_marshal_bstr_in") != 0)
++			return 1;
++		if (mono_test_marshal_bstr_out(out str) != 0 || str != "mono_test_marshal_bstr_out")
++			return 2;
++
++		#endregion // BSTR Tests
++
++		#region VARIANT Tests
++
++		object obj;
++		if (mono_test_marshal_variant_in_sbyte((sbyte)100) != 0)
++			return 3;
++		if (mono_test_marshal_variant_in_byte((byte)100) != 0)
++			return 4;
++		if (mono_test_marshal_variant_in_short((short)314) != 0)
++			return 5;
++		if (mono_test_marshal_variant_in_ushort((ushort)314) != 0)
++			return 6;
++		if (mono_test_marshal_variant_in_int((int)314) != 0)
++			return 7;
++		if (mono_test_marshal_variant_in_uint((uint)314) != 0)
++			return 8;
++		if (mono_test_marshal_variant_in_long((long)314) != 0)
++			return 9;
++		if (mono_test_marshal_variant_in_ulong((ulong)314) != 0)
++			return 10;
++		if (mono_test_marshal_variant_in_float((float)3.14) != 0)
++			return 11;
++		if (mono_test_marshal_variant_in_double((double)3.14) != 0)
++			return 12;
++		if (mono_test_marshal_variant_in_bstr("PI") != 0)
++			return 13;
++		if (mono_test_marshal_variant_out_sbyte(out obj) != 0 || (sbyte)obj != 100)
++			return 14;
++		if (mono_test_marshal_variant_out_byte(out obj) != 0 || (byte)obj != 100)
++			return 15;
++		if (mono_test_marshal_variant_out_short(out obj) != 0 || (short)obj != 314)
++			return 16;
++		if (mono_test_marshal_variant_out_ushort(out obj) != 0 || (ushort)obj != 314)
++			return 17;
++		if (mono_test_marshal_variant_out_int(out obj) != 0 || (int)obj != 314)
++			return 18;
++		if (mono_test_marshal_variant_out_uint(out obj) != 0 || (uint)obj != 314)
++			return 19;
++		if (mono_test_marshal_variant_out_long(out obj) != 0 || (long)obj != 314)
++			return 20;
++		if (mono_test_marshal_variant_out_ulong(out obj) != 0 || (ulong)obj != 314)
++			return 21;
++		if (mono_test_marshal_variant_out_float(out obj) != 0 || ((float)obj - 3.14) / 3.14 > .001)
++			return 22;
++		if (mono_test_marshal_variant_out_double(out obj) != 0 || ((double)obj - 3.14) / 3.14 > .001)
++			return 23;
++		if (mono_test_marshal_variant_out_bstr(out obj) != 0 || (string)obj != "PI")
++			return 24;
++
++		#endregion // VARIANT Tests
++
++		return 0;
++	}
++}
+\ No newline at end of file
+
+Property changes on: mono/mono/tests/cominterop.cs
+___________________________________________________________________
+Name: svn:executable
+   + *
+
+Index: mono/mono/tests/libtest.c
+===================================================================
+--- mono/mono/tests/libtest.c	(revision 61474)
++++ mono/mono/tests/libtest.c	(working copy)
+@@ -6,6 +6,10 @@
+ #include <time.h>
+ 
+ #ifdef WIN32
++#include <windows.h>
++#endif
++
++#ifdef WIN32
+ #define STDCALL __stdcall
+ #else
+ #define STDCALL
+@@ -1242,10 +1246,6 @@
+     return res;
+ }
+ 
+-#ifdef WIN32
+-extern __declspec(dllimport) __stdcall void SetLastError(int x);
+-#endif
+-
+ STDCALL void
+ mono_test_last_error (int err)
+ {
+@@ -1821,3 +1821,213 @@
+ 
+ 	return res;
+ }
++
++/*
++ * COM INTEROP TESTS
++ */
++
++#ifdef WIN32
++
++STDCALL int
++mono_test_marshal_bstr_in(BSTR bstr)
++{
++	if (!wcscmp(bstr, L"mono_test_marshal_bstr_in"))
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_bstr_out(BSTR* bstr)
++{
++	*bstr = SysAllocString(L"mono_test_marshal_bstr_out");
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_sbyte(VARIANT variant)
++{
++	if (variant.vt == VT_I1 && variant.cVal == 100)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_byte(VARIANT variant)
++{
++	if (variant.vt == VT_UI1 && variant.bVal == 100)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_short(VARIANT variant)
++{
++	if (variant.vt == VT_I2 && variant.iVal == 314)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_ushort(VARIANT variant)
++{
++	if (variant.vt == VT_UI2 && variant.uiVal == 314)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_int(VARIANT variant)
++{
++	if (variant.vt == VT_I4 && variant.lVal == 314)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_uint(VARIANT variant)
++{
++	if (variant.vt == VT_UI4 && variant.ulVal == 314)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_long(VARIANT variant)
++{
++	if (variant.vt == VT_I8 && variant.llVal == 314)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_ulong(VARIANT variant)
++{
++	if (variant.vt == VT_UI8 && variant.ullVal == 314)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_float(VARIANT variant)
++{
++	if (variant.vt == VT_R4 && (variant.fltVal - 3.14)/3.14 < .001)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_double(VARIANT variant)
++{
++	if (variant.vt == VT_R8 && (variant.dblVal - 3.14)/3.14 < .001)
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_in_bstr(VARIANT variant)
++{
++	if (variant.vt == VT_BSTR && !wcscmp(variant.bstrVal, L"PI"))
++		return 0;
++	return 1;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_sbyte(VARIANT* variant)
++{
++	variant->vt = VT_I1;
++	variant->cVal = 100;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_byte(VARIANT* variant)
++{	
++	variant->vt = VT_UI1;
++	variant->bVal = 100;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_short(VARIANT* variant)
++{
++	variant->vt = VT_I2;
++	variant->iVal = 314;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_ushort(VARIANT* variant)
++{
++	variant->vt = VT_UI2;
++	variant->uiVal = 314;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_int(VARIANT* variant)
++{
++	variant->vt = VT_I4;
++	variant->lVal = 314;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_uint(VARIANT* variant)
++{
++	variant->vt = VT_UI4;
++	variant->ulVal = 314;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_long(VARIANT* variant)
++{
++	variant->vt = VT_I8;
++	variant->llVal = 314;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_ulong(VARIANT* variant)
++{
++	variant->vt = VT_UI8;
++	variant->ullVal = 314;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_float(VARIANT* variant)
++{
++	variant->vt = VT_R4;
++	variant->fltVal = 3.14;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_double(VARIANT* variant)
++{
++	variant->vt = VT_R8;
++	variant->dblVal = 3.14;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_variant_out_bstr(VARIANT* variant)
++{
++	variant->vt = VT_BSTR;
++	variant->bstrVal = SysAllocString(L"PI");
++
++	return 0;
++}
++
++#endif
+Index: mcs/class/corlib/corlib.dll.sources
+===================================================================
+--- mcs/class/corlib/corlib.dll.sources	(revision 61474)
++++ mcs/class/corlib/corlib.dll.sources	(working copy)
+@@ -235,6 +235,7 @@
+ System/UnhandledExceptionEventHandler.cs
+ System/UnitySerializationHolder.cs
+ System/ValueType.cs
++System/Variant.cs
+ System/Version.cs
+ System/Void.cs
+ System/WeakReference.cs
+Index: mcs/class/corlib/System/Variant.cs
+===================================================================
+--- mcs/class/corlib/System/Variant.cs	(revision 0)
++++ mcs/class/corlib/System/Variant.cs	(revision 0)
+@@ -0,0 +1,206 @@
++//
++// System.Variant
++//
++// Authors:
++//   Jonathan Chambers <jonathan.chambers@ansys.com>
++//
++// Copyright (C) 2006 Novell (http://www.novell.com)
++//
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System.Runtime.InteropServices;
++
++namespace System
++{
++	[StructLayout(LayoutKind.Explicit, Size = 16)]
++	internal unsafe struct Variant
++	{
++		[FieldOffset(0)]
++		public short vt;
++
++		[FieldOffset(2)]
++		public ushort wReserved1;
++
++		[FieldOffset(4)]
++		public ushort wReserved2;
++
++		[FieldOffset(6)]
++		public ushort wReserved3;
++
++		[FieldOffset(8)]
++		public long llVal;
++
++		[FieldOffset(8)]
++		public int lVal;
++
++		[FieldOffset(8)]
++		public byte bVal;
++
++		[FieldOffset(8)]
++		public short iVal;
++
++		[FieldOffset(8)]
++		public float fltVal;
++
++		[FieldOffset(8)]
++		public double dblVal;
++
++		[FieldOffset(8)]
++		public short boolVal;
++
++		[FieldOffset(8)]
++		public IntPtr bstrVal;
++
++		[FieldOffset(8)]
++		public sbyte cVal;
++
++		[FieldOffset(8)]
++		public ushort uiVal;
++
++		[FieldOffset(8)]
++		public uint ulVal;
++
++		[FieldOffset(8)]
++		public ulong ullVal;
++
++		[FieldOffset(8)]
++		public int intVal;
++
++		[FieldOffset(8)]
++		public uint uintVal;
++
++		public void SetValue(object obj) {
++			vt = (short)VarEnum.VT_EMPTY;
++			if (obj == null)
++				return;
++
++			Type t = obj.GetType();
++			if (t == typeof(sbyte))
++			{
++				vt = (short)VarEnum.VT_I1;
++				cVal = (sbyte)obj;
++			}
++			else if (t == typeof(byte))
++			{
++				vt = (short)VarEnum.VT_UI1;
++				bVal = (byte)obj;
++			}
++			else if (t == typeof(short))
++			{
++				vt = (short)VarEnum.VT_I2;
++				iVal = (short)obj;
++			}
++			else if (t == typeof(ushort))
++			{
++				vt = (short)VarEnum.VT_UI2;
++				uiVal = (ushort)obj;
++			}
++			else if (t == typeof(int))
++			{
++				vt = (short)VarEnum.VT_I4;
++				lVal = (int)obj;
++			}
++			else if (t == typeof(uint))
++			{
++				vt = (short)VarEnum.VT_UI4;
++				ulVal = (uint)obj;
++			}
++			else if (t == typeof(long))
++			{
++				vt = (short)VarEnum.VT_I8;
++				llVal = (long)obj;
++			}
++			else if (t == typeof(ulong))
++			{
++				vt = (short)VarEnum.VT_UI8;
++				ullVal = (ulong)obj;
++			}
++			else if (t == typeof(float))
++			{
++				vt = (short)VarEnum.VT_R4;
++				fltVal = (float)obj;
++			}
++			else if (t == typeof(double))
++			{
++				vt = (short)VarEnum.VT_R8;
++				dblVal = (double)obj;
++			}
++			else if (t == typeof(string))
++			{
++				vt = (short)VarEnum.VT_BSTR;
++				bstrVal = Marshal.StringToBSTR((string)obj);
++			}
++			else
++			{
++				throw new NotImplementedException(string.Format("Variant couldn't handle object of type {0}", obj.GetType()));
++			}
++		}
++
++		public object GetValue() {
++			object obj = null;
++			switch ((VarEnum)vt)
++			{
++			case VarEnum.VT_I1:
++			obj = cVal;
++			break;
++			case VarEnum.VT_UI1:
++				obj = bVal;
++				break;
++			case VarEnum.VT_I2:
++				obj = iVal;
++				break;
++			case VarEnum.VT_UI2:
++				obj = uiVal;
++				break;
++			case VarEnum.VT_I4:
++				obj = lVal;
++				break;
++			case VarEnum.VT_UI4:
++				obj = ulVal;
++				break;
++			case VarEnum.VT_I8:
++				obj = llVal;
++				break;
++			case VarEnum.VT_UI8:
++				obj = ullVal;
++				break;
++			case VarEnum.VT_R4:
++				obj = fltVal;
++				break;
++			case VarEnum.VT_R8:
++				obj = dblVal;
++				break;
++			case VarEnum.VT_BSTR:
++				obj = Marshal.PtrToStringBSTR(bstrVal);
++				break;
++			}
++			return obj;
++		}
++
++		public void Clear() {
++			if ((VarEnum)vt == VarEnum.VT_BSTR)
++			{
++				Marshal.FreeBSTR(bstrVal);
++			}
++		}
++	}
++}
+Index: mcs/class/corlib/System/ChangeLog
+===================================================================
+--- mcs/class/corlib/System/ChangeLog	(revision 61474)
++++ mcs/class/corlib/System/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2006-06-05  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
++	* Variant.cs: Added.
++	* Environment.cs: Incremented corlib version since adding Variant.	
++	
+ 2006-06-01  Raja R Harinath  <rharinath@novell.com>
+ 
+ 	* Nullable.cs (operator==, operator!=): Remove.
+Index: mcs/class/corlib/System/Environment.cs
+===================================================================
+--- mcs/class/corlib/System/Environment.cs	(revision 61474)
++++ mcs/class/corlib/System/Environment.cs	(working copy)
+@@ -59,7 +59,7 @@
+ 		 * Changes which are already detected at runtime, like the addition
+ 		 * of icalls, do not require an increment.
+ 		 */
+-		private const int mono_corlib_version = 52;
++		private const int mono_corlib_version = 53;
+ 		
+ 		[MonoTODO]
+ 		public enum SpecialFolder
+Index: mcs/class/corlib/ChangeLog
+===================================================================
+--- mcs/class/corlib/ChangeLog	(revision 61474)
++++ mcs/class/corlib/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-06-5  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
++	* corlib_test.dll.sources : added Variant.cs.
++
+ 2006-05-31  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* corlib.dll.sources: Removed System/MonoDummy.cs.
+Index: mcs/class/corlib/System.Runtime.InteropServices/ChangeLog
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/ChangeLog	(revision 61474)
++++ mcs/class/corlib/System.Runtime.InteropServices/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-06-05  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
++	* Marshal.cs: Implement VARIANT marshalling methods
++
+ 2006-05-20  Zac Bowling <zac@zacbowling.com>
+ 	* VarEnum.cs: ComVisible Attribute (2.0)
+ 	* InterfaceTypeAttribute.cs: ComVisible Attribute (2.0)
+Index: mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(revision 61474)
++++ mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(working copy)
+@@ -238,8 +238,8 @@
+ 		}
+ 
+ 		[MonoTODO]
+-		public static int GetComSlotForMethodInfo (MemberInfo m) {
+-			throw new NotImplementedException ();
++		public static int GetComSlotForMethodInfo(MemberInfo m) {
++			throw new NotImplementedException();
+ 		}
+ 
+ 		[MonoTODO]
+@@ -317,9 +317,10 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO]
+ 		public static void GetNativeVariantForObject (object obj, IntPtr pDstNativeVariant) {
+-			throw new NotImplementedException ();
++			Variant vt = new Variant();
++			vt.SetValue(obj);
++			Marshal.StructureToPtr(vt, pDstNativeVariant, false);
+ 		}
+ 
+ 		[MonoTODO]
+@@ -327,9 +328,9 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO]
+ 		public static object GetObjectForNativeVariant (IntPtr pSrcNativeVariant) {
+-			throw new NotImplementedException ();
++			Variant vt = (Variant)Marshal.PtrToStructure(pSrcNativeVariant, typeof(Variant));
++			return vt.GetValue();
+ 		}
+ 
+ 		[MonoTODO]

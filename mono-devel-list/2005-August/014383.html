@@ -1,0 +1,320 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Patch for compiling System.Web/HttpResponseStream.cs	under TARGET_JVM
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%20for%20compiling%20System.Web/HttpResponseStream.cs%0A%09under%20TARGET_JVM&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="014382.html">
+   <LINK REL="Next"  HREF="014399.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Patch for compiling System.Web/HttpResponseStream.cs	under TARGET_JVM</H1>
+    <B>Eyal Alaluf</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%20for%20compiling%20System.Web/HttpResponseStream.cs%0A%09under%20TARGET_JVM&In-Reply-To="
+       TITLE="[Mono-dev] Patch for compiling System.Web/HttpResponseStream.cs	under TARGET_JVM">eyala at mainsoft.com
+       </A><BR>
+    <I>Mon Aug 29 06:00:21 EDT 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="014382.html">[Mono-dev] Re: [Mono-devel-list] Re: [GENERICS] [PATCH]	sizesofmetadata elements in reflection.c
+</A></li>
+        <LI>Next message: <A HREF="014399.html">[Mono-dev] Patch for compiling	System.Web/HttpResponseStream.cs under TARGET_JVM
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14383">[ date ]</a>
+              <a href="thread.html#14383">[ thread ]</a>
+              <a href="subject.html#14383">[ subject ]</a>
+              <a href="author.html#14383">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi, all.
+
+Attached is a patch for compiling HttpResponseStream.cs under TARGET_JVM.
+Under TARGET_JVM (Grasshopper) we don't support unsafe code. I therefore made the following
+changes to minimize the use of unsafe code and maximize the code sharing:
+  * I created a managed version of Chunk for the TARGET_JVM configuration.
+  * I made ByteBucket a &quot;safe&quot; class
+      * I modified start &amp; pos into indices rather then pointers. I am using the Chunk
+	to maintain the buffer.
+	During that I removed the field 'len' which was never well maintained. I replaced
+	its use with a local variable everywhere.
+      * I added Copy methods to Chunk in order to copy data to and from a chunk. This limited
+	the unsafe code usage to Chunk.
+      * I removed the ToString method since it was unsafe - an alternative is to mark anyway the
+	ByteBucket class as unsafe. I'd rather it stays safe so we can more easily maintain
+	common code for this class.
+Please provide me with your comments, especially since I am modifying here common code to
+TARGET_JVM and Mono in order to have a minimal code differences between the two.
+
+Eyal.
+-------------- next part --------------
+Index: System.Web/HttpResponseStream.cs
+
+===================================================================
+
+--- System.Web/HttpResponseStream.cs	(revision 49056)
+
++++ System.Web/HttpResponseStream.cs	(working copy)
+
+@@ -65,6 +65,100 @@
+
+ 			this.response = response;
+ 		}
+ 		
++#if TARGET_JVM
++		class Chunk
++		{
++			public byte[] data;
++			public int size;
++			public const int Length = 32 * 1024;
++			
++			public Chunk Next, Prev;
++
++			public Chunk () 
++			{
++				data = new byte[Length];
++				size = Length;
++			}
++	
++			public void Dispose ()
++			{
++			}
++	
++			public static Chunk Unlink (ref Chunk head, Chunk b)
++			{
++				if (head == b)
++					head = head.Next;
++				if (b.Prev != null)
++					b.Prev.Next = b.Next;
++				if (b.Next != null)
++					b.Next.Prev = b.Prev;
++
++				b.Next = b.Prev = null;
++				return b;
++			}
++	
++			public static Chunk Link (Chunk head, Chunk b)
++			{
++				b.Next = head;
++				if (head != null)
++					head.Prev = b;
++				return b;
++			}
++
++			public static void Copy(byte[] buff, int offset, Chunk c, int pos, int len)
++			{
++				Array.Copy(buff, offset, c.data, pos, len);
++			}
++
++			public static void Copy(Chunk c, int pos, byte[] buff, int offset, int len)
++			{
++				Array.Copy(c.data, pos, buff, offset, len);
++			}
++		}
++
++		sealed class BufferManager {
++			static Chunk filled;
++			static Chunk empty;
++	
++			// TODO: if cb &gt; chunk size, try to get a larger chunk
++			public static Chunk GetChunk (int cb)
++			{
++				Chunk c;
++				if (empty == null)
++					empty = new Chunk ();
++				
++				c = empty;
++				filled = Chunk.Link (filled, Chunk.Unlink (ref empty, c));
++				return c;
++			}
++	
++			public static void DisposeChunk (Chunk c)
++			{
++				empty = Chunk.Link (empty, Chunk.Unlink (ref filled, c));
++			}
++	
++			public static void DisposeEmptyChunks ()
++			{
++				for (Chunk c = empty; c != null; c = c.Next)
++					c.Dispose ();
++				empty = null;
++			}
++			
++	
++			public static void PrintState ()
++			{
++				Console.WriteLine (&quot;Filled blocks:&quot;);
++				for (Chunk c = filled; c != null; c = c.Next)
++					Console.WriteLine (&quot;\t{0}&quot;, c);
++				Console.WriteLine (&quot;Empty blocks:&quot;);
++				for (Chunk c = empty; c != null; c = c.Next)
++					Console.WriteLine (&quot;\t{0}&quot;, c);	
++				
++			}
++		}
++
++#else // TARGET_JVM
++		
+ 		unsafe class Block {
+ 			byte* data;
+ 			public const int Length = 128 * 1024;
+@@ -162,10 +256,19 @@
+
+ 			public int size;
+ 			public int block_area;
+ 			public Block block;
++
++			public static void Copy(byte[] buff, int offset, Chunk c, int pos, int len)
++			{
++				Marshal.Copy (buff, offset, (IntPtr) (c.data + pos), len);
++			}
++
++			public static void Copy(Chunk c, int pos, byte[] buff, int offset, int len)
++			{
++				Marshal.Copy ((IntPtr) (c.data + pos), buff, offset, len);
++			}
+ 		}
+ 		
+-		
+-		unsafe sealed class BufferManager {
++		sealed class BufferManager {
+ 	
+ 			static Block filled;
+ 			static Block part_filled;
+@@ -230,7 +333,7 @@
+
+ 			}
+ 			
+ 		}
+-		
++#endif		
+ 	
+ 		abstract class Bucket {
+ 			public Bucket Next;
+@@ -243,12 +346,11 @@
+
+ 			public abstract void Send (Stream stream);
+ 		}
+ 	
+-		unsafe class ByteBucket : Bucket {
++		class ByteBucket : Bucket {
+ 			Chunk c;
+-			byte* start;
+-			byte* pos;
++			int start;
++			int pos;
+ 			int rem;
+-			int len;
+ 			bool partial;
+ 	
+ 			ByteBucket () {}
+@@ -256,8 +358,8 @@
+
+ 			public ByteBucket (int cb)
+ 			{
+ 				c = BufferManager.GetChunk (cb);
+-				start = pos = c.data;
+-				rem = len = c.size;
++				start = pos = 0;
++				rem = c.size;
+ 			}
+ 			
+ 			public int Write (byte [] buf, int offset, int count)
+@@ -266,7 +368,7 @@
+
+ 				if (copy == 0)
+ 					return copy;
+ 				
+-				Marshal.Copy (buf, offset, (IntPtr) pos, copy);
++				Chunk.Copy (buf, offset, c, pos, copy);
+ 				
+ 				pos += copy;
+ 				rem -= copy;
+@@ -280,13 +382,11 @@
+
+ 				if (rem &lt; 4 * 1024)
+ 					return null;
+ 	
+-				len = (int) (pos - start);
+-				
+ 				ByteBucket b = new ByteBucket ();
+ 				b.partial = true;
+ 				b.c = c;
+ 				b.start = b.pos = pos;
+-				b.len = b.rem = rem;
++				b.rem = rem;
+ 				return b;
+ 			}
+ 			
+@@ -299,7 +399,7 @@
+
+ 
+ 			public override void Send (HttpWorkerRequest wr)
+ 			{
+-				len = (int) (pos - start);
++				int len = pos - start;
+ #if false
+ 				for (int i = 0; i &lt; len; i++)
+ 					Console.Write (&quot;[{0}:{1}]&quot;, start [i], start [i]);
+@@ -307,23 +407,26 @@
+
+ 				Console.WriteLine (Environment.StackTrace);
+ #endif
+ 				
++#if TARGET_JVM
++				if (start == 0)
++					wr.SendResponseFromMemory (c.data, len);
++				else
++				{
++					byte[] buf = new byte[len];
++					Chunk.Copy(c, start, buf, 0, len);
++				}
++#else
+ 				wr.SendResponseFromMemory ((IntPtr) start, len);
++#endif
+ 			}
+ 
+ 			public override void Send (Stream stream)
+ 			{
+ 				int len = (int) (pos - start);
+ 				byte [] copy = new byte [len];
+-				Marshal.Copy ((IntPtr) start, copy, 0, len);
++				Chunk.Copy (c, start, copy, 0, len);
+ 				stream.Write (copy, 0, len);
+ 			}
+-
+-			public override string ToString ()
+-			{
+-				len = (int) (pos - start);
+-				return String.Format (&quot;0x{0:x} len {1}&quot;, (IntPtr) start, len);
+-			}
+-			
+ 		}
+ 	
+ 		class BufferedFileBucket : Bucket {
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="014382.html">[Mono-dev] Re: [Mono-devel-list] Re: [GENERICS] [PATCH]	sizesofmetadata elements in reflection.c
+</A></li>
+	<LI>Next message: <A HREF="014399.html">[Mono-dev] Patch for compiling	System.Web/HttpResponseStream.cs under TARGET_JVM
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14383">[ date ]</a>
+              <a href="thread.html#14383">[ thread ]</a>
+              <a href="subject.html#14383">[ subject ]</a>
+              <a href="author.html#14383">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

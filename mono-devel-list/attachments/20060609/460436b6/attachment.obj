@@ -1,0 +1,219 @@
+Index: mono/mono/metadata/ChangeLog
+===================================================================
+--- mono/mono/metadata/ChangeLog	(revision 61596)
++++ mono/mono/metadata/ChangeLog	(working copy)
+@@ -1,5 +1,9 @@
+ 2006-06-09  Jonathan Chambers  <jonathan.chambers@ansys.com>
+ 
++	* icall.c: Another fix for building mono in Visual Studio.
++
++2006-06-09  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
+ 	* marshal.c icall.c: Minor fixes for building mono in Visual Studio.
+ 	
+ 2006-06-09  Martin Baulig  <martin@ximian.com>
+Index: mono/mono/metadata/icall.c
+===================================================================
+--- mono/mono/metadata/icall.c	(revision 61596)
++++ mono/mono/metadata/icall.c	(working copy)
+@@ -5622,23 +5622,43 @@
+ static void
+ ves_icall_System_Environment_InternalSetEnvironmentVariable (MonoString *name, MonoString *value)
+ {
++#ifdef PLATFORM_WIN32
++	gunichar2 *utf16_name, *utf16_value;
++#else
+ 	gchar *utf8_name, *utf8_value;
++#endif
+ 
+ 	MONO_ARCH_SAVE_REGS;
++	
++#ifdef PLATFORM_WIN32
++	utf16_name = mono_string_to_utf16 (name);
++	if ((value == NULL) || (mono_string_length (value) == 0) || (mono_string_chars (value)[0] == 0)) {
++		SetEnvironmentVariable (utf16_name, NULL);
++		g_free (utf16_name);
++		return;
++	}
+ 
++	utf16_value = mono_string_to_utf16 (value);
++
++	SetEnvironmentVariable (utf16_name, utf16_value);
++
++	g_free (utf16_name);
++	g_free (utf16_value);
++#else
+ 	utf8_name = mono_string_to_utf8 (name);	/* FIXME: this should be ascii */
+ 
+ 	if ((value == NULL) || (mono_string_length (value) == 0) || (mono_string_chars (value)[0] == 0)) {
+ 		g_unsetenv (utf8_name);
++		g_free (utf8_name);
+ 		return;
+ 	}
+ 
+ 	utf8_value = mono_string_to_utf8 (value);
+-
+ 	g_setenv (utf8_name, utf8_value, TRUE);
+ 
+ 	g_free (utf8_name);
+ 	g_free (utf8_value);
++#endif
+ }
+ 
+ /*
+Index: mcs/class/corlib/System/ChangeLog
+===================================================================
+--- mcs/class/corlib/System/ChangeLog	(revision 61596)
++++ mcs/class/corlib/System/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-06-09  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
++	* Environment.cs: Implement Set/GetEnvironmentVariable for User/Machine.	
++
+ 2006-06-07  Kornél Pál  <kornelpal@gmail.com>
+ 
+ 	* Environment.cs: Use Consts.FxFileVersion for Environment.Version
+Index: mcs/class/corlib/System/Environment.cs
+===================================================================
+--- mcs/class/corlib/System/Environment.cs	(revision 61596)
++++ mcs/class/corlib/System/Environment.cs	(working copy)
+@@ -514,7 +514,6 @@
+ 
+                 
+ #if NET_2_0
+-		[MonoTODO ("Machine and User targets aren't supported")]
+ 		public static string GetEnvironmentVariable (string variable, EnvironmentVariableTarget target)
+ 		{
+ 			switch (target) {
+@@ -522,65 +521,98 @@
+ 				return GetEnvironmentVariable (variable);
+ 			case EnvironmentVariableTarget.Machine:
+ 				new EnvironmentPermission (PermissionState.Unrestricted).Demand ();
+-				// under Windows this reads the LOCAL_MACHINE registry key for env vars
+-				throw new NotImplementedException ();
++				if (!IsRunningOnWindows)
++					return null;
++				using (Microsoft.Win32.RegistryKey env = Microsoft.Win32.Registry.LocalMachine.OpenSubKey (@"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")) {
++					return env.GetValue (variable).ToString ();
++				}
+ 			case EnvironmentVariableTarget.User:
+ 				new EnvironmentPermission (PermissionState.Unrestricted).Demand ();
+-				// under Windows this reads the CURRENT_USER registry key for env vars
+-				throw new NotImplementedException ();
++				if (!IsRunningOnWindows)
++					return null;
++				using (Microsoft.Win32.RegistryKey env = Microsoft.Win32.Registry.CurrentUser.OpenSubKey ("Environment", false)) {
++					return env.GetValue (variable).ToString ();
++				}
+ 			default:
+ 				throw new ArgumentException ("target");
+ 			}
+ 		}
+ 
+-		[MonoTODO ("Machine and User targets aren't supported")]
+ 		public static IDictionary GetEnvironmentVariables (EnvironmentVariableTarget target)
+ 		{
++			IDictionary variables = (IDictionary)new Hashtable ();
+ 			switch (target) {
+ 			case EnvironmentVariableTarget.Process:
+-				return GetEnvironmentVariables ();
++				variables = GetEnvironmentVariables ();
++				break;
+ 			case EnvironmentVariableTarget.Machine:
+ 				new EnvironmentPermission (PermissionState.Unrestricted).Demand ();
+-				// under Windows this reads the LOCAL_MACHINE registry key for env vars
+-				throw new NotImplementedException ();
++				if (IsRunningOnWindows) {
++					using (Microsoft.Win32.RegistryKey env = Microsoft.Win32.Registry.LocalMachine.OpenSubKey (@"SYSTEM\CurrentControlSet\Control\Session Manager\Environment")) {
++						string[] value_names = env.GetValueNames ();
++						foreach (string value_name in value_names)
++							variables.Add (value_name, env.GetValue (value_name));
++					}
++				}
++				break;
+ 			case EnvironmentVariableTarget.User:
+ 				new EnvironmentPermission (PermissionState.Unrestricted).Demand ();
+-				// under Windows this reads the CURRENT_USER registry key for env vars
+-				throw new NotImplementedException ();
++				if (IsRunningOnWindows) {
++					using (Microsoft.Win32.RegistryKey env = Microsoft.Win32.Registry.CurrentUser.OpenSubKey ("Environment")) {
++						string[] value_names = env.GetValueNames ();
++						foreach (string value_name in value_names)
++							variables.Add (value_name, env.GetValue (value_name));
++					}
++				}
++				break;
+ 			default:
+ 				throw new ArgumentException ("target");
+ 			}
++			return variables;
+ 		}
+ 
+ 		[EnvironmentPermission (SecurityAction.Demand, Unrestricted=true)]
+ 		public static void SetEnvironmentVariable (string variable, string value)
+ 		{
++			SetEnvironmentVariable (variable, value, EnvironmentVariableTarget.Process);
++		}
++
++		[EnvironmentPermission (SecurityAction.Demand, Unrestricted = true)]
++		public static void SetEnvironmentVariable (string variable, string value, EnvironmentVariableTarget target)
++		{
+ 			if (variable == null)
+ 				throw new ArgumentNullException ("variable");
+ 			if (variable == String.Empty)
+ 				throw new ArgumentException ("String cannot be of zero length.", "variable");
+ 			if (variable.IndexOf ('=') != -1)
+ 				throw new ArgumentException ("Environment variable name cannot contain an equal character.", "variable");
+-			if (variable [0] == '\0')
++			if (variable[0] == '\0')
+ 				throw new ArgumentException ("The first char in the string is the null character.", "variable");
+ 
+-			InternalSetEnvironmentVariable (variable, value);
+-		}
+-
+-		[MonoTODO]
+-		[EnvironmentPermission (SecurityAction.Demand, Unrestricted=true)]
+-		public static void SetEnvironmentVariable (string variable, string value, EnvironmentVariableTarget target)
+-		{
+ 			switch (target) {
+ 			case EnvironmentVariableTarget.Process:
+ 				InternalSetEnvironmentVariable (variable, value);
+ 				break;
+ 			case EnvironmentVariableTarget.Machine:
+-				// under Windows this reads the LOCAL_MACHINE registry key for env vars
+-				throw new NotImplementedException ();
++				if (!IsRunningOnWindows)
++					return;
++				using (Microsoft.Win32.RegistryKey env = Microsoft.Win32.Registry.LocalMachine.OpenSubKey (@"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", true)) {
++					if (value == null || value.Length == 0)
++						env.DeleteValue (variable, false);
++					else
++						env.SetValue (variable, value);
++				}
++				break;
+ 			case EnvironmentVariableTarget.User:
+-				// under Windows this reads the CURRENT_USER registry key for env vars
+-				throw new NotImplementedException ();
++				if (!IsRunningOnWindows)
++					return;
++				using (Microsoft.Win32.RegistryKey env = Microsoft.Win32.Registry.CurrentUser.OpenSubKey ("Environment", true)) {
++					if (value == null || value.Length == 0)
++						env.DeleteValue (variable, false);
++					else
++						env.SetValue (variable, value);
++				}
++				break;
+ 			default:
+ 				throw new ArgumentException ("target");
+ 			}
+@@ -605,8 +637,8 @@
+ 		{
+ 			throw new NotImplementedException ();
+ 		}
+-#endif                
+-                
++#endif
++
+ 		// private methods
+ 
+ 		internal static bool IsRunningOnWindows {

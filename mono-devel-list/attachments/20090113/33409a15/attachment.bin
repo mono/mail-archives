@@ -1,0 +1,212 @@
+Index: mono/mono/metadata/appdomain.c
+===================================================================
+--- mono/mono/metadata/appdomain.c	(revision 123179)
++++ mono/mono/metadata/appdomain.c	(working copy)
+@@ -1660,11 +1660,8 @@
+ 	g_free (name);
+ 
+ 	if (!parsed) {
+-		MonoException *exc;
+-
+ 		/* This is a parse error... */
+-		exc = mono_get_exception_file_not_found2 (NULL, assRef);
+-		mono_raise_exception (exc);
++		return NULL;
+ 	}
+ 
+ 	ass = mono_assembly_load_full_nosearch (&aname, NULL, &status, refOnly);
+@@ -1677,9 +1674,7 @@
+ 		else
+ 			refass = NULL;
+ 		if (!refass) {
+-			/* FIXME: it doesn't make much sense since we really don't have a filename ... */
+-			MonoException *exc = mono_get_exception_file_not_found2 (NULL, assRef);
+-			mono_raise_exception (exc);
++			return NULL;
+ 		}
+ 	}
+ 
+Index: mcs/class/corlib/System/AppDomain.cs
+===================================================================
+--- mcs/class/corlib/System/AppDomain.cs	(revision 123179)
++++ mcs/class/corlib/System/AppDomain.cs	(working copy)
+@@ -573,6 +573,17 @@
+ 			return Load (assemblyRef, null);
+ 		}
+ 
++		internal Assembly LoadSatellite (AssemblyName assemblyRef)
++		{
++			if (assemblyRef == null)
++				throw new ArgumentNullException ("assemblyRef");
++
++			Assembly result = LoadAssembly (assemblyRef.FullName, null, false);
++			if (result == null)
++				throw new FileNotFoundException (null, assemblyRef.Name);
++			return result;
++		}
++
+ 		public Assembly Load (AssemblyName assemblyRef, Evidence assemblySecurity)
+ 		{
+ 			if (assemblyRef == null)
+@@ -585,16 +596,13 @@
+ 					throw new ArgumentException (Locale.GetText ("assemblyRef.Name cannot be empty."), "assemblyRef");
+ 			}
+ 
+-			FileNotFoundException exc = null;
+-			try {
+-				return LoadAssembly (assemblyRef.FullName, assemblySecurity, false);
+-			} catch (FileNotFoundException e) {
+-				if (assemblyRef.CodeBase == null)
+-					throw;
+-				exc = e;
+-			}
++			Assembly assembly = LoadAssembly (assemblyRef.FullName, assemblySecurity, false);
++			if (assembly != null)
++				return assembly;
+ 
+-			Assembly assembly = null;
++			if (assemblyRef.CodeBase == null)
++				throw new FileNotFoundException (null, assemblyRef.Name);
++
+ 			string cb = assemblyRef.CodeBase;
+ 			if (cb.ToLower (CultureInfo.InvariantCulture).StartsWith ("file://"))
+ 				cb = new Mono.Security.Uri (cb).LocalPath;
+@@ -602,27 +610,27 @@
+ 			try {
+ 				assembly = Assembly.LoadFrom (cb, assemblySecurity);
+ 			} catch {
+-				throw exc;
++				throw new FileNotFoundException (null, assemblyRef.Name);
+ 			}
+ 			AssemblyName aname = assembly.GetName ();
+ 			// Name, version, culture, publickeytoken. Anything else?
+ 			if (assemblyRef.Name != aname.Name)
+-				throw exc;
++				throw new FileNotFoundException (null, assemblyRef.Name);
+ 
+ 			if (assemblyRef.Version != new Version () && assemblyRef.Version != aname.Version)
+-				throw exc;
++				throw new FileNotFoundException (null, assemblyRef.Name);
+ 
+ 			if (assemblyRef.CultureInfo != null && assemblyRef.CultureInfo.Equals (aname))
+-				throw exc;
++				throw new FileNotFoundException (null, assemblyRef.Name);
+ 
+ 			byte [] pt = assemblyRef.GetPublicKeyToken ();
+ 			if (pt != null) {
+ 				byte [] loaded_pt = aname.GetPublicKeyToken ();
+ 				if (loaded_pt == null || (pt.Length != loaded_pt.Length))
+-					throw exc;
++					throw new FileNotFoundException (null, assemblyRef.Name);
+ 				for (int i = pt.Length - 1; i >= 0; i--)
+ 					if (loaded_pt [i] != pt [i])
+-						throw exc;
++						throw new FileNotFoundException (null, assemblyRef.Name);
+ 			}
+ 			return assembly;
+ 		}
+@@ -645,7 +653,10 @@
+ 			if (assemblyString.Length == 0)
+ 				throw new ArgumentException ("assemblyString cannot have zero length");
+ 
+-			return LoadAssembly (assemblyString, assemblySecurity, refonly);
++			Assembly assembly = LoadAssembly (assemblyString, assemblySecurity, refonly);
++			if (assembly == null)
++				throw new FileNotFoundException (null, assemblyString);
++			return assembly;
+ 		}
+ 
+ 		public Assembly Load (byte[] rawAssembly)
+Index: mcs/class/corlib/System.Resources/ResourceManager.cs
+===================================================================
+--- mcs/class/corlib/System.Resources/ResourceManager.cs	(revision 123179)
++++ mcs/class/corlib/System.Resources/ResourceManager.cs	(working copy)
+@@ -332,14 +332,17 @@
+ #endif
+ 		protected virtual ResourceSet InternalGetResourceSet (CultureInfo culture, bool createIfNotExists, bool tryParents)
+ 		{
++			if (culture == null)
++				throw new ArgumentNullException ("key"); // 'key' instead of 'culture' to make a test pass
++
+ 			ResourceSet set;
+ 			
+ 			/* if we already have this resource set, return it */
+-			set = (ResourceSet) ResourceSets [culture];
++			set = (ResourceSet) ResourceSets [culture.Name];
+ 			if (set != null)
+ 				return set;
+ 
+-			if (NonExistent.Contains (culture))
++			if (NonExistent.Contains (culture.Name))
+ 				return null;
+ 
+ 			if (MainAssembly != null) {
+@@ -358,7 +361,7 @@
+ 					/* Try a satellite assembly */
+ 					Version sat_version = GetSatelliteContractVersion (MainAssembly);
+ 					try {
+-						Assembly a = MainAssembly.GetSatelliteAssembly (
++						Assembly a = MainAssembly.GetSatelliteAssemblyNoThrow (
+ 							resourceCulture, sat_version);
+ 						if (a != null){
+ 							stream = a.GetManifestResourceStream (filename);
+@@ -420,9 +423,9 @@
+ 			}
+ 
+ 			if (set != null)
+-				ResourceSets [culture] = set;
++				ResourceSets [culture.Name] = set;
+ 			else
+-				NonExistent [culture] = culture;
++				NonExistent [culture.Name] = culture.Name;
+ 
+ 			return set;
+ 		}
+Index: mcs/class/corlib/System.Reflection/Assembly.cs
+===================================================================
+--- mcs/class/corlib/System.Reflection/Assembly.cs	(revision 123179)
++++ mcs/class/corlib/System.Reflection/Assembly.cs	(working copy)
+@@ -445,14 +445,36 @@
+ 
+ 			aname.CultureInfo = culture;
+ 			aname.Name = aname.Name + ".resources";
+-			try {
+-				return Load (aname);
+-			} catch (Exception) {
+-				// Try the assembly directory
+-				string fullName = Path.Combine (Path.GetDirectoryName (Location), Path.Combine (culture.Name, aname.Name + ".dll"));
+-				return LoadFrom (fullName);
+-			}
++			Assembly assembly = AppDomain.CurrentDomain.LoadSatellite (aname);
++			if (assembly != null)
++				return assembly;
++
++			// Try the assembly directory
++			string fullName = Path.Combine (Path.GetDirectoryName (Location), Path.Combine (culture.Name, aname.Name + ".dll"));
++			return LoadFrom (fullName);
+ 		}
++
++		internal Assembly GetSatelliteAssemblyNoThrow (CultureInfo culture, Version version)
++		{
++			if (culture == null)
++				throw new ArgumentException ("culture");
++
++			AssemblyName aname = GetName (true);
++			if (version != null)
++				aname.Version = version;
++
++			aname.CultureInfo = culture;
++			aname.Name = aname.Name + ".resources";
++			Assembly assembly = AppDomain.CurrentDomain.LoadSatellite (aname);
++			if (assembly != null)
++				return assembly;
++
++			// Try the assembly directory
++			string fullName = Path.Combine (Path.GetDirectoryName (Location), Path.Combine (culture.Name, aname.Name + ".dll"));
++			if (!File.Exists (fullName))
++				return null;
++			return LoadFrom (fullName);
++		}
+ 		
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+ 		private extern static Assembly LoadFrom (String assemblyFile, bool refonly);

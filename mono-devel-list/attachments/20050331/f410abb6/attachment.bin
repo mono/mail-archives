@@ -1,0 +1,207 @@
+Index: Microsoft.CSharp/CSharpCodeCompiler.cs
+===================================================================
+--- Microsoft.CSharp/CSharpCodeCompiler.cs	(revision 42396)
++++ Microsoft.CSharp/CSharpCodeCompiler.cs	(working copy)
+@@ -124,8 +124,66 @@
+ 			return CompileAssemblyFromFileBatch (options, new string []{fileName});
+ 		}
+ 
++#if NET_2_0
++		const string base_compiler = "gmcs";
++#else
++		const string base_compiler = "mcs";
++#endif
++		
++		static bool try_mcs = true;
++		static MethodInfo mcs_ep = null;
++		
+ 		public CompilerResults CompileAssemblyFromFileBatch (CompilerParameters options, string[] fileNames)
+ 		{
++			if (try_mcs && Environment.GetEnvironmentVariable ("DISABLE_MCS") != null){
++				Console.Error.WriteLine ("Disabling MCS");
++				try_mcs = false;
++			}
++			
++			if (try_mcs){
++				try {
++					string compiler = Path.GetDirectoryName (typeof (object).Assembly.Location) + "/" + base_compiler + ".exe";
++					Assembly a = Assembly.LoadFile (compiler);
++					mcs_ep = a.GetType ("Mono.CSharp.CompilerCallableEntryPoint").GetMethod ("InvokeCompiler", 
++						BindingFlags.Static | BindingFlags.Public);
++				} catch (Exception e) {
++					Console.WriteLine ("Failed to init embedded mcs: " + e);
++					mcs_ep = null;
++				}
++				try_mcs = false;
++			}
++
++			if (mcs_ep != null)
++				return MCS_CompileAssemblyFromFileBatch (options, fileNames);
++			else
++				return ExternalCompiler_CompileAssemblyFromFileBatch (options, fileNames);
++		}
++
++		CompilerResults MCS_CompileAssemblyFromFileBatch (CompilerParameters options, string[] fileNames)
++		{
++			CompilerResults results = new CompilerResults (options.TempFiles);
++
++			string [] options_array = BuildArgs (options, new string [0], false).Split (new char [] {' '});
++			string [] all_args = new string [options_array.Length + fileNames.Length];
++			options_array.CopyTo (all_args, 0);
++			fileNames.CopyTo (all_args, options_array.Length);
++
++			StringWriter error_log = new StringWriter ();
++			object [] method_args = new object [2];
++			method_args [0] = all_args;
++			method_args [1] = error_log;
++
++			bool res;
++
++			lock (mcs_ep){
++				res = (bool) mcs_ep.Invoke (null, method_args);
++			}
++			results.NativeCompilerReturnValue = res ? 0 : 1;
++			return ParseCompilerOutput (options, results, error_log.ToString ());
++		}
++		
++		CompilerResults ExternalCompiler_CompileAssemblyFromFileBatch (CompilerParameters options, string[] fileNames)
++		{
+ 			if (null == options)
+ 				throw new ArgumentNullException("options");
+ 			if (null == fileNames)
+@@ -135,20 +193,14 @@
+ 			Process mcs=new Process();
+ 
+ 			string mcs_output;
+-			string[] mcs_output_lines;
+ 			// FIXME: these lines had better be platform independent.
+ 			if (Path.DirectorySeparatorChar == '\\') {
+ 				mcs.StartInfo.FileName = windowsMonoPath;
+-				mcs.StartInfo.Arguments = windowsMcsPath + ' ' + BuildArgs (options, fileNames);
+-			}
+-			else {
+-#if NET_2_0
++				mcs.StartInfo.Arguments = windowsMcsPath + ' ' + BuildArgs (options, fileNames, true);
++			} else {
+ 				// FIXME: This is a temporary hack to make code genaration work in 2.0
+-				mcs.StartInfo.FileName="gmcs";
+-#else
+-				mcs.StartInfo.FileName="mcs";
+-#endif
+-				mcs.StartInfo.Arguments=BuildArgs(options,fileNames);
++				mcs.StartInfo.FileName = base_compiler;
++				mcs.StartInfo.Arguments=BuildArgs(options,fileNames, true);
+ 			}
+ 			mcs.StartInfo.CreateNoWindow=true;
+ 			mcs.StartInfo.UseShellExecute=false;
+@@ -164,35 +216,45 @@
+ 				results.NativeCompilerReturnValue = mcs.ExitCode;
+ 				mcs.Close();
+ 			}
+-			mcs_output_lines=mcs_output.Split(
+-				System.Environment.NewLine.ToCharArray());
+-			bool loadIt=true;
+-			foreach (string error_line in mcs_output_lines)
++			return ParseCompilerOutput (options, results, mcs_output);
++		}
++
++		CompilerResults ParseCompilerOutput (CompilerParameters options, CompilerResults results, string compiler_output)
++		{
++			string[] output_lines;
++			
++			output_lines = compiler_output.Split (System.Environment.NewLine.ToCharArray());
++			bool loadIt = true;
++
++			foreach (string error_line in output_lines)
+ 			{
+-				CompilerError error=CreateErrorFromString(error_line);
+-				if (null!=error)
+-				{
+-					results.Errors.Add(error);
+-					if (!error.IsWarning) loadIt=false;
++				CompilerError error = CreateErrorFromString (error_line);
++
++				if (error != null) {
++					results.Errors.Add (error);
++					if (!error.IsWarning)
++						loadIt = false;
+ 				}
+ 			}
+ 			if (loadIt)
+-				results.CompiledAssembly=Assembly.LoadFrom(options.OutputAssembly);
++				results.CompiledAssembly = Assembly.LoadFrom (options.OutputAssembly);
+ 			else
+-				results.CompiledAssembly=null;
++				results.CompiledAssembly = null;
+ 
+ 			return results;
+ 		}
+-		public CompilerResults CompileAssemblyFromSource (
+-			CompilerParameters options,string source)
++		
++		public CompilerResults CompileAssemblyFromSource (CompilerParameters options,string source)
+ 		{
+ 			return CompileAssemblyFromSourceBatch(options,new string[]{source});
+ 		}
++
+ 		public CompilerResults CompileAssemblyFromSourceBatch (
+ 			CompilerParameters options,string[] sources)
+ 		{
+ 			string[] fileNames=new string[sources.Length];
+ 			int i=0;
++
+ 			foreach (string source in sources) {
+ 				fileNames [i] = GetTempFileNameWithExtension (options.TempFiles, i.ToString () + ".cs");
+ 				FileStream f=new FileStream(fileNames[i],FileMode.OpenOrCreate);
+@@ -205,8 +267,15 @@
+ 			return CompileAssemblyFromFileBatch (options, fileNames);
+ 		}
+ 
+-
+-		private static string BuildArgs(CompilerParameters options,string[] fileNames)
++		//
++		// @options: compiler options to pass to the compiler
++		// @fileNames: the filenames to compile.
++		// @quote: Whether we should do shell quoting, only required if we will
++		// call with a shell.
++		//
++		// FIXME: quoting is very naive
++		//
++		private static string BuildArgs(CompilerParameters options,string[] fileNames, bool quote)
+ 		{
+ 			StringBuilder args=new StringBuilder();
+ 			if (options.GenerateExecutable)
+@@ -227,12 +296,19 @@
+ 
+ 			if (options.OutputAssembly==null)
+ 				options.OutputAssembly = GetTempFileNameWithExtension (options.TempFiles, "dll");
+-			args.AppendFormat("/out:\"{0}\" ",options.OutputAssembly);
++			if (quote)
++				args.AppendFormat("/out:\"{0}\" ",options.OutputAssembly);
++			else
++				args.AppendFormat("/out:{0} ",options.OutputAssembly);
+ 
+ 			if (null != options.ReferencedAssemblies)
+ 			{
+-				foreach (string import in options.ReferencedAssemblies)
+-					args.AppendFormat("/r:\"{0}\" ",import);
++				foreach (string import in options.ReferencedAssemblies){
++					if (quote)
++						args.AppendFormat("/r:\"{0}\" ",import);
++					else
++						args.AppendFormat("/r:{0} ",import);
++				}
+ 			}
+ 
+ 			if (options.CompilerOptions != null) {
+@@ -241,8 +317,9 @@
+ 			}
+ 			
+ 			args.Append (" -- ");
+-			foreach (string source in fileNames)
++			foreach (string source in fileNames){
+ 				args.AppendFormat("\"{0}\" ",source);
++			}
+ 			return args.ToString();
+ 		}
+ 		private static CompilerError CreateErrorFromString(string error_string)

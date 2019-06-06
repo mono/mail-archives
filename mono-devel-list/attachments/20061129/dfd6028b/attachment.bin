@@ -1,0 +1,232 @@
+Index: System.Web/HttpContext.cs
+===================================================================
+--- System.Web/HttpContext.cs	(revision 68646)
++++ System.Web/HttpContext.cs	(working copy)
+@@ -42,6 +42,7 @@
+ using System.Web.UI;
+ using System.Web.Util;
+ #if NET_2_0
++using System.Collections.Generic;
+ using System.Reflection;
+ using System.Resources;
+ using System.Web.Profile;
+@@ -71,6 +72,7 @@
+ 		DateTime time_stamp = DateTime.UtcNow;
+ #if NET_2_0
+ 		ProfileBase profile = null;
++		LinkedList<IHttpHandler> handlers;
+ #endif
+ #if TARGET_JVM // No remoting support (CallContext) yet in Grasshopper
+ 		static LocalDataStoreSlot _ContextSlot = Thread.GetNamedDataSlot ("Context");
+@@ -279,14 +281,46 @@
+ 		}
+ 
+ #if NET_2_0
+-		[MonoTODO ("Not implemented")]
++		internal void PushHandler (IHttpHandler handler)
++		{
++			if (handler == null)
++				return;
++			if (handlers == null)
++				handlers = new LinkedList <IHttpHandler> ();
++			handlers.AddLast (handler);
++		}
++
++		internal void PopHandler ()
++		{
++			if (handlers == null || handlers.Count == 0)
++				return;
++			handlers.RemoveLast ();
++		}
++		
++		IHttpHandler GetCurrentHandler ()
++		{
++			if (handlers == null || handlers.Count == 0)
++				return null;
++			
++			return handlers.Last.Value;
++		}
++
++		IHttpHandler GetPreviousHandler ()
++		{
++			if (handlers == null || handlers.Count <= 1)
++				return null;
++			LinkedListNode <IHttpHandler> previous = handlers.Last.Previous;
++			if (previous != null)
++				return previous.Value;
++			return null;
++		}
++		
+ 		public IHttpHandler CurrentHandler {
+-			get { throw new NotImplementedException (); }
++			get { return GetCurrentHandler (); }
+ 		}
+ 
+-		[MonoTODO ("Not implemented")]
+ 		public IHttpHandler PreviousHandler {
+-			get { throw new NotImplementedException (); }
++			get { return GetPreviousHandler (); }
+ 		}
+ 
+ 		public ProfileBase Profile {
+@@ -428,14 +462,9 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO ("Only implemented for ASP.NET 2.x applications")]
+ 		public object GetSection (string name)
+ 		{
+-#if NET_2_0
+ 			return WebConfigurationManager.GetSection (name);
+-#else
+-			throw new NotImplementedException ();
+-#endif
+ 		}
+ #endif
+ 		object IServiceProvider.GetService (Type service)
+Index: System.Web/HttpApplication.cs
+===================================================================
+--- System.Web/HttpApplication.cs	(revision 68646)
++++ System.Web/HttpApplication.cs	(working copy)
+@@ -818,7 +818,9 @@
+ 					context.Handler = null;
+ 					factory = null;
+ 				}
+-				
++#if NET_2_0
++				context.PopHandler ();
++#endif
+ 				if (begin_iar != null){
+ 					try {
+ 						begin_iar.Complete ();
+@@ -892,6 +894,9 @@
+ 			try {
+ 				handler = GetHandler (context);
+ 				context.Handler = handler;
++#if NET_2_0
++				context.PushHandler (handler);
++#endif
+ 			} catch (FileNotFoundException fnf){
+ 				if (context.Request.IsLocal)
+ 					ProcessError (new HttpException (404, String.Format ("File not found {0}", fnf.FileName), fnf));
+Index: System.Web/HttpServerUtility.cs
+===================================================================
+--- System.Web/HttpServerUtility.cs	(revision 68646)
++++ System.Web/HttpServerUtility.cs	(working copy)
+@@ -35,6 +35,7 @@
+ using System.Web.Util;
+ using System.Collections.Specialized;
+ using System.Security.Permissions;
++using System.Text;
+ 
+ namespace System.Web {
+ 
+@@ -124,6 +125,9 @@
+ 			IHttpHandler handler = context.ApplicationInstance.GetHandler (context);
+ 			TextWriter previous = null;
+ 			try {
++#if NET_2_0
++				context.PushHandler (handler);
++#endif
+ 				previous = response.SetTextWriter (output);
+ 				if (!(handler is IHttpAsyncHandler)) {
+ 					handler.ProcessRequest (context);
+@@ -142,6 +146,9 @@
+ 				response.SetTextWriter (previous);
+ 				if (!preserveQuery)
+ 					request.SetForm (oldForm);
++#if NET_2_0
++				context.PopHandler ();
++#endif
+ 			}
+ 		}
+ 
+@@ -201,7 +208,88 @@
+ 		{
+ 			throw new NotImplementedException ();
+ 		}
++
++		public static byte[] UrlTokenDecode (string input)
++		{
++			if (input == null)
++				throw new ArgumentNullException ("input");
++			if (input.Length < 1)
++				return new byte[0];
++			byte[] bytes = Encoding.ASCII.GetBytes (input);
++			int inputLength = input.Length - 1;
++			int equalsCount = (int)(((char)bytes[inputLength]) - 0x30);
++			char[] ret = new char[inputLength + equalsCount];
++			int i = 0;
++			for (; i < inputLength; i++) {
++				switch ((char)bytes[i]) {
++					case '-':
++						ret[i] = '+';
++						break;
++
++					case '_':
++						ret[i] = '/';
++						break;
++
++					default:
++						ret[i] = (char)bytes[i];
++						break;
++				}
++			}
++			while (equalsCount > 0) {
++				ret[i++] = '=';
++				equalsCount--;
++			}
++			
++			return Convert.FromBase64CharArray (ret, 0, ret.Length);
++		}
++
++		public static string UrlTokenEncode (byte[] input)
++		{
++			if (input == null)
++				throw new ArgumentNullException ("input");
++			if (input.Length < 1)
++				return String.Empty;
++			string base64 = Convert.ToBase64String (input);
++			int retlen;
++			if (base64 == null || (retlen = base64.Length) == 0)
++				return String.Empty;
++
++			// MS.NET implementation seems to process the base64
++			// string before returning. It replaces the chars:
++			//
++			//  + with -
++			//  / with _
++			//
++			// Then removes trailing ==, which may appear in the
++			// base64 string, and replaces them with a single digit
++			// that's the count of removed '=' characters (0 if none
++			// were removed)
++			int equalsCount = 0x30;
++			while (retlen > 0 && base64[retlen - 1] == '=') {
++				equalsCount++;
++				retlen--;
++			}
++			char[] chars = new char[retlen + 1];
++			chars[retlen] = (char)equalsCount;
++			for (int i = 0; i < retlen; i++) {
++				switch (base64[i]) {
++					case '+':
++						chars[i] = '-';
++						break;
++
++					case '/':
++						chars[i] = '_';
++						break;
++					
++					default:
++						chars[i] = base64[i];
++						break;
++				}
++			}
++			return new string (chars);
++		}
+ #endif
++
+ 		public string UrlDecode (string s)
+ 		{
+ 			return HttpUtility.UrlDecode (s);

@@ -1,0 +1,246 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [RFC v2] Handle lack of SA_SIGINFO
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BRFC%20v2%5D%20Handle%20lack%20of%20SA_SIGINFO&In-Reply-To=20100322102719.GX4259%40debian.org">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034445.html">
+   <LINK REL="Next"  HREF="034442.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [RFC v2] Handle lack of SA_SIGINFO</H1>
+    <B>Andreas Faerber</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BRFC%20v2%5D%20Handle%20lack%20of%20SA_SIGINFO&In-Reply-To=20100322102719.GX4259%40debian.org"
+       TITLE="[Mono-dev] [RFC v2] Handle lack of SA_SIGINFO">andreas.faerber at web.de
+       </A><BR>
+    <I>Mon Mar 22 20:34:02 EDT 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034445.html">[Mono-dev] [RFC] Handle lack of SA_SIGINFO
+</A></li>
+        <LI>Next message: <A HREF="034442.html">[Mono-dev] Embedding Scenario with MonoReflectionType
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34454">[ date ]</a>
+              <a href="thread.html#34454">[ thread ]</a>
+              <a href="subject.html#34454">[ subject ]</a>
+              <a href="author.html#34454">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>From: Andreas F&#228;rber &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">andreas.faerber at web.de</A>&gt;
+
+SA_SIGINFO and sigaction are part of the optional POSIX XSI feature.
+In mini, there's MONO_ARCH_USE_SIGACTION but it doesn't cover everything
+and it isn't available elsewhere.
+
+v1 -&gt; v2:
+* Introduce helper macros, suggested by Paolo. (untested)
+
+Cc: Paolo Molaro &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>&gt;
+---
+ Thanks Paolo, here's a draft, not yet compile-tested.
+ 
+ Andreas
+ 
+ mono/metadata/ChangeLog      |    7 +++++++
+ mono/metadata/console-unix.c |   36 ++++++++++++++++++++++++++----------
+ mono/mini/ChangeLog          |    6 ++++++
+ mono/mini/mini-posix.c       |   15 +++++++++++++--
+ 4 files changed, 52 insertions(+), 12 deletions(-)
+
+diff --git a/mono/metadata/ChangeLog b/mono/metadata/ChangeLog
+index b40af41..82c30e2 100644
+--- a/mono/metadata/ChangeLog
++++ b/mono/metadata/ChangeLog
+@@ -1,3 +1,10 @@
++2010-03-22  Andreas F&#228;rber  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">andreas.faerber at web.de</A>&gt;
++
++	* console-unix.c (sigcont_handler, sigwinch_handler): Fix the build
++	on platforms without sigaction (Haiku).
++	
++	Code is contributed under MIT/X11 license.
++
+ 2010-03-22  Geoff Norton  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">gnorton at novell.com</A>&gt;
+ 
+ 	* locales.c: Its possible for CFStringGetCStringPtr
+diff --git a/mono/metadata/console-unix.c b/mono/metadata/console-unix.c
+index 99e0754..8a7da12 100644
+--- a/mono/metadata/console-unix.c
++++ b/mono/metadata/console-unix.c
+@@ -262,10 +262,32 @@ sigint_handler (int signo)
+ 	in_sigint = FALSE;
+ }
+ 
++#define SIGHANDLER_VALID(sigh) \
++	((sigh) != NULL &amp;&amp; \
++	 (sigh) != (void *)SIG_DFL &amp;&amp; \
++	 (sigh) != (void *)SIG_IGN)
++
++#ifdef SA_SIGINFO
++#define SIGHANDLER_SIGNATURE int signo, void *the_siginfo, void *data
++#define INVOKE_SIGHANDLER_IF_VALID(siga) G_STMT_START \
++		if ((siga).sa_flags &amp; SA_SIGINFO) { \
++			if (SIGHANDLER_VALID((siga).sa_sigaction)) \
++				(*(siga).sa_sigaction) (signo, the_siginfo, data); \
++		} else if (SIGHANDLER_VALID((siga).sa_handler)) \
++			(*(siga).sa_handler) (signo); \
++	G_STMT_END
++#else
++#define SIGHANDLER_SIGNATURE int signo
++#define INVOKE_SIGHANDLER_IF_VALID(siga) G_STMT_START \
++		if (SIGHANDLER_VALID((siga).sa_handler)) \
++			(*(siga).sa_handler) (signo); \
++	G_STMT_END
++#endif
++
+ static struct sigaction save_sigcont, save_sigint, save_sigwinch;
+ 
+ static void
+-sigcont_handler (int signo, void *the_siginfo, void *data)
++sigcont_handler (SIGHANDLER_SIGNATURE)
+ {
+ 	// Ignore error, there is not much we can do in the sigcont handler.
+ 	tcsetattr (STDIN_FILENO, TCSANOW, &amp;mono_attr);
+@@ -274,24 +296,18 @@ sigcont_handler (int signo, void *the_siginfo, void *data)
+ 		write (STDOUT_FILENO, keypad_xmit_str, strlen (keypad_xmit_str));
+ 
+ 	// Call previous handler
+-	if (save_sigcont.sa_sigaction != NULL &amp;&amp;
+-	    save_sigcont.sa_sigaction != (void *)SIG_DFL &amp;&amp;
+-	    save_sigcont.sa_sigaction != (void *)SIG_IGN)
+-		(*save_sigcont.sa_sigaction) (signo, the_siginfo, data);
++	INVOKE_SIGHANDLER_IF_VALID (save_sigcont);
+ }
+ 
+ static void
+-sigwinch_handler (int signo, void *the_siginfo, void *data)
++sigwinch_handler (SIGHANDLER_SIGNATURE)
+ {
+ 	int dims = terminal_get_dimensions ();
+ 	if (dims != -1)
+ 		cols_and_lines = dims;
+ 	
+ 	// Call previous handler
+-	if (save_sigwinch.sa_sigaction != NULL &amp;&amp;
+-	    save_sigwinch.sa_sigaction != (void *)SIG_DFL &amp;&amp;
+-	    save_sigwinch.sa_sigaction != (void *)SIG_IGN)
+-		(*save_sigwinch.sa_sigaction) (signo, the_siginfo, data);
++	INVOKE_SIGHANDLER_IF_VALID (save_sigwinch);
+ }
+ 
+ void
+diff --git a/mono/mini/ChangeLog b/mono/mini/ChangeLog
+index f15d276..c1b60ba 100755
+--- a/mono/mini/ChangeLog
++++ b/mono/mini/ChangeLog
+@@ -1,3 +1,9 @@
++2010-03-22  Andreas Faerber  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">andreas.faerber at web.de</A>&gt;
++
++	* mini-posix.c: Fix the build on platforms without SA_SIGINFO (Haiku).
++	
++	Code is contributed under MIT/X11 license.
++
+ 2010-03-22  Zoltan Varga  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">vargaz at gmail.com</A>&gt;
+ 
+ 	* exceptions-amd64.c: Add support for OpenBSD which has no UCONTEXT_GREGS.
+diff --git a/mono/mini/mini-posix.c b/mono/mini/mini-posix.c
+index 823d93b..f53a850 100644
+--- a/mono/mini/mini-posix.c
++++ b/mono/mini/mini-posix.c
+@@ -82,13 +82,17 @@ save_old_signal_handler (int signo, struct sigaction *old_action)
+ 	mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_CONFIG,
+ 				&quot;Saving old signal handler for signal %d.&quot;, signo);
+ 
++#ifdef SA_SIGINFO
+ 	if (! (old_action-&gt;sa_flags &amp; SA_SIGINFO)) {
++#endif
+ 		handler_to_save-&gt;sa_handler = old_action-&gt;sa_handler;
++#ifdef SA_SIGINFO
+ 	} else {
+ #ifdef MONO_ARCH_USE_SIGACTION
+ 		handler_to_save-&gt;sa_sigaction = old_action-&gt;sa_sigaction;
+ #endif /* MONO_ARCH_USE_SIGACTION */
+ 	}
++#endif
+ 	handler_to_save-&gt;sa_mask = old_action-&gt;sa_mask;
+ 	handler_to_save-&gt;sa_flags = old_action-&gt;sa_flags;
+ 	
+@@ -129,13 +133,17 @@ SIG_HANDLER_SIGNATURE (mono_chain_signal)
+ 	GET_CONTEXT;
+ 
+ 	if (saved_handler) {
++#ifdef SA_SIGINFO
+ 		if (!(saved_handler-&gt;sa_flags &amp; SA_SIGINFO)) {
++#endif
+ 			saved_handler-&gt;sa_handler (signal);
++#ifdef SA_SIGINFO
+ 		} else {
+ #ifdef MONO_ARCH_USE_SIGACTION
+ 			saved_handler-&gt;sa_sigaction (signal, info, ctx);
+ #endif /* MONO_ARCH_USE_SIGACTION */
+ 		}
++#endif
+ 		return TRUE;
+ 	}
+ 	return FALSE;
+@@ -381,9 +389,12 @@ add_signal_handler (int signo, gpointer handler)
+ 	g_assert (sigaction (signo, &amp;sa, &amp;previous_sa) != -1);
+ 
+ 	/* if there was already a handler in place for this signal, store it */
+-	if (! (previous_sa.sa_flags &amp; SA_SIGINFO) &amp;&amp;
++	if (
++#ifdef SA_SIGINFO
++		! (previous_sa.sa_flags &amp; SA_SIGINFO) &amp;&amp;
++#endif
+ 			(SIG_DFL == previous_sa.sa_handler)) { 
+-		/* it there is no sa_sigaction function and the sa_handler is default, we can safely ignore this */
++		/* if there is no sa_sigaction function and the sa_handler is default, we can safely ignore this */
+ 	} else {
+ 		if (mono_do_signal_chaining)
+ 			save_old_signal_handler (signo, &amp;previous_sa);
+-- 
+1.7.0.14.g7e948
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034445.html">[Mono-dev] [RFC] Handle lack of SA_SIGINFO
+</A></li>
+	<LI>Next message: <A HREF="034442.html">[Mono-dev] Embedding Scenario with MonoReflectionType
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34454">[ date ]</a>
+              <a href="thread.html#34454">[ thread ]</a>
+              <a href="subject.html#34454">[ subject ]</a>
+              <a href="author.html#34454">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

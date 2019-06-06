@@ -1,0 +1,374 @@
+diff --git a/mono/metadata/gc-internal.h b/mono/metadata/gc-internal.h
+index f975762..cb8fb5a 100644
+--- a/mono/metadata/gc-internal.h
++++ b/mono/metadata/gc-internal.h
+@@ -74,6 +74,10 @@ void    mono_gc_remove_weak_track_handle (guint32 gchandle) MONO_INTERNAL;
+ GSList* mono_gc_remove_weak_track_object (MonoDomain *domain, MonoObject *obj) MONO_INTERNAL;
+ #endif
+ 
++/*Ephemeron functionality*/
++void    mono_gc_ephemeron_array_add (MonoObject *obj) MONO_INTERNAL;
++
++
+ MonoBoolean
+ GCHandle_CheckCurrentDomain (guint32 gchandle) MONO_INTERNAL;
+ 
+diff --git a/mono/metadata/icall-def.h b/mono/metadata/icall-def.h
+index 16c4347..80f0b3c 100644
+--- a/mono/metadata/icall-def.h
++++ b/mono/metadata/icall-def.h
+@@ -268,6 +268,7 @@ ICALL(GC_4a, "RecordPressure", mono_gc_add_memory_pressure)
+ ICALL(GC_5, "SuppressFinalize", ves_icall_System_GC_SuppressFinalize)
+ ICALL(GC_6, "WaitForPendingFinalizers", ves_icall_System_GC_WaitForPendingFinalizers)
+ ICALL(GC_7, "get_MaxGeneration", mono_gc_max_generation)
++ICALL(GC_8, "register_ephemeron_array", mono_gc_ephemeron_array_add)
+ 
+ ICALL_TYPE(COMPINF, "System.Globalization.CompareInfo", COMPINF_1)
+ ICALL(COMPINF_1, "assign_sortkey(object,string,System.Globalization.CompareOptions)", ves_icall_System_Globalization_CompareInfo_assign_sortkey)
+diff --git a/mono/metadata/object.c b/mono/metadata/object.c
+index 59a6263..8e546c2 100644
+--- a/mono/metadata/object.c
++++ b/mono/metadata/object.c
+@@ -633,6 +633,15 @@ compute_class_bitmap (MonoClass *class, gsize *bitmap, int size, int offset, int
+ 		size = max_size;
+ 	}
+ 
++#ifdef HAVE_SGEN_GC
++	/*An Ephemeron cannot be marked by sgen*/
++	if (!static_fields && class->image == mono_defaults.corlib && !strcmp ("Ephemeron", class->name)) {
++		*max_set = 0;
++		memset (bitmap, 0, size / 8);
++		return bitmap;
++	}
++#endif
++
+ 	for (p = class; p != NULL; p = p->parent) {
+ 		gpointer iter = NULL;
+ 		while ((field = mono_class_get_fields (p, &iter))) {
+diff --git a/mono/metadata/sgen-gc.c b/mono/metadata/sgen-gc.c
+index dbbe650..831974b 100644
+--- a/mono/metadata/sgen-gc.c
++++ b/mono/metadata/sgen-gc.c
+@@ -331,6 +331,7 @@ enum {
+ 	INTERNAL_MEM_STORE_REMSET,
+ 	INTERNAL_MEM_MS_TABLES,
+ 	INTERNAL_MEM_MS_BLOCK_INFO,
++	INTERNAL_MEM_EPHEMERON_LINK,
+ 	INTERNAL_MEM_MAX
+ };
+ 
+@@ -735,6 +736,13 @@ struct _DisappearingLinkHashTable {
+ 	int num_links;
+ };
+ 
++typedef struct _EphemeronLinkNode EphemeronLinkNode;
++
++struct _EphemeronLinkNode {
++	EphemeronLinkNode *next;
++	char *array;
++};
++
+ #define LARGE_INTERNAL_MEM_HEADER_MAGIC	0x7d289f3a
+ 
+ typedef struct _LargeInternalMemHeader LargeInternalMemHeader;
+@@ -776,6 +784,8 @@ static FinalizeEntry *critical_fin_list = NULL;
+ static DisappearingLinkHashTable minor_disappearing_link_hash;
+ static DisappearingLinkHashTable major_disappearing_link_hash;
+ 
++static EphemeronLinkNode *ephemeron_list;
++
+ static int num_ready_finalizers = 0;
+ static int no_finalize = 0;
+ 
+@@ -1027,6 +1037,10 @@ void mono_gc_scan_for_specific_ref (MonoObject *key);
+ 
+ static void init_stats (void);
+ 
++static int mark_ephemerons_in_range (CopyOrMarkObjectFunc copy_func, char *start, char *end);
++static void clear_unreachable_ephemerons (CopyOrMarkObjectFunc copy_func, char *start, char *end);
++static void null_ephemerons_for_domain (MonoDomain *domain);
++
+ //#define BINARY_PROTOCOL
+ #include "sgen-protocol.c"
+ #include "sgen-pinning.c"
+@@ -1954,6 +1968,8 @@ mono_gc_clear_domain (MonoDomain * domain)
+ 	major_iterate_objects (TRUE, FALSE, (IterateObjectCallbackFunc)clear_domain_free_major_non_pinned_object_callback, domain);
+ 	major_iterate_objects (FALSE, TRUE, (IterateObjectCallbackFunc)clear_domain_free_major_pinned_object_callback, domain);
+ 
++	null_ephemerons_for_domain (domain);
++
+ 	for (i = GENERATION_NURSERY; i < GENERATION_MAX; ++i)
+ 		null_links_for_domain (domain, i);
+ 
+@@ -2791,6 +2807,7 @@ finish_gray_stack (char *start_addr, char *end_addr, int generation)
+ 	TV_DECLARE (atv);
+ 	TV_DECLARE (btv);
+ 	int fin_ready;
++	int ephemeron_rounds = 0;
+ 	CopyOrMarkObjectFunc copy_func = current_collection_generation == GENERATION_NURSERY ? copy_object : major_copy_or_mark_object;
+ 
+ 	/*
+@@ -2817,6 +2834,20 @@ finish_gray_stack (char *start_addr, char *end_addr, int generation)
+ 	 * that are fin-ready. Speedup with a flag?
+ 	 */
+ 	do {
++		/*
++		 * Walk the ephemeron tables marking all values with reachable keys. This must be completely done
++		 * before processing finalizable objects to avoid finalizing reachable values.
++		 *
++		 * It must be done inside the finalizaters loop since objects must not be removed from CWT tables
++		 * while they are been finalized.
++		 */
++		int done_with_ephemerons = 0;
++		do {
++			done_with_ephemerons = mark_ephemerons_in_range (copy_func, start_addr, end_addr);
++			drain_gray_stack ();
++			++ephemeron_rounds;
++		} while (!done_with_ephemerons);
++
+ 		fin_ready = num_ready_finalizers;
+ 		finalize_in_range (copy_func, start_addr, end_addr, generation);
+ 		if (generation == GENERATION_OLD)
+@@ -2826,8 +2857,15 @@ finish_gray_stack (char *start_addr, char *end_addr, int generation)
+ 		DEBUG (6, fprintf (gc_debug_file, "Precise scan of gray area post fin\n"));
+ 		drain_gray_stack ();
+ 	} while (fin_ready != num_ready_finalizers);
++
++	/*
++	 * Clear ephemeron pairs with unreachable keys.
++	 * We pass the copy func so we can figure out if an array was promoted or not.
++	 */
++	clear_unreachable_ephemerons (copy_func, start_addr, end_addr);
++
+ 	TV_GETTIME (btv);
+-	DEBUG (2, fprintf (gc_debug_file, "Finalize queue handling scan for %s generation: %d usecs\n", generation_name (generation), TV_ELAPSED (atv, btv)));
++	DEBUG (2, fprintf (gc_debug_file, "Finalize queue handling scan for %s generation: %d usecs %d ephemeron roundss\n", generation_name (generation), TV_ELAPSED (atv, btv), ephemeron_rounds));
+ 
+ 	/*
+ 	 * handle disappearing links
+@@ -3036,7 +3074,7 @@ dump_heap (const char *type, int num, const char *reason)
+ 						     "fin-table", "finalize-entry", "dislink-table",
+ 						     "dislink", "roots-table", "root-record", "statistics",
+ 						     "remset", "gray-queue", "store-remset", "marksweep-tables",
+-						     "marksweep-block-info" };
++						     "marksweep-block-info", "ephemeron-link" };
+ 
+ 	ObjectList *list;
+ 	LOSObject *bigobj;
+@@ -4414,6 +4452,182 @@ finalize_in_range (CopyOrMarkObjectFunc copy_func, char *start, char *end, int g
+ 	}
+ }
+ 
++static int
++object_is_reachable (char *object, char *start, char *end)
++{
++	/*This happens for non nursery objects during minor collections. We just treat all objects as alive.*/
++	if (object < start || object >= end)
++		return 1;
++	return !object_is_fin_ready (object) || major_is_object_live (object);
++}
++
++/* LOCKING: requires that the GC lock is held */
++static void
++null_ephemerons_for_domain (MonoDomain *domain)
++{
++	EphemeronLinkNode *current = ephemeron_list, *prev = NULL;
++
++	while (current) {
++		MonoObject *object = (MonoObject*)current->array;
++
++		/*No need to look inside the array as the referenced objects MUST be on the same domain*/
++		if (object && (!object->vtable || mono_object_domain (object) == domain)) {
++			EphemeronLinkNode *tmp = current;
++
++			if (prev)
++				prev->next = current->next;
++			else
++				ephemeron_list = current->next;
++
++			current = current->next;
++			free_internal_mem (tmp, INTERNAL_MEM_EPHEMERON_LINK);
++		} else {
++			prev = current;
++			current = current->next;
++		}
++	}
++}
++
++/* LOCKING: requires that the GC lock is held */
++static void
++clear_unreachable_ephemerons (CopyOrMarkObjectFunc copy_func, char *start, char *end)
++{
++	int was_in_nursery, was_promoted;
++	EphemeronLinkNode *current = ephemeron_list, *prev = NULL;
++	MonoArray *array;
++	mword **ptr;
++	uintptr_t i, length;
++
++	while (current) {
++		char *object = current->array;
++
++		if (!object_is_reachable (object, start, end)) {
++			EphemeronLinkNode *tmp = current;
++
++			DEBUG (5, fprintf (gc_debug_file, "Dead Ephemeron array at %p\n", object));
++
++			if (prev)
++				prev->next = current->next;
++			else
++				ephemeron_list = current->next;
++
++			current = current->next;
++			free_internal_mem (tmp, INTERNAL_MEM_EPHEMERON_LINK);
++
++			continue;
++		}
++
++		was_in_nursery = ptr_in_nursery (object);
++		copy_func ((void**)&object);
++		current->array = object;
++
++		/*The array was promoted. Promote all elements of the array and add global remsets from the ones left behind in the nursery.
++		 */
++		was_promoted = was_in_nursery && !ptr_in_nursery (object);
++
++		DEBUG (5, fprintf (gc_debug_file, "Clearing unreachable entries for ephemeron array at %p\n", object));
++
++		array = (MonoArray*)object;
++		ptr = (mword**)mono_array_addr_with_size (array, sizeof (mword) * 2, 0);
++		length = mono_array_length (array);
++
++		for (i = 0; i < length; ++i) {
++			char *key = (char*)ptr [0];
++			char *value = (char*)ptr [1];
++
++			if (key)
++				DEBUG (5, fprintf (gc_debug_file, "[%d] key %p (%s) value %p (%s)\n", i,
++					key, key && object_is_reachable (key, start, end) ? "reachable" : "unreachable",
++					value, value && object_is_reachable (value, start, end) ? "reachable" : "unreachable"));
++
++			if (key && !object_is_reachable (key, start, end)) {
++				DEBUG (5, fprintf (gc_debug_file, "\tclearing index %d\n", i));
++				ptr [0] = NULL;
++				ptr [1] = NULL;
++				key = NULL;
++			}
++
++			if (key && was_promoted) {
++				if (ptr_in_nursery (key)) {/*key was not promoted*/
++					DEBUG (5, fprintf (gc_debug_file, "\tAdded remset to key %p\n", key));
++					add_to_global_remset (ptr, FALSE);
++				}
++				if (ptr_in_nursery (value)) {/*value was not promoted*/
++					DEBUG (5, fprintf (gc_debug_file, "\tAdded remset to value %p\n", value));
++					add_to_global_remset (ptr + 1, FALSE);
++				}
++			}
++			ptr += 2;
++	   }
++
++
++		prev = current;
++		current = current->next;
++	}
++}
++
++/* LOCKING: requires that the GC lock is held */
++static int
++mark_ephemerons_in_range (CopyOrMarkObjectFunc copy_func, char *start, char *end)
++{
++	int nothing_marked = 1;
++	EphemeronLinkNode *current = ephemeron_list;
++	MonoArray *array;
++	mword **ptr;
++	uintptr_t i, length;
++
++	while (current) {
++		char *object = current->array, *old;
++		DEBUG (5, fprintf (gc_debug_file, "Ephemeron array at %p\n", object));
++		/*We ignore arrays in old gend during minor collections since all objects are promoted by the remset machinery.*/
++
++		if (object < start || object >= end) {
++			current = current->next;
++			continue;
++		}
++
++		/*it has to be alive*/
++		if (!object_is_reachable (object, start, end)) {
++			DEBUG (5, fprintf (gc_debug_file, "Ephemeron array at %p is not reachable\n", object));
++			current = current->next;
++			continue;
++		}
++
++		old = object;
++		copy_func ((void**)&object);
++
++		array = (MonoArray*)object;
++		ptr = (mword**)mono_array_addr_with_size (array, sizeof (mword) * 2, 0);
++		length = mono_array_length (array);
++
++		DEBUG (5, fprintf (gc_debug_file, "Processing Ephemeron array at %p - %p\n", object, old));
++		for (i = 0; i < mono_array_length (array); ++i) {
++			char *key = (char*)ptr [0];
++			char *value = (char*)ptr [1];
++			if (key) {
++				DEBUG (5, fprintf (gc_debug_file, "[%d] key %p value %p", i, key, value));
++				DEBUG (5, fprintf (gc_debug_file, " key (%s) value (%s)\n",
++					key && object_is_reachable (key, start, end) ? "reachable" : "unreachable",
++					value && object_is_reachable (value, start, end) ? "reachable" : "unreachable"));
++			}
++
++			if (key && object_is_reachable (key, start, end)) {
++				copy_func ((void**)ptr); //move the key
++				if (value) {
++					if (!object_is_reachable (value, start, end))
++						nothing_marked = 0;
++					copy_func ((void**)(ptr + 1)); //;move the value
++				}
++			}
++
++			ptr += 2;
++		}
++		current = current->next;
++	}
++	DEBUG (5, fprintf (gc_debug_file, "Ephemeron run finished. Is it done %d\n", nothing_marked));
++	return nothing_marked;
++}
++
+ /* LOCKING: requires that the GC lock is held */
+ static void
+ null_link_in_range (CopyOrMarkObjectFunc copy_func, char *start, char *end, int generation)
+@@ -4752,6 +4966,18 @@ mono_gc_register_disappearing_link (MonoObject *obj, void **link, gboolean track
+ 	}
+ }
+ 
++/* LOCKING: assumes the GC lock is held */
++static void
++mono_gc_register_ephemeron_array (MonoObject *obj)
++{
++	EphemeronLinkNode *node = get_internal_mem (sizeof (EphemeronLinkNode), INTERNAL_MEM_EPHEMERON_LINK);
++	node->array = (char*)obj;
++	node->next = ephemeron_list;
++	ephemeron_list = node;
++
++	DEBUG (5, fprintf (gc_debug_file, "Registered ephemeron array %p\n", obj));
++}
++
+ int
+ mono_gc_invoke_finalizers (void)
+ {
+@@ -6782,6 +7008,14 @@ mono_gc_weak_link_get (void **link_addr)
+ 	return (MonoObject*) REVEAL_POINTER (*link_addr);
+ }
+ 
++void
++mono_gc_ephemeron_array_add (MonoObject *obj)
++{
++	LOCK_GC;
++	mono_gc_register_ephemeron_array (obj);
++	UNLOCK_GC;
++}
++
+ void*
+ mono_gc_make_descr_from_bitmap (gsize *bitmap, int numbits)
+ {

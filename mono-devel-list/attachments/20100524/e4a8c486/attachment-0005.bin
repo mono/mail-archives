@@ -1,0 +1,207 @@
+diff --git a/mono/metadata/ChangeLog b/mono/metadata/ChangeLog
+index 8226c9a..015b91f 100644
+--- a/mono/metadata/ChangeLog
++++ b/mono/metadata/ChangeLog
+@@ -1,5 +1,12 @@
+ 2010-05-24 Rodrigo Kumpera  <rkumpera@novell.com>
+ 
++	* sgen-gc.c: New block map API. Maps addresses to Block structs. Use a two
++	level sparse array similar to boehm's block map.
++
++	* sgen-gc.c: Register common memory regions (nursery, pinned, LOS) to block map.
++
++2010-05-24 Rodrigo Kumpera  <rkumpera@novell.com>
++
+ 	* sgen-gc.c: Introduce two new kinds of memory holes for large objects.
+ 
+ 	* sgen-gc.c: Make LOSObject have a struct Block header. Change
+diff --git a/mono/metadata/sgen-gc.c b/mono/metadata/sgen-gc.c
+index 48b8f10..15ed6cd 100644
+--- a/mono/metadata/sgen-gc.c
++++ b/mono/metadata/sgen-gc.c
+@@ -333,6 +333,7 @@ enum {
+ 	INTERNAL_MEM_MS_TABLES,
+ 	INTERNAL_MEM_MS_BLOCK_INFO,
+ 	INTERNAL_MEM_EPHEMERON_LINK,
++	INTERNAL_MEM_BLOCK_MAP_SEGMENT,
+ 	INTERNAL_MEM_MAX
+ };
+ 
+@@ -1045,6 +1046,113 @@ static int mark_ephemerons_in_range (CopyOrMarkObjectFunc copy_func, char *start
+ static void clear_unreachable_ephemerons (CopyOrMarkObjectFunc copy_func, char *start, char *end);
+ static void null_ephemerons_for_domain (MonoDomain *domain);
+ 
++
++
++/*
++ * ######################################################################
++ * ########  Block Map.
++ * ######################################################################
++ */
++
++/*
++ * Constraints on 32 bits systems:
++ *	level0 + level1 + smallest allocation unit >= 32
++ *
++ * The smallest alloc unit is usually pagesized due to LOS.
++ * Otherwise it would be 16k for Mark&Sweep, 128k for pinned/Copying
++ *
++ * TODO add support for 64 bits systems by using hashing and/or 3 level tables.
++ * TODO alloc segments on an outer loop.
++ * TODO figure out how to release level1 memory (or if it's even desired)
++ */
++#define BITS_PER_WORD (sizeof (mword) * 8)
++#define LEVEL0_BITS 10
++#define LEVEL1_BITS 10
++
++#define LEVEL0_SIZE (1 << LEVEL0_BITS)
++#define LEVEL1_SIZE (1 << LEVEL1_BITS)
++
++#define LEVEL0_SHIFT (BITS_PER_WORD - LEVEL0_BITS)
++#define LEVEL1_SHIFT (BITS_PER_WORD - LEVEL0_BITS - LEVEL1_BITS)
++
++#define LEVEL1_MASK ((1 << LEVEL1_BITS) - 1)
++
++#define SMALL_BITS_SIZE (1 << LEVEL1_SHIFT)
++
++typedef struct {
++	Block *blocks [LEVEL1_SIZE];
++} SgenSegmentInfo;
++
++static SgenSegmentInfo *all_zero_segment;
++static SgenSegmentInfo *block_map [LEVEL0_SIZE];
++
++static mword
++pointer_to_block_index (mword ptr)
++{
++	return (ptr >> LEVEL1_SHIFT) & LEVEL1_MASK;
++}
++
++static mword
++pointer_to_segment_index (mword ptr)
++{
++	return ptr >> LEVEL0_SHIFT;
++}
++
++static SgenSegmentInfo*
++block_map_get_segment (mword ptr)
++{
++	return block_map [pointer_to_segment_index (ptr)];
++}
++
++static Block*
++block_map_find_block (mword ptr)
++{
++	return block_map_get_segment (ptr)->blocks [pointer_to_block_index (ptr)];
++}
++
++/* LOCKING: requires that the GC lock is held */
++static SgenSegmentInfo	*
++block_map_get_or_alloc_segment (mword ptr)
++{
++	mword level0 = pointer_to_segment_index (ptr);
++	SgenSegmentInfo	*segment = block_map [level0];
++
++	if (segment == all_zero_segment)
++		block_map [level0] = segment = get_internal_mem (sizeof (SgenSegmentInfo), INTERNAL_MEM_BLOCK_MAP_SEGMENT);
++
++	return segment;
++}
++
++/* LOCKING: requires that the GC lock is held */
++static void
++block_map_register_block (Block *block, mword start, mword end)
++{
++	for (; start < end; start += SMALL_BITS_SIZE) {
++		SgenSegmentInfo	*segment = block_map_get_or_alloc_segment (start);
++		mword block_idx = pointer_to_block_index (start);
++		segment->blocks [block_idx] = block;
++	}
++}
++
++/* LOCKING: requires that the GC lock is held */
++static void
++block_map_deregister_block (mword start, mword end)
++{
++	for (; start < end; start += LEVEL1_SIZE) {
++		SgenSegmentInfo	*segment = block_map_get_segment (start);
++		segment->blocks [pointer_to_block_index (start)] = NULL;
++	}
++}
++
++static void
++block_map_init (void)
++{
++	int i;
++	all_zero_segment = get_internal_mem (sizeof (SgenSegmentInfo), INTERNAL_MEM_BLOCK_MAP_SEGMENT);
++	for (i = 0; i < LEVEL0_SIZE; ++i)
++		block_map [i] = all_zero_segment;
++}
++
+ //#define BINARY_PROTOCOL
+ #include "sgen-protocol.c"
+ #include "sgen-pinning.c"
+@@ -2760,6 +2868,8 @@ alloc_nursery (void)
+ 
+ 	nursery_section = section;
+ 
++	block_map_register_block (&section->block, (mword)section->data, (mword)section->end_data);
++
+ 	/* Setup the single first large fragment */
+ 	frag = alloc_fragment ();
+ 	frag->fragment_start = nursery_start;
+@@ -3114,7 +3224,7 @@ dump_heap (const char *type, int num, const char *reason)
+ 						     "fin-table", "finalize-entry", "dislink-table",
+ 						     "dislink", "roots-table", "root-record", "statistics",
+ 						     "remset", "gray-queue", "store-remset", "marksweep-tables",
+-						     "marksweep-block-info", "ephemeron-link" };
++						     "marksweep-block-info", "ephemeron-link", "block-map-segments" };
+ 
+ 	ObjectList *list;
+ 	LOSObject *bigobj;
+@@ -3768,6 +3878,10 @@ alloc_pinned_chunk (void)
+ 	chunk->page_sizes [0] = PINNED_FIRST_SLOT_SIZE;
+ 	build_freelist (chunk, slot_for_size (PINNED_FIRST_SLOT_SIZE), PINNED_FIRST_SLOT_SIZE, chunk->start_data, ((char*)chunk + FREELIST_PAGESIZE));
+ 	DEBUG (4, fprintf (gc_debug_file, "Allocated pinned chunk %p, size: %d\n", chunk, size));
++
++	/*FIXME where are pinned chucks released? */
++	block_map_register_block (&chunk->block, (mword)chunk->start_data, (mword)((char*)chunk + size));
++
+ 	return chunk;
+ }
+ 
+@@ -3901,6 +4015,8 @@ free_large_object (LOSObject *obj)
+ 	size += sizeof (LOSObject);
+ 	size += pagesize - 1;
+ 	size &= ~(pagesize - 1);
++	block_map_deregister_block ((mword)obj->data, (mword)((char*)obj->data + size));
++
+ 	total_alloc -= size;
+ 	los_num_objects--;
+ 	free_os_memory (obj, size);
+@@ -3969,6 +4085,7 @@ alloc_large_inner (MonoVTable *vtable, size_t size)
+ 	obj->block.role = MEMORY_ROLE_SINGLE_LOS;
+ 	obj->block.next = los_object_list;
+ 
++	block_map_register_block (&obj->block, (mword)obj->data, (mword)((char*)obj->data + size));
+ 	los_object_list = obj;
+ 	los_memory_usage += size;
+ 	los_num_objects++;
+@@ -5840,7 +5957,7 @@ scan_from_remsets (void *start_nursery, void *end_nursery)
+ 		DEBUG (4, fprintf (gc_debug_file, "Scanning global remset range: %p-%p, size: %zd\n", remset->data, remset->store_next, remset->store_next - remset->data));
+ 		store_pos = remset->data;
+ 		for (p = remset->data; p < remset->store_next; p = next_p) {
+-			void **ptr = p [0];
++			void **ptr = (void**)p [0];
+ 
+ 			/*Ignore previously processed remset.*/
+ 			if (!global_remset_location_was_not_added (ptr)) {
+@@ -7222,6 +7339,8 @@ mono_gc_base_init (void)
+ 	pthread_key_create (&thread_info_key, NULL);
+ #endif
+ 
++	block_map_init ();
++
+ 	gc_initialized = TRUE;
+ 	UNLOCK_GC;
+ 	mono_gc_register_thread (&sinfo);

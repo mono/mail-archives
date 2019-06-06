@@ -1,0 +1,176 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] ARM PInvoke issue when using long
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20ARM%20PInvoke%20issue%20when%20using%20long&In-Reply-To=20061114092936.93394.qmail%40web57913.mail.re3.yahoo.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="021346.html">
+   <LINK REL="Next"  HREF="021362.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] ARM PInvoke issue when using long</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20ARM%20PInvoke%20issue%20when%20using%20long&In-Reply-To=20061114092936.93394.qmail%40web57913.mail.re3.yahoo.com"
+       TITLE="[Mono-dev] ARM PInvoke issue when using long">lupus at ximian.com
+       </A><BR>
+    <I>Tue Nov 14 13:34:43 EST 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="021346.html">[Mono-dev] ARM PInvoke issue when using long
+</A></li>
+        <LI>Next message: <A HREF="021362.html">[Mono-dev] ARM PInvoke issue when using long
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21360">[ date ]</a>
+              <a href="thread.html#21360">[ thread ]</a>
+              <a href="subject.html#21360">[ subject ]</a>
+              <a href="author.html#21360">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 11/14/06 D M wrote:
+&gt;<i> I think the issue is with the mini-arm.c add_general (guint *gr, guint *stack_size, ArgInfo *ainfo, gboolean simple) function.
+</I>&gt;<i> It doesn't work properly for MONO_TYPE_I8/MONO_TYPE_R8 if just the first half fits in one register and the other on the stack.
+</I>&gt;<i> mono_arch_create_trampoline seems to handle this case.
+</I>&gt;<i> Is there an easy fix ?
+</I>
+You may want to try this mostly untested patch.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+-------------- next part --------------
+Index: inssel-arm.brg
+===================================================================
+--- inssel-arm.brg	(revision 67852)
++++ inssel-arm.brg	(working copy)
+@@ -274,6 +274,21 @@
+ 
+ stmt: OP_OUTARG_MEMBASE (lreg) {
+ 	int offset = tree-&gt;backend.arg_info &gt;&gt; 8;
++	int partial = (tree-&gt;backend.arg_info &amp; 0xff) == 0xff;
++	if (partial) {
++		MonoCallInst *call = (MonoCallInst*)tree-&gt;inst_right;
++		if (G_BYTE_ORDER == G_BIG_ENDIAN) {
++			MONO_EMIT_NEW_STORE_MEMBASE (s, OP_STORE_MEMBASE_REG, ARMREG_SP, offset, state-&gt;left-&gt;reg1);
++		} else {
++			MONO_EMIT_NEW_STORE_MEMBASE (s, OP_STORE_MEMBASE_REG, ARMREG_SP, offset, state-&gt;left-&gt;reg2);
++		}
++		tree-&gt;opcode = OP_SETREG;
++		tree-&gt;dreg = mono_regstate_next_int (s-&gt;rs);
++		tree-&gt;sreg1 = G_BYTE_ORDER == G_BIG_ENDIAN? state-&gt;left-&gt;reg2: state-&gt;left-&gt;reg1;
++		mono_bblock_add_inst (s-&gt;cbb, tree);
++		mono_call_inst_add_outarg_reg (s, call, tree-&gt;dreg, ARMREG_R3, FALSE);
++		return;
++	}
+ 	if (G_BYTE_ORDER == G_BIG_ENDIAN) {
+ 		MONO_EMIT_NEW_STORE_MEMBASE (s, OP_STORE_MEMBASE_REG, ARMREG_SP, offset, state-&gt;left-&gt;reg2);
+ 		MONO_EMIT_NEW_STORE_MEMBASE (s, OP_STORE_MEMBASE_REG, ARMREG_SP, offset + 4, state-&gt;left-&gt;reg1);
+@@ -286,6 +301,7 @@
+ stmt: OP_OUTARG_MEMBASE (freg) {
+ 	int offset = tree-&gt;backend.arg_info &gt;&gt; 8;
+ 	if (SOFT_FLOAT_IMPL) {
++		int partial = (tree-&gt;backend.arg_info &amp; 0xff) == 0xff;
+ 		/* same as OP_OUTARG_MEMBASE (lreg) */
+ 		if (G_BYTE_ORDER == G_BIG_ENDIAN) {
+ 			MONO_EMIT_NEW_STORE_MEMBASE (s, OP_STORE_MEMBASE_REG, ARMREG_SP, offset, state-&gt;left-&gt;reg2);
+@@ -299,7 +315,17 @@
+ 			MONO_EMIT_NEW_STORE_MEMBASE (s, OP_STORER8_MEMBASE_REG, ARMREG_SP, offset, state-&gt;left-&gt;reg1);
+ 		else if ((tree-&gt;backend.arg_info &amp; 0xff) == 4)
+ 			MONO_EMIT_NEW_STORE_MEMBASE (s, OP_STORER4_MEMBASE_REG, ARMREG_SP, offset, state-&gt;left-&gt;reg1);
+-		else
++		else if ((tree-&gt;backend.arg_info &amp; 0xff) == 0xff) {
++			MonoCallInst *call = (MonoCallInst*)tree-&gt;inst_right;
++			int creg;
++			MONO_EMIT_NEW_STORE_MEMBASE (s, OP_STORER8_MEMBASE_REG, ARMREG_SP, (s-&gt;param_area - 8), state-&gt;left-&gt;reg1);
++			creg = mono_regstate_next_int (s-&gt;rs);
++			mono_call_inst_add_outarg_reg (s, call, creg, ARMREG_R3, FALSE);
++			MONO_EMIT_NEW_LOAD_MEMBASE_OP (s, OP_LOAD_MEMBASE, creg, ARMREG_SP, (s-&gt;param_area - 8));
++			creg = mono_regstate_next_int (s-&gt;rs);
++			MONO_EMIT_NEW_LOAD_MEMBASE_OP (s, OP_LOAD_MEMBASE, creg, ARMREG_SP, (s-&gt;param_area - 4));
++			MONO_EMIT_NEW_STORE_MEMBASE (s, OP_STORE_MEMBASE_REG, ARMREG_SP, offset, creg);
++		} else
+ 			g_assert_not_reached ();
+ 	}
+ }
+Index: mini-arm.c
+===================================================================
+--- mini-arm.c	(revision 67852)
++++ mini-arm.c	(working copy)
+@@ -318,6 +318,7 @@
+ enum {
+ 	RegTypeGeneral,
+ 	RegTypeBase,
++	RegTypeBaseGen,
+ 	RegTypeFP,
+ 	RegTypeStructByVal,
+ 	RegTypeStructByAddr
+@@ -355,7 +356,13 @@
+ 			ainfo-&gt;reg = *gr;
+ 		}
+ 	} else {
+-		if (*gr &gt; ARMREG_R2) {
++		if (*gr == ARMREG_R3) {
++			/* first word in r3 and the second on the stack */
++			ainfo-&gt;offset = *stack_size;
++			ainfo-&gt;reg = ARMREG_SP; /* in the caller */
++			ainfo-&gt;regtype = RegTypeBaseGen;
++			*stack_size += 4;
++		} else if (*gr &gt; ARMREG_R3) {
+ 			/**stack_size += 7;
+ 			*stack_size &amp;= ~7;*/
+ 			ainfo-&gt;offset = *stack_size;
+@@ -820,6 +827,12 @@
+ 			} else if (ainfo-&gt;regtype == RegTypeBase) {
+ 				arg-&gt;opcode = OP_OUTARG_MEMBASE;
+ 				arg-&gt;backend.arg_info = (ainfo-&gt;offset &lt;&lt; 8) | ainfo-&gt;size;
++			} else if (ainfo-&gt;regtype == RegTypeBaseGen) {
++				call-&gt;used_iregs |= 1 &lt;&lt; ARMREG_R3;
++				arg-&gt;opcode = OP_OUTARG_MEMBASE;
++				arg-&gt;backend.arg_info = (ainfo-&gt;offset &lt;&lt; 8) | 0xff;
++				if (arg-&gt;type == STACK_R8)
++					cfg-&gt;flags |= MONO_CFG_HAS_FPOUT;
+ 			} else if (ainfo-&gt;regtype == RegTypeFP) {
+ 				arg-&gt;backend.reg3 = ainfo-&gt;reg;
+ 				/* FP args are passed in int regs */
+@@ -2984,6 +2997,12 @@
+ 					}
+ 					break;
+ 				}
++			} else if (ainfo-&gt;regtype == RegTypeBaseGen) {
++				g_assert (arm_is_imm12 (prev_sp_offset + ainfo-&gt;offset));
++				g_assert (arm_is_imm12 (inst-&gt;inst_offset));
++				ARM_LDR_IMM (code, ARMREG_LR, ARMREG_SP, (prev_sp_offset + ainfo-&gt;offset));
++				ARM_STR_IMM (code, ARMREG_LR, inst-&gt;inst_basereg, inst-&gt;inst_offset + 4);
++				ARM_STR_IMM (code, ARMREG_R3, inst-&gt;inst_basereg, inst-&gt;inst_offset);
+ 			} else if (ainfo-&gt;regtype == RegTypeBase) {
+ 				g_assert (arm_is_imm12 (prev_sp_offset + ainfo-&gt;offset));
+ 				switch (ainfo-&gt;size) {
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="021346.html">[Mono-dev] ARM PInvoke issue when using long
+</A></li>
+	<LI>Next message: <A HREF="021362.html">[Mono-dev] ARM PInvoke issue when using long
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21360">[ date ]</a>
+              <a href="thread.html#21360">[ thread ]</a>
+              <a href="subject.html#21360">[ subject ]</a>
+              <a href="author.html#21360">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

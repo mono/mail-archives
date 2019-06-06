@@ -1,0 +1,1398 @@
+Index: ChangeLog
+from  Raja R Harinath  <rharinath@novell.com>
+
+	Improve standard-compliance of simple name and member access 
+	resolution.  Fixes bugs #52697, #57200, #67520, #69519.
+	* ecore.cs (FullNamedExpression): New abstract base class 
+	for Namespaces and TypeExpressions.
+	(ResolveFlags.SimpleName): Remove.
+	(SimpleName): Remove support for dotted names.
+	(SimpleName.ResolveAsTypeStep): Simplify.  Now just a wrapper to 
+	DeclSpace.FindType and DeclSpace.LookupType.
+	(SimpleName.DoSimpleNameResolve): Remove support for dotted names.
+	(Expression.ExprClassName): Make member function.
+	* expression.cs (MemberAccess.ResolveAsTypeStep): Support LHS being
+	a namespace.  Remove creation of dotted "SimpleName"s.
+	(MemberAccess.DoResolve): Likewise.
+	* decl.cs (DeclSpace.Cache): Make private.
+	(DeclSpace.LookupInterfaceOrClass): Return a FullNamedExpression.
+	(DeclSpace.FindType): Update.
+	(DeclSpace.LookupType): Move here from RootContext.  Return a 
+	FullNamedExpression.
+	* namespace.cs (Namespace): Derive from FullNamedExpression
+	so that it can be part of expression resolution.
+	(Namespace.Lookup): Return an FullNamedExpression.
+	(NamespaceEntry.LookupAlias): Lookup aliases only in current
+	namespace.
+	* rootcontext.cs (NamespaceLookup): Remove.
+	(LookupType): Move to DeclSpace.
+	* attribute.cs (CheckAttributeType): Update.
+	* doc.cs (FindDocumentedType): Remove allowAlias argument.
+	(FindDocumentedTypeNonArray): Likewise.
+
+Index: rootcontext.cs
+===================================================================
+--- rootcontext.cs	(revision 38480)
++++ rootcontext.cs	(working copy)
+@@ -473,97 +473,6 @@
+ 			helper_classes.Add (helper_class);
+ 		}
+ 		
+-		static Type NamespaceLookup (DeclSpace ds, string name, Location loc)
+-		{
+-			IAlias result = ds.NamespaceEntry.LookupNamespaceOrType (ds, name, loc);
+-			if (result == null)
+-				return null;
+-
+-			if (!result.IsType)
+-				return null;
+-
+-			TypeExpr texpr = result.ResolveAsType (ds.EmitContext);
+-			if (texpr == null)
+-				return null;
+-
+-			return texpr.Type;
+-		}
+-		
+-		//
+-		// Public function used to locate types, this can only
+-		// be used after the ResolveTree function has been invoked.
+-		//
+-		// Returns: Type or null if they type can not be found.
+-		//
+-		// Come to think of it, this should be a DeclSpace
+-		//
+-		static public Type LookupType (DeclSpace ds, string name, bool silent, Location loc)
+-		{
+-			Type t;
+-
+-			if (ds.Cache.Contains (name)) {
+-				t = (Type) ds.Cache [name];
+-			} else {
+-				//
+-				// For the case the type we are looking for is nested within this one
+-				// or is in any base class
+-				//
+-				DeclSpace containing_ds = ds;
+-				while (containing_ds != null){
+-					
+-					// if the member cache has been created, lets use it.
+-					// the member cache is MUCH faster.
+-					if (containing_ds.MemberCache != null) {
+-						t = containing_ds.MemberCache.FindNestedType (name);
+-						if (t == null) {
+-							containing_ds = containing_ds.Parent;
+-							continue;
+-						}
+-
+-						ds.Cache [name] = t;
+-						return t;
+-					}
+-					
+-					// no member cache. Do it the hard way -- reflection
+-					Type current_type = containing_ds.TypeBuilder;
+-					
+-					while (current_type != null &&
+-					       current_type != TypeManager.object_type) {
+-						//
+-						// nested class
+-						//
+-						t = TypeManager.LookupType (current_type.FullName + "." + name);
+-						if (t != null){
+-							ds.Cache [name] = t;
+-							return t;
+-						}
+-						
+-						current_type = current_type.BaseType;
+-					}
+-					
+-					containing_ds = containing_ds.Parent;
+-				}
+-				
+-				t = NamespaceLookup (ds, name, loc);
+-				if (!silent || t != null)
+-					ds.Cache [name] = t;
+-			}
+-
+-			if (t == null && !silent)
+-				Report.Error (246, loc, "Cannot find type `"+name+"'");
+-			
+-			return t;
+-		}
+-
+-		// <summary>
+-		//   This is the silent version of LookupType, you can use this
+-		//   to `probe' for a type
+-		// </summary>
+-		static public Type LookupType (TypeContainer tc, string name, Location loc)
+-		{
+-			return LookupType (tc, name, true, loc);
+-		}
+-
+ 		static void Report1530 (Location loc)
+ 		{
+ 			Report.Error (1530, loc, "Keyword new not allowed for namespace elements");
+Index: namespace.cs
+===================================================================
+--- namespace.cs	(revision 38480)
++++ namespace.cs	(working copy)
+@@ -13,8 +13,11 @@
+ 
+ 	/// <summary>
+ 	///   Keeps track of the namespaces defined in the C# code.
++	///
++	///   This is an Expression to allow it to be referenced in the
++	///   compiler parse/intermediate tree during name resolution.
+ 	/// </summary>
+-	public class Namespace : IAlias {
++	public class Namespace : FullNamedExpression, IAlias {
+ 		static ArrayList all_namespaces = new ArrayList ();
+ 		static Hashtable namespaces_map = new Hashtable ();
+ 		
+@@ -31,6 +34,11 @@
+ 		/// </summary>
+ 		public Namespace (Namespace parent, string name)
+ 		{
++			// Expression members.
++			this.eclass = ExprClass.Namespace;
++			this.Type = null;
++			this.loc = Location.Null;
++
+ 			this.parent = parent;
+ 
+ 			string pname = parent != null ? parent.Name : "";
+@@ -50,6 +58,16 @@
+ 			namespaces_map [fullname] = true;
+ 		}
+ 
++		public override Expression DoResolve (EmitContext ec)
++		{
++			return this;
++		}
++
++		public override void Emit (EmitContext ec)
++		{
++			throw new InternalErrorException ("Expression tree referenced namespace " + fullname + " during Emit ()");
++		}
++
+ 		public static bool IsNamespace (string name)
+ 		{
+ 			return namespaces_map [name] != null;
+@@ -88,9 +106,9 @@
+ 			return Root.GetNamespace (name, create);
+ 		}
+ 
+-		public IAlias Lookup (DeclSpace ds, string name, Location loc)
++		public FullNamedExpression Lookup (DeclSpace ds, string name, Location loc)
+ 		{
+-			IAlias o = Lookup (name);
++			IAlias o = (IAlias) defined_names [name];
+ 
+ 			Type t;
+ 			DeclSpace tdecl = o as DeclSpace;
+@@ -98,7 +116,7 @@
+ 				t = tdecl.DefineType ();
+ 
+ 				if ((ds == null) || ds.CheckAccessLevel (t))
+-					return new TypeExpression (t, loc);
++					return new TypeExpression (t, Location.Null);
+ 			}
+ 
+ 			Namespace ns = GetNamespace (name, false);
+@@ -109,7 +127,7 @@
+ 			if ((t == null) || ((ds != null) && !ds.CheckAccessLevel (t)))
+ 				return null;
+ 
+-			return new TypeExpression (t, loc);
++			return new TypeExpression (t, Location.Null);
+ 		}
+ 
+ 		public void AddNamespaceEntry (NamespaceEntry entry)
+@@ -122,11 +140,6 @@
+ 			defined_names.Add (name, o);
+ 		}
+ 
+-		public IAlias Lookup (string name)
+-		{
+-			return (IAlias) defined_names [name];
+-		}
+-
+ 		static public ArrayList UserDefinedNamespaces {
+ 			get {
+ 				return all_namespaces;
+@@ -142,6 +155,12 @@
+ 			}
+ 		}
+ 
++		public override string FullName {
++			get {
++				return fullname;
++			}
++		}
++
+ 		/// <summary>
+ 		///   The parent of this namespace, used by the parser to "Pop"
+ 		///   the current namespace declaration
+@@ -226,7 +245,7 @@
+ 				if (resolved_ns != null)
+ 					return resolved_ns;
+ 
+-				object resolved = NamespaceEntry.LookupForUsing (Name, Location);
++				FullNamedExpression resolved = NamespaceEntry.LookupForUsing (Name, Location);
+ 				resolved_ns = resolved as Namespace;
+ 				return resolved_ns;
+ 			}
+@@ -246,9 +265,9 @@
+ 				Location = loc;
+ 			}
+ 
+-			IAlias resolved;
++			FullNamedExpression resolved;
+ 
+-			public IAlias Resolve ()
++			public FullNamedExpression Resolve ()
+ 			{
+ 				if (resolved != null)
+ 					return resolved;
+@@ -362,28 +381,15 @@
+ 			aliases [name] = new AliasEntry (this, name, alias, loc);
+ 		}
+ 
+-		protected AliasEntry GetAliasEntry (string alias)
++		public FullNamedExpression LookupAlias (string alias)
+ 		{
+ 			AliasEntry entry = null;
+-
+ 			if (aliases != null)
+ 				entry = (AliasEntry) aliases [alias];
+-			if (entry == null && Parent != null)
+-				entry = Parent.GetAliasEntry (alias);
+ 
+-			return entry;
++			return entry == null ? null : entry.Resolve ();
+ 		}
+ 
+-		public IAlias LookupAlias (string alias)
+-		{
+-			AliasEntry entry = GetAliasEntry (alias);
+-
+-			if (entry == null)
+-				return null;
+-
+-			return entry.Resolve ();
+-		}
+-
+ 		//
+ 		// According to section 16.3.1 (using-alias-directive), the namespace-or-type-name is 
+ 		// resolved as if the immediately containing namespace body has no using-directives.
+@@ -391,7 +397,7 @@
+ 		// Section 16.3.2 says that the same rule is applied when resolving the namespace-name
+ 		// in the using-namespace-directive.
+ 		//
+-		public IAlias LookupForUsing (string dotted_name, Location loc)
++		public FullNamedExpression LookupForUsing (string dotted_name, Location loc)
+ 		{
+ 			int pos = dotted_name.IndexOf ('.');
+ 			string simple_name = dotted_name;
+@@ -401,7 +407,7 @@
+ 				rest = dotted_name.Substring (pos + 1);
+ 			}
+ 
+-			IAlias o = NS.Lookup (null, simple_name, loc);
++			FullNamedExpression o = NS.Lookup (null, simple_name, loc);
+ 			if (o == null && ImplicitParent != null)
+ 				o = ImplicitParent.LookupNamespaceOrType (null, simple_name, loc);
+ 
+@@ -412,16 +418,16 @@
+ 			if (ns != null)
+ 				return ns.Lookup (null, rest, loc);
+ 			
+-			Type nested = TypeManager.LookupType (o.Name + "." + rest);
++			Type nested = TypeManager.LookupType (o.FullName + "." + rest);
+ 			if (nested == null)
+ 				return null;
+ 
+-			return new TypeExpression (nested, loc);
++			return new TypeExpression (nested, Location.Null);
+ 		}
+ 
+-		public IAlias LookupNamespaceOrType (DeclSpace ds, string name, Location loc)
++		public FullNamedExpression LookupNamespaceOrType (DeclSpace ds, string name, Location loc)
+ 		{
+-			IAlias resolved = null;
++			FullNamedExpression resolved = null;
+ 			for (NamespaceEntry curr_ns = this; curr_ns != null; curr_ns = curr_ns.ImplicitParent) {
+ 				if ((resolved = curr_ns.Lookup (ds, name, loc)) != null)
+ 					break;
+@@ -429,9 +435,9 @@
+ 			return resolved;
+ 		}
+ 
+-		private IAlias Lookup (DeclSpace ds, string name, Location loc)
++		private FullNamedExpression Lookup (DeclSpace ds, string name, Location loc)
+ 		{
+-			IAlias o;
++			FullNamedExpression o;
+ 			Namespace ns;
+ 
+ 			//
+@@ -455,11 +461,11 @@
+ 				if (ns != null)
+ 					return ns.Lookup (ds, last, loc);
+ 
+-				Type nested = TypeManager.LookupType (o.Name + "." + last);
++				Type nested = TypeManager.LookupType (o.FullName + "." + last);
+ 				if ((nested == null) || ((ds != null) && !ds.CheckAccessLevel (nested)))
+ 					return null;
+ 
+-				return new TypeExpression (nested, loc);
++				return new TypeExpression (nested, Location.Null);
+ 			}
+ 
+ 			//
+@@ -472,12 +478,9 @@
+ 			//
+ 			// Check aliases.
+ 			//
+-			AliasEntry entry = GetAliasEntry (name);
+-			if (entry != null) {
+-				o = entry.Resolve ();
+-				if (o != null)
+-					return o;
+-			}
++			o = LookupAlias (name);
++			if (o != null)
++				return o;
+ 
+ 			if (name.IndexOf ('.') > 0)
+ 				return null;
+@@ -485,12 +488,12 @@
+ 			//
+ 			// Check using entries.
+ 			//
+-			IAlias t = null, match = null;
++			FullNamedExpression t = null, match = null;
+ 			foreach (Namespace using_ns in GetUsingTable ()) {
+ 				match = using_ns.Lookup (ds, name, loc);
+-				if ((match != null) && match.IsType){
++				if ((match != null) && (match is TypeExpr)) {
+ 					if (t != null) {
+-						DeclSpace.Error_AmbiguousTypeReference (loc, name, t.Name, match.Name);
++						DeclSpace.Error_AmbiguousTypeReference (loc, name, t.FullName, match.FullName);
+ 						return null;
+ 					} else {
+ 						t = match;
+@@ -507,10 +510,12 @@
+ 		{
+ 			if (namespace_using_table != null)
+ 				return namespace_using_table;
+-			
+-			if (using_clauses == null)
+-				return new Namespace [0];
+ 
++			if (using_clauses == null) {
++				namespace_using_table = new Namespace [0];
++				return namespace_using_table;
++			}
++
+ 			ArrayList list = new ArrayList (using_clauses.Count);
+ 
+ 			foreach (UsingEntry ue in using_clauses) {
+Index: ecore.cs
+===================================================================
+--- ecore.cs	(revision 38480)
++++ ecore.cs	(working copy)
+@@ -51,20 +51,15 @@
+ 		// Returns a method group.
+ 		MethodGroup		= 4,
+ 
+-		// Allows SimpleNames to be returned.
+-		// This is used by MemberAccess to construct long names that can not be
+-		// partially resolved (namespace-qualified names for example).
+-		SimpleName		= 8,
+-
+ 		// Mask of all the expression class flags.
+-		MaskExprClass		= 15,
++		MaskExprClass		= 7,
+ 
+ 		// Disable control flow analysis while resolving the expression.
+ 		// This is used when resolving the instance expression of a field expression.
+-		DisableFlowAnalysis	= 16,
++		DisableFlowAnalysis	= 8,
+ 
+ 		// Set if this is resolving the first part of a MemberAccess.
+-		Intermediate		= 32
++		Intermediate		= 16
+ 	}
+ 
+ 	//
+@@ -308,11 +303,10 @@
+ 		}
+ 
+ 		//
+-		// This is used if the expression should be resolved as a type.
+-		// the default implementation fails.   Use this method in
+-		// those participants in the SimpleName chain system.
++		// This is used if the expression should be resolved as a type or namespace name.
++		// the default implementation fails.   
+ 		//
+-		public virtual Expression ResolveAsTypeStep (EmitContext ec)
++		public virtual FullNamedExpression ResolveAsTypeStep (EmitContext ec)
+ 		{
+ 			return null;
+ 		}
+@@ -326,14 +320,25 @@
+ 		{
+ 			int errors = Report.Errors;
+ 
+-			TypeExpr te = ResolveAsTypeStep (ec) as TypeExpr;
++			if (ec == null)
++				throw new InternalErrorException ("How in hell? ec");
+ 
+-			if (te == null || te.eclass != ExprClass.Type) {
++			FullNamedExpression e = ResolveAsTypeStep (ec);
++
++			if (e == null) {
+ 				if (!silent && errors == Report.Errors)
+ 					Report.Error (246, Location, "Cannot find type '{0}'", ToString ());
+ 				return null;
+ 			}
++			if (e.eclass != ExprClass.Type) {
++				if (!silent && errors == Report.Errors)
++					Report.Error (118, Location, "'{0}' denotes a '{1}', where a type was expected",
++						      e.FullName, e.ExprClassName ());
++				return null;
++			}
+ 
++			TypeExpr te = e as TypeExpr;
++
+ 			if (!te.CheckAccessLevel (ec.DeclSpace)) {
+ 				Report.Error (122, Location, "'{0}' is inaccessible due to its protection level", te.Name);
+ 				return null;
+@@ -369,22 +374,14 @@
+ 
+ 			ec.DoFlowAnalysis = old_do_flow_analysis;
+ 
+-			if (e == null)
+-				return null;
+-
+-			if (e is SimpleName){
+-				SimpleName s = (SimpleName) e;
+-
+-				if ((flags & ResolveFlags.SimpleName) == 0) {
+-					MemberLookupFailed (ec, null, ec.ContainerType, s.Name,
++			if (e == null) {
++				if (this is SimpleName)
++					MemberLookupFailed (ec, null, ec.ContainerType, ((SimpleName) this).Name, 
+ 							    ec.DeclSpace.Name, loc);
+-					return null;
+-				}
+-
+-				return s;
++				return null;
+ 			}
+ 
+-			if ((e is TypeExpr) || (e is ComposedCast)) {
++			if ((e is TypeExpr) || (e is ComposedCast) || (e is Namespace)) {
+ 				if ((flags & ResolveFlags.Type) == 0) {
+ 					e.Error_UnexpectedKind (flags, loc);
+ 					return null;
+@@ -395,6 +392,7 @@
+ 
+ 			switch (e.eclass) {
+ 			case ExprClass.Type:
++			case ExprClass.Namespace:
+ 				if ((flags & ResolveFlags.VariableOrValue) == 0) {
+ 					e.Error_UnexpectedKind (flags, loc);
+ 					return null;
+@@ -431,11 +429,12 @@
+ 						     " ExprClass is Invalid after resolve");
+ 			}
+ 
+-			if (e.type == null)
++			if (e.type == null && !(e is Namespace)) {
+ 				throw new Exception (
+ 					"Expression " + e.GetType () +
+ 					" did not set its type after Resolve\n" +
+ 					"called from: " + this.GetType ());
++			}
+ 
+ 			return e;
+ 		}
+@@ -854,9 +853,9 @@
+ 			return operator_true;
+ 		}
+ 		
+-		static string ExprClassName (ExprClass c)
++		public string ExprClassName ()
+ 		{
+-			switch (c){
++			switch (eclass){
+ 			case ExprClass.Invalid:
+ 				return "Invalid";
+ 			case ExprClass.Value:
+@@ -886,11 +885,7 @@
+ 		/// </summary>
+ 		public void Error_UnexpectedKind (string expected, Location loc)
+ 		{
+-			string kind = "Unknown";
+-			
+-			kind = ExprClassName (eclass);
+-
+-			Report.Error (118, loc, "Expression denotes a `" + kind +
++			Report.Error (118, loc, "Expression denotes a `" + ExprClassName () +
+ 			       "' where a `" + expected + "' was expected");
+ 		}
+ 
+@@ -909,9 +904,6 @@
+ 			if ((flags & ResolveFlags.MethodGroup) != 0)
+ 				valid.Add ("method group");
+ 
+-			if ((flags & ResolveFlags.SimpleName) != 0)
+-				valid.Add ("simple name");
+-
+ 			if (valid.Count == 0)
+ 				valid.Add ("unknown");
+ 
+@@ -924,9 +916,7 @@
+ 				sb.Append (valid [i]);
+ 			}
+ 
+-			string kind = ExprClassName (eclass);
+-
+-			Error (119, "Expression denotes a `" + kind + "' where " +
++			Error (119, "Expression denotes a `" + ExprClassName () + "' where " +
+ 			       "a `" + sb.ToString () + "' was expected");
+ 		}
+ 		
+@@ -1976,53 +1966,16 @@
+ 	}
+ 	
+ 	/// <summary>
+-	///   SimpleName expressions are initially formed of a single
+-	///   word and it only happens at the beginning of the expression.
++	///   SimpleName expressions are formed of a single word and only happen at the beginning 
++	///   of a dotted-name.
+ 	/// </summary>
+-	///
+-	/// <remarks>
+-	///   The expression will try to be bound to a Field, a Method
+-	///   group or a Property.  If those fail we pass the name to our
+-	///   caller and the SimpleName is compounded to perform a type
+-	///   lookup.  The idea behind this process is that we want to avoid
+-	///   creating a namespace map from the assemblies, as that requires
+-	///   the GetExportedTypes function to be called and a hashtable to
+-	///   be constructed which reduces startup time.  If later we find
+-	///   that this is slower, we should create a `NamespaceExpr' expression
+-	///   that fully participates in the resolution process. 
+-	///   
+-	///   For example `System.Console.WriteLine' is decomposed into
+-	///   MemberAccess (MemberAccess (SimpleName ("System"), "Console"), "WriteLine")
+-	///   
+-	///   The first SimpleName wont produce a match on its own, so it will
+-	///   be turned into:
+-	///   MemberAccess (SimpleName ("System.Console"), "WriteLine").
+-	///   
+-	///   System.Console will produce a TypeExpr match.
+-	///   
+-	///   The downside of this is that we might be hitting `LookupType' too many
+-	///   times with this scheme.
+-	/// </remarks>
+ 	public class SimpleName : Expression {
+ 		public string Name;
+ 
+-		//
+-		// If true, then we are a simple name, not composed with a ".
+-		//
+-		bool is_base;
+-
+-		public SimpleName (string a, string b, Location l)
+-		{
+-			Name = String.Concat (a, ".", b);
+-			loc = l;
+-			is_base = false;
+-		}
+-		
+ 		public SimpleName (string name, Location l)
+ 		{
+ 			Name = name;
+ 			loc = l;
+-			is_base = true;
+ 		}
+ 
+ 		public static void Error_ObjectRefRequired (EmitContext ec, Location l, string name)
+@@ -2073,56 +2026,19 @@
+ 			return SimpleNameResolve (ec, null, true, intermediate);
+ 		}
+ 
+-		public override Expression ResolveAsTypeStep (EmitContext ec)
++		public override FullNamedExpression ResolveAsTypeStep (EmitContext ec)
+ 		{
+ 			DeclSpace ds = ec.DeclSpace;
+-			NamespaceEntry ns = ds.NamespaceEntry;
+-			Type t;
+-			IAlias alias_value;
++			FullNamedExpression dt;
+ 
+-			//
+-			// Since we are cheating: we only do the Alias lookup for
+-			// namespaces if the name does not include any dots in it
+-			//
+-			if (ns != null && is_base)
+-				alias_value = ns.LookupAlias (Name);
+-			else
+-				alias_value = null;
++			int errors = Report.Errors;
++			dt = ec.ResolvingTypeTree 
++				? ds.FindType (loc, Name)
++				: ds.LookupType (Name, true, loc);
++			if (Report.Errors != errors)
++				return null;
+ 
+-			if (ec.ResolvingTypeTree){
+-				int errors = Report.Errors;
+-				Type dt = ds.FindType (loc, Name);
+-
+-				if (Report.Errors != errors)
+-					return null;
+-				
+-				if (dt != null)
+-					return new TypeExpression (dt, loc);
+-
+-				if (alias_value != null){
+-					if (alias_value.IsType)
+-						return alias_value.ResolveAsType (ec);
+-					if ((t = RootContext.LookupType (ds, alias_value.Name, true, loc)) != null)
+-						return new TypeExpression (t, loc);
+-				}
+-			}
+-
+-			if ((t = RootContext.LookupType (ds, Name, true, loc)) != null)
+-				return new TypeExpression (t, loc);
+-
+-			if (alias_value != null) {
+-				if (alias_value.IsType)
+-					return alias_value.ResolveAsType (ec);
+-				if ((t = RootContext.LookupType (ds, alias_value.Name, true, loc)) != null)
+-					return new TypeExpression (t, loc);
+-
+-				// we have alias value, but it isn't Type, so try if it's namespace
+-				return new SimpleName (alias_value.Name, loc);
+-			}
+-
+-			// No match, maybe our parent can compose us
+-			// into something meaningful.
+-			return this;
++			return dt;
+ 		}
+ 
+ 		Expression SimpleNameResolve (EmitContext ec, Expression right_side,
+@@ -2134,12 +2050,9 @@
+ 
+ 			Block current_block = ec.CurrentBlock;
+ 			if (current_block != null){
+-				//LocalInfo vi = current_block.GetLocalInfo (Name);
+-				if (is_base &&
+-				    current_block.IsVariableNameUsedInChildBlock(Name)) {
++				if (current_block.IsVariableNameUsedInChildBlock (Name)) {
+ 					Report.Error (135, Location,
+-						      "'{0}' has a different meaning in a " +
+-						      "child block", Name);
++						      "'{0}' has a different meaning in a child block", Name);
+ 					return null;
+ 				}
+ 			}
+@@ -2213,34 +2126,8 @@
+ 			if (e == null && ec.ContainerType != null)
+ 				e = MemberLookup (ec, ec.ContainerType, Name, loc);
+ 
+-			if (e == null) {
+-				//
+-				// Since we are cheating (is_base is our hint
+-				// that we are the beginning of the name): we
+-				// only do the Alias lookup for namespaces if
+-				// the name does not include any dots in it
+-				//
+-				NamespaceEntry ns = ec.DeclSpace.NamespaceEntry;
+-				if (is_base && ns != null){
+-					IAlias alias_value = ns.LookupAlias (Name);
+-					if (alias_value != null){
+-						if (alias_value.IsType)
+-							return alias_value.ResolveAsType (ec);
+-
+-						Name = alias_value.Name;
+-						Type t;
+-
+-						if ((t = TypeManager.LookupType (Name)) != null)
+-							return new TypeExpression (t, loc);
+-					
+-						// No match, maybe our parent can compose us
+-						// into something meaningful.
+-						return this;
+-					}
+-				}
+-
++			if (e == null)
+ 				return ResolveAsTypeStep (ec);
+-			}
+ 
+ 			if (e is TypeExpr)
+ 				return e;
+@@ -2302,12 +2189,22 @@
+ 			return Name;
+ 		}
+ 	}
++
++	/// <summary>
++	///   Represents a namespace or a type.  The name of the class was inspired by
++	///   section 10.8.1 (Fully Qualified Names).
++	/// </summary>
++	public abstract class FullNamedExpression : Expression {
++		public abstract string FullName {
++			get;
++		}
++	}
+ 	
+ 	/// <summary>
+ 	///   Fully resolved expression that evaluates to a type
+ 	/// </summary>
+-	public abstract class TypeExpr : Expression, IAlias {
+-		override public Expression ResolveAsTypeStep (EmitContext ec)
++	public abstract class TypeExpr : FullNamedExpression {
++		override public FullNamedExpression ResolveAsTypeStep (EmitContext ec)
+ 		{
+ 			TypeExpr t = DoResolveAsTypeStep (ec);
+ 			if (t == null)
+@@ -2405,18 +2302,9 @@
+ 		{
+ 			return Name;
+ 		}
+-
+-		bool IAlias.IsType {
+-			get { return true; }
+-		}
+-
+-		TypeExpr IAlias.ResolveAsType (EmitContext ec)
+-		{
+-			return ResolveAsTypeTerminal (ec, false);
+-		}
+ 	}
+ 
+-	public class TypeExpression : TypeExpr, IAlias {
++	public class TypeExpression : TypeExpr {
+ 		public TypeExpression (Type t, Location l)
+ 		{
+ 			Type = t;
+@@ -2435,7 +2323,7 @@
+ 			}
+ 		}
+ 
+-		string IAlias.Name {
++		public override string FullName {
+ 			get {
+ 				return Type.FullName;
+ 			}
+@@ -2458,10 +2346,12 @@
+ 		public override TypeExpr DoResolveAsTypeStep (EmitContext ec)
+ 		{
+ 			if (type == null) {
+-				type = RootContext.LookupType (
+-					ec.DeclSpace, name, false, Location.Null);
+-				if (type == null)
++				FullNamedExpression t = ec.DeclSpace.LookupType (name, false, Location.Null);
++				if (t == null)
+ 					return null;
++				if (!(t is TypeExpr))
++					return null;
++				type = ((TypeExpr) t).ResolveType (ec);
+ 			}
+ 
+ 			return this;
+@@ -2472,11 +2362,16 @@
+ 				return name;
+ 			}
+ 		}
++
++		public override string FullName {
++			get {
++				return name;
++			}
++		}
+ 	}
+ 
+-	public class TypeAliasExpression : TypeExpr, IAlias {
++	public class TypeAliasExpression : TypeExpr {
+ 		TypeExpr texpr;
+-		string name;
+ 
+ 		public TypeAliasExpression (TypeExpr texpr, Location l)
+ 		{
+@@ -2484,13 +2379,16 @@
+ 			loc = texpr.Location;
+ 
+ 			eclass = ExprClass.Type;
+-			name = texpr.Name;
+ 		}
+ 
+ 		public override string Name {
+-			get { return name; }
++			get { return texpr.Name; }
+ 		}
+ 
++		public override string FullName {
++			get { return texpr.FullName; }
++		}
++
+ 		public override TypeExpr DoResolveAsTypeStep (EmitContext ec)
+ 		{
+ 			Type type = texpr.ResolveType (ec);
+Index: decl.cs
+===================================================================
+--- decl.cs	(revision 38480)
++++ decl.cs	(working copy)
+@@ -432,7 +432,7 @@
+ 		//
+ 		public NamespaceEntry NamespaceEntry;
+ 
+-		public Hashtable Cache = new Hashtable ();
++		private Hashtable Cache = new Hashtable ();
+ 		
+ 		public string Basename;
+ 		
+@@ -516,17 +516,6 @@
+ 				in_transit = value;
+ 			}
+ 		}
+-
+-		/// <summary>
+-		///   Looks up the alias for the name
+-		/// </summary>
+-		public IAlias LookupAlias (string name)
+-		{
+-			if (NamespaceEntry != null)
+-				return NamespaceEntry.LookupAlias (name);
+-			else
+-				return null;
+-		}
+ 		
+ 		// 
+ 		// root_types contains all the types.  All TopLevel types
+@@ -818,9 +807,10 @@
+ 			return tc.DefineType ();
+ 		}
+ 		
+-		Type LookupInterfaceOrClass (string ns, string name, out bool error)
++		FullNamedExpression LookupInterfaceOrClass (string ns, string name, out bool error)
+ 		{
+ 			DeclSpace parent;
++			FullNamedExpression result;
+ 			Type t;
+ 			object r;
+ 			
+@@ -828,7 +818,7 @@
+ 			int p = name.LastIndexOf ('.');
+ 
+ 			if (dh.Lookup (ns, name, out r))
+-				return (Type) r;
++				return (FullNamedExpression) r;
+ 			else {
+ 				//
+ 				// If the type is not a nested type, we do not need `LookupType's processing.
+@@ -849,10 +839,25 @@
+ 			}
+ 			
+ 			if (t != null) {
+-				dh.Insert (ns, name, t);
+-				return t;
++				result = new TypeExpression (t, Location.Null);
++				dh.Insert (ns, name, result);
++				return result;
+ 			}
+ 
++			if (ns != "" && Namespace.IsNamespace (ns)) {
++				result = Namespace.LookupNamespace (ns, false).Lookup (this, name, Location.Null);
++				if (result != null) {
++					dh.Insert (ns, name, result);
++					return result;
++				}
++			}
++
++			if (ns == "" && Namespace.IsNamespace (name)) {
++				result = Namespace.LookupNamespace (name, false);
++				dh.Insert (ns, name, result);
++				return result;
++			}
++
+ 			//
+ 			// In case we are fed a composite name, normalize it.
+ 			//
+@@ -861,7 +866,10 @@
+ 				ns = MakeFQN (ns, name.Substring (0, p));
+ 				name = name.Substring (p+1);
+ 			}
+-			
++
++			if (ns.IndexOf ('+') != -1)
++				ns = ns.Replace ('+', '.');
++
+ 			parent = RootContext.Tree.LookupByNamespace (ns, name);
+ 			if (parent == null) {
+ 				dh.Insert (ns, name, null);
+@@ -874,8 +882,9 @@
+ 				return null;
+ 			}
+ 			
+-			dh.Insert (ns, name, t);
+-			return t;
++			result = new TypeExpression (t, Location.Null);
++			dh.Insert (ns, name, result);
++			return result;
+ 		}
+ 
+ 		public static void Error_AmbiguousTypeReference (Location loc, string name, string t1, string t2)
+@@ -897,15 +906,16 @@
+ 		///   during the tree resolution process and potentially define
+ 		///   recursively the type
+ 		/// </remarks>
+-		public Type FindType (Location loc, string name)
++		public FullNamedExpression FindType (Location loc, string name)
+ 		{
+-			Type t;
++			FullNamedExpression t;
+ 			bool error;
+ 
+ 			//
+ 			// For the case the type we are looking for is nested within this one
+ 			// or is in any base class
+ 			//
++
+ 			DeclSpace containing_ds = this;
+ 
+ 			while (containing_ds != null){
+@@ -919,7 +929,7 @@
+ 					if (error)
+ 						return null;
+ 				
+-					if ((t != null) && containing_ds.CheckAccessLevel (t))
++					if ((t != null) && containing_ds.CheckAccessLevel (t.Type))
+ 						return t;
+ 
+ 					current_type = current_type.BaseType;
+@@ -966,34 +976,27 @@
+ 				if (name.IndexOf ('.') > 0)
+ 					continue;
+ 
+-				IAlias alias_value = ns.LookupAlias (name);
+-				if (alias_value != null) {
+-					t = LookupInterfaceOrClass ("", alias_value.Name, out error);
+-					if (error)
+-						return null;
++				t = ns.LookupAlias (name);
++				if (t != null)
++					return t;
+ 
+-					if (t != null)
+-						return t;
+-				}
+-
+ 				//
+ 				// Now check the using clause list
+ 				//
+-				Type match = null;
++				FullNamedExpression match = null;
+ 				foreach (Namespace using_ns in ns.GetUsingTable ()) {
+ 					match = LookupInterfaceOrClass (using_ns.Name, name, out error);
+ 					if (error)
+ 						return null;
+ 
+-					if (match != null){
++					if ((match != null) && (match is TypeExpr)) {
++						Type matched = ((TypeExpr) match).Type;
++						if (!CheckAccessLevel (matched))
++							continue;
+ 						if (t != null){
+-							if (CheckAccessLevel (match)) {
+-								Error_AmbiguousTypeReference (loc, name, t.FullName, match.FullName);
+-								return null;
+-							}
+-							continue;
++							Error_AmbiguousTypeReference (loc, name, t.FullName, match.FullName);
++							return null;
+ 						}
+-						
+ 						t = match;
+ 					}
+ 				}
+@@ -1005,6 +1008,74 @@
+ 			return null;
+ 		}
+ 
++		//
++		// Public function used to locate types, this can only
++		// be used after the ResolveTree function has been invoked.
++		//
++		// Returns: Type or null if they type can not be found.
++		//
++		// Come to think of it, this should be a DeclSpace
++		//
++		public FullNamedExpression LookupType (string name, bool silent, Location loc)
++		{
++			FullNamedExpression e;
++
++			if (Cache.Contains (name)) {
++				e = (FullNamedExpression) Cache [name];
++			} else {
++				//
++				// For the case the type we are looking for is nested within this one
++				// or is in any base class
++				//
++				DeclSpace containing_ds = this;
++				while (containing_ds != null){
++					
++					// if the member cache has been created, lets use it.
++					// the member cache is MUCH faster.
++					if (containing_ds.MemberCache != null) {
++						Type t = containing_ds.MemberCache.FindNestedType (name);
++						if (t == null) {
++							containing_ds = containing_ds.Parent;
++							continue;
++						}
++
++						e = new TypeExpression (t, Location.Null);
++						Cache [name] = e;
++						return e;
++					}
++					
++					// no member cache. Do it the hard way -- reflection
++					Type current_type = containing_ds.TypeBuilder;
++					
++					while (current_type != null &&
++					       current_type != TypeManager.object_type) {
++						//
++						// nested class
++						//
++						Type t = TypeManager.LookupType (current_type.FullName + "." + name);
++						if (t != null){
++							e = new TypeExpression (t, Location.Null);
++							Cache [name] = e;
++							return e;
++						}
++						
++						current_type = current_type.BaseType;
++					}
++					
++					containing_ds = containing_ds.Parent;
++				}
++				
++				e = NamespaceEntry.LookupNamespaceOrType (this, name, loc);
++				if (!silent || e != null)
++					Cache [name] = e;
++			}
++
++			if (e == null && !silent)
++				Report.Error (246, loc, "Cannot find type `"+name+"'");
++			
++			return e;
++		}
++
+ 		/// <remarks>
+ 		///   This function is broken and not what you're looking for.  It should only
+ 		///   be used while the type is still being created since it doesn't use the cache
+Index: expression.cs
+===================================================================
+--- expression.cs	(revision 38480)
++++ expression.cs	(working copy)
+@@ -7061,7 +7061,7 @@
+ 			if (sn == null || left == null || left.Type.Name != sn.Name)
+ 				return false;
+ 
+-			return RootContext.LookupType (ec.DeclSpace, sn.Name, true, loc) != null;
++			return ec.DeclSpace.LookupType (sn.Name, true, loc) != null;
+ 		}
+ 		
+ 		// TODO: possible optimalization
+@@ -7280,12 +7280,12 @@
+ 			if (expr == null)
+ 				return null;
+ 
+-			if (expr is SimpleName){
+-				SimpleName child_expr = (SimpleName) expr;
+-
+-				Expression new_expr = new SimpleName (child_expr.Name, Identifier, loc);
+-
+-				return new_expr.Resolve (ec, flags);
++			if (expr is Namespace) {
++				Namespace ns = (Namespace) expr;
++				FullNamedExpression retval = ns.Lookup (ec.DeclSpace, Identifier, loc);
++				if (retval == null)
++					Report.Error (234, loc, "The type or namespace name `{0}' could not be found in namespace `{1}'", Identifier, ns.FullName);
++				return retval;
+ 			}
+ 					
+ 			//
+@@ -7349,7 +7349,7 @@
+ 				return null;
+ 
+ 			if (member_lookup is TypeExpr) {
+-				if (!(expr is TypeExpr) && !(expr is SimpleName)) {
++				if (!(expr is TypeExpr)) {
+ 					Error (572, "Can't reference type `" + Identifier + "' through an expression; try `" +
+ 					       member_lookup.Type + "' instead");
+ 					return null;
+@@ -7375,47 +7375,27 @@
+ 
+ 		public override Expression DoResolve (EmitContext ec)
+ 		{
+-			return DoResolve (ec, null, ResolveFlags.VariableOrValue |
+-					  ResolveFlags.SimpleName | ResolveFlags.Type);
++			return DoResolve (ec, null, ResolveFlags.VariableOrValue | ResolveFlags.Type);
+ 		}
+ 
+ 		public override Expression DoResolveLValue (EmitContext ec, Expression right_side)
+ 		{
+-			return DoResolve (ec, right_side, ResolveFlags.VariableOrValue |
+-					  ResolveFlags.SimpleName | ResolveFlags.Type);
++			return DoResolve (ec, right_side, ResolveFlags.VariableOrValue | ResolveFlags.Type);
+ 		}
+ 
+-		public override Expression ResolveAsTypeStep (EmitContext ec)
++		public override FullNamedExpression ResolveAsTypeStep (EmitContext ec)
+ 		{
+-			string fname = null;
+-			MemberAccess full_expr = this;
+-			while (full_expr != null) {
+-				if (fname != null)
+-					fname = String.Concat (full_expr.Identifier, ".", fname);
+-				else
+-					fname = full_expr.Identifier;
++			FullNamedExpression new_expr = expr.ResolveAsTypeStep (ec);
+ 
+-				if (full_expr.Expr is SimpleName) {
+-					string full_name = String.Concat (((SimpleName) full_expr.Expr).Name, ".", fname);
+-					Type fully_qualified = ec.DeclSpace.FindType (loc, full_name);
+-					if (fully_qualified != null)
+-						return new TypeExpression (fully_qualified, loc);
+-				}
+-
+-				full_expr = full_expr.Expr as MemberAccess;
+-			}
+-
+-			Expression new_expr = expr.ResolveAsTypeStep (ec);
+-
+ 			if (new_expr == null)
+ 				return null;
+ 
+-			if (new_expr is SimpleName){
+-				SimpleName child_expr = (SimpleName) new_expr;
+-				
+-				new_expr = new SimpleName (child_expr.Name, Identifier, loc);
+-
+-				return new_expr.ResolveAsTypeStep (ec);
++			if (new_expr is Namespace) {
++				Namespace ns = (Namespace) new_expr;
++				FullNamedExpression retval = ns.Lookup (ec.DeclSpace, Identifier, loc);
++				if (retval == null)
++					Report.Error (234, loc, "The type or namespace name `{0}' could not be found in namespace `{1}'", Identifier, ns.FullName);
++				return retval;
+ 			}
+ 
+ 			Type expr_type = new_expr.Type;
+@@ -7426,17 +7406,21 @@
+ 				return null;
+ 			}
+ 			
+-			Expression member_lookup;
+-			member_lookup = MemberLookupFinal (ec, expr_type, expr_type, Identifier, loc);
+-			if (member_lookup == null)
++			Expression member_lookup = MemberLookupFinal (ec, expr_type, expr_type, Identifier, loc);
++			if (member_lookup == null) {
++				Report.Error (234, loc, "The type name `{0}' could not be found in type `{1}'", 
++					      Identifier, new_expr.FullName);
+ 				return null;
++			}
+ 
+-			if (member_lookup is TypeExpr){
+-				member_lookup.Resolve (ec, ResolveFlags.Type);
+-				return member_lookup;
++			if (!(member_lookup is TypeExpr)) {
++				Report.Error (118, loc, "'{0}.{1}' denotes a '{2}', where a type was expected",
++					      new_expr.FullName, Identifier, member_lookup.ExprClassName ());
++				return null;
+ 			} 
+ 
+-			return null;			
++			member_lookup = member_lookup.Resolve (ec, ResolveFlags.Type);
++			return (member_lookup as TypeExpr);
+ 		}
+ 
+ 		public override void Emit (EmitContext ec)
+@@ -8586,7 +8570,9 @@
+ 				//
+ 				// For now, fall back to the full lookup in that case.
+ 				//
+-				type = RootContext.LookupType (ec.DeclSpace, cname, false, loc);
++				FullNamedExpression e = ec.DeclSpace.LookupType (cname, false, loc);
++				if (e is TypeExpr)
++					type = ((TypeExpr) e).ResolveType (ec);
+ 				if (type == null)
+ 					return null;
+ 			}
+@@ -8611,6 +8597,12 @@
+ 				return left + dim;
+ 			}
+ 		}
++
++		public override string FullName {
++			get {
++				return type.FullName;
++			}
++		}
+ 	}
+ 
+ 	//
+Index: attribute.cs
+===================================================================
+--- attribute.cs	(revision 38480)
++++ attribute.cs	(working copy)
+@@ -151,15 +151,21 @@
+ 		{
+ 			string NameAttribute = Name + "Attribute";
+ 
+-			Type t1 = ec.ResolvingTypeTree
++			FullNamedExpression n1 = ec.ResolvingTypeTree
+ 				? ec.DeclSpace.FindType (Location, Name)
+-				: RootContext.LookupType (ec.DeclSpace, Name, true, Location);
++				: ec.DeclSpace.LookupType (Name, true, Location);
+ 
+ 			// FIXME: Shouldn't do this for quoted attributes: [@A]
+-			Type t2 = ec.ResolvingTypeTree
++			FullNamedExpression n2 = ec.ResolvingTypeTree
+ 				? ec.DeclSpace.FindType (Location, NameAttribute)
+-				: RootContext.LookupType (ec.DeclSpace, NameAttribute, true, Location);
++				: ec.DeclSpace.LookupType (NameAttribute, true, Location);
+ 
++			TypeExpr e1 = n1 == null ? null : n1 as TypeExpr;
++			TypeExpr e2 = n2 == null ? null : n2 as TypeExpr;			
++
++			Type t1 = e1 == null ? null : e1.ResolveType (ec);
++			Type t2 = e2 == null ? null : e2.ResolveType (ec);
++
+ 			String err0616 = null;
+ 
+ 			if (t1 != null && ! t1.IsSubclassOf (TypeManager.attribute_type)) {
+Index: doc.cs
+===================================================================
+--- doc.cs	(revision 38480)
++++ doc.cs	(working copy)
+@@ -263,8 +263,7 @@
+ 		// returns a full runtime type name from a name which might
+ 		// be C# specific type name.
+ 		//
+-		private static Type FindDocumentedType (MemberCore mc,
+-			string name, DeclSpace ds, bool allowAlias, string cref)
++		private static Type FindDocumentedType (MemberCore mc, string name, DeclSpace ds, string cref)
+ 		{
+ 			bool isArray = false;
+ 			string identifier = name;
+@@ -275,16 +274,14 @@
+ 					isArray = true;
+ 				}
+ 			}
+-			Type t = FindDocumentedTypeNonArray (mc, identifier,
+-				ds, allowAlias, cref);
++			Type t = FindDocumentedTypeNonArray (mc, identifier, ds, cref);
+ 			if (t != null && isArray)
+ 				t = Array.CreateInstance (t, 0).GetType ();
+ 			return t;
+ 		}
+ 
+-		private static Type FindDocumentedTypeNonArray (MemberCore mc,
+-			string identifier, DeclSpace ds, bool allowAlias,
+-			string cref)
++		private static Type FindDocumentedTypeNonArray (MemberCore mc, 
++			string identifier, DeclSpace ds, string cref)
+ 		{
+ 			switch (identifier) {
+ 			case "int":
+@@ -320,30 +317,23 @@
+ 			case "void":
+ 				return typeof (void);
+ 			}
+-			if (allowAlias) {
+-				IAlias alias = ds.LookupAlias (identifier);
+-				if (alias != null)
+-					identifier = alias.Name;
+-			}
+-			Type t = ds.FindType (mc.Location, identifier);
+-			if (t == null)
+-				t = TypeManager.LookupType (identifier);
+-			if (t == null) {
+-				int index = identifier.LastIndexOf ('.');
+-				if (index < 0)
++			FullNamedExpression e = ds.FindType (mc.Location, identifier);
++			if (e != null) {
++				if (!(e is TypeExpr))
+ 					return null;
+-				int warn;
+-				Type parent = FindDocumentedType (mc,
+-					identifier.Substring (0, index),
+-					ds, allowAlias, cref);
+-				if (parent == null)
+-					return null;
+-				t = FindDocumentedMember (mc, parent,
+-					identifier.Substring (index + 1),
+-					emptyParamList,
+-					ds, out warn, cref) as Type;
++				return ((TypeExpr) e).ResolveType (ds.EmitContext);
+ 			}
+-			return t;
++			int index = identifier.LastIndexOf ('.');
++			if (index < 0)
++				return null;
++			int warn;
++			Type parent = FindDocumentedType (mc, identifier.Substring (0, index), ds, cref);
++			if (parent == null)
++				return null;
++			return FindDocumentedMember (mc, parent,
++				identifier.Substring (index + 1),
++				emptyParamList,
++				ds, out warn, cref) as Type;
+ 		}
+ 
+ 		//
+@@ -467,7 +457,7 @@
+ 				((PropertyInfo) mi).PropertyType :
+ 				null;
+ 			if (returnTypeName != null) {
+-				Type returnType = FindDocumentedType (mc, returnTypeName, ds, true, cref);
++				Type returnType = FindDocumentedType (mc, returnTypeName, ds, cref);
+ 				if (returnType == null || returnType != expected) {
+ 					warningType = 1581;
+ 					Report.Warning (1581, 1, mc.Location, "Invalid return type in XML comment cref attribute '{0}'", cref);
+@@ -548,7 +538,7 @@
+ 				ArrayList plist = new ArrayList ();
+ 				for (int i = 0; i < paramList.Length; i++) {
+ 					string paramTypeName = paramList [i].Trim (wsChars);
+-					Type paramType = FindDocumentedType (mc, paramTypeName, ds, true, cref);
++					Type paramType = FindDocumentedType (mc, paramTypeName, ds, cref);
+ 					if (paramType == null) {
+ 						Report.Warning (1580, 1, mc.Location, "Invalid type for parameter '{0}' in XML comment cref attribute '{1}'", i + 1, cref);
+ 						return;
+@@ -568,7 +558,7 @@
+ 				parameters = sb.ToString ();
+ 			}
+ 
+-			Type type = FindDocumentedType (mc, name, ds, true, cref);
++			Type type = FindDocumentedType (mc, name, ds, cref);
+ 			if (type != null) {
+ 				xref.SetAttribute ("cref", "T:" + type.FullName.Replace ("+", "."));
+ 				return; // a type
+@@ -584,7 +574,7 @@
+ 			if (period > 0) {
+ 				string typeName = name.Substring (0, period);
+ 				string memberName = name.Substring (period + 1);
+-				type = FindDocumentedType (mc, typeName, ds, false, cref);
++				type = FindDocumentedType (mc, typeName, ds, cref);
+ 				int warnResult;
+ 				if (type != null) {
+ 					MemberInfo mi = FindDocumentedMember (mc, type, memberName, parameterTypes, ds, out warnResult, cref);

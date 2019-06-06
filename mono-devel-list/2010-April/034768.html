@@ -1,0 +1,209 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Mono generates inefficient vectorized code
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Mono%20generates%20inefficient%20vectorized%20code&In-Reply-To=z2t19e4cfaf1004130801of1e7b5cby1ddecc9660e6482e%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034766.html">
+   <LINK REL="Next"  HREF="034772.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Mono generates inefficient vectorized code</H1>
+    <B>Rodrigo Kumpera</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Mono%20generates%20inefficient%20vectorized%20code&In-Reply-To=z2t19e4cfaf1004130801of1e7b5cby1ddecc9660e6482e%40mail.gmail.com"
+       TITLE="[Mono-dev] Mono generates inefficient vectorized code">kumpera at gmail.com
+       </A><BR>
+    <I>Tue Apr 13 12:18:25 EDT 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034766.html">[Mono-dev] Mono generates inefficient vectorized code
+</A></li>
+        <LI>Next message: <A HREF="034772.html">[Mono-dev] Mono generates inefficient vectorized code
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34768">[ date ]</a>
+              <a href="thread.html#34768">[ thread ]</a>
+              <a href="subject.html#34768">[ subject ]</a>
+              <a href="author.html#34768">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi Sergei,
+
+I'm glad to hear about your improvements. Can you share the code?
+
+I believe this is not the best approach. Mono.Simd was never intended to be
+a variable width simd API. Making such proposition
+makes coding over it significantly harder.
+
+My suggestion is to implement both scalar replacement and then force
+inlining of all Mono.Simd operations.
+
+For example:
+
+Vector4f a,b,c;
+...
+a = b + c;
+
+SR would replace it with:
+float a0,a1,a2,a3,b0....
+
+a0 = b0 + c0;
+a1 = b1 + c1;
+...
+
+This will have acceptable performance and result in equivalent execution
+semantics, which is a much more usable model.
+
+Scalar replacement requires two major changes in the JIT. First we need to
+convert all valuetype operations to use a higher level IR
+without explicit memory operations. Second, with this new IR, we can scalar
+replace all vector types that have no memory ops over them. IOW, something
+like:
+
+Right now &quot;a  = new Vector4f (1,2,3,4)&quot; generates an IR similar to this:
+
+ldaddr R10 &lt;- R8
+storer4_membase [R10 + 0], 1
+storer4_membase [R10 + 4], 2
+storer4_membase [R10 + 8], 3
+storer4_membase [R10 + 12], 4
+
+Which imposes that the vector type must be in memory. If we generate
+something like:
+
+vzero R8
+storer4_field [x] R8, 1
+storer4_field [y] R8, 2
+storer4_field [z] R8, 3
+storer4_field [w] R8, 4
+
+This new IR has no memory ops over the vector type, so we can scalar replace
+it to something like:
+
+r4_const R11, 0
+r4_const R12, 0
+r4_const R13, 0
+r4_const R14, 0
+
+r4_const R11, 1
+r4_const R12, 2
+r4_const R13, 3
+r4_const R14, 4
+
+The first four stores will be removed by the DCE pass.
+
+I have a WIP patch to do the first part of the transformation. It's based on
+a 3 months old trunk and has a bunch of bugs, so it requires quite some work
+before it's functional. I can send it to you, if you want to continue
+working on it.
+
+
+On Tue, Apr 13, 2010 at 12:01 PM, Sergei Dyshel &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">qyron.private at gmail.com</A>&gt;wrote:
+
+&gt;<i> Hello Rodrigo,
+</I>&gt;<i> Regarding your question unfortunately I cannot apply for GSoC due to time
+</I>&gt;<i> and other constraints.
+</I>&gt;<i>
+</I>&gt;<i> With your tips I managed to extend linear scan on to vector registers and
+</I>&gt;<i> now SIMD code runs much faster. Thank you!
+</I>&gt;<i>
+</I>&gt;<i> My next (:]) question is about &quot;scalarization&quot;, i.e. running programs with
+</I>&gt;<i> SIMD intrinsics on non-SIMD platforms (just simulating this with -O=-simd).
+</I>&gt;<i> Current implementation in Mono simply treats vectors as vtypes and passes
+</I>&gt;<i> them by value using stack, thus doing a lot of superfluous memory copies.
+</I>&gt;<i> Therefore &quot;scalarized&quot; code runs slow, way behind code without vector
+</I>&gt;<i> intrinsics.
+</I>&gt;<i>
+</I>&gt;<i> A better solution I'm thinking of is to &quot;reduce&quot; vector size to 1, i.e.
+</I>&gt;<i> interpret Mono.Simd datatypes as corresponding scalar types. For example:
+</I>&gt;<i> Vector4i a;
+</I>&gt;<i> Vector4i b;
+</I>&gt;<i> Vector4i c = op_addition (a, b);
+</I>&gt;<i> will be transformed to something like:
+</I>&gt;<i> int a;
+</I>&gt;<i> int b;
+</I>&gt;<i> int c = op_addition (a,b);
+</I>&gt;<i>
+</I>&gt;<i> of course not any code allows such transformation (it must not use
+</I>&gt;<i> hard-coded SIMD size but use some kind of get-vector-size intrinsics). I
+</I>&gt;<i> tried some test by manually replacing assembly and it showed great results.
+</I>&gt;<i> But now I want to do transformation inside the JIT.
+</I>&gt;<i>
+</I>&gt;<i> Can you please help me to find corresponding place in JIT where I can do
+</I>&gt;<i> the transformation? I tried searching through 'method-to-ir.c' but could
+</I>&gt;<i> realize where exactly vtypes can be transformed to scalar types.
+</I>&gt;<i> Thanks!
+</I>&gt;<i> --
+</I>&gt;<i> Regards,
+</I>&gt;<i> Sergei Dyshel
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> On Thu, Apr 8, 2010 at 18:08, Rodrigo Kumpera &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">kumpera at gmail.com</A>&gt; wrote:
+</I>&gt;<i>
+</I>&gt;&gt;<i> Hi Sergei,
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> On Thu, Apr 8, 2010 at 11:59 AM, Sergei Dyshel &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">qyron.private at gmail.com</A>&gt;wrote:
+</I>&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> Hello Rodrigo,
+</I>&gt;&gt;&gt;<i> Just picking up this conversation we had some time ago. I was asking why
+</I>&gt;&gt;&gt;<i> JIT does unneeded loads and stores and you answered that this behavior is
+</I>&gt;&gt;&gt;<i> because of lack of global reg allocator. I understand it so that any vreg
+</I>&gt;&gt;&gt;<i> which is used in different basic blocks is &quot;promoted&quot; to &quot;memory variable&quot;
+</I>&gt;&gt;&gt;<i> and hence gets loaded and stored each time.
+</I>&gt;&gt;&gt;<i> Then I asked why bare &quot;global&quot; 'ints' are treated differently (and more
+</I>&gt;&gt;&gt;<i> effectively) and you said that there are callee-saved iregs so there is a
+</I>&gt;&gt;&gt;<i> specialized allocator for them.
+</I>&gt;&gt;&gt;<i> Can you please point at the relevant place in code?
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Look into liveness.c / linear_scan.c.
+</I>&gt;&gt;<i> In liveness.c look for mono_analyze_liveness
+</I>&gt;&gt;<i> In linear_scan.c look for mono_linear_scan
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;&gt;<i> On Altivec we have callee-saved vector registers too. Is it possible to
+</I>&gt;&gt;&gt;<i> use the same trick with them , in order to remove unnecessary loads/stores?
+</I>&gt;&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> Yes, it might be possible to do so, not sure how much work it will be
+</I>&gt;&gt;<i> thou.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>
+</I>&gt;<i>
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20100413/fd9ba2b1/attachment.html">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20100413/fd9ba2b1/attachment.html</A> 
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034766.html">[Mono-dev] Mono generates inefficient vectorized code
+</A></li>
+	<LI>Next message: <A HREF="034772.html">[Mono-dev] Mono generates inefficient vectorized code
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34768">[ date ]</a>
+              <a href="thread.html#34768">[ thread ]</a>
+              <a href="subject.html#34768">[ subject ]</a>
+              <a href="author.html#34768">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

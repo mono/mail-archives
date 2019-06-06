@@ -1,0 +1,227 @@
+Index: metadata/image.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/image.c,v
+retrieving revision 1.77
+diff -u -r1.77 image.c
+--- metadata/image.c	26 Apr 2004 19:26:41 -0000	1.77
++++ metadata/image.c	28 Apr 2004 02:59:57 -0000
+@@ -554,8 +554,10 @@
+ 	image->delegate_invoke_cache = 
+ 		g_hash_table_new ((GHashFunc)mono_signature_hash, 
+ 				  (GCompareFunc)mono_metadata_signature_equal);
+-
+-	image->runtime_invoke_cache = g_hash_table_new (NULL, NULL);
++	image->runtime_invoke_cache  = 
++		g_hash_table_new ((GHashFunc)mono_signature_hash, 
++				  (GCompareFunc)mono_metadata_signature_equal);
++	
+ 	image->managed_wrapper_cache = g_hash_table_new (NULL, NULL);
+ 	image->native_wrapper_cache = g_hash_table_new (NULL, NULL);
+ 	image->remoting_invoke_cache = g_hash_table_new (NULL, NULL);
+Index: metadata/marshal.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/marshal.c,v
+retrieving revision 1.154
+diff -u -r1.154 marshal.c
+--- metadata/marshal.c	27 Apr 2004 17:33:27 -0000	1.154
++++ metadata/marshal.c	28 Apr 2004 02:59:58 -0000
+@@ -559,16 +559,20 @@
+ 	return res;
+ }
+ 
++static void
++mono_mb_emit_calli (MonoMethodBuilder *mb, MonoMethodSignature *sig)
++{
++	mono_mb_emit_byte (mb, CEE_CALLI);
++	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, sig));
++}
++
+ void
+ mono_mb_emit_managed_call (MonoMethodBuilder *mb, MonoMethod *method, MonoMethodSignature *opt_sig)
+ {
+-	if (!opt_sig)
+-		opt_sig = method->signature;
+ 	mono_mb_emit_byte (mb, CEE_PREFIX1);
+ 	mono_mb_emit_byte (mb, CEE_LDFTN);
+ 	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, method));
+-	mono_mb_emit_byte (mb, CEE_CALLI);
+-	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, opt_sig));
++	mono_mb_emit_calli (mb, opt_sig ? opt_sig : method->signature);
+ }
+ 
+ void
+@@ -577,8 +581,7 @@
+ 	mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
+ 	mono_mb_emit_byte (mb, CEE_MONO_LDPTR);
+ 	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, func));
+-	mono_mb_emit_byte (mb, CEE_CALLI);
+-	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, sig));
++	mono_mb_emit_calli (mb, sig);
+ }
+ 
+ void
+@@ -1801,44 +1804,62 @@
+ 
+ /*
+  * generates IL code for the runtime invoke function 
+- * MonoObject *runtime_invoke (MonoObject *this, void **params, MonoObject **exc)
++ * MonoObject *runtime_invoke (MonoObject *this, void **params, MonoObject **exc, void* method)
+  *
+  * we also catch exceptions if exc != null
+  */
+ MonoMethod *
+ mono_marshal_get_runtime_invoke (MonoMethod *method)
+ {
+-	MonoMethodSignature *sig, *csig;
++	MonoMethodSignature *sig, *csig, *callsig;
+ 	MonoExceptionClause *clause;
+ 	MonoMethodHeader *header;
+ 	MonoMethodBuilder *mb;
+ 	MonoMethod *res;
+ 	GHashTable *cache;
+ 	static MonoString *string_dummy = NULL;
++	static MonoType* void_p_type = NULL;
+ 	int i, pos, sigsize;
+-
++	char *name;
++	
+ 	g_assert (method);
++	
++	if (method->string_ctor) {
++		static MonoMethodSignature *strsig = NULL;
++		if (!strsig) {
++			strsig = g_memdup (method->signature, sizeof (MonoMethodSignature) + method->signature->param_count * sizeof (MonoType *));
++			strsig->ret = &mono_defaults.string_class->byval_arg;
++		}
++		
++		callsig = strsig;
++	} else
++		callsig = method->signature;
+ 
+ 	cache = method->klass->image->runtime_invoke_cache;
+-	if ((res = mono_marshal_find_in_cache (cache, method)))
++	if ((res = mono_marshal_find_in_cache (cache, callsig)))
+ 		return res;
+ 	
+ 	/* to make it work with our special string constructors */
+ 	if (!string_dummy)
+ 		string_dummy = mono_string_new_wrapper ("dummy");
++	if (!void_p_type)
++		void_p_type = & mono_ptr_class_get (&mono_defaults.void_class->byval_arg)->byval_arg;
+ 
+ 	sig = method->signature;
+ 
+-	sigsize = sizeof (MonoMethodSignature) + 3 * sizeof (MonoType *);
++	sigsize = sizeof (MonoMethodSignature) + 4 * sizeof (MonoType *);
+ 	csig = g_malloc0 (sigsize);
+ 
+-	csig->param_count = 3;
++	csig->param_count = 4;
+ 	csig->ret = &mono_defaults.object_class->byval_arg;
+ 	csig->params [0] = &mono_defaults.object_class->byval_arg;
+ 	csig->params [1] = &mono_defaults.int_class->byval_arg;
+ 	csig->params [2] = &mono_defaults.int_class->byval_arg;
++	csig->params [3] = void_p_type;
+ 
+-	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_RUNTIME_INVOKE);
++	name = mono_signature_to_name (callsig, "runtime_invoke");
++	mb = mono_mb_new (method->klass, name,  MONO_WRAPPER_RUNTIME_INVOKE);
++	g_free (name);
+ 
+ 	/* allocate local 0 (object) tmp */
+ 	mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
+@@ -1939,17 +1960,9 @@
+ 		}		
+ 	}
+ 
+-	if (method->string_ctor) {
+-		MonoMethodSignature *strsig;
+-
+-		sigsize = sizeof (MonoMethodSignature) + sig->param_count * sizeof (MonoType *);
+-		strsig = g_memdup (sig, sigsize);
+-		strsig->ret = &mono_defaults.string_class->byval_arg;
+-
+-		mono_mb_emit_managed_call (mb, method, strsig);		
+-	} else 
+-		mono_mb_emit_managed_call (mb, method, NULL);
+-
++	mono_mb_emit_ldarg (mb, 3);
++	mono_mb_emit_calli (mb, callsig);
++	
+ 	if (sig->ret->byref) {
+ 		/* fixme: */
+ 		g_assert_not_reached ();
+@@ -2036,7 +2049,7 @@
+ 	mono_mb_emit_ldloc (mb, 0);
+ 	mono_mb_emit_byte (mb, CEE_RET);
+ 	
+-	res = mono_mb_create_and_cache (cache, method,
++	res = mono_mb_create_and_cache (cache, callsig,
+ 										 mb, csig, sig->param_count + 16);
+ 	mono_mb_free (mb);
+ 
+Index: metadata/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/ChangeLog,v
+retrieving revision 1.1546
+diff -u -r1.1546 ChangeLog
+--- metadata/ChangeLog	27 Apr 2004 17:33:27 -0000	1.1546
++++ metadata/ChangeLog	28 Apr 2004 03:00:00 -0000
+@@ -1,3 +1,15 @@
++2004-04-27 Ben Maurer  <bmaurer@users.sourceforge.net>
++
++	* image.c: image->runtime_invoke_cache is keyed on signatures now.
++	* marshal.c (mono_mb_emit_calli): new helper to emit a CEE_CALLI with
++	a signature.
++	(mono_mb_emit_managed_call, mono_mb_emit_native_call): use the above.
++	(mono_marshal_get_runtime_invoke): The runtime invoke method now takes
++	an extra param that is the pointer of the method to invoke. The IL for
++	the invoke method is no longer specific to the method, but to the
++	signature of the method. Thus, we can share the same code for multiple
++	methods. This reduces the number of methods that have to be compiled.
++
+ 2004-04-27  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* marshal.c: Handle null properly in PtrToString* icalls. Fixes #57706.
+Index: mini/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/ChangeLog,v
+retrieving revision 1.471
+diff -u -r1.471 ChangeLog
+--- mini/ChangeLog	27 Apr 2004 09:39:52 -0000	1.471
++++ mini/ChangeLog	28 Apr 2004 03:00:02 -0000
+@@ -1,3 +1,7 @@
++2004-04-27 Ben Maurer  <bmaurer@users.sourceforge.net>
++
++	* mini.c (mono_jit_runtime_invoke): Follow new convention
++	of calling the invoke method with an function pointer.
+ 
+ Tue Apr 27 12:15:59 CEST 2004 Paolo Molaro <lupus@ximian.com>
+ 
+Index: mini/mini.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/mini.c,v
+retrieving revision 1.222
+diff -u -r1.222 mini.c
+--- mini/mini.c	22 Apr 2004 16:45:12 -0000	1.222
++++ mini/mini.c	28 Apr 2004 03:00:02 -0000
+@@ -8070,7 +8070,8 @@
+ mono_jit_runtime_invoke (MonoMethod *method, void *obj, void **params, MonoObject **exc)
+ {
+ 	MonoMethod *invoke;
+-	MonoObject *(*runtime_invoke) (MonoObject *this, void **params, MonoObject **exc);
++	MonoObject *(*runtime_invoke) (MonoObject *this, void **params, MonoObject **exc, void* compiled_method);
++	void* compiled_method;
+ 
+ 	if (obj == NULL && !(method->flags & METHOD_ATTRIBUTE_STATIC) && !method->string_ctor && (method->wrapper_type == 0)) {
+ 		g_warning ("Ignoring invocation of an instance method on a NULL instance.\n");
+@@ -8079,7 +8080,8 @@
+ 
+ 	invoke = mono_marshal_get_runtime_invoke (method);
+ 	runtime_invoke = mono_jit_compile_method (invoke);
+-	return runtime_invoke (obj, params, exc);
++	compiled_method = mono_jit_compile_method (method);
++	return runtime_invoke (obj, params, exc, compiled_method);
+ }
+ 
+ #ifdef PLATFORM_WIN32

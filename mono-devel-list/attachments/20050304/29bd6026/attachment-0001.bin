@@ -1,0 +1,303 @@
+Index: security-manager.c
+===================================================================
+--- security-manager.c	(revision 41401)
++++ security-manager.c	(working copy)
+@@ -38,6 +38,10 @@
+ 		"InternalDemand", 2);	
+ 	g_assert (secman.demand);
+ 
++	secman.demandchoice = mono_class_get_method_from_name (secman.securitymanager,
++		"InternalDemandChoice", 2);	
++	g_assert (secman.demandchoice);
++
+ 	secman.inheritancedemand = mono_class_get_method_from_name (secman.securitymanager,
+ 		"InheritanceDemand", 2);	
+ 	g_assert (secman.inheritancedemand);
+@@ -62,6 +66,10 @@
+ 		"LinkDemandSecurityException", 3);
+ 	g_assert (secman.linkdemandsecurityexception);
+ 
++	secman.reflectedlinkdemand = mono_class_get_method_from_name (secman.securitymanager,
++		"ReflectedLinkDemand", 2);
++	g_assert (secman.reflectedlinkdemand);
++
+ 	secman.aptc = mono_class_from_name (mono_defaults.corlib, "System.Security", 
+ 		"AllowPartiallyTrustedCallersAttribute");
+ 	g_assert (secman.aptc);
+@@ -167,6 +175,8 @@
+ 	return TRUE;
+ }
+ 
++/* System.Security icalls */
++
+ MonoBoolean
+ ves_icall_System_Security_SecurityManager_get_SecurityEnabled (void)
+ {
+@@ -200,3 +210,78 @@
+ 		mono_security_manager_execution = value;
+ 	}
+ }
++
++/* reflection helper */
++
++static gboolean
++mono_secman_reflectedlinkdemand (MonoReflectionMethod *m, MonoDeclSecurityActions *kactions, MonoDeclSecurityActions *mactions)
++{
++	MonoMethod *method = m->method;
++	/* we want the original as the wrapper is "free" of the security informations */
++	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
++		method = mono_marshal_method_from_wrapper (method);
++	}
++
++	mono_class_init (method->klass);
++
++	/* if either the method or it's class has security (any type) */
++	if ((method->flags & METHOD_ATTRIBUTE_HAS_SECURITY) || (method->klass->flags & TYPE_ATTRIBUTE_HAS_SECURITY)) {
++		memset (kactions, 0, sizeof (MonoDeclSecurityActions));
++		memset (mactions, 0, sizeof (MonoDeclSecurityActions));
++
++		/* get any linkdemand (either on the method or it's class) */
++		return mono_declsec_get_linkdemands (method, kactions, mactions);
++	}
++	return FALSE;
++}
++
++/* System.MonoType icalls */
++
++MonoBoolean
++ves_icall_System_MonoType_InternalReflectedLinkDemand (MonoReflectionMethod *m)
++{
++	MonoDeclSecurityActions kactions;
++	MonoDeclSecurityActions mactions;
++
++	MONO_ARCH_SAVE_REGS;
++
++	if (mono_secman_reflectedlinkdemand (m, &kactions, &mactions)) {
++		MonoAssembly *assembly = mono_image_get_assembly (m->method->klass->image);
++		MonoDomain *domain = mono_domain_get ();
++		MonoReflectionAssembly *refass = mono_assembly_get_object (domain, assembly);
++		MonoSecurityManager *secman = mono_security_manager_get_methods ();
++		MonoObject *res;
++		gpointer args [3];
++
++		args [0] = refass;
++		args [1] = &kactions;
++		args [2] = &mactions;
++
++		res = mono_runtime_invoke (secman->linkdemand, NULL, args, NULL);
++		return !(*(MonoBoolean *) mono_object_unbox(res));
++	}
++
++	return FALSE;
++}
++
++/* System.Reflection.MonoMethod|MonoCMethod shared icalls */
++
++void
++ves_icall_System_Reflection_MonoMethod_InternalReflectedLinkDemand (MonoReflectionMethod *m)
++{
++	MonoDeclSecurityActions kactions;
++	MonoDeclSecurityActions mactions;
++
++	MONO_ARCH_SAVE_REGS;
++
++	if (mono_secman_reflectedlinkdemand (m, &kactions, &mactions)) {
++		/* when invoked thru reflection LinkDemand are promoted to full Demand */
++		MonoSecurityManager* secman = mono_security_manager_get_methods ();
++		gpointer args [2];
++
++		args [0] = &kactions;
++		args [1] = &mactions;
++
++		mono_runtime_invoke (secman->reflectedlinkdemand, NULL, args, NULL);
++	}
++}
+Index: security-manager.h
+===================================================================
+--- security-manager.h	(revision 41401)
++++ security-manager.h	(working copy)
+@@ -19,6 +19,8 @@
+ #include "marshal.h"
+ #include "image.h"
+ #include "reflection.h"
++#include "tabledefs.h"
++#include "exception.h"
+ 
+ 
+ /* Definitions */
+@@ -38,15 +40,13 @@
+ 	MonoClass *securitymanager;		/* System.Security.SecurityManager */
+ 	MonoMethod *demand;			/* SecurityManager.InternalDemand */
+ 	MonoMethod *demandchoice;		/* SecurityManager.InternalDemandChoice */
+-	MonoMethod *assert;			/* SecurityManager.InternalAssert */
+-	MonoMethod *deny;			/* SecurityManager.InternalDeny */
+-	MonoMethod *permitonly;			/* SecurityManager.InternalPermitOnly */
+ 	MonoMethod *inheritancedemand;		/* SecurityManager.InheritanceDemand */
+ 	MonoMethod *inheritsecurityexception;	/* SecurityManager.InheritanceDemandSecurityException */
+ 	MonoMethod *linkdemand;			/* SecurityManager.LinkDemand */
+ 	MonoMethod *linkdemandfulltrust;	/* SecurityManager.LinkDemandFullTrust */
+ 	MonoMethod *linkdemandunmanaged;	/* SecurityManager.LinkDemandUnmanaged */
+ 	MonoMethod *linkdemandsecurityexception;/* SecurityManager.LinkDemandSecurityException */
++	MonoMethod *reflectedlinkdemand;	/* SecurityManager.ReflectedLinkDemand */
+ 	MonoClass *aptc;			/* System.Security.AllowPartiallyTrustedCallersAttribute */
+ } MonoSecurityManager;
+ 
+@@ -67,5 +67,8 @@
+ MonoBoolean ves_icall_System_Security_SecurityManager_get_CheckExecutionRights (void);
+ void ves_icall_System_Security_SecurityManager_set_CheckExecutionRights (MonoBoolean value);
+ 
++MonoBoolean ves_icall_System_MonoType_InternalReflectedLinkDemand (MonoReflectionMethod *m);
++void ves_icall_System_Reflection_MonoMethod_InternalReflectedLinkDemand (MonoReflectionMethod *m);
+ 
++
+ #endif /* _MONO_METADATA_SECURITY_MANAGER_H_ */
+Index: exception.c
+===================================================================
+--- exception.c	(revision 41401)
++++ exception.c	(working copy)
+@@ -410,3 +410,33 @@
+ {
+ 	return mono_exception_from_name (mono_get_corlib (), "System", "StackOverflowException");	
+ }
++
++MonoException *
++mono_get_exception_reflection_type_load (MonoArray *types, MonoArray *exceptions)
++{
++	MonoClass *klass;
++	gpointer args [2];
++	MonoObject *exc;
++	MonoMethod *method;
++	gpointer iter;
++
++	klass = mono_class_from_name (mono_get_corlib (), "System.Reflection", "ReflectionTypeLoadException");
++	g_assert (klass);
++	mono_class_init (klass);
++
++	iter = NULL;
++	while ((method = mono_class_get_methods (klass, &iter))) {
++		if (!strcmp (".ctor", mono_method_get_name (method)) && mono_method_signature (method)->param_count == 2)
++			break;
++		method = NULL;
++	}
++	g_assert (method);
++
++	args [0] = types;
++	args [1] = exceptions;
++
++	exc = mono_object_new (mono_domain_get (), klass);
++	mono_runtime_invoke (method, exc, args, NULL);
++
++	return (MonoException *) exc;
++}
+Index: exception.h
+===================================================================
+--- exception.h	(revision 41401)
++++ exception.h	(working copy)
+@@ -112,4 +112,7 @@
+ MonoException *
+ mono_get_exception_stack_overflow (void);
+ 
++MonoException *
++mono_get_exception_reflection_type_load (MonoArray *types, MonoArray *exceptions);
++
+ #endif /* _MONO_METADATA_EXCEPTION_H_ */
+Index: icall.c
+===================================================================
+--- icall.c	(revision 41402)
++++ icall.c	(working copy)
+@@ -3325,9 +3325,21 @@
+ 		/* g_print ("failed find\n"); */
+ 		return NULL;
+ 	}
++
++	if (type->type == MONO_TYPE_CLASS) {
++		MonoClass *klass = mono_type_get_class (type);
++		/* need to report exceptions ? */
++		if (throwOnError && klass->exception_type) {
++			/* report SecurityException (or others) that occured when loading the assembly */
++			MonoException *exc = mono_class_get_exception_for_failure (klass);
++			mono_raise_exception (exc);
++		} else if (klass->exception_type == MONO_EXCEPTION_SECURITY_INHERITANCEDEMAND) {
++			return NULL;
++		}
++	}
++
+ 	/* g_print ("got it\n"); */
+ 	return mono_type_get_object (mono_object_domain (assembly), type);
+-
+ }
+ 
+ static MonoString *
+@@ -4179,7 +4191,47 @@
+ 				}
+ 			}
+ 		}
+-	}		
++	}
++
++	if (mono_is_security_manager_active ()) {
++		/* the ReflectionTypeLoadException must have all the types (Types property), 
++		 * NULL replacing types which throws an exception. The LoaderException must
++		 * contains all exceptions for NULL items.
++		 */
++
++		guint32 len = mono_array_length (res);
++		GList *list = NULL;
++
++		for (i = 0; i < len; i++) {
++			MonoReflectionType *t = mono_array_get (res, gpointer, i);
++			if (t->type->type == MONO_TYPE_CLASS) {
++				MonoClass *klass = mono_type_get_class (t->type);
++				if ((klass != NULL) && klass->exception_type) {
++					/* get the exception */
++					list = g_list_append (list, mono_class_get_exception_for_failure (klass));
++					/* and replace Type with NULL */
++					mono_array_set (res, gpointer, i, NULL);
++				}
++			}
++		}
++
++		if (list) {
++			GList *tmp = NULL;
++			MonoException *exc = NULL;
++			int length = g_list_length (list);
++
++			MonoArray *exl = mono_array_new (domain, mono_defaults.exception_class, length);
++			for (i = 0, tmp = list; i < length; i++, tmp = tmp->next) {
++				mono_array_set (exl, gpointer, i, tmp->data);
++			}
++			g_list_free (list);
++			list = NULL;
++
++			exc = mono_get_exception_reflection_type_load (res, exl);
++			mono_raise_exception (exc);
++		}
++	}
++		
+ 	return res;
+ }
+ 
+@@ -6082,6 +6134,7 @@
+ 	{"GetNestedTypes", ves_icall_Type_GetNestedTypes},
+ 	{"GetPropertiesByName", ves_icall_Type_GetPropertiesByName},
+ 	{"InternalGetEvent", ves_icall_MonoType_GetEvent},
++	{"InternalReflectedLinkDemand", ves_icall_System_MonoType_InternalReflectedLinkDemand},
+ 	{"IsByRefImpl", ves_icall_type_isbyref},
+ 	{"IsPointerImpl", ves_icall_type_ispointer},
+ 	{"IsPrimitiveImpl", ves_icall_type_isprimitive},
+@@ -6164,6 +6217,7 @@
+ static const IcallEntry monocmethod_icalls [] = {
+   	{"GetGenericMethodDefinition_impl", ves_icall_MonoMethod_GetGenericMethodDefinition},
+ 	{"InternalInvoke", ves_icall_InternalInvoke},
++	{"InternalReflectedLinkDemand", ves_icall_System_Reflection_MonoMethod_InternalReflectedLinkDemand},
+ 	{"get_Mono_IsInflatedMethod", ves_icall_MonoMethod_get_Mono_IsInflatedMethod}
+ };
+ 
+@@ -6204,6 +6258,7 @@
+ 	{"GetGenericArguments", ves_icall_MonoMethod_GetGenericArguments},
+   	{"GetGenericMethodDefinition_impl", ves_icall_MonoMethod_GetGenericMethodDefinition},
+ 	{"InternalInvoke", ves_icall_InternalInvoke},
++	{"InternalReflectedLinkDemand", ves_icall_System_Reflection_MonoMethod_InternalReflectedLinkDemand},
+ 	{"get_HasGenericParameters", ves_icall_MonoMethod_get_HasGenericParameters},
+ 	{"get_IsGenericMethodDefinition", ves_icall_MonoMethod_get_IsGenericMethodDefinition},
+ 	{"get_Mono_IsInflatedMethod", ves_icall_MonoMethod_get_Mono_IsInflatedMethod},

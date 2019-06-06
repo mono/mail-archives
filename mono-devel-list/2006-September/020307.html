@@ -1,0 +1,349 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Extended error reporting for libgdiplus/System.Drawing
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Extended%20error%20reporting%20for%20libgdiplus/System.Drawing&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="020306.html">
+   <LINK REL="Next"  HREF="020308.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Extended error reporting for libgdiplus/System.Drawing</H1>
+    <B>Jonathan Gilbert</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Extended%20error%20reporting%20for%20libgdiplus/System.Drawing&In-Reply-To="
+       TITLE="[Mono-dev] Extended error reporting for libgdiplus/System.Drawing">2a5gjx302 at sneakemail.com
+       </A><BR>
+    <I>Mon Sep  4 18:57:16 EDT 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="020306.html">[Mono-dev] Mono Winforms Team: we are hiring.
+</A></li>
+        <LI>Next message: <A HREF="020308.html">[Mono-dev] Plea for guidance
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20307">[ date ]</a>
+              <a href="thread.html#20307">[ thread ]</a>
+              <a href="subject.html#20307">[ subject ]</a>
+              <a href="author.html#20307">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Ever since I started working on libgdiplus and the related System.Drawing
+bits, I've always been somewhat unimpressed by the error reporting
+capabilities of GDI+. I didn't think it would be too hard to make them a
+lot better, even without breaking cross-platform compatibility, but I
+didn't have the free time to sit down and work it out until now.
+
+My proposal is two added functions to libgdiplus, along with a new GpStatus
+value.
+
+  GpStatus.ExtendedError (1000000): Indicates that the last error which
+    occurred has an extended description accessible through
+    GdipGetErrorEx ().
+
+  GpStatus GdipSetErrorEx (GpStatus status, char *description): Places
+    the specified status code &amp; description into TLS slots allocated
+    for the purpose and returns GpStatus.ExtendedError. In the event
+    that TLS slots could not be allocated (a non-fatal error during
+    GdipStartup ()), GdipSetErrorEx actually simply returns its first
+    argument, and the feature is transparently disabled.
+
+  int GdipGetErrorEx (GpStatus *status, char *description): Copies the
+    last error set with GdipSetErrorEx into the parameters. Either
+    parameter can be NULL. If description is not NULL, then it is
+    assumed to be large enough to store the string. The caller
+    determines this size by first calling the function with a NULL
+    pointer for description; the return value is the necessary number
+    of bytes (including null-terminator) for the buffer.
+  
+This extended error status code (GpStatus.ExtendedError) is then detected
+in the System.Drawing side. Of course, we would break compatibility if we
+added an entry for it to the managed enumeration, but it's easy enough to
+test for by casting the Status result to an int. If the GDIPlus.CheckStatus
+function finds this extended error status value, then it uses the
+GdipGetErrorEx function to get the actual error details. When
+System.Drawing is running against Microsoft's GDIPLUS.DLL, it will never
+get this value (or so we can reasonably assume) and thus it won't ever try
+to call GdipGetErrorEx (which won't be exported by GDIPLUS.DLL, of course).
+
+I have attached a pair of patches which implement this functionality,
+paving the way for the translation of error return codes in libgdiplus to
+have more meaningful descriptions.
+
+  extendederrorreporting.libgdiplus.diff: Apply in &quot;/source/trunk/libgdiplus&quot;
+  extendederrorreporting.System.Drawing.diff: Apply in
+&quot;/source/trunk/mcs/class/System.Drawing&quot;
+  
+Thoughts? Comments? If nobody thinks this is a bad idea (and some people
+think it is a good idea), I can commit it.
+
+Thanks,
+
+Jonathan Gilbert
+
+-----
+I have included the patches inline in the e-mail as well as attaching them
+in gzipped form, because my e-mail client
+isn't smart enough to properly encode text attachments with LF-only line
+endings. Enjoy.
+
+=== extendederrorreporting.libgdiplus.diff ===
+Index: general.c
+===================================================================
+--- general.c	(revision 64773)
++++ general.c	(working copy)
+@@ -52,12 +52,21 @@
+ 
+ extern void cairo_test_xlib_disable_render();
+ 
++static pthread_key_t last_error_status_tls_key,
+last_error_description_tls_key;
++static BOOL use_extended_error_reporting = TRUE;
++
+ GpStatus 
+ GdiplusStartup(unsigned long *token, const struct startupInput *input,
+struct startupOutput *output)
+ {
+ 	/* don't initialize multiple time, e.g. for each appdomain */
+ 	if (!startup) {
+ 		startup = TRUE;
++
++		/* Ensure TLS storage for error information. */
++		if (pthread_key_create(&amp;last_error_status_tls_key, NULL)
++		 || pthread_key_create(&amp;last_error_description_tls_key, free))
++			use_extended_status = FALSE;
++
+ 		g_mem_allocations = NULL;
+ 		initCodecList (); 
+ 		FcInit ();
+@@ -693,3 +702,41 @@
+ 
+ 	cairo_curve_to (graphics-&gt;ct, x1, y1, x2, y2, x3, y3);
+ }
++
++/* New Error-Reporting Functionality */
++GpStatus
++GdipSetErrorEx(GpStatus status, char *description)
++{
++	if (!use_extended_error_reporting)
++		return status;
++
++	free(pthread_getspecific(last_error_description_tls_key));
++
++	pthread_setspecific(last_error_status_tls_key, (void *)status);
++	pthread_setspecific(last_error_description_tls_key, strdup(description));
++
++	return ExtendedError;
++}
++
++int
++GdipGetErrorEx(GpStatus *status, char *description)
++{
++	char *last_error_description;
++
++	if (status != NULL)
++		*status = (GpStatus)pthread_getspecific(last_error_status_tls_key);
++
++	last_error_description =
+pthread_getspecific(last_error_description_tls_key);
++
++	if (last_error_description != NULL) {
++		if (description != NULL)
++			strcpy(description, last_error_description);
++		return strlen(last_error_description) + 1;
++	}
++	else {
++		if (description != NULL)
++			description[0] = '\0';
++		return 1; /* Null-terminator only. */
++	}
++}
++
+Index: gdip.h
+===================================================================
+--- gdip.h	(revision 64773)
++++ gdip.h	(working copy)
+@@ -189,7 +189,14 @@
+     UnsupportedGdiplusVersion = 17,
+     GdiplusNotInitialized = 18,
+     PropertyNotFound = 19,
+-    PropertyNotSupported = 20
++    PropertyNotSupported = 20,
++
++    /* New error-reporting mechanism: This value means that the caller
++     * can assume that GdipGetErrorEx () will be present and will
++     * return a meaningful error string along with the correct GpStatus
++     * value for the last operation on the current thread.
++     */
++    ExtendedError = 1000000
+ } GpStatus;
+ 
+ typedef enum  {
+@@ -1057,6 +1064,9 @@
+ int gdip_from_RGB_to_ARGB (BYTE *src, int width, int height, int stride,
+BYTE **dest, int* dest_stride);
+ int gdip_from_ARGB_to_RGB (BYTE *src, int width, int height, int stride,
+BYTE **dest, int* dest_stride);
+ 
++/* Error */
++int GdipGetErrorEx(GpStatus *status, char *description);
++
+ /* Pen */
+ void gdip_pen_init (GpPen *pen);
+ GpPen *gdip_pen_new (void);
+
+=== extendederrorreporting.System.Drawing.diff ===
+Index: System.Drawing/gdipFunctions.cs
+===================================================================
+--- System.Drawing/gdipFunctions.cs	(revision 64908)
++++ System.Drawing/gdipFunctions.cs	(working copy)
+@@ -161,9 +161,38 @@
+ 			return dest;			
+ 		}
+ 
++		// Extended error reporting
++		[DllImport(&quot;gdiplus&quot;)]
++		static extern int GdipGetErrorEx (out Status status, StringBuilder
+description);
++
++		[DllImport(&quot;gdiplus&quot;)]
++		static extern int GdipGetErrorEx (IntPtr status_ptr, StringBuilder
+description);
++
++		static private string coalesce (string t1, string t2)
++		{
++			return (t1 != null) ? t1 : t2;
++		}
++
+ 		// Converts a status into exception
+ 		static internal void CheckStatus (Status status)
+ 		{
++			string error_text = null;
++
++			if (status == (Status)1000000) { /* GpStatus.ExtendedError */
++				int text_length = GdipGetErrorEx (out status, null);
++
++				StringBuilder text_buffer = new StringBuilder ();
++				text_buffer.Length = text_length;
++
++				GdipGetErrorEx (IntPtr.Zero, text_buffer);
++
++				for (text_length = 0; text_length &lt; text_buffer.Length; text_length++)
++					if (text_buffer[text_length] == '\0')
++						break;
++
++				error_text = text_buffer.ToString(0, text_length);
++			}
++
+ 			switch (status) {
+ 
+ 				case Status.Ok:
+@@ -172,43 +201,43 @@
+ 				// TODO: Add more status code mappings here
+ 
+ 				case Status.GenericError:
+-					throw new Exception (&quot;Generic Error.&quot;);
++					throw new Exception (coalesce (error_text, &quot;Generic Error.&quot;));
+ 
+ 				case Status.InvalidParameter:
+-					throw new ArgumentException (&quot;Invalid Parameter. A null reference or
+invalid value was found.&quot;);
++					throw new ArgumentException (coalesce (error_text, &quot;Invalid
+Parameter. A null reference or invalid value was found.&quot;));
+ 
+ 				case Status.OutOfMemory:
+-					throw new OutOfMemoryException (&quot;Out of memory.&quot;);
++					throw new OutOfMemoryException (coalesce (error_text, &quot;Out of
+memory.&quot;));
+ 
+ 				case Status.ObjectBusy:
+-					throw new MemberAccessException (&quot;Object busy.&quot;);
++					throw new MemberAccessException (coalesce (error_text, &quot;Object busy.&quot;));
+ 
+ 				case Status.InsufficientBuffer:
+-					throw new IO.InternalBufferOverflowException (&quot;Insufficient buffer.&quot;);
++					throw new IO.InternalBufferOverflowException (coalesce (error_text,
+&quot;Insufficient buffer.&quot;));
+ 
+ 				case Status.PropertyNotSupported:
+-					throw new NotSupportedException (&quot;Property not supported.&quot;);
++					throw new NotSupportedException (coalesce (error_text, &quot;Property not
+supported.&quot;));
+ 
+ 				case Status.FileNotFound:
+-					throw new IO.FileNotFoundException (&quot;File not found.&quot;);
++					throw new IO.FileNotFoundException (coalesce (error_text, &quot;File not
+found.&quot;));
+ 
+ 				case Status.AccessDenied:
+-					throw new UnauthorizedAccessException (&quot;Access denied.&quot;);
++					throw new UnauthorizedAccessException (coalesce (error_text, &quot;Access
+denied.&quot;));
+ 
+ 				case Status.UnknownImageFormat:
+-					throw new NotSupportedException (&quot;Either image format is unknown or
+you don't have the required libraries for this format.&quot;);
++					throw new NotSupportedException (coalesce (error_text, &quot;Either image
+format is unknown or you don't have the required libraries for this
+format.&quot;));
+ 
+ 				case Status.NotImplemented:
+-					throw new NotImplementedException (&quot;Feature not implemented.&quot;);
++					throw new NotImplementedException (coalesce (error_text, &quot;Feature not
+implemented.&quot;));
+ 
+ 				case Status.WrongState:
+-					throw new ArgumentException (&quot;Properties not set properly.&quot;);
++					throw new ArgumentException (coalesce (error_text, &quot;Properties not
+set properly.&quot;));
+ 
+ 				case Status.FontFamilyNotFound:
+-					throw new ArgumentException (&quot;FontFamily wasn't found.&quot;);
++					throw new ArgumentException (coalesce (error_text, &quot;FontFamily wasn't
+found.&quot;));
+ 
+ 				default:
+-					throw new Exception (&quot;Unknown Error.&quot;);
++					throw new Exception (coalesce (error_text, &quot;Unknown Error.&quot;));
+ 			}
+ 		}
+ 		
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: extendederrorreporting.libgdiplus.diff.gz
+Type: application/octet-stream
+Size: 1164 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20060904/59ff5dcb/attachment.obj">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20060904/59ff5dcb/attachment.obj</A> 
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: extendederrorreporting.System.Drawing.diff.gz
+Type: application/octet-stream
+Size: 1115 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20060904/59ff5dcb/attachment-0001.obj">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20060904/59ff5dcb/attachment-0001.obj</A> 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="020306.html">[Mono-dev] Mono Winforms Team: we are hiring.
+</A></li>
+	<LI>Next message: <A HREF="020308.html">[Mono-dev] Plea for guidance
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#20307">[ date ]</a>
+              <a href="thread.html#20307">[ thread ]</a>
+              <a href="subject.html#20307">[ subject ]</a>
+              <a href="author.html#20307">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

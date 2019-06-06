@@ -1,0 +1,2145 @@
+Index: Mono.Cecil.csproj
+===================================================================
+--- Mono.Cecil.csproj	(revision 84855)
++++ Mono.Cecil.csproj	(working copy)
+@@ -283,11 +283,13 @@
+     <Compile Include="Mono.Cecil\IReflectionVisitable.cs" />
+     <Compile Include="Mono.Cecil\IReflectionVisitor.cs" />
+     <Compile Include="Mono.Cecil\IRequireResolving.cs" />
++    <Compile Include="Mono.Cecil\LazyReflectionReader.cs" />
+     <Compile Include="Mono.Cecil\LinkedResource.cs" />
+     <Compile Include="Mono.Cecil\ManifestResourceAttributes.cs" />
+     <Compile Include="Mono.Cecil\MarshalSpec.cs" />
+     <Compile Include="Mono.Cecil\MemberReference.cs" />
+     <Compile Include="Mono.Cecil\MemberReferenceCollection.cs" />
++    <Compile Include="Mono.Cecil\MetadataRelations.cs" />
+     <Compile Include="Mono.Cecil\MethodAttributes.cs" />
+     <Compile Include="Mono.Cecil\MethodCallingConvention.cs" />
+     <Compile Include="Mono.Cecil\MethodDefinition.cs" />
+Index: Mono.Cecil/AssemblyFactory.cs
+===================================================================
+--- Mono.Cecil/AssemblyFactory.cs	(revision 84855)
++++ Mono.Cecil/AssemblyFactory.cs	(working copy)
+@@ -40,9 +40,9 @@
+ 		{
+ 		}
+ 
+-		static AssemblyDefinition GetAssembly (ImageReader irv, bool manifestOnly)
++		static AssemblyDefinition GetAssembly (ImageReader irv, bool manifestOnly, bool lazy)
+ 		{
+-			StructureReader srv = new StructureReader (irv, manifestOnly);
++			StructureReader srv = new StructureReader (irv, manifestOnly, lazy);
+ 			AssemblyDefinition asm = new AssemblyDefinition (
+ 				new AssemblyNameDefinition (), srv);
+ 
+@@ -50,11 +50,16 @@
+ 			return asm;
+ 		}
+ 
+-		static AssemblyDefinition GetAssembly (ImageReader reader)
++		static AssemblyDefinition GetAssembly (ImageReader reader, bool manifestOnly)
+ 		{
+-			return GetAssembly (reader, false);
++			return GetAssembly (reader, manifestOnly, false);
+ 		}
+ 
++		static AssemblyDefinition GetAssembly (ImageReader reader)
++		{
++			return GetAssembly (reader, false, false);
++		}		
++
+ 		static AssemblyDefinition GetAssemblyManifest (ImageReader reader)
+ 		{
+ 			return GetAssembly (reader, true);
+@@ -65,6 +70,11 @@
+ 			return GetAssembly (ImageReader.Read (file));
+ 		}
+ 
++		public static AssemblyDefinition GetAssembly (string file, bool lazy)
++		{
++			return GetAssembly (ImageReader.Read (file), false,lazy);
++		}
++
+ 		public static AssemblyDefinition GetAssembly (byte [] assembly)
+ 		{
+ 			return GetAssembly (ImageReader.Read (assembly));
+Index: Mono.Cecil/ConstructorCollection.cs
+===================================================================
+--- Mono.Cecil/ConstructorCollection.cs	(revision 84855)
++++ Mono.Cecil/ConstructorCollection.cs	(working copy)
+@@ -156,7 +156,7 @@
+ 
+ 		void Attach (MemberReference member)
+ 		{
+-			if (member.DeclaringType != null)
++			if (member.DeclaringType != null && member.DeclaringType != m_container)
+ 				throw new ReflectionException ("Member already attached, clone it instead");
+ 
+ 			member.DeclaringType = m_container;
+Index: Mono.Cecil/FieldDefinition.cs
+===================================================================
+--- Mono.Cecil/FieldDefinition.cs	(revision 84855)
++++ Mono.Cecil/FieldDefinition.cs	(working copy)
+@@ -42,13 +42,39 @@
+ 		uint m_offset;
+ 
+ 		RVA m_rva;
++		private bool m_rvaInitialized;
+ 		byte [] m_initVal;
+ 
+ 		bool m_hasConstant;
+ 		object m_const;
+-
++		bool m_constantInitialized;
+ 		MarshalSpec m_marshalDesc;
++		LazyReflectionReader m_reader;
++		bool declaringTypeInitialized;
+ 
++		internal LazyReflectionReader Reader {
++			get {
++				return m_reader;
++			}
++			set {
++				m_reader = value;
++			}
++		}
++
++		public override TypeReference DeclaringType {
++			get {
++				if (m_reader != null && !declaringTypeInitialized) {
++					base.DeclaringType = Reader.GetDeclaringType (MetadataToken);
++					declaringTypeInitialized = true;
++				}
++				return base.DeclaringType;
++			}
++			set {
++				declaringTypeInitialized = true;
++				base.DeclaringType = value;
++			}
++		}
++
+ 		public bool HasLayoutInfo {
+ 			get { return m_hasInfo; }
+ 		}
+@@ -62,13 +88,30 @@
+ 		}
+ 
+ 		public RVA RVA {
+-			get { return m_rva; }
+-			set { m_rva = value; }
++			get {
++				if (!m_rvaInitialized && Reader != null) {
++					m_rva = Reader.GetFieldRVA (MetadataToken);
++					m_rvaInitialized = true;
++				}
++				return m_rva;
++			}
++			set {
++				m_rvaInitialized = true;
++				m_rva = value;
++			}
+ 		}
+ 
+ 		public byte [] InitialValue {
+-			get { return m_initVal; }
+-			set { m_initVal = value; }
++			get {
++				if (!m_rvaInitialized && Reader != null)
++					m_rva = Reader.GetFieldRVA (MetadataToken);
++				if (m_initVal == null && Reader != null && m_rva != RVA.Zero)
++					m_initVal = Reader.GetFieldInitialValue (MetadataToken);
++				return m_initVal;
++			}
++			set {
++				m_initVal = value;
++			}
+ 		}
+ 
+ 		public FieldAttributes Attributes {
+@@ -77,22 +120,45 @@
+ 		}
+ 
+ 		public bool HasConstant {
+-			get { return m_hasConstant; }
++			get {
++				if (Reader != null && !m_constantInitialized)
++					InitConstant ();				
++				return m_hasConstant; 
++			}
+ 		}
+ 
+ 		public object Constant {
+-			get { return m_const; }
++			get {
++				if (Reader != null && !m_constantInitialized) {
++					InitConstant ();
++				}
++				return m_const;
++			}
+ 			set {
+ 				m_hasConstant = true;
++				m_constantInitialized = true;
+ 				m_const = value;
+ 			}
+ 		}
+ 
++		private void InitConstant ()
++		{
++			m_hasConstant = Reader.HasConstant (MetadataToken);			
++			if (m_hasConstant)			
++				m_const = Reader.GetConstant (MetadataToken);							
++			m_constantInitialized = true;
++		}
++
+ 		public CustomAttributeCollection CustomAttributes {
+ 			get {
+-				if (m_customAttrs == null)
++				if (m_customAttrs == null) {
+ 					m_customAttrs = new CustomAttributeCollection (this);
+-
++					if (Reader != null) {
++						CustomAttribute [] attrs = Reader.GetCustomAttributes (MetadataToken);
++						for (int i = 0; i < attrs.Length; ++i)
++							m_customAttrs.Add (attrs [i]);
++					}
++				}
+ 				return m_customAttrs;
+ 			}
+ 		}
+@@ -267,7 +333,7 @@
+ 			FieldAttributes attrs) : base (name, fieldType)
+ 		{
+ 			m_attributes = attrs;
+-		}
++		}		
+ 
+ 		public FieldDefinition Clone ()
+ 		{
+Index: Mono.Cecil/FieldDefinitionCollection.cs
+===================================================================
+--- Mono.Cecil/FieldDefinitionCollection.cs	(revision 84855)
++++ Mono.Cecil/FieldDefinitionCollection.cs	(working copy)
+@@ -118,7 +118,7 @@
+ 
+ 		void Attach (MemberReference member)
+ 		{
+-			if (member.DeclaringType != null)
++			if (member.DeclaringType != null && member.DeclaringType != m_container)
+ 				throw new ReflectionException ("Member already attached, clone it instead");
+ 
+ 			member.DeclaringType = m_container;
+Index: Mono.Cecil/LazyReflectionReader.cs
+===================================================================
+--- Mono.Cecil/LazyReflectionReader.cs	(revision 0)
++++ Mono.Cecil/LazyReflectionReader.cs	(revision 0)
+@@ -0,0 +1,850 @@
++//
++// ReflectionReader.cs
++//
++// Author:
++//   Jb Evain (jbevain@gmail.com)
++//
++// (C) 2005 - 2007 Jb Evain
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++namespace Mono.Cecil
++{
++
++	using System;
++	using System.IO;
++	using System.Text;
++
++	using Mono.Cecil.Binary;
++	using Mono.Cecil.Cil;
++	using Mono.Cecil.Metadata;
++	using Mono.Cecil.Signatures;
++
++	internal class LazyReflectionReader : ReflectionReader
++	{
++
++		ModuleDefinition m_module;
++		ImageReader m_reader;
++		SecurityDeclarationReader m_secReader;
++
++		bool m_isCorlib;
++		AssemblyNameReference m_corlib;
++
++		private RelationsManager m_relationsManager;
++
++
++		public RelationsManager Relations {
++			get {
++				if (m_relationsManager == null)
++					m_relationsManager = new RelationsManager (this);
++				return m_relationsManager;
++			}
++		}
++
++		public LazyReflectionReader (ModuleDefinition module)
++			: base (module) {
++			m_module = module;
++			m_reader = m_module.ImageReader;
++			m_root = m_module.Image.MetadataRoot;
++			m_tHeap = m_root.Streams.TablesHeap;
++			m_checkDeleted = (m_tHeap.HeapSizes & 0x80) != 0;
++			if (m_reader != null)
++				m_tableReader = m_reader.MetadataReader.TableReader;
++			m_codeReader = new CodeReader (this);
++			m_sigReader = new SignatureReader (m_root, this);
++			m_isCorlib = module.Assembly.Name.Name == Constants.Corlib;
++		}
++
++		#region ReflectionReader overriden method
++		public override TypeReference GetTypeRefAt (uint rid) {
++			TypeReference typeRef = m_typeRefs [rid - 1];
++			if (typeRef == null) {
++				AddTypeRef (TableReader.GetTypeRefTable (), (int) rid - 1);
++				typeRef = m_typeRefs [rid - 1];
++			}
++			return typeRef;
++		}
++
++		public override FieldDefinition GetFieldDefAt (uint rid) {
++			FieldTable fldTable = m_tableReader.GetFieldTable ();
++			if (m_fields == null) {
++				if (fldTable != null)
++					m_fields = new FieldDefinition [fldTable.Rows.Count];
++				else
++					return null;
++			}
++			FieldDefinition f = m_fields [rid - 1];
++			if (f != null)
++				return f;
++			FieldRow frow = fldTable [(int) rid - 1];
++			FieldSig fsig = m_sigReader.GetFieldSig (frow.Signature);
++			MetadataToken fieldToken = MetadataToken.FromMetadataRow (TokenType.Field, (int) rid - 1);
++			TypeReference declaring = GetDeclaringType (fieldToken);
++			GenericContext context = new GenericContext (declaring);
++			FieldDefinition fdef = new FieldDefinition (
++				m_root.Streams.StringsHeap [frow.Name],
++				GetTypeRefFromSig (fsig.Type, context), frow.Flags);
++			fdef.MetadataToken = fieldToken;
++
++			if (fsig.CustomMods.Length > 0)
++				fdef.FieldType = GetModifierType (fsig.CustomMods, fdef.FieldType);
++			fdef.Reader = this;
++			m_fields [(int) rid - 1] = fdef;
++			return fdef;
++		}
++
++		public override MethodDefinition GetMethodDefAt (uint rid) {
++			if (m_meths == null)
++				m_meths = new MethodDefinition [TableReader.GetMethodTable ().Rows.Count];
++			MethodDefinition method = m_meths [rid - 1];
++			if (method != null)
++				return method;
++
++			MethodRow mRow = (MethodRow) TableReader.GetMethodTable ().Rows [(int) rid - 1];
++			MethodDefinition meth = new MethodDefinition (
++				m_root.Streams.StringsHeap [mRow.Name],
++				mRow.Flags);
++			meth.Reader = this;
++			meth.RVA = mRow.RVA;
++			meth.ImplAttributes = mRow.ImplFlags;
++			meth.MetadataToken = MetadataToken.FromMetadataRow (TokenType.Method, (int) rid - 1);
++			MethodSig msig = m_sigReader.GetMethodDefSig (mRow.Signature);
++			meth.CallingConvention = msig.MethCallConv;
++			m_meths [rid - 1] = meth;
++			return meth;
++		}
++
++		public override ParameterDefinition GetParamDefAt (uint rid) {
++			ParamTable paramTable = TableReader.GetParamTable ();
++			if (m_parameters == null)
++				m_parameters = new ParameterDefinition [paramTable.Rows.Count];
++			if (m_parameters [(int) rid - 1] != null)
++				return m_parameters [(int) rid - 1];
++			ParamRow pRow = paramTable [(int) rid - 1];
++			MetadataToken ownerMethod = Relations.ParamDefs [RelationType.Owner].GetRelatedItem (rid);
++			MethodRow methodRow = TableReader.GetMethodTable () [(int) ownerMethod.RID - 1];
++			MethodDefinition methodDef = GetMethodDefAt (ownerMethod.RID);
++			MethodDefSig msig = m_sigReader.GetMethodDefSig (methodRow.Signature);
++			GenericContext context = new GenericContext (methodDef);
++
++			ParameterDefinition pdef = null;
++			if (pRow.Sequence == 0) // ret type
++			{
++				pdef = new ParameterDefinition (
++					m_root.Streams.StringsHeap [pRow.Name],
++					0,
++					pRow.Flags,
++					null);
++				methodDef.ReturnType = GetMethodReturnType (msig, context);
++				MethodReturnType mrt = methodDef.ReturnType;
++				mrt.Method = methodDef;
++				mrt.Parameter = pdef;
++				mrt.Parameter.ParameterType = mrt.ReturnType;
++			}
++			else {
++				Param psig = msig.Parameters [(int) pRow.Sequence - 1];
++				pdef = BuildParameterDefinition (
++					m_root.Streams.StringsHeap [pRow.Name],
++					pRow.Sequence, pRow.Flags, psig, context);
++				pdef.MetadataToken = MetadataToken.FromMetadataRow (TokenType.Param, (int) rid - 1);
++				if (HasConstant (pdef.MetadataToken))
++					pdef.Constant = GetConstant (pdef.MetadataToken);
++			}
++			pdef.Method = methodDef;
++			m_parameters [(int) rid - 1] = pdef;
++
++			return pdef;
++		}
++
++		public override GenericParameter GetGenericParameterAt (uint rid) {
++			if (m_genericParameters == null)
++				m_genericParameters = new GenericParameter [TableReader.GetGenericParamTable ().Rows.Count];
++			GenericParameter genParam = m_genericParameters [rid - 1];
++			if (genParam != null)
++				return genParam;
++
++			GenericParamRow gpRow = TableReader.GetGenericParamTable () [(int) rid - 1];
++			IGenericParameterProvider owner;
++			if (gpRow.Owner.TokenType == TokenType.Method)
++				owner = GetMethodDefAt (gpRow.Owner.RID);
++			else if (gpRow.Owner.TokenType == TokenType.TypeDef)
++				owner = GetTypeDefAt (gpRow.Owner.RID);
++			else
++				throw new ReflectionException ("Unknown owner type for generic parameter");
++
++			GenericParameter gp = new GenericParameter (gpRow.Number, owner);
++			gp.Attributes = gpRow.Flags;
++			gp.Name = MetadataRoot.Streams.StringsHeap [gpRow.Name];
++			gp.MetadataToken = MetadataToken.FromMetadataRow (TokenType.GenericParam, (int) rid - 1);
++
++			//owner.GenericParameters.Add (gp);
++			m_genericParameters [rid - 1] = gp;
++			return gp;
++		}
++
++		public override void VisitTypeDefinitionCollection (TypeDefinitionCollection types) {
++			// type def reading
++			TypeDefTable typesTable = m_tableReader.GetTypeDefTable ();
++			m_typeDefs = new TypeDefinition [typesTable.Rows.Count];
++			for (int i = 0; i < typesTable.Rows.Count; i++) {
++				TypeDefRow type = typesTable [i];
++				TypeDefinition t = new TypeDefinition (
++					m_root.Streams.StringsHeap [type.Name],
++					m_root.Streams.StringsHeap [type.Namespace],
++					type.Flags);
++				t.Reader = this;
++				t.MetadataToken = MetadataToken.FromMetadataRow (TokenType.TypeDef, i);
++
++				m_typeDefs [i] = t;
++			}
++
++			foreach (TypeDefinition type in m_typeDefs)
++				if (!IsDeleted (type))
++					types.Add (type);
++
++			// type ref reading
++			if (m_tHeap.HasTable (TypeRefTable.RId)) {
++				TypeRefTable typesRef = m_tableReader.GetTypeRefTable ();
++				m_typeRefs = new TypeReference [typesRef.Rows.Count];
++				for (int i = 0; i < typesRef.Rows.Count; i++)
++					AddTypeRef (typesRef, i);
++			}
++			else
++				m_typeRefs = new TypeReference [0];
++
++			ReadTypeSpecs ();
++			ReadMethodSpecs ();
++			ReadMemberReferences ();
++
++			ReadGenericParameterConstraints ();
++			ReadClassLayoutInfos ();
++			ReadFieldLayoutInfos ();
++			ReadPInvokeInfos ();
++			ReadProperties ();
++			ReadEvents ();
++			ReadSemantics ();
++			ReadInterfaces ();
++			ReadOverrides ();
++			ReadSecurityDeclarations ();
++			ReadCustomAttributes ();
++			//ReadConstants ();
++			ReadExternTypes ();
++			ReadMarshalSpecs ();
++			//////////ReadInitialValues ();			
++		}
++		#endregion
++
++		#region private methods taken from AggressiveReflectionReader
++		void ReadTypeSpecs () {
++			if (!m_tHeap.HasTable (TypeSpecTable.RId))
++				return;
++
++			TypeSpecTable tsTable = m_tableReader.GetTypeSpecTable ();
++			m_typeSpecs = new TypeReference [tsTable.Rows.Count];
++		}
++
++		void ReadMethodSpecs () {
++			if (!m_tHeap.HasTable (MethodSpecTable.RId))
++				return;
++
++			MethodSpecTable msTable = m_tableReader.GetMethodSpecTable ();
++			m_methodSpecs = new GenericInstanceMethod [msTable.Rows.Count];
++		}
++
++		void ReadMemberReferences () {
++			if (!m_tHeap.HasTable (MemberRefTable.RId))
++				return;
++
++			MemberRefTable mrefTable = m_tableReader.GetMemberRefTable ();
++			m_memberRefs = new MemberReference [mrefTable.Rows.Count];
++		}
++
++		void ReadGenericParameterConstraints () {
++			if (!m_tHeap.HasTable (GenericParamConstraintTable.RId))
++				return;
++
++			GenericParamConstraintTable gpcTable = m_tableReader.GetGenericParamConstraintTable ();
++			for (int i = 0; i < gpcTable.Rows.Count; i++) {
++				GenericParamConstraintRow gpcRow = gpcTable [i];
++				GenericParameter gp = GetGenericParameterAt (gpcRow.Owner);
++
++				gp.Constraints.Add (GetTypeDefOrRef (gpcRow.Constraint, new GenericContext (gp.Owner)));
++			}
++		}
++
++		void ReadClassLayoutInfos () {
++			if (!m_tHeap.HasTable (ClassLayoutTable.RId))
++				return;
++
++			ClassLayoutTable clTable = m_tableReader.GetClassLayoutTable ();
++			for (int i = 0; i < clTable.Rows.Count; i++) {
++				ClassLayoutRow clRow = clTable [i];
++				TypeDefinition type = GetTypeDefAt (clRow.Parent);
++				type.PackingSize = clRow.PackingSize;
++				type.ClassSize = clRow.ClassSize;
++			}
++		}
++
++		void ReadFieldLayoutInfos () {
++			if (!m_tHeap.HasTable (FieldLayoutTable.RId))
++				return;
++
++			FieldLayoutTable flTable = m_tableReader.GetFieldLayoutTable ();
++			for (int i = 0; i < flTable.Rows.Count; i++) {
++				FieldLayoutRow flRow = flTable [i];
++				FieldDefinition field = GetFieldDefAt (flRow.Field);
++				field.Offset = flRow.Offset;
++			}
++		}
++
++		void ReadPInvokeInfos () {
++			if (!m_tHeap.HasTable (ImplMapTable.RId))
++				return;
++
++			ImplMapTable imTable = m_tableReader.GetImplMapTable ();
++			for (int i = 0; i < imTable.Rows.Count; i++) {
++				ImplMapRow imRow = imTable [i];
++				if (imRow.MemberForwarded.TokenType == TokenType.Method) { // should always be true
++					MethodDefinition meth = GetMethodDefAt (imRow.MemberForwarded.RID);
++					meth.PInvokeInfo = new PInvokeInfo (
++						meth, imRow.MappingFlags, MetadataRoot.Streams.StringsHeap [imRow.ImportName],
++						Module.ModuleReferences [(int) imRow.ImportScope - 1]);
++				}
++			}
++		}
++
++		void ReadProperties () {
++			if (!m_tHeap.HasTable (PropertyTable.RId))
++				return;
++
++			PropertyTable propsTable = m_tableReader.GetPropertyTable ();
++			PropertyMapTable pmapTable = m_tableReader.GetPropertyMapTable ();
++			m_properties = new PropertyDefinition [propsTable.Rows.Count];
++			for (int i = 0; i < pmapTable.Rows.Count; i++) {
++				PropertyMapRow pmapRow = pmapTable [i];
++				if (pmapRow.Parent == 0)
++					continue;
++
++				TypeDefinition owner = GetTypeDefAt (pmapRow.Parent);
++
++				GenericContext context = new GenericContext (owner);
++
++				int start = (int) pmapRow.PropertyList, last = propsTable.Rows.Count + 1, end;
++				if (i < pmapTable.Rows.Count - 1)
++					end = (int) pmapTable [i + 1].PropertyList;
++				else
++					end = last;
++
++				if (end > last)
++					end = last;
++
++				for (int j = start; j < end; j++) {
++					PropertyRow prow = propsTable [j - 1];
++					PropertySig psig = m_sigReader.GetPropSig (prow.Type);
++					PropertyDefinition pdef = new PropertyDefinition (
++						m_root.Streams.StringsHeap [prow.Name],
++						GetTypeRefFromSig (psig.Type, context),
++					prow.Flags);
++					pdef.Reader = this;
++					pdef.MetadataToken = MetadataToken.FromMetadataRow (TokenType.Property, j - 1);
++
++					if (psig.CustomMods != null && psig.CustomMods.Length > 0)
++						pdef.PropertyType = GetModifierType (psig.CustomMods, pdef.PropertyType);
++
++					if (!IsDeleted (pdef))
++						owner.Properties.Add (pdef);
++
++					m_properties [j - 1] = pdef;
++				}
++			}
++		}
++
++		void ReadEvents () {
++			if (!m_tHeap.HasTable (EventTable.RId))
++				return;
++
++			EventTable evtTable = m_tableReader.GetEventTable ();
++			EventMapTable emapTable = m_tableReader.GetEventMapTable ();
++			m_events = new EventDefinition [evtTable.Rows.Count];
++			for (int i = 0; i < emapTable.Rows.Count; i++) {
++				EventMapRow emapRow = emapTable [i];
++				if (emapRow.Parent == 0)
++					continue;
++
++				TypeDefinition owner = GetTypeDefAt (emapRow.Parent);
++				GenericContext context = new GenericContext (owner);
++
++				int start = (int) emapRow.EventList, last = evtTable.Rows.Count + 1, end;
++				if (i < (emapTable.Rows.Count - 1))
++					end = (int) emapTable [i + 1].EventList;
++				else
++					end = last;
++
++				if (end > last)
++					end = last;
++
++				for (int j = start; j < end; j++) {
++					EventRow erow = evtTable [j - 1];
++					EventDefinition edef = new EventDefinition (
++						m_root.Streams.StringsHeap [erow.Name],
++						GetTypeDefOrRef (erow.EventType, context), erow.EventFlags);
++					edef.MetadataToken = MetadataToken.FromMetadataRow (TokenType.Event, j - 1);
++
++					if (!IsDeleted (edef))
++						owner.Events.Add (edef);
++
++					m_events [j - 1] = edef;
++				}
++			}
++		}
++
++		void ReadSemantics () {
++			if (!m_tHeap.HasTable (MethodSemanticsTable.RId))
++				return;
++
++			MethodSemanticsTable semTable = m_tableReader.GetMethodSemanticsTable ();
++			for (int i = 0; i < semTable.Rows.Count; i++) {
++				MethodSemanticsRow semRow = semTable [i];
++				MethodDefinition semMeth = GetMethodDefAt (semRow.Method);
++				semMeth.SemanticsAttributes = semRow.Semantics;
++				switch (semRow.Association.TokenType) {
++				case TokenType.Event:
++					EventDefinition evt = GetEventDefAt (semRow.Association.RID);
++					if ((semRow.Semantics & MethodSemanticsAttributes.AddOn) != 0)
++						evt.AddMethod = semMeth;
++					else if ((semRow.Semantics & MethodSemanticsAttributes.Fire) != 0)
++						evt.InvokeMethod = semMeth;
++					else if ((semRow.Semantics & MethodSemanticsAttributes.RemoveOn) != 0)
++						evt.RemoveMethod = semMeth;
++					break;
++				case TokenType.Property:
++					PropertyDefinition prop = GetPropertyDefAt (semRow.Association.RID);
++					if ((semRow.Semantics & MethodSemanticsAttributes.Getter) != 0)
++						prop.GetMethod = semMeth;
++					else if ((semRow.Semantics & MethodSemanticsAttributes.Setter) != 0)
++						prop.SetMethod = semMeth;
++					break;
++				}
++			}
++		}
++
++		void ReadInterfaces () {
++			if (!m_tHeap.HasTable (InterfaceImplTable.RId))
++				return;
++
++			InterfaceImplTable intfsTable = m_tableReader.GetInterfaceImplTable ();
++			for (int i = 0; i < intfsTable.Rows.Count; i++) {
++				InterfaceImplRow intfsRow = intfsTable [i];
++				TypeDefinition owner = GetTypeDefAt (intfsRow.Class);
++				owner.Interfaces.Add (GetTypeDefOrRef (intfsRow.Interface, new GenericContext (owner)));
++			}
++		}
++
++		void ReadOverrides () {
++			if (!m_tHeap.HasTable (MethodImplTable.RId))
++				return;
++
++			MethodImplTable implTable = m_tableReader.GetMethodImplTable ();
++			for (int i = 0; i < implTable.Rows.Count; i++) {
++				MethodImplRow implRow = implTable [i];
++				if (implRow.MethodBody.TokenType == TokenType.Method) {
++					MethodDefinition owner = GetMethodDefAt (implRow.MethodBody.RID);
++					switch (implRow.MethodDeclaration.TokenType) {
++					case TokenType.Method:
++						owner.Overrides.Add (
++							GetMethodDefAt (implRow.MethodDeclaration.RID));
++						break;
++					case TokenType.MemberRef:
++						owner.Overrides.Add (
++							(MethodReference) GetMemberRefAt (
++								implRow.MethodDeclaration.RID, new GenericContext (owner)));
++						break;
++					}
++				}
++			}
++		}
++
++		void ReadSecurityDeclarations () {
++			if (!m_tHeap.HasTable (DeclSecurityTable.RId))
++				return;
++
++			DeclSecurityTable dsTable = m_tableReader.GetDeclSecurityTable ();
++			for (int i = 0; i < dsTable.Rows.Count; i++) {
++				DeclSecurityRow dsRow = dsTable [i];
++				SecurityDeclaration dec = BuildSecurityDeclaration (dsRow);
++
++				if (dsRow.Parent.RID == 0)
++					continue;
++
++				IHasSecurity owner = null;
++				switch (dsRow.Parent.TokenType) {
++				case TokenType.Assembly:
++					owner = this.Module.Assembly;
++					break;
++				case TokenType.TypeDef:
++					owner = GetTypeDefAt (dsRow.Parent.RID);
++					break;
++				case TokenType.Method:
++					owner = GetMethodDefAt (dsRow.Parent.RID);
++					break;
++				}
++
++				owner.SecurityDeclarations.Add (dec);
++			}
++		}
++
++		private CustomAttribute CreateCustomAttribute (MetadataToken token) {
++			CustomAttributeRow caRow = TableReader.GetCustomAttributeTable () [(int) token.RID - 1];
++			MethodReference ctor;
++
++			if (caRow.Type.TokenType == TokenType.Method)
++				ctor = GetMethodDefAt (caRow.Type.RID);
++			else
++				ctor = GetMemberRefAt (caRow.Type.RID, new GenericContext ()) as MethodReference;
++
++			CustomAttrib ca = m_sigReader.GetCustomAttrib (caRow.Value, ctor);
++			CustomAttribute cattr;
++			if (!ca.Read) {
++				cattr = new CustomAttribute (ctor);
++				cattr.Resolved = false;
++				cattr.Blob = m_root.Streams.BlobHeap.Read (caRow.Value);
++			}
++			else
++				cattr = BuildCustomAttribute (ctor, ca);
++			return cattr;
++		}
++
++		void ReadCustomAttributes () {
++			if (!m_tHeap.HasTable (CustomAttributeTable.RId))
++				return;
++
++			CustomAttributeTable caTable = m_tableReader.GetCustomAttributeTable ();
++			for (int i = 0; i < caTable.Rows.Count; i++) {
++				CustomAttributeRow caRow = caTable [i];
++				MethodReference ctor;
++
++				if (caRow.Type.RID == 0)
++					continue;
++
++				if (caRow.Parent.RID == 0)
++					continue;
++
++				ICustomAttributeProvider owner = null;
++				switch (caRow.Parent.TokenType) {
++				case TokenType.Assembly:
++					owner = this.Module.Assembly;
++					break;
++				case TokenType.Module:
++					owner = this.Module;
++					break;
++				case TokenType.TypeRef:
++					owner = GetTypeRefAt (caRow.Parent.RID);
++					break;
++				case TokenType.Property:
++					owner = GetPropertyDefAt (caRow.Parent.RID);
++					break;
++				case TokenType.Event:
++					owner = GetEventDefAt (caRow.Parent.RID);
++					break;
++				case TokenType.Param:					
++					owner = GetParamDefAt (caRow.Parent.RID);
++					break;
++				case TokenType.GenericParam:
++					owner = GetGenericParameterAt (caRow.Parent.RID);
++					break;
++				default:
++					//TODO: support other ?
++					break;
++				}
++
++				if (owner == null)
++					continue;
++
++				if (caRow.Type.TokenType == TokenType.Method)
++					ctor = GetMethodDefAt (caRow.Type.RID);
++				else
++					ctor = GetMemberRefAt (caRow.Type.RID, new GenericContext ()) as MethodReference;
++
++				CustomAttrib ca = m_sigReader.GetCustomAttrib (caRow.Value, ctor);
++				CustomAttribute cattr;
++				if (!ca.Read) {
++					cattr = new CustomAttribute (ctor);
++					cattr.Resolved = false;
++					cattr.Blob = m_root.Streams.BlobHeap.Read (caRow.Value);
++				}
++				else
++					cattr = BuildCustomAttribute (ctor, ca);
++
++				owner.CustomAttributes.Add (cattr);
++			}
++		}
++
++		void ReadExternTypes () {
++			base.VisitExternTypeCollection (Module.ExternTypes);
++		}
++
++		void ReadMarshalSpecs () {
++			if (!m_tHeap.HasTable (FieldMarshalTable.RId))
++				return;
++
++			FieldMarshalTable fmTable = m_tableReader.GetFieldMarshalTable ();
++			for (int i = 0; i < fmTable.Rows.Count; i++) {
++				FieldMarshalRow fmRow = fmTable [i];
++
++				IHasMarshalSpec owner = null;
++				switch (fmRow.Parent.TokenType) {
++				case TokenType.Field:
++					owner = GetFieldDefAt (fmRow.Parent.RID);
++					break;
++				case TokenType.Param:
++					owner = GetParamDefAt (fmRow.Parent.RID);
++					break;
++				}
++
++				owner.MarshalSpec = BuildMarshalDesc (
++					m_sigReader.GetMarshalSig (fmRow.NativeType), owner);
++			}
++		}
++
++		#endregion
++
++		#region Lazy helper methods
++
++		public CustomAttribute [] GetCustomAttributes (MetadataToken token) {
++			MetadataToken [] tokens = Relations [token.TokenType] [RelationType.CustomAttributes].GetRelatedItems (token.RID);
++			CustomAttribute [] attrs = new CustomAttribute [tokens.Length];
++			for (int i = 0; i < tokens.Length; ++i)
++				attrs [i] = CreateCustomAttribute (tokens [i]);
++			return attrs;
++		}
++
++		public GenericParameter [] GetGenericParameters (MetadataToken token) {
++			MetadataToken [] genParamsRID = null;
++			if (token.TokenType == TokenType.TypeDef)
++				genParamsRID = Relations.TypeDefs [RelationType.GenericParameters].GetRelatedItems (token.RID);
++			else
++				genParamsRID = Relations.MethodDefs [RelationType.GenericParameters].GetRelatedItems (token.RID);
++			if (genParamsRID == null)
++				return new GenericParameter [0];
++			GenericParameter [] genParams = new GenericParameter [genParamsRID.Length];
++			for (int i = 0; i < genParams.Length; ++i)
++				genParams [i] = GetGenericParameterAt (genParamsRID [i].RID);
++			return genParams;
++		}
++
++		public ParameterDefinition [] GetParameters (MetadataToken token) {
++			ParamTable paramsTable = TableReader.GetParamTable ();
++			if (m_parameters == null) {
++				if (paramsTable != null)
++					m_parameters = new ParameterDefinition [paramsTable.Rows.Count];
++				else
++					m_parameters = new ParameterDefinition [0];
++			}
++
++			int currentMethodIndex = (int) token.RID - 1;
++			MethodTable methTable = TableReader.GetMethodTable ();
++			MethodRow methRow = methTable [currentMethodIndex];
++			MethodDefSig msig = m_sigReader.GetMethodDefSig (methRow.Signature);
++			int start = (int) methRow.ParamList - 1;
++			int prms = (currentMethodIndex == methTable.Rows.Count - 1) ?
++				m_parameters.Length : (int) methTable [currentMethodIndex + 1].ParamList - 1;
++			if (paramsTable != null && start < prms) //ret value
++			{
++				ParamRow pRetRow = paramsTable [start];
++				if (pRetRow != null && pRetRow.Sequence == 0) // ret type				
++					start++;
++			}
++			ParameterDefinition [] parameters = new ParameterDefinition [msig.ParamCount];
++			for (int k = 0; k < msig.ParamCount; k++) {
++				parameters [k] = GetParamDefAt ((uint) (k + start + 1));
++			}
++
++			return parameters;
++		}
++
++		public SecurityDeclaration [] GetSecurityDeclarations (MetadataToken token) {
++			return new SecurityDeclaration [0];
++		}
++
++		public PInvokeInfo GetPInvoke (MetadataToken token) {
++			return null;
++		}
++
++		public MethodReference [] GetOverrides (MetadataToken token) {
++			return new MethodReference [0];
++		}
++
++		public TypeReference [] GetInterfaces (MetadataToken token) {
++			return new TypeReference [0];
++		}
++
++		public TypeDefinition [] GetNestedTypes (MetadataToken token) {
++			return new TypeDefinition [0];
++		}
++
++		public TypeReference GetBaseType (MetadataToken token) {
++			TypeDefRow typeRow = TableReader.GetTypeDefTable () [(int) token.RID - 1];
++			if (typeRow.Extends.RID == 0)
++				return null;
++			TypeReference child = (TypeReference) LookupByToken (token);
++			return GetTypeDefOrRef (typeRow.Extends, new GenericContext (child));
++		}
++
++		public MethodDefinition [] GetMethods (MetadataToken token) {
++			int rowIndex = (int) token.RID - 1;
++			TypeDefTable typeDefs = TableReader.GetTypeDefTable ();
++			MethodTable methodDefs = TableReader.GetMethodTable ();
++			TypeDefRow row = typeDefs [rowIndex];
++			uint start = row.MethodList;
++			uint end = rowIndex == typeDefs.Rows.Count - 1 ?
++				(uint) methodDefs.Rows.Count + 1 : typeDefs [rowIndex + 1].MethodList;
++			MethodDefinition [] methods = new MethodDefinition [end - start];
++			for (uint i = 0; i < methods.Length; ++i)
++				methods [i] = GetMethodDefAt (i + start);
++			return methods;
++		}
++
++		public FieldDefinition [] GetFields (MetadataToken token) {
++			int rowIndex = (int) token.RID - 1;
++			TypeDefTable typeDefs = TableReader.GetTypeDefTable ();
++			FieldTable fieldTable = TableReader.GetFieldTable ();
++			if (fieldTable == null)
++				return new FieldDefinition [0];
++			TypeDefRow row = typeDefs [rowIndex];
++			uint start = row.FieldList;
++			uint end = rowIndex == typeDefs.Rows.Count - 1 ?
++				(uint) fieldTable.Rows.Count + 1 : typeDefs [rowIndex + 1].FieldList;
++			FieldDefinition [] fields = new FieldDefinition [end - start];
++			for (uint i = 0; i < fields.Length; ++i)
++				fields [i] = GetFieldDefAt (i + start);
++			return fields;
++
++
++		}
++
++		public EventDefinition [] GetEvents (MetadataToken token) {
++			return new EventDefinition [0];
++		}
++
++		public PropertyDefinition [] GetProperties (MetadataToken token) {
++			return new PropertyDefinition [0];
++		}
++
++		public object GetConstant (MetadataToken token) {
++			ConstantRow csRow = Relations.GetConstantValue (token);
++			if (csRow == null)
++				return null;
++			return GetConstant (csRow.Value, csRow.Type);
++		}
++
++		public bool HasConstant (MetadataToken token) {
++			ConstantRow csRow = Relations.GetConstantValue (token);
++			return csRow != null;
++		}
++
++		public RVA GetFieldRVA (MetadataToken token) {
++			FieldRVARow row = Relations.GetFieldRVA (token);
++			if (row != null) {
++				FieldDefinition field = GetFieldDefAt (token.RID);
++				return row.RVA;
++			}
++			return RVA.Zero;
++		}
++
++		public byte [] GetFieldInitialValue (MetadataToken token) {
++			FieldDefinition field = GetFieldDefAt (token.RID);
++			int size = 0;
++			TypeReference fieldType = field.FieldType;
++			switch (fieldType.FullName) {
++			case Constants.Byte:
++			case Constants.SByte:
++				size = 1;
++				break;
++			case Constants.Int16:
++			case Constants.UInt16:
++			case Constants.Char:
++				size = 2;
++				break;
++			case Constants.Int32:
++			case Constants.UInt32:
++			case Constants.Single:
++				size = 4;
++				break;
++			case Constants.Int64:
++			case Constants.UInt64:
++			case Constants.Double:
++				size = 8;
++				break;
++			default:
++				fieldType = fieldType.GetOriginalType ();
++
++				TypeDefinition fieldTypeDef = fieldType as TypeDefinition;
++
++				if (fieldTypeDef != null)
++					size = (int) fieldTypeDef.ClassSize;
++				break;
++			}
++
++			if (size > 0 && field.RVA != RVA.Zero) {
++				BinaryReader br = m_reader.MetadataReader.GetDataReader (field.RVA);
++				return br == null ? new byte [size] : br.ReadBytes (size);
++			}
++			else
++				return new byte [0];
++		}
++
++		public MethodReturnType GetMethodReturnType (MethodDefinition mdef) {
++			MethodRow mdefRow = TableReader.GetMethodTable () [(int) mdef.MetadataToken.RID - 1];
++			MethodDefSig mdefSig = m_sigReader.GetMethodDefSig (mdefRow.Signature);
++			return GetMethodReturnType (mdefSig, new GenericContext (mdef));
++		}
++
++		public TypeReference GetDeclaringType (MetadataToken token) {
++			MetadataToken declaringToken = new MetadataToken ();
++			switch (token.TokenType) {
++			case TokenType.Method:
++			case TokenType.Field:
++			case TokenType.TypeDef:
++			case TokenType.Property:
++				declaringToken =
++					Relations [token.TokenType] [RelationType.DeclaringType].GetRelatedItem (token.RID);
++				break;
++
++			case TokenType.MemberRef:
++				MemberRefRow memRow = TableReader.GetMemberRefTable () [(int) token.RID - 1];
++				declaringToken = memRow.Class;
++				break;
++
++			case TokenType.TypeRef:
++				TypeRefRow typeRow = TableReader.GetTypeRefTable () [(int) token.RID - 1];
++				declaringToken = typeRow.ResolutionScope;
++				break;
++			default:
++				throw new NotSupportedException ("not supported token type");
++			}
++			if (declaringToken.TokenType == TokenType.TypeRef || declaringToken.TokenType == TokenType.TypeDef)
++				return (TypeReference) LookupByToken (declaringToken);
++			return null;
++		}
++
++		#endregion
++	}
++}
+Index: Mono.Cecil/MetadataRelations.cs
+===================================================================
+--- Mono.Cecil/MetadataRelations.cs	(revision 0)
++++ Mono.Cecil/MetadataRelations.cs	(revision 0)
+@@ -0,0 +1,369 @@
++using System;
++using System.Collections.Generic;
++using System.Text;
++using Mono.Cecil.Metadata;
++using System.Collections;
++
++namespace Mono.Cecil
++{
++	public enum RelationType
++	{
++		DeclaringType,
++		NestedTypes,
++		CustomAttributes,
++		GenericParameters,
++		FieldRVA,
++		Owner
++	};
++
++	/**
++	 * This interface provides functionality of relating items from one table 
++	 * to item/items of another table
++	 */
++	interface IMetadataRelation
++	{
++		MetadataToken GetRelatedItem (uint sourceRowID);
++		MetadataToken [] GetRelatedItems (uint sourceRowID);
++		RelationType GetRelationType ();
++	}
++
++	internal class MetaDataRelationBase : IMetadataRelation
++	{
++		private MetadataToken [] m_oneToOneData;
++		private ArrayList [] m_oneToManyData;
++		private RelationType m_type;
++
++		public MetaDataRelationBase (RelationType type, MetadataToken [] data) {
++			m_type = type;
++			m_oneToOneData = data;
++		}
++
++		public MetaDataRelationBase (RelationType type, ArrayList [] data) {
++			m_type = type;
++			m_oneToManyData = data;
++		}
++
++		public MetadataToken GetRelatedItem (uint sourceRowID) {
++			if (m_oneToOneData == null)
++				throw new NotSupportedException ("The operation GetRelatedItem is not implemented in this relation.");
++			return m_oneToOneData [sourceRowID - 1];
++		}
++
++		public MetadataToken [] GetRelatedItems (uint sourceRowID) {
++			if (m_oneToManyData == null)
++				throw new NotSupportedException ("The operation GetRelatedItems is not implemented in this relation.");
++			if (m_oneToManyData [sourceRowID - 1] == null)
++				return new MetadataToken [0];
++			return (MetadataToken []) m_oneToManyData [sourceRowID - 1].ToArray (typeof (MetadataToken));
++		}
++
++		public RelationType GetRelationType () {
++			return m_type;
++		}
++	}
++
++	internal class MetadataRelationsCollection
++	{
++		private Hashtable m_relations = new Hashtable ();
++
++		public MetadataRelationsCollection () {
++		}
++
++		public IMetadataRelation this [RelationType type] {
++			get {
++				return (IMetadataRelation) m_relations [type];
++			}
++		}
++
++		internal void AddRelation (IMetadataRelation relation) {
++			m_relations [relation.GetRelationType ()] = relation;
++		}
++	}
++
++	internal class RelationsManager
++	{
++		private ReflectionReader m_reader;
++		private MetadataRelationsCollection m_typeDefs = new MetadataRelationsCollection ();
++		private MetadataRelationsCollection m_methodDefs = new MetadataRelationsCollection ();
++		private MetadataRelationsCollection m_fieldDefs = new MetadataRelationsCollection ();
++		private MetadataRelationsCollection m_memberRefs = new MetadataRelationsCollection ();
++		private MetadataRelationsCollection m_parameDefs = new MetadataRelationsCollection ();
++
++		private FieldRVARow [] m_RVARelation;
++		private ConstantRow [] m_fieldsConstants;
++		private ConstantRow [] m_propertiesConstants;
++		private ConstantRow [] m_parametersConstants;
++
++		public RelationsManager (ReflectionReader reader) {
++			m_reader = reader;
++			VisitNestedTypesTable ();
++			VisitGenericParametersTable ();
++			VisitTypeDefsTable ();
++			VisitFieldRVATAble ();
++			VisitConstantTable ();
++			VisitMethodsTable ();
++			VisitCustomAttributes ();
++		}
++
++		public MetadataRelationsCollection this [TokenType sourceType] {
++			get {
++				switch (sourceType) {
++				case TokenType.TypeDef:
++					return TypeDefs;
++				case TokenType.Method:
++					return MethodDefs;
++				case TokenType.Field:
++					return FieldDefs;
++				case TokenType.MemberRef:
++					return MemberRefs;
++				case TokenType.Param:
++					return ParamDefs;
++				default:
++					throw new NotSupportedException ("Not supported token type");
++				}
++			}
++		}
++
++		public FieldRVARow GetFieldRVA (MetadataToken token) {
++			if (m_RVARelation != null)
++				return m_RVARelation [(int) token.RID - 1];
++			return null;
++		}
++
++		public ConstantRow GetConstantValue (MetadataToken token) {
++			switch (token.TokenType) {
++			case TokenType.Field:
++				return m_fieldsConstants [(int) token.RID - 1];
++			case TokenType.Property:
++				return m_propertiesConstants [(int) token.RID - 1];
++			case TokenType.Param:
++				return m_parametersConstants [(int) token.RID - 1];
++			default:
++				throw new InvalidOperationException ("The token type " + token.TokenType + " has no constant");
++			}
++		}
++
++		public ConstantRow [] PropertyConstants {
++			get {
++				return m_propertiesConstants;
++			}
++		}
++
++		public MetadataRelationsCollection TypeDefs {
++			get {
++				return m_typeDefs;
++			}
++		}
++
++		public MetadataRelationsCollection MethodDefs {
++			get {
++				return m_methodDefs;
++			}
++		}
++
++		public MetadataRelationsCollection FieldDefs {
++			get {
++				return m_fieldDefs;
++			}
++		}
++
++		public MetadataRelationsCollection MemberRefs {
++			get {
++				return m_memberRefs;
++			}
++		}
++
++		public MetadataRelationsCollection ParamDefs {
++			get {
++				return m_parameDefs;
++			}
++		}
++
++		private void VisitNestedTypesTable () {
++			MetadataTableReader tableReader = m_reader.TableReader;
++			MetadataToken [] declaringTypes = new MetadataToken [tableReader.GetTypeDefTable ().Rows.Count];
++			NestedClassTable nestedTable = tableReader.GetNestedClassTable ();
++			ArrayList [] list = new ArrayList [tableReader.GetTypeDefTable ().Rows.Count];
++			if (nestedTable != null) {
++				foreach (NestedClassRow row in nestedTable.Rows) {
++					//declaring types relation
++					declaringTypes [row.NestedClass - 1] = new MetadataToken (TokenType.TypeDef, row.EnclosingClass);
++
++					//nested types relation
++					ArrayList current = list [row.EnclosingClass - 1];
++					if (current == null) {
++						current = new ArrayList ();
++						list [row.EnclosingClass - 1] = current;
++					}
++					current.Add (new MetadataToken (TokenType.TypeDef, row.NestedClass));
++				}
++			}
++			m_typeDefs.AddRelation (new MetaDataRelationBase (RelationType.DeclaringType, declaringTypes));
++			m_typeDefs.AddRelation (new MetaDataRelationBase (RelationType.NestedTypes, list));
++		}
++
++		private void VisitGenericParametersTable () {
++			MetadataTableReader tableReader = m_reader.TableReader;
++			GenericParamTable genTable = tableReader.GetGenericParamTable ();
++			MethodTable mTable = tableReader.GetMethodTable ();
++			TypeDefTable typesTable = tableReader.GetTypeDefTable ();
++			ArrayList [] typesRelation = new ArrayList [typesTable == null ? 0 : typesTable.Rows.Count];
++			ArrayList [] methodsRelation = new ArrayList [mTable == null ? 0 : mTable.Rows.Count];
++			if (genTable != null) {
++				for (int i = 0; i < genTable.Rows.Count; ++i) {
++					GenericParamRow row = (GenericParamRow) genTable.Rows [i];
++					if (row.Owner.TokenType == TokenType.TypeDef)
++						AddItem (typesRelation, (int) row.Owner.RID - 1, MetadataToken.FromMetadataRow (TokenType.GenericParam, i));
++					else
++						AddItem (methodsRelation, (int) row.Owner.RID - 1, MetadataToken.FromMetadataRow (TokenType.GenericParam, i));
++				}
++			}
++			m_typeDefs.AddRelation (new MetaDataRelationBase (RelationType.GenericParameters, typesRelation));
++			m_methodDefs.AddRelation (new MetaDataRelationBase (RelationType.GenericParameters, methodsRelation));
++		}
++
++		private void VisitTypeDefsTable () {
++			TypeDefTable typeDefs = m_reader.TableReader.GetTypeDefTable ();
++			MethodTable methodDefs = m_reader.TableReader.GetMethodTable ();
++			FieldTable fieldDefs = m_reader.TableReader.GetFieldTable ();
++
++			MetadataToken [] methodsDeclaring = new MetadataToken [methodDefs == null ? 0 : methodDefs.Rows.Count];
++			MetadataToken [] fieldssDeclaring = new MetadataToken [fieldDefs == null ? 0 : fieldDefs.Rows.Count];
++
++			for (int i = 0; i < typeDefs.Rows.Count; ++i) {
++				TypeDefRow typeRow = typeDefs [i];
++				MetadataToken typeToken = MetadataToken.FromMetadataRow (TokenType.TypeDef, i);
++
++				if (methodDefs != null) {
++					uint startMethods = typeRow.MethodList;
++					uint endMethods = (i == typeDefs.Rows.Count - 1) ? (uint) methodDefs.Rows.Count :
++											typeDefs [i + 1].MethodList;
++					for (uint j = startMethods; j < endMethods; ++j)
++						methodsDeclaring [j - 1] = typeToken;
++				}
++				if (fieldDefs != null) {
++					uint startFields = typeRow.FieldList;
++					uint endFields = (i == typeDefs.Rows.Count - 1) ? (uint) fieldDefs.Rows.Count :
++											typeDefs [i + 1].FieldList;
++					for (uint j = startFields; j < endFields; ++j)
++						fieldssDeclaring [j - 1] = typeToken;
++				}
++			}
++			m_methodDefs.AddRelation (new MetaDataRelationBase (RelationType.DeclaringType, methodsDeclaring));
++			m_fieldDefs.AddRelation (new MetaDataRelationBase (RelationType.DeclaringType, fieldssDeclaring));
++		}
++
++		public void VisitFieldRVATAble () {
++			FieldRVATable frTable = m_reader.TableReader.GetFieldRVATable ();
++			FieldTable fldTable = m_reader.TableReader.GetFieldTable ();
++			m_RVARelation = new FieldRVARow [fldTable == null ? 0 : fldTable.Rows.Count];
++			if (frTable != null) {
++				for (int i = 0; i < frTable.Rows.Count; i++) {
++					FieldRVARow frRow = frTable [i];
++					m_RVARelation [frRow.Field - 1] = frRow;
++				}
++			}
++		}
++
++		public void VisitConstantTable () {
++			ConstantTable consts = m_reader.TableReader.GetConstantTable ();
++			FieldTable fldTable = m_reader.TableReader.GetFieldTable ();
++			if (fldTable != null)
++				m_fieldsConstants = new ConstantRow [fldTable.Rows.Count];
++			ParamTable paramTable = m_reader.TableReader.GetParamTable ();
++			if (paramTable != null)
++				m_parametersConstants = new ConstantRow [paramTable.Rows.Count];
++			PropertyTable propTable = m_reader.TableReader.GetPropertyTable ();
++			if (propTable != null)
++				m_propertiesConstants = new ConstantRow [propTable.Rows.Count];
++			if (consts != null) {
++				for (int i = 0; i < consts.Rows.Count; ++i) {
++					ConstantRow row = consts [i];
++					switch (row.Parent.TokenType) {
++					case TokenType.Field:
++						m_fieldsConstants [(int) row.Parent.RID - 1] = row;
++						break;
++					case TokenType.Property:
++						m_propertiesConstants [(int) row.Parent.RID - 1] = row;
++						break;
++					case TokenType.Param:
++						m_parametersConstants [(int) row.Parent.RID - 1] = row;
++						break;
++					}
++				}
++			}
++		}
++
++		private void VisitCustomAttributes () {
++			CustomAttributeTable cTable = m_reader.TableReader.GetCustomAttributeTable ();
++			TypeDefTable typesTable = m_reader.TableReader.GetTypeDefTable ();
++			MethodTable methodsTable = m_reader.TableReader.GetMethodTable ();
++			FieldTable fieldsTable = m_reader.TableReader.GetFieldTable ();
++			ParamTable paramTable = m_reader.TableReader.GetParamTable ();
++
++			ArrayList [] typeDefsAttributes = new ArrayList [typesTable == null ? 0 : typesTable.Rows.Count];
++			ArrayList [] methodDefsAttributes = new ArrayList [methodsTable == null ? 0 : methodsTable.Rows.Count];
++			ArrayList [] fieldDefsAttributes = new ArrayList [fieldsTable == null ? 0 : fieldsTable.Rows.Count];
++			ArrayList [] paramDefsAttributes = new ArrayList [paramTable == null ? 0 : paramTable.Rows.Count];
++
++			if (cTable != null) {
++				for (int i = 0; i < cTable.Rows.Count; ++i) {
++					CustomAttributeRow row = cTable [i];
++					ArrayList [] currentList = null;
++					switch (row.Parent.TokenType) {
++					case TokenType.TypeDef:
++						currentList = typeDefsAttributes;
++						break;
++					case TokenType.Method:
++						currentList = methodDefsAttributes;
++						break;
++					case TokenType.Field:
++						currentList = fieldDefsAttributes;
++						break;
++					case TokenType.Param:
++						currentList = paramDefsAttributes;
++						break;
++					default:
++						break;
++					}
++					if (currentList != null) {
++						ArrayList list = currentList [(int) row.Parent.RID - 1];
++						if (list == null) {
++							list = new ArrayList ();
++							currentList [(int) row.Parent.RID - 1] = list;
++						}
++						list.Add (MetadataToken.FromMetadataRow (TokenType.CustomAttribute, i));
++					}
++				}
++			}
++
++			m_typeDefs.AddRelation (new MetaDataRelationBase (RelationType.CustomAttributes, typeDefsAttributes));
++			m_methodDefs.AddRelation (new MetaDataRelationBase (RelationType.CustomAttributes, methodDefsAttributes));
++			m_fieldDefs.AddRelation (new MetaDataRelationBase (RelationType.CustomAttributes, fieldDefsAttributes));
++			m_parameDefs.AddRelation (new MetaDataRelationBase (RelationType.CustomAttributes, paramDefsAttributes));
++		}
++
++		private void VisitMethodsTable () {
++			ParamTable pTable = m_reader.TableReader.GetParamTable ();
++			MetadataToken [] paramsMethodsRelation = new MetadataToken [pTable == null ? 0 : pTable.Rows.Count];
++			MethodTable mTable = m_reader.TableReader.GetMethodTable ();
++			if (pTable != null) {
++				for (int i = 0; i < mTable.Rows.Count; ++i) {
++					MethodRow row = mTable [i];
++					uint start = row.ParamList;
++					uint end = (i == mTable.Rows.Count - 1) ?
++						(uint) pTable.Rows.Count + 1 : mTable [i + 1].ParamList;
++					for (uint j = start; j < end; ++j)
++						paramsMethodsRelation [(int) j - 1] = MetadataToken.FromMetadataRow (TokenType.Method, i);
++				}
++			}
++			m_parameDefs.AddRelation (new MetaDataRelationBase (RelationType.Owner, paramsMethodsRelation));
++		}
++
++		private void AddItem (ArrayList [] array, int index, MetadataToken item) {
++			if (array [index] == null)
++				array [index] = new ArrayList ();
++			array [index].Add (item);
++		}
++	}
++}
+Index: Mono.Cecil/MethodDefinition.cs
+===================================================================
+--- Mono.Cecil/MethodDefinition.cs	(revision 84855)
++++ Mono.Cecil/MethodDefinition.cs	(working copy)
+@@ -49,7 +49,10 @@
+ 		RVA m_rva;
+ 		OverrideCollection m_overrides;
+ 		PInvokeInfo m_pinvoke;
++		bool m_pinvokeInitialized;
+ 		readonly ParameterDefinition m_this;
++		LazyReflectionReader m_reader;
++		bool declaringTypeInitialized;
+ 
+ 		public MethodAttributes Attributes {
+ 			get { return m_attributes; }
+@@ -66,9 +69,25 @@
+ 			set { m_semAttrs = value; }
+ 		}
+ 
++		internal LazyReflectionReader Reader {
++			get {
++				return m_reader;
++			}
++			set {
++				m_reader = value;
++			}
++		}
++
+ 		public override TypeReference DeclaringType {
+-			get { return base.DeclaringType; }
++			get {
++				if (m_reader != null && !declaringTypeInitialized) {
++					base.DeclaringType = Reader.GetDeclaringType (MetadataToken);
++					declaringTypeInitialized = true;
++				}
++				return base.DeclaringType;
++			}
+ 			set {
++				declaringTypeInitialized = true;
+ 				base.DeclaringType = value;
+ 				TypeDefinition t = value as TypeDefinition;
+ 				if (t != null)
+@@ -76,10 +95,55 @@
+ 			}
+ 		}
+ 
++		public override MethodReturnType ReturnType {
++			get {
++				if (Reader != null && (base.ReturnType == null || base.ReturnType.ReturnType == null))
++					base.ReturnType = Reader.GetMethodReturnType (this);
++				return base.ReturnType;
++			}
++			set { base.ReturnType = value; }
++		}
++
++		public override ParameterDefinitionCollection Parameters {
++			get {
++				if (m_parameters == null) {
++					m_parameters = new ParameterDefinitionCollection (this);
++					if (Reader != null) {
++						ParameterDefinition [] parameters = Reader.GetParameters (MetadataToken);
++						for (int i = 0; i < parameters.Length; ++i)
++							m_parameters.Add (parameters [i]);
++					}
++				}
++				return m_parameters;
++			}
++		}
++
++		public override GenericParameterCollection GenericParameters {
++			get {
++				if (m_genparams == null) {
++					m_genparams = new GenericParameterCollection (this);
++					if (Reader != null) {
++						GenericParameter [] genParams = Reader.GetGenericParameters (MetadataToken);
++						for (int i = 0; i < genParams.Length; ++i)
++							m_genparams.Add (genParams [i]);
++					}
++				}
++				return m_genparams;
++			}
++		}
++
+ 		public SecurityDeclarationCollection SecurityDeclarations {
+ 			get {
+ 				if (m_secDecls == null)
++				{
+ 					m_secDecls = new SecurityDeclarationCollection (this);
++					if (Reader != null)
++					{
++						SecurityDeclaration [] decl = Reader.GetSecurityDeclarations (MetadataToken);
++						for (int i = 0; i < decl.Length; ++i)
++							m_secDecls.Add (decl [i]);
++					}
++				}
+ 
+ 				return m_secDecls;
+ 			}
+@@ -88,7 +152,15 @@
+ 		public CustomAttributeCollection CustomAttributes {
+ 			get {
+ 				if (m_customAttrs == null)
++				{
+ 					m_customAttrs = new CustomAttributeCollection (this);
++					if (Reader != null)
++					{
++						CustomAttribute [] attr = Reader.GetCustomAttributes (MetadataToken);
++						for (int i = 0; i < attr.Length; ++i)
++							m_customAttrs.Add (attr [i]);
++					}
++				}
+ 
+ 				return m_customAttrs;
+ 			}
+@@ -108,14 +180,30 @@
+ 		}
+ 
+ 		public PInvokeInfo PInvokeInfo {
+-			get { return m_pinvoke; }
+-			set { m_pinvoke = value; }
++			get {
++				if (Reader != null && !m_pinvokeInitialized)
++				{
++					m_pinvoke = Reader.GetPInvoke (MetadataToken);
++					m_pinvokeInitialized = true;
++				}
++				return m_pinvoke; 
++			}
++			set {
++				m_pinvokeInitialized = true; 
++				m_pinvoke = value;
++			}
+ 		}
+ 
+ 		public OverrideCollection Overrides {
+ 			get {
+-				if (m_overrides == null)
++				if (m_overrides == null) {
+ 					m_overrides = new OverrideCollection (this);
++					if (Reader != null) {
++						MethodReference [] overrides = Reader.GetOverrides (MetadataToken);
++						for (int i = 0; i < overrides.Length; ++i)
++							m_overrides.Add (overrides [i]);
++					}
++				}
+ 
+ 				return m_overrides;
+ 			}
+@@ -366,7 +454,7 @@
+ 			this.HasThis = !this.IsStatic;
+ 			if (!IsStatic)
+ 				m_this = new ParameterDefinition ("this", 0, (ParameterAttributes) 0, null);
+-		}
++		}		
+ 
+ 		public MethodDefinition (string name, MethodAttributes attrs, TypeReference returnType) :
+ 			this (name, attrs)
+Index: Mono.Cecil/MethodDefinitionCollection.cs
+===================================================================
+--- Mono.Cecil/MethodDefinitionCollection.cs	(revision 84855)
++++ Mono.Cecil/MethodDefinitionCollection.cs	(working copy)
+@@ -166,7 +166,7 @@
+ 
+ 		void Attach (MemberReference member)
+ 		{
+-			if (member.DeclaringType != null)
++			if (member.DeclaringType != null && member.DeclaringType != m_container)
+ 				throw new ReflectionException ("Member already attached, clone it instead");
+ 
+ 			member.DeclaringType = m_container;
+Index: Mono.Cecil/MethodReference.cs
+===================================================================
+--- Mono.Cecil/MethodReference.cs	(revision 84855)
++++ Mono.Cecil/MethodReference.cs	(working copy)
+@@ -32,13 +32,13 @@
+ 
+ 	public class MethodReference : MemberReference, IMethodSignature, IGenericParameterProvider {
+ 
+-		ParameterDefinitionCollection m_parameters;
++		protected ParameterDefinitionCollection m_parameters;
+ 		MethodReturnType m_returnType;
+ 
+ 		bool m_hasThis;
+ 		bool m_explicitThis;
+-		MethodCallingConvention m_callConv;
+-		GenericParameterCollection m_genparams;
++		protected MethodCallingConvention m_callConv;
++		protected GenericParameterCollection m_genparams;
+ 
+ 		public virtual bool HasThis {
+ 			get { return m_hasThis; }
+@@ -63,7 +63,7 @@
+ 			}
+ 		}
+ 
+-		public GenericParameterCollection GenericParameters {
++		public virtual GenericParameterCollection GenericParameters {
+ 			get {
+ 				if (m_genparams == null)
+ 					m_genparams = new GenericParameterCollection (this);
+@@ -118,7 +118,7 @@
+ 			int sentinel = GetSentinel ();
+ 
+ 			StringBuilder sb = new StringBuilder ();
+-			sb.Append (m_returnType.ReturnType.FullName);
++			sb.Append (ReturnType.ReturnType.FullName);
+ 			sb.Append (" ");
+ 			sb.Append (base.ToString ());
+ 			sb.Append ("(");
+Index: Mono.Cecil/ModuleDefinition.cs
+===================================================================
+--- Mono.Cecil/ModuleDefinition.cs	(revision 84855)
++++ Mono.Cecil/ModuleDefinition.cs	(working copy)
+@@ -143,12 +143,12 @@
+ 		{
+ 		}
+ 
+-		internal ModuleDefinition (string name, AssemblyDefinition asm, StructureReader reader) :
+-			this (name, asm, reader, false)
++		internal ModuleDefinition (string name, AssemblyDefinition asm, StructureReader reader, bool lazy) :
++			this (name, asm, reader, false, lazy)
+ 		{
+ 		}
+ 
+-		internal ModuleDefinition (string name, AssemblyDefinition asm, StructureReader reader, bool main) : base (name)
++		internal ModuleDefinition (string name, AssemblyDefinition asm, StructureReader reader, bool main, bool lazy) : base (name)
+ 		{
+ 			if (asm == null)
+ 				throw new ArgumentNullException ("asm");
+@@ -174,7 +174,7 @@
+ 			m_refs = new TypeReferenceCollection (this);
+ 			m_members = new MemberReferenceCollection (this);
+ 
+-			m_controller = new ReflectionController (this);
++			m_controller = new ReflectionController (this, lazy);
+ 		}
+ 
+ 		public IMetadataTokenProvider LookupByToken (MetadataToken token)
+Index: Mono.Cecil/PropertyDefinition.cs
+===================================================================
+--- Mono.Cecil/PropertyDefinition.cs	(revision 84855)
++++ Mono.Cecil/PropertyDefinition.cs	(working copy)
+@@ -43,7 +43,21 @@
+ 
+ 		bool m_hasConstant;
+ 		object m_const;
++		bool m_constantInitialized;
++		LazyReflectionReader m_reader;		
+ 
++		internal LazyReflectionReader Reader
++		{
++			get
++			{
++				return m_reader;
++			}
++			set
++			{
++				m_reader = value;
++			}
++		}		
++
+ 		public PropertyAttributes Attributes {
+ 			get { return m_attributes; }
+ 			set { m_attributes = value; }
+@@ -97,17 +111,35 @@
+ 		}
+ 
+ 		public bool HasConstant {
+-			get { return m_hasConstant; }
++			get {
++				if (Reader != null && !m_constantInitialized)
++					InitConstant ();
++				return m_hasConstant;
++			}
+ 		}
+ 
+ 		public object Constant {
+-			get { return m_const; }
++			get {
++				if (Reader != null && !m_constantInitialized) {
++					InitConstant ();
++				}
++				return m_const;
++			}
+ 			set {
+ 				m_hasConstant = true;
++				m_constantInitialized = true;
+ 				m_const = value;
+ 			}
+ 		}
+ 
++		private void InitConstant ()
++		{
++			m_hasConstant = Reader.HasConstant (MetadataToken);
++			if (m_hasConstant)
++				m_const = Reader.GetConstant (MetadataToken);
++			m_constantInitialized = true;
++		}
++
+ 		#region PropertyAttributes
+ 
+ 		public bool IsSpecialName {
+Index: Mono.Cecil/ReflectionController.cs
+===================================================================
+--- Mono.Cecil/ReflectionController.cs	(revision 84855)
++++ Mono.Cecil/ReflectionController.cs	(working copy)
+@@ -51,9 +51,12 @@
+ 			get { return m_importer; }
+ 		}
+ 
+-		public ReflectionController (ModuleDefinition module)
++		public ReflectionController (ModuleDefinition module, bool lazy)
+ 		{
+-			m_reader = new AggressiveReflectionReader (module);
++			if (lazy)
++				m_reader = new LazyReflectionReader (module);
++			else 
++				m_reader = new AggressiveReflectionReader(module);			
+ 			m_writer = new ReflectionWriter (module);
+ 			m_helper = new ReflectionHelper (module);
+ 			m_importer = new DefaultImporter (module);
+Index: Mono.Cecil/ReflectionReader.cs
+===================================================================
+--- Mono.Cecil/ReflectionReader.cs	(revision 84855)
++++ Mono.Cecil/ReflectionReader.cs	(working copy)
+@@ -126,7 +126,7 @@
+ 			return m_typeDefs [rid - 1];
+ 		}
+ 
+-		public TypeReference GetTypeRefAt (uint rid)
++		public virtual TypeReference GetTypeRefAt (uint rid)
+ 		{
+ 			return m_typeRefs [rid - 1];
+ 		}
+@@ -148,12 +148,12 @@
+ 			return tspec;
+ 		}
+ 
+-		public FieldDefinition GetFieldDefAt (uint rid)
++		public virtual FieldDefinition GetFieldDefAt (uint rid)
+ 		{
+ 			return m_fields [rid - 1];
+ 		}
+ 
+-		public MethodDefinition GetMethodDefAt (uint rid)
++		public virtual MethodDefinition GetMethodDefAt (uint rid)
+ 		{
+ 			return m_meths [rid - 1];
+ 		}
+@@ -285,12 +285,12 @@
+ 			return m_events [rid - 1];
+ 		}
+ 
+-		public ParameterDefinition GetParamDefAt (uint rid)
++		public virtual ParameterDefinition GetParamDefAt (uint rid)
+ 		{
+ 			return m_parameters [rid - 1];
+ 		}
+ 
+-		public GenericParameter GetGenericParameterAt (uint rid)
++		public virtual GenericParameter GetGenericParameterAt (uint rid)
+ 		{
+ 			return m_genericParameters [rid - 1];
+ 		}
+@@ -394,7 +394,7 @@
+ 			case TokenType.Property :
+ 				return GetPropertyDefAt (token.RID);
+ 			case TokenType.Param :
+-				return GetParamDefAt (token.RID);
++				return GetParamDefAt (token.RID);				
+ 			default :
+ 				throw new NotSupportedException ("Lookup is not allowed on this kind of token");
+ 			}
+@@ -479,7 +479,7 @@
+ 			ReadMemberReferences ();
+ 		}
+ 
+-		void AddTypeRef (TypeRefTable typesRef, int i)
++		protected void AddTypeRef (TypeRefTable typesRef, int i)
+ 		{
+ 			// Check if index has been already added.
+ 			if (m_typeRefs [i] != null)
+Index: Mono.Cecil/StructureReader.cs
+===================================================================
+--- Mono.Cecil/StructureReader.cs	(revision 84855)
++++ Mono.Cecil/StructureReader.cs	(working copy)
+@@ -44,6 +44,7 @@
+ 		MetadataStreamCollection m_streams;
+ 		TablesHeap m_tHeap;
+ 		MetadataTableReader m_tableReader;
++		bool m_lazyLoad;
+ 
+ 		public bool ManifestOnly {
+ 			get { return m_manifestOnly; }
+@@ -74,6 +75,13 @@
+ 			m_manifestOnly = manifestOnly;
+ 		}
+ 
++		public StructureReader (ImageReader ir, bool manifestOnly, bool lazy)
++			: this (ir)
++		{
++			m_manifestOnly = manifestOnly;
++			m_lazyLoad = lazy;
++		}
++
+ 		byte [] ReadBlob (uint pointer)
+ 		{
+ 			if (pointer == 0)
+@@ -206,7 +214,7 @@
+ 
+ 			ModuleRow mr = mt [0];
+ 			string name = ReadString (mr.Name);
+-			ModuleDefinition main = new ModuleDefinition (name, m_asmDef, this, true);
++			ModuleDefinition main = new ModuleDefinition (name, m_asmDef, this, true, m_lazyLoad);
+ 			main.Mvid = m_streams.GuidHeap [mr.Mvid];
+ 			main.MetadataToken = new MetadataToken (TokenType.Module, 1);
+ 			modules.Add (main);
+@@ -235,7 +243,7 @@
+ 
+ 					mr = mt [0];
+ 					ModuleDefinition modext = new ModuleDefinition (name, m_asmDef,
+-						new StructureReader (module, m_manifestOnly), false);
++						new StructureReader (module, m_manifestOnly), false,m_lazyLoad);
+ 					modext.Mvid = module.Image.MetadataRoot.Streams.GuidHeap [mr.Mvid];
+ 
+ 					modules.Add (modext);
+Index: Mono.Cecil/TypeDefinition.cs
+===================================================================
+--- Mono.Cecil/TypeDefinition.cs	(revision 84855)
++++ Mono.Cecil/TypeDefinition.cs	(working copy)
+@@ -45,14 +45,72 @@
+ 		EventDefinitionCollection m_events;
+ 		PropertyDefinitionCollection m_properties;
+ 		SecurityDeclarationCollection m_secDecls;
++		LazyReflectionReader m_reader;
++		bool declaringTypeInitialized;
+ 
++		internal LazyReflectionReader Reader {
++			get {
++				return m_reader;
++			}
++			set {
++				m_reader = value;
++			}
++		}
++
++		public override TypeReference DeclaringType {
++			get {
++				if (m_reader != null && !declaringTypeInitialized) {
++					base.DeclaringType = Reader.GetDeclaringType (MetadataToken);
++					declaringTypeInitialized = true;
++				}
++				return base.DeclaringType;
++			}
++			set {
++				declaringTypeInitialized = true;
++				base.DeclaringType = value;
++			}
++		}
++
++		public override CustomAttributeCollection CustomAttributes {
++			get {
++				if (m_customAttrs == null) {
++					m_customAttrs = new CustomAttributeCollection (this);
++					if (Reader != null) {
++						CustomAttribute [] attrs = Reader.GetCustomAttributes (MetadataToken);
++						for (int i = 0; i < attrs.Length; ++i)
++							m_customAttrs.Add (attrs [i]);
++					}
++				}
++
++				return m_customAttrs;
++			}
++		}
++
++		public override GenericParameterCollection GenericParameters {
++			get {
++				if (m_genparams == null) {
++					m_genparams = new GenericParameterCollection (this);
++					if (Reader != null) {
++						GenericParameter [] parameters = Reader.GetGenericParameters (MetadataToken);
++						foreach (GenericParameter p in parameters)
++							m_genparams.Add (p);
++					}
++				}
++				return m_genparams;
++			}
++		}
++
+ 		public TypeAttributes Attributes {
+ 			get { return m_attributes; }
+ 			set { m_attributes = value; }
+ 		}
+ 
+ 		public TypeReference BaseType {
+-			get { return m_baseType; }
++			get {
++				if (m_baseType == null && Reader != null)
++					m_baseType = Reader.GetBaseType (MetadataToken);
++				return m_baseType;
++			}
+ 			set { m_baseType = value; }
+ 		}
+ 
+@@ -78,8 +136,14 @@
+ 
+ 		public InterfaceCollection Interfaces {
+ 			get {
+-				if (m_interfaces == null)
++				if (m_interfaces == null) {
+ 					m_interfaces = new InterfaceCollection (this);
++					if (Reader != null) {
++						TypeReference [] interfaces = Reader.GetInterfaces (MetadataToken);
++						for (int i = 0; i < interfaces.Length; ++i)
++							m_interfaces.Add (interfaces [i]);
++					}
++				}
+ 
+ 				return m_interfaces;
+ 			}
+@@ -87,8 +151,14 @@
+ 
+ 		public NestedTypeCollection NestedTypes {
+ 			get {
+-				if (m_nestedTypes == null)
++				if (m_nestedTypes == null) {
+ 					m_nestedTypes = new NestedTypeCollection (this);
++					if (Reader != null) {
++						TypeDefinition [] nestedTypes = Reader.GetNestedTypes (MetadataToken);
++						for (int i = 0; i < nestedTypes.Length; ++i)
++							m_nestedTypes.Add (nestedTypes [i]);
++					}
++				}
+ 
+ 				return m_nestedTypes;
+ 			}
+@@ -96,8 +166,13 @@
+ 
+ 		public MethodDefinitionCollection Methods {
+ 			get {
+-				if (m_methods == null)
++				if (m_methods == null) {
+ 					m_methods = new MethodDefinitionCollection (this);
++					if (Reader != null) {
++						m_ctors = new ConstructorCollection (this);
++						InitMethods ();
++					}
++				}
+ 
+ 				return m_methods;
+ 			}
+@@ -105,17 +180,41 @@
+ 
+ 		public ConstructorCollection Constructors {
+ 			get {
+-				if (m_ctors == null)
++				if (m_ctors == null) {
+ 					m_ctors = new ConstructorCollection (this);
++					if (Reader != null) {
++						m_methods = new MethodDefinitionCollection (this);
++						InitMethods ();
++					}
+ 
++				}
++
+ 				return m_ctors;
+ 			}
+ 		}
+ 
++		private void InitMethods ()
++		{
++			MethodDefinition [] methods = Reader.GetMethods (MetadataToken);
++			for (int i = 0; i < methods.Length; ++i)
++			{
++				if (methods [i].IsConstructor)
++					m_ctors.Add (methods [i]);
++				else
++					m_methods.Add (methods [i]);
++			}
++		}
++
+ 		public FieldDefinitionCollection Fields {
+ 			get {
+-				if (m_fields == null)
++				if (m_fields == null) {
+ 					m_fields = new FieldDefinitionCollection (this);
++					if (Reader != null) {
++						FieldDefinition [] fields = Reader.GetFields (MetadataToken);
++						for (int i = 0; i < fields.Length; ++i)
++							m_fields.Add (fields [i]);
++					}
++				}
+ 
+ 				return m_fields;
+ 			}
+@@ -123,8 +222,14 @@
+ 
+ 		public EventDefinitionCollection Events {
+ 			get {
+-				if (m_events == null)
++				if (m_events == null) {
+ 					m_events = new EventDefinitionCollection (this);
++					if (Reader != null) {
++						EventDefinition [] events = Reader.GetEvents (MetadataToken);
++						for (int i = 0; i < events.Length; ++i)
++							m_events.Add (events [i]);
++					}
++				}
+ 
+ 				return m_events;
+ 			}
+@@ -133,7 +238,15 @@
+ 		public PropertyDefinitionCollection Properties {
+ 			get {
+ 				if (m_properties == null)
++				{
+ 					m_properties = new PropertyDefinitionCollection (this);
++					if (Reader != null)
++					{
++						PropertyDefinition [] props = Reader.GetProperties (MetadataToken);
++						for (int i = 0; i < props.Length; ++i)
++							m_properties.Add (props [i]);
++					}
++				}
+ 
+ 				return m_properties;
+ 			}
+@@ -142,7 +255,15 @@
+ 		public SecurityDeclarationCollection SecurityDeclarations {
+ 			get {
+ 				if (m_secDecls == null)
++				{
+ 					m_secDecls = new SecurityDeclarationCollection (this);
++					if (Reader != null)
++					{
++						SecurityDeclaration [] dec = Reader.GetSecurityDeclarations (MetadataToken);
++						for (int i = 0; i < dec.Length; ++i)
++							m_secDecls.Add (dec [i]);
++					}
++				}
+ 
+ 				return m_secDecls;
+ 			}
+@@ -432,7 +553,7 @@
+ 		{
+ 			this.BaseType = baseType;
+ 		}
+-
++		
+ 		public TypeDefinition Clone ()
+ 		{
+ 			return Clone (this, new ImportContext (NullReferenceImporter.Instance, this));
+Index: Mono.Cecil/TypeReference.cs
+===================================================================
+--- Mono.Cecil/TypeReference.cs	(revision 84855)
++++ Mono.Cecil/TypeReference.cs	(working copy)
+@@ -37,8 +37,8 @@
+ 		IMetadataScope m_scope;
+ 		ModuleDefinition m_module;
+ 
+-		CustomAttributeCollection m_customAttrs;
+-		GenericParameterCollection m_genparams;
++		protected CustomAttributeCollection m_customAttrs;
++		protected GenericParameterCollection m_genparams;
+ 
+ 		public override string Name {
+ 			get { return base.Name; }
+@@ -66,7 +66,8 @@
+ 			set { m_module = value; }
+ 		}
+ 
+-		public CustomAttributeCollection CustomAttributes {
++		public virtual CustomAttributeCollection CustomAttributes
++		{
+ 			get {
+ 				if (m_customAttrs == null)
+ 					m_customAttrs = new CustomAttributeCollection (this);
+@@ -75,7 +76,7 @@
+ 			}
+ 		}
+ 
+-		public GenericParameterCollection GenericParameters {
++		public virtual GenericParameterCollection GenericParameters {
+ 			get {
+ 				if (m_genparams == null)
+ 					m_genparams = new GenericParameterCollection (this);

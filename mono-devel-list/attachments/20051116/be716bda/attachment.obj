@@ -1,0 +1,348 @@
+Index: metadata/class.c
+===================================================================
+--- metadata/class.c	(revision 52794)
++++ metadata/class.c	(working copy)
+@@ -2682,6 +2682,12 @@
+ 		g_assert (class->field.count == 0);
+ 	}
+ 
++	/* reserve space to store COM object pointer in RCW */
++	if (class->flags & TYPE_ATTRIBUTE_IMPORT && !MONO_CLASS_IS_INTERFACE(class)) {
++		class->instance_size += 2 * sizeof (gpointer);
++		g_assert (class->field.count == 0);
++	}
++
+ 	if (class->enumtype) {
+ 		class->enum_basetype = mono_class_find_enum_basetype (class);
+ 		class->cast_class = class->element_class = mono_class_from_mono_type (class->enum_basetype);
+Index: metadata/object-internals.h
+===================================================================
+--- metadata/object-internals.h	(revision 52794)
++++ metadata/object-internals.h	(working copy)
+@@ -993,6 +993,17 @@
+ 	guint32 location;
+ } MonoManifestResourceInfo;
+ 
++
++typedef struct {
++	MonoObject object;
++	MonoString *guid;
++} MonoReflectionGuidAttribute;
++
++typedef struct {
++	MonoObject object;
++	guint16 intType;
++} MonoInterfaceTypeAttribute;
++
+ /* Keep in sync with System.GenericParameterAttributes */
+ typedef enum {
+ 	GENERIC_PARAMETER_ATTRIBUTE_NON_VARIANT		= 0,
+Index: metadata/marshal.c
+===================================================================
+--- metadata/marshal.c	(revision 52794)
++++ metadata/marshal.c	(working copy)
+@@ -6309,6 +6309,279 @@
+ 	mono_mb_emit_byte (mb, CEE_RET);
+ }
+ 
++void
++component_get_object_and_fnc_ptr(MonoObject *this, MonoMethod* method, gpointer* pObj, gpointer* pFunc)
++{
++	IUnknown * pUnk = NULL;
++	int ** vtable;
++	int i = 0;
++	int offset = 0;
++	GUID clsid;
++
++	for (i = 0; i < method->klass->interface_count; i++)
++	{
++		int first;
++		MonoClass* itf = *(method->klass->interfaces+i);
++
++		first = itf->method.first;
++		if (first <= method->slot && first+itf->method.count > method->slot)
++		{
++			static MonoClass *GuidAttribute;
++			static MonoClass *InterfaceTypeAttribute;
++			MonoCustomAttrInfo *cinfo;
++			MonoReflectionGuidAttribute *attr;
++			MonoInterfaceTypeAttribute* itf_attr;
++
++			offset = method->slot - first;
++
++			if (!GuidAttribute)
++				GuidAttribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "GuidAttribute");
++			if (!InterfaceTypeAttribute)
++				InterfaceTypeAttribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "InterfaceTypeAttribute");
++
++			if (GuidAttribute) {
++				cinfo = mono_custom_attrs_from_class (itf);
++				if (cinfo) {
++					attr = (MonoReflectionGuidAttribute*)mono_custom_attrs_get_attr (cinfo, GuidAttribute);
++					itf_attr = (MonoInterfaceTypeAttribute*)mono_custom_attrs_get_attr (cinfo, InterfaceTypeAttribute);
++					if (attr) {
++						LPOLESTR temp;
++						wchar_t buf[50];
++						wsprintf(buf,L"{%s}",attr->guid->chars);
++						CLSIDFromString(buf, &clsid);
++						((IUnknown*)*((int*)this+sizeof(MonoObject)))->lpVtbl->QueryInterface(((IUnknown*)*((int*)this+sizeof(MonoObject))), &clsid, &pUnk);
++
++						if (pUnk)
++						{
++							*pObj = pUnk;
++							vtable = pUnk->lpVtbl;
++
++							if (itf_attr && itf_attr->intType == 1)
++								offset += 3;
++							else
++								offset += 7;
++
++							*pFunc = (*(vtable+offset));
++						}
++						else
++						{
++							/* bad news */
++						}
++
++					}
++					if (!cinfo->cached)
++						mono_custom_attrs_free (cinfo);
++				}
++			}
++
++			break;
++		}
++	}
++
++}
++
++void
++component_destroy (MonoObject * this)
++{
++	/* 
++	 * need to release COM object here,
++	 * except this isn't called yet
++	 */
++}
++
++void
++component_create (MonoObject * this)
++{
++	void * pUnk;
++	int i = 0;
++	GUID clsid;
++
++	
++	static MonoClass *GuidAttribute;
++	MonoCustomAttrInfo *cinfo;
++	MonoReflectionGuidAttribute *attr;
++	static int coinit = 0;
++
++	if (!coinit)
++	{
++		CoInitialize(NULL);
++		coinit = 1;
++	}
++
++	if (!GuidAttribute)
++			GuidAttribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "GuidAttribute");
++
++	if (GuidAttribute) {
++		cinfo = mono_custom_attrs_from_class (this->vtable->klass);
++		if (cinfo) {
++			attr = (MonoReflectionGuidAttribute*)mono_custom_attrs_get_attr (cinfo, GuidAttribute);
++			if (attr) {
++				LPOLESTR temp;
++				wchar_t buf[50];
++				wsprintf(buf,L"{%s}",attr->guid->chars);
++				CLSIDFromString(buf, &clsid);
++				/*gunichar2 * sguid = attr->guid->chars;
++				for (i = 0; i < )
++				clsid = attr->guid->chars;*/
++			}
++			if (!cinfo->cached)
++				mono_custom_attrs_free (cinfo);
++		}
++	}
++
++
++
++	CoCreateInstance(&clsid, NULL, CLSCTX_INPROC, &IID_IUnknown, (void**)&pUnk);
++
++	*((int*)this+sizeof(MonoObject)) = (gpointer)pUnk;
++}
++
++MonoMethod *
++component_get_native_wrapper (MonoMethod *method)
++{
++	MonoMethodSignature *sig, *csig;
++	MonoMethodBuilder *mb;
++	MonoMethod *res;
++	GHashTable *cache;
++
++	g_assert (method != NULL);
++	g_assert (method->klass->flags & TYPE_ATTRIBUTE_IMPORT);
++	g_assert (method->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_RUNTIME));
++
++	cache = method->klass->image->native_wrapper_cache;
++	sig = mono_method_signature (method);
++
++	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_MANAGED_TO_NATIVE);
++	mb->method->save_lmf = 1;
++
++	g_print ("Finding internal method for COM object '%s.%s::%s'.\n",method->klass->name_space, method->klass->name,method->name);
++
++	if (!strcmp(method->name,".ctor"))
++	{
++		csig = sig;
++		
++		if (sig->hasthis)
++			mono_mb_emit_byte (mb, CEE_LDARG_0);
++
++		/*for (i = 0; i < sig->param_count; i++)
++			mono_mb_emit_ldarg (mb, i + sig->hasthis);
++		*/
++
++		mono_mb_emit_native_call (mb, csig, component_create);
++		emit_thread_interrupt_checkpoint (mb);
++		mono_mb_emit_byte (mb, CEE_RET);
++
++		csig = mono_metadata_signature_dup (csig);
++		csig->pinvoke = 0;
++		res = mono_mb_create_and_cache (cache, method,
++										mb, csig, csig->param_count + 16);
++		mono_mb_free (mb);
++		return res;
++	}
++	else
++	{
++		/* get the function pointer from the object/vtable */
++		static MonoMethodSignature *comsig = NULL;
++		MonoMethodSignature *callsig = NULL;		
++		int i = 0;
++
++		csig = sig;
++
++		if (!comsig) {
++			comsig = mono_metadata_signature_alloc (method->klass->image, 3);
++			comsig->hasthis = 1;
++			comsig->params [0] = &mono_defaults.int_class->byval_arg;
++			comsig->params [1] = &mono_defaults.int_class->this_arg;
++			comsig->params [2] = &mono_defaults.int_class->this_arg;
++			comsig->ret = &mono_defaults.void_class->byval_arg;
++			comsig->pinvoke = 0;
++		}
++
++		callsig = mono_metadata_signature_alloc (method->klass->image, csig->param_count + (MONO_TYPE_IS_VOID(csig->ret) ? 0: 1));
++		callsig->hasthis = 1;
++		callsig->ret = &mono_defaults.int_class->byval_arg;
++
++		/* regular params */
++		for (i = 0; i < csig->param_count; i++)
++			callsig->params[i] = csig->params[i];
++		
++		/* return val as last param by ref*/
++		if (!MONO_TYPE_IS_VOID(csig->ret))
++			callsig->params[csig->param_count] = &mono_class_from_mono_type(csig->ret)->this_arg;
++
++		/* not sure about this */
++		callsig->pinvoke = 1;
++
++		/* COM is stdcall */
++		callsig->call_convention = MONO_CALL_STDCALL;
++		
++		/* for func ptr */
++		mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
++		mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
++
++		/* HRESULT */
++		mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
++
++		/* local for return val */
++		if (!MONO_TYPE_IS_VOID(csig->ret))
++			mono_mb_add_local (mb, csig->ret);
++		
++		/* 
++		 * get interface pointer and function pointer
++		 * store in locals declared above
++		 */
++
++		if (sig->hasthis)
++			mono_mb_emit_byte (mb, CEE_LDARG_0);
++
++		mono_mb_emit_byte (mb, CEE_LDC_I4);
++		mono_mb_emit_i4 (mb, method);
++
++		mono_mb_emit_ldloc_addr(mb, 0);
++		mono_mb_emit_ldloc_addr(mb, 1);
++
++		mono_mb_emit_native_call (mb, comsig, component_get_object_and_fnc_ptr);
++		emit_thread_interrupt_checkpoint (mb);
++
++		/* now, call the function ptr
++		* always stdcall calling conv for now
++		* the COM interface pointer is the first arg on the stack
++		*/
++
++		/* 'this' pointer */
++		mono_mb_emit_byte (mb, CEE_LDLOC_0);
++		
++		/* args */
++		for (i = 0; i < sig->param_count; i++)
++			mono_mb_emit_ldarg (mb, i + sig->hasthis);			
++		
++		/* return val */
++		if (!MONO_TYPE_IS_VOID(csig->ret))
++			mono_mb_emit_ldloc_addr(mb, 3);
++
++		/* function ptr */
++		mono_mb_emit_byte (mb, CEE_LDLOC_1);
++		mono_mb_emit_calli (mb, callsig);
++
++		/* store HRESULT, TODO: convert to exception*/
++		mono_mb_emit_byte (mb, CEE_STLOC_2);
++
++		/* load return value if there is one */
++		if (!MONO_TYPE_IS_VOID(csig->ret))
++			mono_mb_emit_byte (mb, CEE_LDLOC_3);
++
++		mono_mb_emit_byte (mb, CEE_RET);
++
++		csig = mono_metadata_signature_dup (csig);
++		csig->pinvoke = 0;
++		res = mono_mb_create_and_cache (cache, method,
++										mb, csig, csig->param_count + 16);
++		mono_mb_free (mb);
++		return res;
++	}
++}
++
++
+ /**
+  * mono_marshal_get_native_wrapper:
+  * @method: The MonoMethod to wrap.
+@@ -6337,6 +6610,11 @@
+ 	if ((res = mono_marshal_find_in_cache (cache, method)))
+ 		return res;
+ 
++	if (method->klass->flags & TYPE_ATTRIBUTE_IMPORT)
++	{
++		return component_get_native_wrapper(method);
++	}
++
+ 	sig = mono_method_signature (method);
+ 
+ 	if (!(method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) &&
+Index: mini/mini.c
+===================================================================
+--- mini/mini.c	(revision 52794)
++++ mini/mini.c	(working copy)
+@@ -9522,7 +9522,7 @@
+ 		MonoMethod *nm;
+ 		MonoMethodPInvoke* piinfo = (MonoMethodPInvoke *) method;
+ 
+-		if (method->iflags & METHOD_IMPL_ATTRIBUTE_NATIVE)
++		if (method->iflags & METHOD_IMPL_ATTRIBUTE_NATIVE && !(method->klass->flags & TYPE_ATTRIBUTE_IMPORT))
+ 			g_error ("Method '%s' in assembly '%s' contains native code and mono can't run it. The assembly was probably created by Managed C++.\n", mono_method_full_name (method, TRUE), method->klass->image->name);
+ 
+ 		if (!piinfo->addr) {

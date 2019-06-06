@@ -1,0 +1,427 @@
+Index: Test/Microsoft.Build.BuildEngine/ProjectTest.cs
+===================================================================
+--- Test/Microsoft.Build.BuildEngine/ProjectTest.cs	(revision 58130)
++++ Test/Microsoft.Build.BuildEngine/ProjectTest.cs	(working copy)
+@@ -33,23 +33,68 @@
+ namespace MonoTests.Microsoft.Build.BuildEngine {
+ 	[TestFixture]
+ 	public class ProjectTest {
++		// Clones a project by reloading from original.Xml
++		private Project CloneProject(Project original)
++		{
++			Project clone;
++			
++			clone = original.ParentEngine.CreateNewProject();
++			clone.LoadXml(original.Xml);
++
++			return clone;
++		}
++
+ 		[Test]
+ 		public void AssignmentTest ()
+ 		{
+ 			Engine engine;
+ 			Project project;
+-			string binPath = "binPath";
+-			XmlDocument xd;
+ 			string documentString =
+-			"<Project></Project>";
++				"<Project></Project>";
+ 			
+-			engine = new Engine (binPath);
++			engine = new Engine ();
+ 			project = engine.CreateNewProject ();
+-			xd = new XmlDocument ();
+-			xd.LoadXml (documentString);
+-			project.LoadFromXml (xd);
++			project.LoadXml(documentString);
+ 			
+ 			Assert.AreEqual (String.Empty, project.FullFileName, "FullFileName");
+ 		}
++
++		[Test]
++		public void DefaultTargetsTest ()
++		{
++			Engine engine;
++			Project proj;
++			Project cproj;
++			string documentString =
++				"<Project DefaultTargets=\"Build;Compile\"></Project>";
++			
++			engine = new Engine ();
++			proj = engine.CreateNewProject ();
++			proj.LoadXml(documentString);
++			
++			Assert.AreEqual ("Build;Compile", proj.DefaultTargets, "Initial DefaultTargets");
++			proj.DefaultTargets = "Build";
++			Assert.AreEqual ("Build", proj.DefaultTargets, "Modified DefaultTargets");
++			cproj = CloneProject(proj);
++			Assert.AreEqual (proj.DefaultTargets, cproj.DefaultTargets, "Reloaded DefaultTargets");
++		}
++
++		[Test]
++		public void ListProperties ()
++		{
++			Engine engine = new Engine ();
++			Project proj = engine.CreateNewProject ();
++
++			string documentString = @"
++				<Project>
++					<PropertyGroup>
++						<Prop1>value1</Prop1>
++					</PropertyGroup>
++				</Project>
++			";
++
++			proj.LoadXml(documentString);
++			Assert.AreEqual (proj.PropertyGroups.Count, 1, "PropertyGroups.Count");
++		}
+ 	}
+ }
+Index: Microsoft.Build.BuildEngine/BuildTask.cs
+===================================================================
+--- Microsoft.Build.BuildEngine/BuildTask.cs	(revision 58130)
++++ Microsoft.Build.BuildEngine/BuildTask.cs	(working copy)
+@@ -82,7 +82,7 @@
+ 
+ 			LogTaskStarted ();
+ 			
+-			taskEngine = new TaskEngine ();
++			taskEngine = new TaskEngine (parentTarget.Project);
+ 			
+ 			taskEngine.Prepare (InitializeTask (), this.taskElement,GetParameters (), this.Type);
+ 			
+@@ -224,4 +224,4 @@
+ 	}
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+Index: Microsoft.Build.BuildEngine/TaskEngine.cs
+===================================================================
+--- Microsoft.Build.BuildEngine/TaskEngine.cs	(revision 58130)
++++ Microsoft.Build.BuildEngine/TaskEngine.cs	(working copy)
+@@ -51,8 +51,9 @@
+ 			outputAttribute = typeof (Microsoft.Build.Framework.OutputAttribute);
+ 		}
+ 
+-		public TaskEngine ()
++		public TaskEngine (Project project)
+ 		{
++			parentProject = project;
+ 		}
+ 		
+ 		public void Prepare (ITask task, XmlElement taskElement,
+@@ -86,11 +87,7 @@
+ 		
+ 		public bool Execute ()
+ 		{
+-			bool	result;
+-			
+-			result = task.Execute ();
+-		
+-			return result;
++			return task.Execute ();
+ 		}
+ 		
+ 		public void PublishOutput ()
+@@ -246,4 +243,4 @@
+ 	}
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+Index: Microsoft.Build.BuildEngine/Expression.cs
+===================================================================
+--- Microsoft.Build.BuildEngine/Expression.cs	(revision 58130)
++++ Microsoft.Build.BuildEngine/Expression.cs	(working copy)
+@@ -28,6 +28,7 @@
+ #if NET_2_0
+ 
+ using System;
++using System.IO;
+ using System.Collections;
+ using System.Text;
+ using Microsoft.Build.Framework;
+@@ -57,7 +58,10 @@
+ 			// FIXME: change StringBuilder to substrings 
+ 			if (source == null)
+ 				throw new ArgumentNullException ("source");				
+-			
++
++			// FIXME: hack
++			source = source.Replace('/', Path.DirectorySeparatorChar);
++			source = source.Replace('\\', Path.DirectorySeparatorChar);
+ 			StringBuilder temp = new StringBuilder ();
+ 			CharEnumerator it = source.GetEnumerator ();
+ 			EvaluationState eState = EvaluationState.Out;
+@@ -374,4 +378,4 @@
+ 	}
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+Index: Microsoft.Build.BuildEngine/BuildPropertyGroup.cs
+===================================================================
+--- Microsoft.Build.BuildEngine/BuildPropertyGroup.cs	(revision 58130)
++++ Microsoft.Build.BuildEngine/BuildPropertyGroup.cs	(working copy)
+@@ -38,8 +38,6 @@
+ 	public class BuildPropertyGroup : IEnumerable {
+ 	
+ 		XmlElement		propertyGroup;
+-		XmlAttribute		condition;
+-		string			importedFromFilename;
+ 		bool			isImported;
+ 		GroupingCollection	parentCollection;
+ 		Project			parentProject;
+@@ -47,21 +45,20 @@
+ 		IDictionary		propertiesByName;
+ 	
+ 		public BuildPropertyGroup ()
+-			: this (true, null)
++			: this (null, null)
+ 		{
+ 		}
+-		
+-		internal BuildPropertyGroup (bool forXml, Project project)
++
++		internal BuildPropertyGroup (XmlElement xmlElement, Project project)
+ 		{
+ 			this.propertyGroup = null;
+-			this.condition = null;
+-			this.importedFromFilename = null;
+ 			this.isImported = false;
+ 			this.parentCollection = null;
+ 			this.parentProject = project;
+-			if (forXml == true)
++			if (xmlElement != null) {
+ 				this.properties = new ArrayList ();
+-			else
++				BindToXml(xmlElement);
++			} else
+ 				this.propertiesByName = CollectionsUtil.CreateCaseInsensitiveHashtable ();
+ 		}
+ 
+@@ -183,14 +180,12 @@
+ 			((BuildProperty) propertiesByName [propertyName]).Value = propertyValue;
+ 		}
+ 		
+-		internal void BindToXml (XmlElement propertyGroupElement)
++		private void BindToXml (XmlElement propertyGroupElement)
+ 		{
+ 			if (propertyGroupElement == null)
+ 				throw new ArgumentNullException ();
+ 			this.properties = new ArrayList ();
+ 			this.propertyGroup = propertyGroupElement;
+-			this.condition = propertyGroupElement.GetAttributeNode ("Condition");
+-			this.importedFromFilename = null;
+ 			this.isImported = false;
+ 			foreach (XmlElement xe in propertyGroupElement.ChildNodes) {
+ 				BuildProperty bp = AddNewProperty(xe.Name, xe.InnerText);
+@@ -204,14 +199,10 @@
+ 		
+ 		public string Condition {
+ 			get {
+-				if (condition == null)
+-					return null;
+-				else
+-					return condition.Value;
++				return propertyGroup.GetAttribute("Condition");
+ 			}
+ 			set {
+-				if (condition != null)
+-					condition.Value = value;
++				propertyGroup.SetAttribute("Condition", value);
+ 			}
+ 		}
+ 
+@@ -226,12 +217,6 @@
+ 			}
+ 		}
+ 
+-		internal string ImportedFromFilename {
+-			get {
+-				return importedFromFilename;
+-			}
+-		}
+-
+ 		public bool IsImported {
+ 			get {
+ 				return isImported;
+@@ -258,4 +243,4 @@
+ 	}
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+Index: Microsoft.Build.BuildEngine/ChangeLog
+===================================================================
+--- Microsoft.Build.BuildEngine/ChangeLog	(revision 58130)
++++ Microsoft.Build.BuildEngine/ChangeLog	(working copy)
+@@ -1,3 +1,10 @@
++2006-03-18  Crestez Leonard  <cdleonard@gmail.com>
++	* Project.cs: Cleaned up add
++	* Expression.cs: Hacked to transform \ and / to path separators.
++	* BuildPropertyGroup.cs: Small cleanup
++	* BuildTask.cs, TaskEngine.cs: Fix TaskEngine not getting a Project
++	reference.
++	
+ 2006-03-11  Marek Sieradzki  <marek.sieradzki@gmail.com> 
+ 
+ 	* BatchingImpl.cs: Updated with BuildTask instead of TaskElement.
+Index: Microsoft.Build.BuildEngine/Project.cs
+===================================================================
+--- Microsoft.Build.BuildEngine/Project.cs	(revision 58130)
++++ Microsoft.Build.BuildEngine/Project.cs	(working copy)
+@@ -70,7 +70,7 @@
+ 		DateTime			timeOfLastDirty;
+ 		IList				usingTaskElements;
+ 		XmlDocument			xmlDocument;
+-		XmlElement			xmlElement;
++		//XmlElement			xmlElement;
+ 
+ 		public Project ()
+ 			: this (null)
+@@ -85,7 +85,7 @@
+ 			evaluatedItemsByName = CollectionsUtil.CreateCaseInsensitiveHashtable ();
+ 			evaluatedItemsByNameIgnoringCondition = CollectionsUtil.CreateCaseInsensitiveHashtable ();
+ 			evaluatedItemsIgnoringCondition = new BuildItemGroup (this);
+-			evaluatedProperties = new BuildPropertyGroup (false, null);
++			evaluatedProperties = new BuildPropertyGroup ();
+ 			groups = new GroupingCollection ();
+ 			itemGroups = new BuildItemGroupCollection (groups);
+ 			propertyGroups = new BuildPropertyGroupCollection (groups);
+@@ -212,57 +212,52 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
++		// Does the actual loading.
++		private void DoLoad(TextReader textReader)
++		{
++			XmlReaderSettings settings = new XmlReaderSettings();
++
++			if (SchemaFile != null) {
++				settings.Schemas.Add(null, SchemaFile);
++				settings.ValidationType = ValidationType.Schema;
++				settings.ValidationEventHandler += new ValidationEventHandler (ValidationCallBack);
++			}
++
++			XmlReader xmlReader = XmlReader.Create(textReader, settings);
++			xmlDocument.Load (xmlReader);
++			ProcessXml();
++		}
++
+ 		public void Load (string projectFileName)
+ 		{
+ 			this.fullFileName = Path.GetFullPath (projectFileName);
+-			XmlSchemaCollection xmlSchemaCollection = null;
+-			XmlTextReader xmlTextReader = null;
+-			XmlValidatingReader xmlValidatingReader = null;
+-			
+-			if (this.schemaFile != null) {
+-				xmlSchemaCollection = new XmlSchemaCollection ();
+-				xmlSchemaCollection.ValidationEventHandler += new ValidationEventHandler (ValidationCallBack);
+-				xmlSchemaCollection.Add (null, this.schemaFile);
+-				if (xmlSchemaCollection.Count > 0) {
+-					xmlTextReader = new XmlTextReader (projectFileName);
+-					xmlValidatingReader = new XmlValidatingReader (xmlTextReader);
+-					xmlValidatingReader.ValidationType = ValidationType.Schema;
+-					xmlValidatingReader.Schemas.Add (xmlSchemaCollection);
+-					xmlValidatingReader.ValidationEventHandler += new ValidationEventHandler (ValidationCallBack);
+-				}
+-			} else {
+-				xmlTextReader = new XmlTextReader (projectFileName);
+-			}
+-			if (xmlValidatingReader != null)
+-				xmlDocument.Load (xmlValidatingReader);
+-			else if (xmlTextReader != null)
+-				xmlDocument.Load (xmlTextReader);
+-			else
+-				throw new Exception ();
+-			xmlElement = xmlDocument.DocumentElement;
+-			if (xmlElement.Name != "Project")
+-				throw new InvalidProjectFileException ("Invalid root element.");
+-			if (xmlElement.GetAttributeNode ("DefaultTargets") != null)
+-				defaultTargets = xmlElement.GetAttribute ("DefaultTargets").Split (';');
+-			else
+-				defaultTargets = new string [0];
+-			
+-			ProcessElements (xmlElement, null);
+-			
+-			isDirty = false;
++			DoLoad(new StreamReader(projectFileName));
+ 		}
+ 		
+-		[MonoTODO]
+-		public void Load (TextWriter textWriter)
++		public void Load (TextReader textReader)
+ 		{
++			
+ 			throw new NotImplementedException ();
+ 		}
+ 
++		public void LoadXml (string projectXml)
++		{
++			fullFileName = "";
++			DoLoad(new StringReader(projectXml));
++		}
++
++		// This is not in ms.net. WTF?
+ 		public void LoadFromXml (XmlDocument projectXml)
+ 		{
+ 			fullFileName = "";
+ 			xmlDocument = projectXml;
+-			xmlElement = xmlDocument.DocumentElement;
++			ProcessXml();
++		}
++
++		// Begin processing xml.
++		private void ProcessXml()
++		{
++			XmlElement xmlElement = xmlDocument.DocumentElement;
+ 			if (xmlElement.Name != "Project")
+ 				throw new InvalidProjectFileException ("Invalid root element.");
+ 			if (xmlElement.GetAttributeNode ("DefaultTargets") != null)
+@@ -529,7 +524,6 @@
+ 			
+ 			string importedFile;
+ 			Expression importedFileExpr;
+-			ImportedProject ImportedProject;
+ 
+ 			importedFileExpr = new Expression (this, xmlElement.GetAttribute ("Project"));
+ 			importedFile = (string) importedFileExpr.ToNonArray (typeof (string));
+@@ -567,8 +561,7 @@
+ 		{
+ 			if (xmlElement == null)
+ 				throw new ArgumentNullException ("xmlElement");
+-			BuildPropertyGroup bpg = new BuildPropertyGroup (true, this);
+-			bpg.BindToXml (xmlElement);
++			BuildPropertyGroup bpg = new BuildPropertyGroup (xmlElement, this);
+ 			propertyGroups.Add (bpg);
+ 		}
+ 		
+@@ -597,9 +590,11 @@
+ 		}
+ 
+ 		public string DefaultTargets {
+-			get { return xmlElement.GetAttribute ("DefaultTargets"); }
++			get {
++				return xmlDocument.DocumentElement.GetAttribute ("DefaultTargets");
++			}
+ 			set {
+-				xmlElement.SetAttribute ("DefaultTargets",value);
++				xmlDocument.DocumentElement.SetAttribute ("DefaultTargets", value);
+ 				defaultTargets = value.Split (';');
+ 			}
+ 		}
+@@ -699,4 +694,4 @@
+ 	}
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif

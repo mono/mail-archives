@@ -1,0 +1,161 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Double-locking and thread safety
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Double-locking%20and%20thread%20safety&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012742.html">
+   <LINK REL="Next"  HREF="012743.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Double-locking and thread safety</H1>
+    <B>Korn&#233;l P&#225;l</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Double-locking%20and%20thread%20safety&In-Reply-To="
+       TITLE="[Mono-devel-list] Double-locking and thread safety">kornelpal at hotmail.com
+       </A><BR>
+    <I>Thu Jun 23 13:03:51 EDT 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012742.html">[Mono-devel-list] [PATCH] Reworked unified Locale classes
+</A></li>
+        <LI>Next message: <A HREF="012743.html">[Mono-devel-list] C# Threading : libgcc_s.so.1 must be installed	for pthread_cancel to work
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12757">[ date ]</a>
+              <a href="thread.html#12757">[ thread ]</a>
+              <a href="subject.html#12757">[ subject ]</a>
+              <a href="author.html#12757">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Note that I changed subject because this dicussion is not specific to my
+patch altough it applies to my patch.
+
+First of all: If any of my conclusions are wrong please let me know.
+
+&gt;<i> From: Jonathan Pryor
+</I>&gt;&gt;<i> private static ResourceManager GetResourceManager ()
+</I>&gt;&gt;<i> {
+</I>&gt;&gt;<i>  if (resources == null)
+</I>&gt;&gt;<i>   lock (resourcesLock) {
+</I>&gt;&gt;<i>    if (resources == null)
+</I>&gt;&gt;<i>     resources = new GetTextResourceManager (typeof
+</I>&gt;&gt;<i> (Locale).Assembly.GetName
+</I>&gt;&gt;<i> ().Name, typeof (Locale).Assembly);
+</I>&gt;&gt;<i>   }
+</I>&gt;&gt;<i>  return resources;
+</I>&gt;&gt;<i> }
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i> I think this is good, because it is intended to initialize resources only
+</I>&gt;&gt;<i> once.
+</I>&gt;<i>
+</I>&gt;<i> It looks good.  It acts good.  It isn't good.
+</I>&gt;<i>
+</I>&gt;<i> See:
+</I>&gt;<i> <A HREF="http://galactus.ximian.com/pipermail/mono-devel-list/2004-February/004101.html">http://galactus.ximian.com/pipermail/mono-devel-list/2004-February/004101.html</A>
+</I>&gt;<i> <A HREF="http://blogs.msdn.com/cbrumme/archive/2003/05/17/51445.aspx">http://blogs.msdn.com/cbrumme/archive/2003/05/17/51445.aspx</A>
+</I>
+Using the following code as the example:
+
+if (a == null)
+{
+  lock(obj)
+  {
+    if (a == null) a = new A();
+  }
+}
+
+I see the problem as the following:
+
+1. Declaring &quot;a&quot; as volatile would solve the problem but it results in
+performance loss because of memory barriers for each read.
+2. Removing the check outside the lock would solve the problem but it
+results in performance loss because of memory barriers for each read.
+3. It is not a problem that &quot;a&quot; may be seen as null even if it was already
+created because lock will do memory barrier.
+4. The problem is that &quot;a&quot; may be assigned before it's content is stored
+(has the same side effects as using the object without executing the
+constructor) because reordering and this will cause problems if a processor
+did not cached value of &quot;a&quot; and wants to read it from the shared memory then
+it will see the object in &quot;a&quot; but will see an uninitialized object.
+5. Using a memory barrier after the object was created but before it is
+assigned to &quot;a&quot; solves the problem and does not result in performance loss
+when the object is already created.
+
+So the following code is good:
+if (a == null)
+{
+  lock(obj)
+  {
+    if (a == null)
+    {
+      object newA = new A();
+      Thread.MemoryBarrier();
+      a = newA;
+    }
+  }
+}
+
+I think using a lock is better than constructing a new instance because the
+new instance would be dropped if it's already created as we want to use a
+single instance so it's better to suspend the thread by doing a wait than
+creating a new instance because the CPU time can be used for useful
+operations instead of wating time.
+
+<A HREF="http://blogs.msdn.com/cbrumme/archive/2003/05/17/51445.aspx:">http://blogs.msdn.com/cbrumme/archive/2003/05/17/51445.aspx:</A>
+&quot;Realize that synchronization is expensive.  The full fence implied by
+Interlocked.Increment can be many 100&#8217;s of cycles on modern hardware.  That
+penalty may continue to grow, in relative terms.&quot;
+
+I think this applies to Interlocked.CompareExchange as well.
+
+So I suggest to use this model instead of Interlocked.CompareExchange.
+Furthermore I think using two Thread.MemoryBarrier() is less effective than
+using lock and and a single Thread.MemoryBarrier() because there will be not
+useless object creation, Thread.MemoryBarrier() allways does a full barrier
+while lock does acrique at the begining and release at the end and
+Interlocked.CompareExchange does barriers as well so there are more barriers
+and thus locks in your &quot;lock-free&quot; code than in the locked code.
+
+&gt;<i> From: J&#246;rg Rosenkranz
+</I>&gt;<i> How about using Thread.MemoryBarrier how it's been suggested
+</I>&gt;<i> in Brad Abrams' blog:
+</I>&gt;<i> <A HREF="http://blogs.msdn.com/brada/archive/2004/05/12/130935.aspx">http://blogs.msdn.com/brada/archive/2004/05/12/130935.aspx</A>
+</I>
+This code does the same as the above code so this code should be good.
+
+&gt;<i> Is this supposed to work on Mono?
+</I>
+Thread.MemoryBarrier is not implemented by Mono yet (no exception but does
+nothing), but it seems that it is required only by IA64 that is not
+supported by Mono yet so you can already use it but will be implemented only
+when it will be necessary.
+
+Korn&#233;l
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012742.html">[Mono-devel-list] [PATCH] Reworked unified Locale classes
+</A></li>
+	<LI>Next message: <A HREF="012743.html">[Mono-devel-list] C# Threading : libgcc_s.so.1 must be installed	for pthread_cancel to work
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12757">[ date ]</a>
+              <a href="thread.html#12757">[ thread ]</a>
+              <a href="subject.html#12757">[ subject ]</a>
+              <a href="author.html#12757">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

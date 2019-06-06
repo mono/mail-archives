@@ -1,0 +1,532 @@
+diff --git a/mono/metadata/domain-internals.h b/mono/metadata/domain-internals.h
+index 56f7c69..d02e10c 100644
+--- a/mono/metadata/domain-internals.h
++++ b/mono/metadata/domain-internals.h
+@@ -85,6 +85,7 @@ typedef struct {
+ 	union {
+ 		MonoClass *catch_class;
+ 		gpointer filter;
++		gpointer handler_end;
+ 	} data;
+ } MonoJitExceptionInfo;
+ 
+diff --git a/mono/mini/ChangeLog b/mono/mini/ChangeLog
+index 85fa4dc..dd500c8 100755
+--- a/mono/mini/ChangeLog
++++ b/mono/mini/ChangeLog
+@@ -1,3 +1,32 @@
++2010-03-24 Rodrigo Kumpera  <rkumpera@novell.com>
++
++	* mini-exceptions.c: Introduce mono_walk_stack_full, which
++	allows to select if it's new or old context that is passed to 
++	the callback.
++
++	* mini-exceptions.c (mono_handle_exception_internal): Handle the
++	case when executing a guarded handler from the EH machinery.
++
++	* mini-exceptions.c (mono_install_handler_block_guard): New function
++	responsible for checking for handler blocks, installing the guard and
++	clearing abort state.
++
++	* mini-posix.c (sigusr1_signal_handler): Call mono_install_handler_block_guard
++	to check for handler blocks and skip interruption logic if one was found
++
++	* mini-trampolines.c (mono_handler_block_guard_trampoline): Function called
++	by the handler block guard trampoline. Resumes interruption by raising the
++	pending ThreadAbortException.
++
++	* mini.c (create_jit_info): Calculate the end address of a finally block.
++
++	* mini-x86.c (mono_arch_install_handler_block_guard): Patch the return address
++	of a finally block to a specified address and return the old one.
++
++	* tramp-x86.c (mono_arch_create_handler_block_trampoline): The handler block
++	trampoline patches the original return address and calls the trampoline function.
++
++
+ 2010-03-24  Mark Probst  <mark.probst@gmail.com>
+ 
+ 	* mini.c (mono_create_tls_get): Only create a TLS operation if the
+diff --git a/mono/mini/mini-exceptions.c b/mono/mini/mini-exceptions.c
+index ae29d77..5b0e0a1 100644
+--- a/mono/mini/mini-exceptions.c
++++ b/mono/mini/mini-exceptions.c
+@@ -63,6 +63,7 @@ static gpointer restore_stack_protection_tramp = NULL;
+ 
+ static void try_more_restore (void);
+ static void restore_stack_protection (void);
++static void mono_walk_stack_full (MonoDomain *domain, MonoJitTlsData *jit_tls, MonoContext *start_ctx, MonoStackFrameWalk func, gboolean use_new_ctx, gpointer user_data);
+ 
+ void
+ mono_exceptions_init (void)
+@@ -659,6 +660,12 @@ ves_icall_get_trace (MonoException *exc, gint32 skip, MonoBoolean need_file_info
+ void
+ mono_walk_stack (MonoDomain *domain, MonoJitTlsData *jit_tls, MonoContext *start_ctx, MonoStackFrameWalk func, gpointer user_data)
+ {
++	mono_walk_stack_full (domain, jit_tls, start_ctx, func, TRUE, user_data);
++}
++
++static void
++mono_walk_stack_full (MonoDomain *domain, MonoJitTlsData *jit_tls, MonoContext *start_ctx, MonoStackFrameWalk func, gboolean use_new_ctx, gpointer user_data)
++{
+ 	MonoLMF *lmf = mono_get_lmf ();
+ 	MonoJitInfo *ji, rji;
+ 	gint native_offset;
+@@ -676,7 +683,7 @@ mono_walk_stack (MonoDomain *domain, MonoJitTlsData *jit_tls, MonoContext *start
+ 		if (!ji || ji == (gpointer)-1)
+ 			return;
+ 
+-		if (func (domain, &new_ctx, ji, user_data))
++		if (func (domain, use_new_ctx ? &new_ctx : &ctx, ji, user_data))
+ 			return;
+ 
+ 		ctx = new_ctx;
+@@ -1168,6 +1175,7 @@ mono_handle_exception_internal (MonoContext *ctx, gpointer obj, gpointer origina
+ 	gboolean has_dynamic_methods = FALSE;
+ 	gint32 filter_idx, first_filter_idx;
+ 
++
+ 	g_assert (ctx != NULL);
+ 	if (!obj) {
+ 		MonoException *ex = mono_get_exception_null_reference ();
+@@ -1382,6 +1390,41 @@ mono_handle_exception_internal (MonoContext *ctx, gpointer obj, gpointer origina
+ 
+ 								return TRUE;
+ 							}
++							/*
++							 * This guards against the situation that we abort a thread that is executing a finally clause
++							 * that was called by the EH machinery. It won't have a guard trampoline installed, so we must
++							 * check for this situation here and resume interruption if we are below the guarded block.
++							 */
++							if (G_UNLIKELY (jit_tls->handler_block_return_address)) {
++								gboolean is_outside = FALSE;
++								gpointer prot_bp = MONO_CONTEXT_GET_BP (&jit_tls->ex_ctx);
++								gpointer catch_bp = MONO_CONTEXT_GET_BP (ctx);
++								//FIXME make this stack direction aware
++								if (catch_bp > prot_bp) {
++									is_outside = TRUE;
++								} else if (catch_bp == prot_bp) {
++									/* Can be either try { try { } catch {} } finally {} or try { try { } finally {} } catch {}
++									 * So we check if the catch handler_start is protected by the guarded handler protected region
++									 *
++									 * Assumptions:
++									 *	If there is an outstanding guarded_block return address, it means the current thread must be aborted.
++									 *	This is the only way to reach out the guarded block as other cases are handled by the trampoline.
++									 *	There aren't any further finally/fault handler blocks down the stack over this exception.
++									 *   This must be ensured by the code that installs the guard trampoline.
++									 */
++									g_assert (ji == mini_jit_info_table_find (domain, MONO_CONTEXT_GET_IP (&jit_tls->ex_ctx), NULL));
++
++									if (!is_address_protected (ji, jit_tls->handler_block, ei->handler_start)) {
++										is_outside = TRUE;
++									}
++								}
++								if (is_outside) {
++									jit_tls->handler_block_return_address = NULL;
++									jit_tls->handler_block = NULL;
++									mono_thread_resume_interruption (); /*We ignore the exception here, it will be raised later*/
++								}
++							}
++
+ 							if (mono_trace_is_enabled () && mono_trace_eval (ji->method))
+ 								g_print ("EXCEPTION: catch found at clause %d of %s\n", i, mono_method_full_name (ji->method, TRUE));
+ 							mono_profiler_exception_clause_handler (ji->method, ei->flags, i);
+@@ -2027,3 +2070,83 @@ mono_resume_unwind (void)
+ 
+ 	restore_context (&ctx);
+ }
++
++#ifdef MONO_ARCH_HAVE_HANDLER_BLOCK_GUARD
++
++typedef struct {
++	MonoJitInfo *ji;
++	MonoContext ctx;
++	MonoJitExceptionInfo *ei;
++} FindHandlerBlockData;
++
++static gboolean
++find_last_handler_block (MonoDomain *domain, MonoContext *ctx, MonoJitInfo *ji, gpointer data)
++{
++	int i;
++	gpointer ip;
++	FindHandlerBlockData *pdata = data;
++
++	if (ji->method->wrapper_type)
++		return FALSE;
++
++	ip = MONO_CONTEXT_GET_IP (ctx);
++
++	for (i = 0; i < ji->num_clauses; ++i) {
++		MonoJitExceptionInfo *ei = ji->clauses + i;
++		if (ei->flags != MONO_EXCEPTION_CLAUSE_FINALLY)
++			continue;
++		/*If ip points to the first instruction it means the handler block didn't start
++		 so we can leave its execution to the EH machinery*/
++		if (ei->handler_start < ip && ip < ei->data.handler_end) {
++			pdata->ji = ji;
++			pdata->ei = ei;
++			pdata->ctx = *ctx;
++			break;
++		}
++	}
++	return FALSE;
++}
++
++
++/*
++ * Finds the bottom handler block running and install a block guard if needed.
++ */
++gboolean
++mono_install_handler_block_guard (MonoInternalThread *thread, MonoContext *ctx)
++{
++	FindHandlerBlockData data = { 0 };
++	MonoDomain *domain = mono_domain_get ();
++	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
++	gpointer resume_ip;
++
++	if (jit_tls->handler_block_return_address)
++		return FALSE;
++
++	mono_walk_stack_full (domain, jit_tls, ctx, find_last_handler_block, FALSE, &data);
++
++	if (!data.ji)
++		return FALSE;
++
++	memcpy (&jit_tls->ex_ctx, &data.ctx, sizeof (MonoContext));
++
++	resume_ip = mono_arch_install_handler_block_guard (data.ji, &data.ctx, mono_create_handler_block_trampoline ());
++	if (resume_ip == NULL)
++		return FALSE;
++
++	jit_tls->handler_block_return_address = resume_ip;
++	jit_tls->handler_block = data.ei;
++	/*Clear current thread from been wapi interrupted otherwise things can go south*/
++	wapi_clear_interruption ();
++
++	return TRUE;
++}
++
++#else
++gboolean
++mono_install_handler_block_guard (MonoInternalThread *thread, MonoContext *ctx)
++{
++	return FALSE;
++}
++
++#endif
++
+diff --git a/mono/mini/mini-posix.c b/mono/mini/mini-posix.c
+index 823d93b..c4b9292 100644
+--- a/mono/mini/mini-posix.c
++++ b/mono/mini/mini-posix.c
+@@ -159,6 +159,7 @@ SIG_HANDLER_SIGNATURE (sigabrt_signal_handler)
+ static void
+ SIG_HANDLER_SIGNATURE (sigusr1_signal_handler)
+ {
++	MonoContext mctx;
+ 	gboolean running_managed;
+ 	MonoException *exc;
+ 	MonoInternalThread *thread = mono_thread_internal_current ();
+@@ -189,7 +190,15 @@ SIG_HANDLER_SIGNATURE (sigusr1_signal_handler)
+ 
+ 	if (mono_debugger_agent_thread_interrupt (ctx, ji))
+ 		return;
+-	
++
++	/* We can't do handler block checking from metadata since it requires doing
++	 * a stack walk with context.
++	 */
++	mono_arch_sigctx_to_monoctx (ctx, &mctx);
++	if (mono_install_handler_block_guard (thread, &mctx)) {
++		return;
++	}
++#
+ 	exc = mono_thread_request_interruption (running_managed); 
+ 	if (!exc)
+ 		return;
+diff --git a/mono/mini/mini-trampolines.c b/mono/mini/mini-trampolines.c
+index fb7f638..2c90b22 100644
+--- a/mono/mini/mini-trampolines.c
++++ b/mono/mini/mini-trampolines.c
+@@ -986,6 +986,60 @@ mono_delegate_trampoline (mgreg_t *regs, guint8 *code, gpointer *tramp_data, gui
+ 
+ #endif
+ 
++static gpointer
++mono_handler_block_guard_trampoline (mgreg_t *regs, guint8 *code, gpointer *tramp_data, guint8* tramp)
++{
++	MonoContext ctx;
++	MonoException *exc;
++	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
++	gpointer resume_ip = jit_tls->handler_block_return_address;
++
++	MonoInternalThread *thread = mono_thread_internal_current ();
++
++	memcpy (&ctx, &jit_tls->ex_ctx, sizeof (MonoContext));
++	MONO_CONTEXT_SET_IP (&ctx, jit_tls->handler_block_return_address);
++
++	jit_tls->handler_block_return_address = NULL;
++	jit_tls->handler_block = NULL;
++
++	if (!resume_ip) /*this should not happen, but we should avoid crashing */
++		exc = mono_get_exception_execution_engine ("Invalid internal state, resuming abort after handler block but no resume ip found");
++	else
++		exc = mono_thread_resume_interruption ();
++
++	if (exc) {
++		static void (*restore_context) (MonoContext *);
++
++		if (!restore_context)
++			restore_context = mono_get_restore_context ();
++
++		mono_handle_exception (&ctx, exc, NULL, FALSE);
++		restore_context (&ctx);
++	}
++
++	return resume_ip;
++}
++
++gpointer
++mono_create_handler_block_trampoline (void)
++{
++	static gpointer code;
++
++	if (mono_aot_only) {
++		g_assert (0);
++		return code;
++	}
++
++	mono_trampolines_lock ();
++
++	if (!code)
++		code = mono_arch_create_handler_block_trampoline ();
++
++	mono_trampolines_unlock ();
++
++	return code;
++}
++
+ /*
+  * mono_get_trampoline_func:
+  *
+@@ -1027,6 +1081,10 @@ mono_get_trampoline_func (MonoTrampolineType tramp_type)
+ 	case MONO_TRAMPOLINE_LLVM_VCALL:
+ 		return mono_llvm_vcall_trampoline;
+ #endif
++#ifdef MONO_ARCH_HAVE_HANDLER_BLOCK_GUARD
++	case MONO_TRAMPOLINE_HANDLER_BLOCK_GUARD:
++		return mono_handler_block_guard_trampoline;
++#endif
+ 	default:
+ 		g_assert_not_reached ();
+ 		return NULL;
+@@ -1060,6 +1118,10 @@ mono_trampolines_init (void)
+ #ifdef MONO_ARCH_LLVM_SUPPORTED
+ 	mono_trampoline_code [MONO_TRAMPOLINE_LLVM_VCALL] = mono_arch_create_trampoline_code (MONO_TRAMPOLINE_LLVM_VCALL);
+ #endif
++#ifdef MONO_ARCH_HAVE_HANDLER_BLOCK_GUARD
++	mono_trampoline_code [MONO_TRAMPOLINE_HANDLER_BLOCK_GUARD] = mono_arch_create_trampoline_code (MONO_TRAMPOLINE_HANDLER_BLOCK_GUARD);
++	mono_create_handler_block_trampoline ();
++#endif
+ 
+ 	mono_counters_register ("Calls to trampolines", MONO_COUNTER_JIT | MONO_COUNTER_INT, &trampoline_calls);
+ }
+diff --git a/mono/mini/mini-x86.c b/mono/mini/mini-x86.c
+index e818084..925bd07 100644
+--- a/mono/mini/mini-x86.c
++++ b/mono/mini/mini-x86.c
+@@ -5809,6 +5809,70 @@ mono_arch_decompose_long_opts (MonoCompile *cfg, MonoInst *long_ins)
+ #endif /* MONO_ARCH_SIMD_INTRINSICS */
+ }
+ 
++/*MONO_ARCH_HAVE_HANDLER_BLOCK_GUARD*/
++gpointer
++mono_arch_install_handler_block_guard (MonoJitInfo *ji, MonoContext *ctx, gpointer new_value)
++{
++	int i;
++	int offset;
++	MonoJitExceptionInfo *clause = NULL;
++	gpointer ip, *sp, old_value;
++	char *bp;
++	const unsigned char *handler;
++
++	ip = MONO_CONTEXT_GET_IP (ctx);
++
++	for (i = 0; i < ji->num_clauses; ++i) {
++		clause = &ji->clauses [i];
++		if (clause->flags != MONO_EXCEPTION_CLAUSE_FINALLY)
++			continue;
++		if (clause->handler_start < ip && clause->data.handler_end > ip)
++			break;
++	}
++
++	/*no matching finally */
++	if (i == ji->num_clauses)
++		return NULL;
++
++	/*If we stopped on the instruction right before the try, we haven't actually started executing it*/
++	if (ip == clause->handler_start)
++		return NULL;
++
++	/*Decode the first instruction to figure out where did we store the spvar*/
++	/*Our jit MUST generate the following:
++	 mov %esp, -?(%ebp)
++	 Which is encoded as: 0x89 mod_rm.
++	 mod_rm (esp, ebp, imm) which can be: (imm will never be zero)
++		mod (reg + imm8):  01 reg(esp): 100 rm(ebp): 101 -> 01100101 (0x65)
++		mod (reg + imm32): 10 reg(esp): 100 rm(ebp): 101 -> 10100101 (0xA5)
++	*/
++	handler = clause->handler_start;
++
++	if (*handler != 0x89)
++		return NULL;
++
++	++handler;
++
++	if (*handler == 0x65)
++		offset = *(signed char*)(handler + 1);
++	else if (*handler == 0xA5)
++		offset = *(int*)(handler + 1);
++	else
++		return NULL;
++
++	/*Load the spvar*/
++	bp = MONO_CONTEXT_GET_BP (ctx);
++	sp = *(gpointer*)(bp + offset);
++
++	old_value = *sp;
++	if (old_value < ji->code_start || (char*)old_value > ((char*)ji->code_start + ji->code_size))
++		return old_value;
++
++	*sp = new_value;
++
++	return old_value;
++}
++
+ #if __APPLE__
+ #define DBG_SIGNAL SIGBUS
+ #else
+diff --git a/mono/mini/mini-x86.h b/mono/mini/mini-x86.h
+index bc7e0df..5af560c 100644
+--- a/mono/mini/mini-x86.h
++++ b/mono/mini/mini-x86.h
+@@ -278,6 +278,7 @@ typedef struct {
+ #define MONO_ARCH_SOFT_DEBUG_SUPPORTED 1
+ #define MONO_ARCH_HAVE_FIND_JIT_INFO_EXT 1
+ #define MONO_ARCH_HAVE_EXCEPTIONS_INIT 1
++#define MONO_ARCH_HAVE_HANDLER_BLOCK_GUARD 1
+ 
+ /* Used for optimization, not complete */
+ #define MONO_ARCH_IS_OP_MEMBASE(opcode) ((opcode) == OP_X86_PUSH_MEMBASE)
+diff --git a/mono/mini/mini.c b/mono/mini/mini.c
+index bde06c4..6adfa85 100644
+--- a/mono/mini/mini.c
++++ b/mono/mini/mini.c
+@@ -3577,6 +3577,18 @@ create_jit_info (MonoCompile *cfg, MonoMethod *method_to_compile)
+ 					break;
+ 				}
+ 			}
++
++			if (ec->flags == MONO_EXCEPTION_CLAUSE_FINALLY) {
++				int end_offset;
++				if (ec->handler_offset + ec->handler_len < header->code_size) {
++					tblock = cfg->cil_offset_to_bb [ec->handler_offset + ec->handler_len];
++					g_assert (tblock);
++					end_offset = tblock->native_offset;
++				} else {
++					end_offset = cfg->epilog_begin;
++				}
++				ei->data.handler_end = cfg->native_code + end_offset;
++			}
+ 		}
+ 
+ 		if (G_UNLIKELY (cfg->verbose_level >= 4)) {
+diff --git a/mono/mini/mini.h b/mono/mini/mini.h
+index a97bfdf..af058c7 100644
+--- a/mono/mini/mini.h
++++ b/mono/mini/mini.h
+@@ -817,10 +817,14 @@ typedef struct {
+ 	/* Used to implement --debug=casts */
+ 	MonoClass       *class_cast_from, *class_cast_to;
+ 
+-	/* Stores state needed by mono_resume_unwind () */
++	/* Stores state needed by mono_resume_unwind () and the handler block with a guard */
+ 	MonoContext     ex_ctx;
+ 	/* FIXME: GC */
+ 	gpointer        ex_obj;
++	/* handle block return address */
++	gpointer handler_block_return_address;
++	/* handler block been guarded */
++	MonoJitExceptionInfo *handler_block;
+ } MonoJitTlsData;
+ 
+ typedef enum {
+@@ -911,6 +915,9 @@ typedef enum {
+ #ifdef MONO_ARCH_LLVM_SUPPORTED
+ 	MONO_TRAMPOLINE_LLVM_VCALL,
+ #endif
++#ifdef MONO_ARCH_HAVE_HANDLER_BLOCK_GUARD
++	MONO_TRAMPOLINE_HANDLER_BLOCK_GUARD,
++#endif
+ 	MONO_TRAMPOLINE_NUM
+ } MonoTrampolineType;
+ 
+@@ -1800,6 +1807,12 @@ MonoVTable* mono_arch_find_static_call_vtable   (mgreg_t *regs, guint8 *code) MO
+ gpointer    mono_arch_build_imt_thunk           (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count, gpointer fail_tramp) MONO_INTERNAL;
+ void    mono_arch_notify_pending_exc            (void) MONO_INTERNAL;
+ 
++/* Handle block guard */
++gpointer mono_arch_install_handler_block_guard (MonoJitInfo *ji, MonoContext *ctx, gpointer new_value) MONO_INTERNAL;
++gpointer mono_arch_create_handler_block_trampoline (void) MONO_INTERNAL;
++gpointer mono_create_handler_block_trampoline (void) MONO_INTERNAL;
++gboolean mono_install_handler_block_guard (MonoInternalThread *thread, MonoContext *ctx) MONO_INTERNAL;
++
+ /* Exception handling */
+ 
+ /* Same as MonoStackWalk, but pass the context/frame type as well */
+diff --git a/mono/mini/tramp-x86.c b/mono/mini/tramp-x86.c
+index 5373ab4..3a9095e 100644
+--- a/mono/mini/tramp-x86.c
++++ b/mono/mini/tramp-x86.c
+@@ -832,3 +832,41 @@ mono_arch_invalidate_method (MonoJitInfo *ji, void *func, gpointer func_arg)
+ 	x86_push_imm (code, func_arg);
+ 	x86_call_code (code, (guint8*)func);
+ }
++
++static void
++handler_block_trampoline_helper (gpointer *ptr)
++{
++	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
++	*ptr = jit_tls->handler_block_return_address;
++}
++
++gpointer
++mono_arch_create_handler_block_trampoline (void)
++{
++	guint8 *tramp = mono_get_trampoline_code (MONO_TRAMPOLINE_HANDLER_BLOCK_GUARD);
++	guint8 *code, *buf;
++	int tramp_size = 64;
++	code = buf = mono_global_codeman_reserve (tramp_size);
++
++	/*
++	This trampoline restore the call chain of the handler block then jumps into the code that deals with it.
++	*/
++
++	if (mono_get_jit_tls_offset () != -1) {
++		code = mono_x86_emit_tls_get (code, X86_EAX, mono_get_jit_tls_offset ());
++		x86_mov_reg_membase (code, X86_EAX, X86_EAX, G_STRUCT_OFFSET (MonoJitTlsData, handler_block_return_address), 4);
++		/*simulate a call*/
++		x86_push_reg (code, X86_EAX);
++		x86_jump_code (code, tramp);
++	} else {
++		/*Slow path uses a c helper*/
++		x86_push_reg (code, X86_ESP);
++		x86_push_imm (code, tramp);
++		x86_jump_code (code, handler_block_trampoline_helper);
++	}
++
++	mono_arch_flush_icache (buf, code - buf);
++	g_assert (code - buf <= tramp_size);
++
++	return buf;
++}

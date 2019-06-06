@@ -1,0 +1,374 @@
+Index: System.Web.UI/Page.cs
+===================================================================
+--- System.Web.UI/Page.cs	(revision 91144)
++++ System.Web.UI/Page.cs	(working copy)
+@@ -385,7 +385,7 @@
+ #if NET_2_0
+ 			return isPostBack;
+ #else
+-			return _requestValueCollection != null && !HttpContext.Current.InTransit;
++			return _requestValueCollection != null;
+ #endif
+ 		}
+ 	}
+@@ -758,6 +758,13 @@
+ 	[EditorBrowsable (EditorBrowsableState.Advanced)]
+ 	protected virtual NameValueCollection DeterminePostBackMode ()
+ 	{
++		// if request was transfered from other page such Transfer
++#if NET_2_0
++		if(!isCrossPagePostBack)
++#endif
++		if (this != _context.Handler)
++			return null;
++		
+ 		HttpRequest req = Request;
+ 		if (req == null)
+ 			return null;
+@@ -1284,12 +1291,6 @@
+ 	protected void AsyncPageEndProcessRequest (IAsyncResult result) 
+ 	{
+ 	}
+-
+-	internal void ProcessCrossPagePostBack (HttpContext context)
+-	{
+-		isCrossPagePostBack = true;
+-		ProcessRequest (context);
+-	}
+ #endif
+ 
+ 	void InternalProcessRequest ()
+@@ -1297,8 +1298,6 @@
+ 		_requestValueCollection = this.DeterminePostBackMode();
+ 
+ #if NET_2_0
+-		HttpContext ctx = Context;
+-				
+ 		_lifeCycle = PageLifeCycle.Start;
+ 		// http://msdn2.microsoft.com/en-us/library/ms178141.aspx
+ 		if (_requestValueCollection != null) {
+@@ -1309,7 +1308,7 @@
+ 				isCallback = _requestValueCollection [CallbackArgumentID] != null;
+ 				// LAMESPEC: on Callback IsPostBack is set to false, but true.
+ 				//isPostBack = !isCallback;
+-				isPostBack = !ctx.InTransit;
++				isPostBack = true;
+ 			}
+ 			string lastFocus = _requestValueCollection [LastFocusID];
+ 			if (!String.IsNullOrEmpty (lastFocus)) {
+@@ -1317,9 +1316,11 @@
+ 			}
+ 		}
+ 		
+-		// if request was transfered from other page - track Prev. Page
+-		previousPage = ctx.LastPage;
+-		ctx.LastPage = this;
++		if (!isCrossPagePostBack) {
++			if (_context.PreviousHandler is Page) {
++				previousPage = (Page) _context.PreviousHandler;
++			}
++		}
+ 
+ 		_lifeCycle = PageLifeCycle.PreInit;
+ 		Trace.Write ("aspx.page", "Begin PreInit");
+@@ -2520,7 +2521,8 @@
+ 			string prevPage = _requestValueCollection [PreviousPageID];
+ 			if (prevPage != null) {
+ 				previousPage = (Page) PageParser.GetCompiledPageInstance (prevPage, Server.MapPath (prevPage), Context);
+-				previousPage.ProcessCrossPagePostBack (Context);
++				previousPage.isCrossPagePostBack = true;
++				previousPage.ProcessRequest (Context);
+ 			} 
+ 		}
+ 	}
+Index: System.Web/HttpApplication.cs
+===================================================================
+--- System.Web/HttpApplication.cs	(revision 91144)
++++ System.Web/HttpApplication.cs	(working copy)
+@@ -970,7 +970,7 @@
+ 			// Obtain the handler for the request.
+ 			IHttpHandler handler = null;
+ 			try {
+-				handler = GetHandler (context);
++				handler = GetHandler (context, context.Request.FilePath);
+ 				context.Handler = handler;
+ #if NET_2_0
+ 				context.PushHandler (handler);
+@@ -1240,11 +1240,10 @@
+ 		}
+ 		
+ 		// Used by HttpServerUtility.Execute
+-		internal IHttpHandler GetHandler (HttpContext context)
++		internal IHttpHandler GetHandler (HttpContext context,string url)
+ 		{
+ 			HttpRequest request = context.Request;
+ 			string verb = request.RequestType;
+-			string url = request.FilePath;
+ 			
+ 			IHttpHandler handler = null;
+ 			object o = LocateHandler (verb, url);
+@@ -1254,7 +1253,7 @@
+ 			if (factory == null) {
+ 				handler = (IHttpHandler) o;
+ 			} else {
+-				handler = factory.GetHandler (context, verb, url, request.PhysicalPath);
++				handler = factory.GetHandler (context, verb, url, request.MapPath (url));
+ 			}
+ 
+ 			return handler;
+Index: System.Web/HttpContext.cs
+===================================================================
+--- System.Web/HttpContext.cs	(revision 91144)
++++ System.Web/HttpContext.cs	(working copy)
+@@ -72,7 +72,6 @@
+ 		object config_timeout;
+ 		int timeout_possible;
+ 		DateTime time_stamp = DateTime.UtcNow;
+-		bool inTransit; // the page is being transferred to another
+ 
+ #if NET_2_0
+ 		
+@@ -89,11 +88,6 @@
+ 		ProfileBase profile = null;
+ 		LinkedList<IHttpHandler> handlers;
+ #endif
+-
+-		internal bool InTransit {
+-			get { return inTransit; }
+-			set { inTransit = value; }
+-		}
+ 		
+ 		public HttpContext (HttpWorkerRequest wr)
+ 		{
+@@ -644,19 +638,5 @@
+ 		}
+ #endif
+ #endregion
+-
+-#if NET_2_0
+-		Page last_page;
+-		
+-		internal Page LastPage {
+-			get {
+-				return last_page;
+-			}
+-
+-			set {
+-				last_page = value;
+-			}
+-		}
+-#endif
+ 	}
+ }
+Index: System.Web/HttpRequest.cs
+===================================================================
+--- System.Web/HttpRequest.cs	(revision 91144)
++++ System.Web/HttpRequest.cs	(working copy)
+@@ -1310,7 +1310,6 @@
+ 		{
+ 			cached_url = null;
+ 			current_exe_path = path;
+-			file_path = path;
+ 			UrlComponents.Path = path;
+ 			// recreated on demand
+ 			root_virtual_dir = null;
+Index: System.Web/HttpServerUtility.cs
+===================================================================
+--- System.Web/HttpServerUtility.cs	(revision 91144)
++++ System.Web/HttpServerUtility.cs	(working copy)
+@@ -100,51 +100,62 @@
+ #endif
+ 		void Execute (string path, TextWriter writer, bool preserveForm)
+ 		{			
++			Execute (path, writer, preserveForm, false);
++		}
++
++		void Execute (string path, TextWriter writer, bool preserveForm, bool isTransfer) {
+ 			if (path == null)
+ 				throw new ArgumentNullException ("path");
+ 
+ 			if (path.IndexOf (':') != -1)
+ 				throw new ArgumentException ("Invalid path.");
+ 
+-			HttpRequest request = context.Request;
+-			string oldQuery = request.QueryStringRaw;
++			string queryString = null;
+ 			int qmark = path.IndexOf ('?');
+ 			if (qmark != -1) {
+-				request.QueryStringRaw = path.Substring (qmark + 1);
++				queryString = path.Substring (qmark + 1);
+ 				path = path.Substring (0, qmark);
++			}
++
++			string exePath = UrlUtils.Combine (context.Request.BaseVirtualDir, path);
++			IHttpHandler handler = context.ApplicationInstance.GetHandler (context, exePath);
++
++			Execute (handler, writer, preserveForm, exePath, queryString, isTransfer);
++		}
++
++		void Execute (IHttpHandler handler, TextWriter writer, bool preserveForm, string exePath, string queryString, bool isTransfer) {
++#if NET_2_0 && !TARGET_J2EE
++			// If the target handler is not Page, the transfer must not occur.
++			// InTransit == true means we're being called from Transfer
++			if (isTransfer && !(handler is Page))
++				throw new HttpException ("Transfer is possible only to .aspx files");
++#endif
++
++			HttpRequest request = context.Request;
++			string oldQuery = request.QueryStringRaw;
++			if (queryString != null) {
++				request.QueryStringRaw = queryString;
+ 			} else if (!preserveForm) {
+-				request.QueryStringRaw = "";
++				request.QueryStringRaw = String.Empty;
+ 			}
+ 
+ 			HttpResponse response = context.Response;
+-			WebROCollection oldForm = null;
++			WebROCollection oldForm = request.Form as WebROCollection;
+ 			if (!preserveForm) {
+-				oldForm = request.Form as WebROCollection;
+ 				request.SetForm (new WebROCollection ());
+ 			}
+ 
+ 			TextWriter output = writer;
+ 			if (output == null)
+ 			 	output = response.Output;
+-
+-			string oldFilePath = request.FilePath;
+-			request.SetCurrentExePath (UrlUtils.Combine (request.BaseVirtualDir, path));
+-			IHttpHandler handler = context.ApplicationInstance.GetHandler (context);
+-			request.SetCurrentExePath (oldFilePath);
+ 			
+-#if NET_2_0
+-			// If the target handler is not Page, the transfer must not occur.
+-			// InTransit == true means we're being called from Transfer
+-			if (context.InTransit && !(handler is Page))
+-				throw new HttpException ("Transfer is possible only to .aspx files");
+-#endif
+-			
+-			TextWriter previous = null;
++			TextWriter previous = response.SetTextWriter (output);
++			string oldExePath = request.CurrentExecutionFilePath;
+ 			try {
+ #if NET_2_0
+ 				context.PushHandler (handler);
+ #endif
+-				previous = response.SetTextWriter (output);
++				request.SetCurrentExePath (exePath);
+ 				
+ 				if (!(handler is IHttpAsyncHandler)) {
+ 					handler.ProcessRequest (context);
+@@ -162,10 +173,10 @@
+ 				response.SetTextWriter (previous);
+ 				if (!preserveForm)
+ 					request.SetForm (oldForm);
+-				context.InTransit = false;
+ #if NET_2_0
+ 				context.PopHandler ();
+ #endif
++				request.SetCurrentExePath (oldExePath);
+ 			}
+ 		}
+ 
+@@ -203,30 +214,11 @@
+ 
+ 		public void Transfer (string path)
+ 		{
+-			// If it's a page and a postback, don't pass form data
+-			// See bug #65613.
+-			bool preserveForm = true;
+-			if (context.Handler is Page) {
+-				Page page = (Page) context.Handler;
+-				preserveForm = !page.IsPostBack;
+-			}
+-#if NET_2_0
+-			else
+-				throw new HttpException ("Transfer may only be called from within a Page instance");
+-#endif
+-
+-			Transfer (path, preserveForm);
++			Transfer (path, true);
+ 		}
+ 
+-		public void Transfer (string path, bool preserveForm)
+-		{
+-#if NET_2_0
+-			if (!(context.Handler is Page))
+-				throw new HttpException ("Transfer may only be called from within a Page instance");
+-#endif
+-
+-			context.InTransit = true;
+-			Execute (path, null, preserveForm);
++		public void Transfer (string path, bool preserveForm) {
++			Execute (path, null, preserveForm, true);
+ 			context.Response.End ();
+ 		}
+ #if NET_2_0
+@@ -234,14 +226,11 @@
+ 		{
+ 			if (handler == null)
+ 				throw new ArgumentNullException ("handler");
+-			if (!(handler is Page))
+-				throw new HttpException ("Transfer may only be called from within a Page instance");
+-			
++
+ 			// TODO: see the MS doc and search for "enableViewStateMac": this method is not
+ 			// allowed for pages when preserveForm is true and the page IsCallback property
+ 			// is true.
+-
+-			Execute (handler, null, preserveForm);
++			Execute (handler, null, preserveForm, context.Request.CurrentExecutionFilePath, null, true);
+ 			context.Response.End ();
+ 		}
+ 
+@@ -250,48 +239,7 @@
+ 			if (handler == null)
+ 				throw new ArgumentNullException ("handler");
+ 
+-			// If the target handler is not Page, the transfer must not occur.
+-			// InTransit == true means we're being called from Transfer
+-			if (context.InTransit && !(handler is Page))
+-				throw new HttpException ("Transfer is possible only to .aspx files");
+-			
+-			HttpRequest request = context.Request;
+-			string oldQuery = request.QueryStringRaw;
+-			if (!preserveForm) {
+-				request.QueryStringRaw = "";
+-			}
+-
+-			HttpResponse response = context.Response;
+-			WebROCollection oldForm = null;
+-			if (!preserveForm) {
+-				oldForm = request.Form as WebROCollection;
+-				request.SetForm (new WebROCollection ());
+-			}
+-
+-			TextWriter output = writer;
+-			if (output == null)
+-			 	output = response.Output;
+-
+-			TextWriter previous = null;
+-			try {
+-				previous = response.SetTextWriter (output);
+-				if (!(handler is IHttpAsyncHandler)) {
+-					handler.ProcessRequest (context);
+-				} else {
+-					IHttpAsyncHandler asyncHandler = (IHttpAsyncHandler) handler;
+-					IAsyncResult ar = asyncHandler.BeginProcessRequest (context, null, null);
+-					ar.AsyncWaitHandle.WaitOne ();
+-					asyncHandler.EndProcessRequest (ar);
+-				}
+-			} finally {
+-				if (oldQuery != null && oldQuery != "" && oldQuery != request.QueryStringRaw) {
+-					oldQuery = oldQuery.Substring (1); // Ignore initial '?'
+-					request.QueryStringRaw = oldQuery; // which is added here.
+-				}
+-				response.SetTextWriter (previous);
+-				if (!preserveForm)
+-					request.SetForm (oldForm);
+-			}
++			Execute (handler, writer, preserveForm, context.Request.CurrentExecutionFilePath, null, false);
+ 		}
+ 
+ 		public static byte[] UrlTokenDecode (string input)

@@ -1,0 +1,322 @@
+Index: mono/metadata/class.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/class.c,v
+retrieving revision 1.165
+diff -u -r1.165 class.c
+--- mono/metadata/class.c	15 Apr 2003 09:24:43 -0000	1.165
++++ mono/metadata/class.c	6 May 2003 19:21:27 -0000
+@@ -108,7 +108,7 @@
+ MonoMarshalType *
+ mono_marshal_load_type_info (MonoClass* klass)
+ {
+-	int i, j, count = 0;
++	int i, j, count = 0, native_size = 0;
+ 	MonoMarshalType *info;
+ 	guint32 layout;
+ 
+@@ -131,8 +131,17 @@
+ 	klass->marshal_info = info = g_malloc0 (sizeof (MonoMarshalType) + sizeof (MonoMarshalField) * count);
+ 	info->num_fields = count;
+ 	
+-	if (klass->parent)
+-		info->native_size = mono_class_native_size (klass->parent, NULL);
++	/* Try to find a size for this type in metadata
++	 */
++	mono_metadata_packing_from_typedef (klass->image, klass->type_token, NULL, &native_size);
++
++	if (klass->parent) {
++		int parent_size = mono_class_native_size (klass->parent, NULL);
++
++		/* Add parent size to real size */
++		native_size += parent_size;
++		info->native_size = parent_size;
++	}
+ 
+ 	for (j = i = 0; i < klass->field.count; ++i) {
+ 		int size, align;
+@@ -146,26 +155,33 @@
+ 
+ 		info->fields [j].field = &klass->fields [i];
+ 
++		size = mono_marshal_type_size (klass->fields [i].type, info->fields [j].mspec, 
++			&align, TRUE, klass->unicode);
++
+ 		switch (layout) {
+ 		case TYPE_ATTRIBUTE_AUTO_LAYOUT:
+ 		case TYPE_ATTRIBUTE_SEQUENTIAL_LAYOUT:
+-			size = mono_marshal_type_size (klass->fields [i].type, info->fields [j].mspec, 
+-						       &align, TRUE, klass->unicode);
+ 			align = klass->packing_size ? MIN (klass->packing_size, align): align;	
+ 			info->fields [j].offset = info->native_size;
+ 			info->fields [j].offset += align - 1;
+ 			info->fields [j].offset &= ~(align - 1);
++			info->fields [j].size = size;
+ 			info->native_size = info->fields [j].offset + size;
+ 			break;
+ 		case TYPE_ATTRIBUTE_EXPLICIT_LAYOUT:
+ 			/* FIXME: */
+ 			info->fields [j].offset = klass->fields [i].offset - sizeof (MonoObject);
++			info->fields [j].size = size;
+ 			info->native_size = klass->instance_size - sizeof (MonoObject);
+ 			break;
+ 		}	
+ 		j++;
+ 	}
+ 
++	if(layout != TYPE_ATTRIBUTE_AUTO_LAYOUT) {
++		info->native_size = MAX(native_size, info->native_size);
++	}
++
+ 	if (info->native_size & (klass->min_align - 1)) {
+ 		info->native_size += klass->min_align - 1;
+ 		info->native_size &= ~(klass->min_align - 1);
+@@ -191,7 +207,7 @@
+ 	const int top = class->field.count;
+ 	guint32 layout = class->flags & TYPE_ATTRIBUTE_LAYOUT_MASK;
+ 	MonoTableInfo *t = &m->tables [MONO_TABLE_FIELD];
+-	int i, blittable = TRUE;
++	int i, blittable = TRUE, real_size = 0;
+ 	guint32 rva;
+ 	guint32 packing_size = 0;
+ 
+@@ -203,14 +219,16 @@
+ 			class_compute_field_layout (class->parent);
+ 		class->instance_size += class->parent->instance_size;
+ 		class->min_align = class->parent->min_align;
++		blittable = class->blittable;
+ 	} else {
+ 		class->instance_size = sizeof (MonoObject);
+ 		class->min_align = 1;
+ 	}
+ 
+-	if (mono_metadata_packing_from_typedef (class->image, class->type_token, &packing_size, &class->instance_size)) {
+-		class->instance_size += sizeof (MonoObject);
+-	}
++	/*
++	 *	Get the real size
++	 */
++	mono_metadata_packing_from_typedef (class->image, class->type_token, &packing_size, &real_size);
+ 
+ 	g_assert ((packing_size & 0xfffffff0) == 0);
+ 	class->packing_size = packing_size;
+@@ -280,7 +298,15 @@
+ 		if (!((strcmp (class->name, "Enum") == 0) && (strcmp (class->name_space, "System") == 0)))
+ 			G_BREAKPOINT ();
+ 	}
++
+ 	mono_class_layout_fields (class);
++
++	if(real_size) {
++		if(class->parent)
++			real_size += class->parent->instance_size;
++
++		class->instance_size = MAX(real_size, class->instance_size);
++	}
+ }
+ 
+ void
+@@ -310,6 +336,7 @@
+ 			class->fields [i].offset = class->instance_size;
+ 			class->fields [i].offset += align - 1;
+ 			class->fields [i].offset &= ~(align - 1);
++			class->fields [i].size = size;
+ 			class->instance_size = class->fields [i].offset + size;
+ 
+ 		}
+@@ -340,6 +367,7 @@
+ 			 * classes and valuetypes.
+ 			 */
+ 			class->fields [i].offset += sizeof (MonoObject);
++			class->fields [i].size = size;
+ 
+ 			/*
+ 			 * Calc max size.
+@@ -367,6 +395,7 @@
+ 			class->fields [i].offset = class->class_size;
+ 			class->fields [i].offset += align - 1;
+ 			class->fields [i].offset &= ~(align - 1);
++			class->fields [i].size = size;
+ 			class->class_size = class->fields [i].offset + size;
+ 
+ 		}
+@@ -387,6 +416,7 @@
+ 			class->fields [i].offset = class->class_size;
+ 			class->fields [i].offset += align - 1;
+ 			class->fields [i].offset &= ~(align - 1);
++			class->fields [i].size = size;
+ 			class->class_size = class->fields [i].offset + size;
+ 		}
+ 		break;
+Index: mono/metadata/class.h
+===================================================================
+RCS file: /mono/mono/mono/metadata/class.h,v
+retrieving revision 1.81
+diff -u -r1.81 class.h
+--- mono/metadata/class.h	8 Apr 2003 09:27:56 -0000	1.81
++++ mono/metadata/class.h	6 May 2003 19:21:27 -0000
+@@ -15,6 +15,7 @@
+ typedef struct {
+ 	MonoType        *type;
+ 	int              offset;
++	guint32		 size;
+ 	const char      *name;
+ 	const char      *data;
+ 	MonoClass       *parent;
+@@ -23,6 +24,7 @@
+ typedef struct {
+ 	MonoClassField *field;
+ 	guint32 offset;
++	guint32 size;
+ 	MonoMarshalSpec *mspec;
+ } MonoMarshalField;
+ 
+Index: mono/metadata/marshal.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/marshal.c,v
+retrieving revision 1.93
+diff -u -r1.93 marshal.c
+--- mono/metadata/marshal.c	6 May 2003 11:56:15 -0000	1.93
++++ mono/metadata/marshal.c	6 May 2003 19:21:36 -0000
+@@ -574,7 +574,7 @@
+ 		/* create a new array */
+ 		/* fixme: this only works for SZARRAYS */
+ 		mono_mb_emit_byte (mb, CEE_LDLOC_1);
+-		mono_mb_emit_icon (mb, msize / esize);
++		mono_mb_emit_icon (mb, usize / esize);
+ 		mono_mb_emit_byte (mb, CEE_NEWARR);	
+ 		mono_mb_emit_i4 (mb, mono_mb_add_data (mb, eclass));
+ 		mono_mb_emit_byte (mb, CEE_STIND_I);
+@@ -800,6 +803,9 @@
+ 	MonoMarshalType *info;
+ 	int i;
+ 
++	if(klass->parent)
++		emit_struct_conv(mb, klass->parent, to_object);
++
+ 	info = mono_marshal_load_type_info (klass);
+ 
+ 	if (klass->blittable) {
+@@ -815,8 +821,8 @@
+ 		MonoMarshalNative ntype;
+ 		MonoMarshalConv conv;
+ 		MonoType *ftype = info->fields [i].field->type;
+-		int msize = 0;
+-		int usize = 0;
++		int msize = 0, moffset = 0;
++		int usize = 0, uoffset = 0;
+ 		gboolean last_field = i < (info->num_fields -1) ? 0 : 1;
+ 
+ 		if (ftype->attrs & FIELD_ATTRIBUTE_STATIC)
+@@ -824,13 +830,9 @@
+ 
+ 		ntype = mono_type_to_unmanaged (ftype, info->fields [i].mspec, TRUE, klass->unicode, &conv);
+ 			
+-		if (last_field) {
+-			msize = klass->instance_size - info->fields [i].field->offset;
+-			usize = info->native_size - info->fields [i].offset;
+-		} else {
+-			msize = klass->fields [i + 1].offset - info->fields [i].field->offset;
+-			usize = info->fields [i + 1].offset - info->fields [i].offset;
+-		}
++                msize = info->fields [i].field->size;
++                usize = info->fields [i].size;
++
+ 		g_assert (msize > 0 && usize > 0);
+ 
+ 		switch (conv) {
+@@ -915,13 +917,21 @@
+ 			else
+ 				emit_str_to_ptr_conv (mb, ftype, conv, usize, msize);	
+ 		}
+-		
++				
++		if (last_field) {
++			moffset = klass->instance_size - info->fields [i].field->offset;
++			uoffset = info->native_size - info->fields [i].offset;
++		} else {
++			moffset = klass->fields [i + 1].offset - info->fields [i].field->offset;
++			uoffset = info->fields [i + 1].offset - info->fields [i].offset;
++		}
++
+ 		if (to_object) {
+-			mono_mb_emit_add_to_local (mb, 0, usize);
+-			mono_mb_emit_add_to_local (mb, 1, msize);
++			mono_mb_emit_add_to_local (mb, 0, uoffset);
++			mono_mb_emit_add_to_local (mb, 1, moffset);
+ 		} else {
+-			mono_mb_emit_add_to_local (mb, 0, msize);
+-			mono_mb_emit_add_to_local (mb, 1, usize);
++			mono_mb_emit_add_to_local (mb, 0, moffset);
++			mono_mb_emit_add_to_local (mb, 1, uoffset);
+ 		}				
+ 	}
+ }
+@@ -3531,7 +3541,7 @@
+ 	MonoMarshalType *info;
+ 	MonoClass *klass;
+ 	char *fname;
+-	int i;
++	int i, match_index = -1;
+ 
+ 	MONO_ARCH_SAVE_REGS;
+ 
+@@ -3541,18 +3551,36 @@
+ 	fname = mono_string_to_utf8 (field_name);
+ 	klass = mono_class_from_mono_type (type->type);
+ 
+-	info = mono_marshal_load_type_info (klass);	
+-	
+-	for (i = 0; i < klass->field.count; ++i) {
+-		if (*fname == *klass->fields [i].name && 
+-		    strcmp (fname, klass->fields [i].name) == 0)
+-			break;
++	while(klass && match_index == -1) {
++		for (i = 0; i < klass->field.count; ++i) {
++			if (*fname == *klass->fields [i].name && strcmp (fname, klass->fields [i].name) == 0) {
++				match_index = i;
++				break;
++			}
++		}
++
++		if(match_index == -1)
++			klass = klass->parent;
+ 	}
++
+ 	g_free (fname);
+ 
+-	mono_assert (i < klass->field.count);
++	if(match_index == -1) {
++		MonoException* exc;
++		gchar *tmp;
++
++		/* Get back original class instance */
++		klass = mono_class_from_mono_type (type->type);
++
++		tmp = g_strdup_printf ("Field passed in is not a marshaled member of the type %s", klass->name);
++		exc = mono_get_exception_argument ("fieldName", tmp);
++		g_free (tmp);
+ 
+-	return info->fields [i].offset;
++		mono_raise_exception ((MonoException*)exc);
++	}
++
++	info = mono_marshal_load_type_info (klass);	
++	return info->fields [match_index].offset;
+ }
+ 
+ gpointer
+Index: mono/tests/Makefile.am
+===================================================================
+RCS file: /mono/mono/mono/tests/Makefile.am,v
+retrieving revision 1.125
+diff -u -r1.125 Makefile.am
+--- mono/tests/Makefile.am	5 May 2003 13:58:00 -0000	1.125
++++ mono/tests/Makefile.am	6 May 2003 19:21:46 -0000
+@@ -146,6 +146,7 @@
+ 	marshal5.cs		\
+ 	marshal6.cs		\
+ 	marshal7.cs		\
++	marshal8.cs		\
+ 	thread.cs		\
+ 	thread5.cs		\
+ 	thread6.cs		\

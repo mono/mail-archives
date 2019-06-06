@@ -1,0 +1,190 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Interpreter?
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Interpreter%3F&In-Reply-To=A7D8CDF3-A2DE-4095-88C1-F21B985D5E5C%40web.de">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="024029.html">
+   <LINK REL="Next"  HREF="024042.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Interpreter?</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Interpreter%3F&In-Reply-To=A7D8CDF3-A2DE-4095-88C1-F21B985D5E5C%40web.de"
+       TITLE="[Mono-dev] Interpreter?">lupus at ximian.com
+       </A><BR>
+    <I>Tue Jul  3 11:55:53 EDT 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="024029.html">[Mono-dev] Problems trying to compile Plastic on Linux
+</A></li>
+        <LI>Next message: <A HREF="024042.html">[Mono-dev] Interpreter?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24037">[ date ]</a>
+              <a href="thread.html#24037">[ thread ]</a>
+              <a href="subject.html#24037">[ subject ]</a>
+              <a href="author.html#24037">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 07/03/07 Andreas F&#228;rber wrote:
+&gt;<i> First, it includes changes to eglib/configure.in to make it compile  
+</I>&gt;<i> on OS X and adds VPATH support to facilitate compiling for ppc and  
+</I>&gt;<i> ppc64.
+</I>
+I suggest sending the eglib changes separately (note that the vararg
+changes need to be inside a #ifdef conditional).
+
+&gt;<i> Next, it reorganizes the ppc-codegen.h (header still needs some  
+</I>&gt;<i> changes Miguel requested) - instructions are now listed  
+</I>
+I'm sorry you have been led to do this kind of change: it is not
+acceptable to do extensive cleanups together with code changes:
+please send us only the code changes so we can actually review them
+(this will also remove one third from the patch length).
+
+&gt;<i> Then, the mini and arch ppc files were updated with #ifdefs for ppc64  
+</I>&gt;<i> doing all kinds of necessary changes. I have some FIXMEs/CHECKMEs in  
+</I>&gt;<i> there, especially some numeric offsets and alignments are unclear to  
+</I>&gt;<i> me. This is where I suspect the most issues.
+</I>&gt;<i> Finally, all occurrences of ppc in the sources were checked and adapted.
+</I>
+I gave a very quick read of the changes, here are a few suggestions:
+*) you shold minimize the number of inserted #ifdefs. A patch that does:
+
++#ifdef __ppc64__
++               offset += 8;
++#else
+                offset += 4;
++#endif
+
+is not acceptable, while if it did:
+
+-               offset += 4;
++               offset += sizeof (gpointer);
+
+it would be applied right away.
+Similar issues are with changes like:
++#ifdef __ppc64__
++       __asm__ volatile(&quot;ld    %0,0(r1)&quot; : &quot;=r&quot; (sframe));
++#else
+        __asm__ volatile(&quot;lwz   %0,0(r1)&quot; : &quot;=r&quot; (sframe));
++#endif
+
+Just add to the header something like:
+#ifdef __ppc64__
+#define PPC_LOAD_REG_INS &quot;ld&quot;
+#else
+#define PPC_LOAD_REG_INS &quot;lwz&quot;
+#endif
+
+and replace the asm statements with:
+        __asm__ volatile (PPC_LOAD_REG_INS &quot;   %0,0(r1)&quot; : &quot;=r&quot; (sframe));
+
+Something similar should be done also for the native code emitting
+macros. Instead of:
+
++#ifdef __ppc64__
++               ppc_ld  (buf, ppc_r0, (guint16)G_STRUCT_OFFSET(MonoLMF, previous_lmf) &gt;&gt; 2, ppc_r3);
++               ppc_std (buf, ppc_r0, (guint16)G_STRUCT_OFFSET(MonoLMF, previous_lmf) &gt;&gt; 2, ppc_r11);
++#else
+                ppc_lwz (buf, ppc_r0, G_STRUCT_OFFSET(MonoLMF, previous_lmf), ppc_r3);
+                ppc_stw (buf, ppc_r0, G_STRUCT_OFFSET(MonoLMF, previous_lmf), ppc_r11);
++#endif
+
+define in ppc_codegen:
+
+#ifdef __ppc64__
+#define ppc_load_reg(a,b,c,d) ppc_ld(a,b,(((c) &gt;&gt; 2) &amp; 0xffff),d)
+#define ppc_store_reg(a,b,c,d) ppc_std(a,b,(((c) &gt;&gt; 2) &amp; 0xffff),d)
+#else
+#define ppc_load_reg(a,b,c,d) ppc_lwz(a,b,c,d)
+#define ppc_store_reg(a,b,c,d) ppc_stw(a,b,c,d)
+#endif
+
+This will make the changes so much cleaner that it will be possible to
+more easily review them and find the issues (and it will also allow
+us to commit them incrementally to svn).
+
+*) cpu-g5.md should become cpu-ppc64.md
+
+*) the ppc_load changes are not acceptable: add a ppc_load_sequence
+or something like that that will emit lis/ori on 32 and the full
+sequence on 64 bit and use that where it is required.
+
+*) mono/io-layer/atomic.h: the changes here can't be skipped, they are
+used in many parts of the runtime and without the 64 bit support there
+can be memory corruption.
+
+*) the emit_tls_access optimizations should likely be removed unless
+they have been tested explicitly (they look a bit bogus).
+
+
+&gt;<i> compilation of System.dll using the new mono (or on execution of a  
+</I>&gt;<i> hello world assembly) it aborts with empty stacktrace:
+</I>&gt;<i> 
+</I>&gt;<i> MONO_PATH=&quot;../../class/lib/basic:$MONO_PATH&quot; /Users/andreas/Mono/mono- 
+</I>&gt;<i> ppc64/mono/runtime/mono-wrapper  ../../class/lib/basic/mcs.exe / 
+</I>&gt;<i> codepage:65001   -d:NET_1_1 -d:ONLY_1_1 -d:BOOTSTRAP_WITH_OLDLIB - 
+</I>&gt;<i> debug /noconfig -define:XML_DEP -r:System.Xml.dll -target:library - 
+</I>&gt;<i> out:System.dll  @System.dll.sources
+</I>&gt;<i> Stacktrace:
+</I>[...]
+&gt;<i> (gdb) run ../../../testassembly.exe
+</I>&gt;<i> Starting program: /Users/andreas/Mono/mono-ppc64/mono/mono/mini/ 
+</I>&gt;<i> mono ../../../testassembly.exe
+</I>&gt;<i> Reading symbols for shared libraries .++ done
+</I>&gt;<i> 
+</I>&gt;<i> Program received signal SIGBUS, Bus error.
+</I>&gt;<i> 0x0000000000000000 in ?? ()
+</I>
+This looks like the result of a jump to NULL.
+What are the results of running make rcheck in mini/? That is the first
+thing that needs checking. If it fails in the same way before starting
+the tests it is likely related to something earlier on in the
+initialization. The first thing that comes to mind is: doesn't ppc64 on OSX
+use function descriptors like all the other ppc64 platforms? If it does
+use them this would be the first thing to fix as any indirect call would
+pretty much fail.
+
+&gt;<i> I haven't been able to locate the error(s) for several months now and  
+</I>
+Well, I've been here and I don't remember seeing any jit-related request
+for help:) Follow the above suggestions for now and we can both try to
+get the changes in svn and get the bugs fixed.
+
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="024029.html">[Mono-dev] Problems trying to compile Plastic on Linux
+</A></li>
+	<LI>Next message: <A HREF="024042.html">[Mono-dev] Interpreter?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24037">[ date ]</a>
+              <a href="thread.html#24037">[ thread ]</a>
+              <a href="subject.html#24037">[ subject ]</a>
+              <a href="author.html#24037">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

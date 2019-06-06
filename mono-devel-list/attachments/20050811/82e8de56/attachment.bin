@@ -1,0 +1,489 @@
+Index: assembly.c
+===================================================================
+--- assembly.c	(revisión: 47896)
++++ assembly.c	(copia de trabajo)
+@@ -20,6 +20,7 @@
+ #include <mono/metadata/loader.h>
+ #include <mono/metadata/tabledefs.h>
+ #include <mono/metadata/metadata-internals.h>
++#include <mono/metadata/class-internals.h>
+ #include <mono/metadata/domain-internals.h>
+ #include <mono/io-layer/io-layer.h>
+ #include <mono/utils/mono-uri.h>
+@@ -193,6 +194,249 @@
+ 	}
+ }
+ 
++static gboolean
++assembly_binding_maps_name (AssemblyBindingInfo *info, MonoAssemblyName *aname)
++{
++	if (info->public_key_token [0] == 0 || aname->public_key_token [0] == 0)
++		return FALSE;
++	
++	if (strcmp (info->name, aname->name))
++		return FALSE;
++
++	if (info->major != aname->major || info->minor != aname->minor)
++		return FALSE;
++
++	if ((info->culture != NULL) != (aname->culture != NULL))
++		return FALSE;
++	
++	if (info->culture && strcmp (info->culture, aname->culture))
++		return FALSE;
++	
++	if (strcmp (info->public_key_token, aname->public_key_token))
++		return FALSE;
++
++	return TRUE;
++}
++
++void
++assembly_binding_info_free (AssemblyBindingInfo *info)
++{
++	g_free (info->name);
++	g_free (info->culture);
++}
++
++static void
++start_element (GMarkupParseContext *context, 
++		const gchar *element_name,
++		const gchar **attribute_names,
++		const gchar **attribute_values,
++		gpointer user_data,
++		GError **error)
++{
++	AssemblyBindingInfo *info;
++	int n;
++
++	info = user_data;
++	if (!strcmp (element_name, "assemblyIdentity")) {
++		for (n = 0; attribute_names [n]; n++) {
++			const gchar *attribute_name = attribute_names [n];
++			
++			if (!strcmp (attribute_name, "name"))
++				info->name = g_strdup (attribute_values [n]);
++			else if (!strcmp (attribute_name, "publicKeyToken")) {
++				if (strlen (attribute_values [n]) == MONO_PUBLIC_KEY_TOKEN_LENGTH - 1)
++					g_strlcpy (info->public_key_token, attribute_values [n], MONO_PUBLIC_KEY_TOKEN_LENGTH);
++			}
++			else if (!strcmp (attribute_name, "culture")) {
++				if (!strcmp (attribute_values [n], "neutral"))
++					info->culture = g_strdup ("");
++				else
++					info->culture = g_strdup (attribute_values [n]);
++			}
++		}
++	}
++	else if (!strcmp (element_name, "bindingRedirect")) {
++		for (n = 0; attribute_names [n]; n++) {
++			const gchar *attribute_name = attribute_names [n];
++
++			if (!strcmp (attribute_name, "oldVersion")) {
++				gchar **numbers, **version, **versions;
++
++				/* Invalid value */
++				if (!strcmp (attribute_values [n], ""))
++					return;
++				
++				versions = g_strsplit (attribute_values [n], "-", 2);
++				version = g_strsplit (*versions, ".", 4);
++
++				numbers = version;
++				info->old_version_bottom.major = *numbers ? atoi (*numbers++) : -1;
++				info->old_version_bottom.minor = *numbers ? atoi (*numbers++) : -1;
++				info->old_version_bottom.build = *numbers ? atoi (*numbers++) : -1;
++				info->old_version_bottom.revision = *numbers ? atoi (*numbers) : -1;
++				g_strfreev (version);
++
++				if (!*(versions + 1)) {
++					g_strfreev (versions);
++					continue;
++				}
++				
++				numbers = version = g_strsplit (*(versions + 1), ".", 4);
++				info->old_version_top.major = *numbers ? atoi (*numbers++) : -1;
++				info->old_version_top.minor = *numbers ? atoi (*numbers++) : -1;
++				info->old_version_top.build = *numbers ? atoi (*numbers++) : -1;
++				info->old_version_top.revision = *numbers ? atoi (*numbers) : 1;
++				g_strfreev (version);
++
++				g_strfreev (versions);
++			}
++			else if (!strcmp (attribute_name, "newVersion")) {
++				gchar **numbers, **version;
++
++				/* Invalid value */
++				if (!strcmp (attribute_values [n], ""))
++					return;
++
++				numbers = version = g_strsplit (attribute_values [n], ".", 4);
++				info->new_version.major = *numbers ? atoi (*numbers++) : -1;
++				info->new_version.minor = *numbers ? atoi (*numbers++) : -1;
++				info->new_version.build = *numbers ? atoi (*numbers++) : -1;
++				info->new_version.revision = *numbers ? atoi (*numbers) : -1;
++				g_strfreev (version);
++			}
++		}
++	}
++}
++
++static const GMarkupParser
++policy_parser = {
++	start_element,
++	NULL,
++	NULL,
++	NULL,
++	NULL
++};
++
++static gboolean
++get_publisher_policy_info (MonoImage *image, MonoAssemblyName *aname, AssemblyBindingInfo *binding_info)
++{
++	GMarkupParseContext *context;
++	MonoTableInfo *t;
++	guint32 cols [MONO_MANIFEST_SIZE];
++	const gchar *filename;
++	gchar *config_file, *subpath, *fullpath;
++	gboolean could_read;
++	gsize len;
++
++	t = &image->tables [MONO_TABLE_MANIFESTRESOURCE];
++	/* MS Impl. accepts policy assemblies with more than
++	 * one manifest resource, and only takes the first one */
++	if (t->rows < 1)
++		return FALSE;
++	
++	mono_metadata_decode_row (t, 0, cols, MONO_MANIFEST_SIZE);
++	if ((cols [MONO_MANIFEST_IMPLEMENTATION] & MONO_IMPLEMENTATION_MASK) != MONO_IMPLEMENTATION_FILE)
++		return FALSE;
++	
++	filename = mono_metadata_string_heap (image, cols [MONO_MANIFEST_NAME]);
++	g_assert (filename != NULL);
++	
++	subpath = g_path_get_dirname (image->name);
++	fullpath = g_build_path (G_DIR_SEPARATOR_S, subpath, filename, NULL);
++	could_read = g_file_get_contents (fullpath, &config_file, &len, NULL);
++	g_free (subpath);
++	g_free (fullpath);
++
++	if (!could_read)
++		return FALSE;
++	
++	binding_info->major = aname->major;
++	binding_info->minor = aname->minor;
++	binding_info->new_version.major = binding_info->new_version.minor = binding_info->new_version.build = binding_info->new_version.revision = -1;
++	binding_info->old_version_bottom = binding_info->new_version;
++	binding_info->old_version_top = binding_info->new_version;
++	
++	context = g_markup_parse_context_new (
++			&policy_parser, /* GMarkupParser */
++			0, /* flags */
++			binding_info, /* user_data */
++			NULL);
++
++	if (g_markup_parse_context_parse (context, config_file, len, NULL))
++		g_markup_parse_context_end_parse (context, NULL);
++	
++	g_markup_parse_context_free (context);
++	g_free (config_file);
++
++	/* Define the optional elements/attributes */
++	if (!binding_info->culture)
++		binding_info->culture = g_strdup ("");
++	
++	/* Check that the most important elements/attributes exist */
++	if (!binding_info->name || !binding_info->public_key_token [0] || binding_info->new_version.major < 0 || binding_info->new_version.minor < 0 || 
++			binding_info->new_version.revision < 0 || binding_info->new_version.build < 0 || binding_info->old_version_bottom.major < 0 || 
++			binding_info->old_version_bottom.minor < 0 || binding_info->old_version_bottom.revision < 0 || 
++			binding_info->old_version_bottom.build < 0 || !assembly_binding_maps_name (binding_info, aname)) {
++		
++		assembly_binding_info_free (binding_info);
++		return FALSE;
++	}
++
++	return TRUE;
++}
++
++static int
++compare_versions (struct version *v, MonoAssemblyName *aname)
++{
++	if (v->major > aname->major)
++		return 1;
++	else if (v->major < aname->major)
++		return -1;
++
++	if (v->minor > aname->minor)
++		return 1;
++	else if (v->minor < aname->minor)
++		return -1;
++
++	if (v->build > aname->build)
++		return 1;
++	else if (v->build < aname->build)
++		return -1;
++
++	if (v->revision > aname->revision)
++		return 1;
++	else if (v->revision < aname->revision)
++		return -1;
++
++	return 0;
++}
++
++static gboolean
++check_policy_versions (AssemblyBindingInfo *info, MonoAssemblyName *name)
++{
++	/* If we have defined the top old version numbers as -1,
++	 * then we don't have a range, so we need to have the exact version
++	 * pointed by info->old_version_bottom */
++	if (info->old_version_top.major == -1 && info->old_version_top.minor == -1 &&
++			info->old_version_top.build == -1 && info->old_version_top.revision == -1) {
++	
++		if (compare_versions (&info->old_version_bottom, name) == 0)
++			return TRUE;
++
++		return FALSE;
++	}
++
++	/* Check that the version defined by name is valid for the range */
++	if (compare_versions (&info->old_version_top, name) < 0)
++		return FALSE;
++
++	/* We should be greater or equal than the small version */
++	if (compare_versions (&info->old_version_bottom, name) > 0)
++		return FALSE;
++
++	return TRUE;
++}
++
+ gboolean
+ mono_assembly_names_equal (MonoAssemblyName *l, MonoAssemblyName *r)
+ {
+@@ -1287,6 +1531,160 @@
+ 	return res;
+ }
+ 
++static MonoImage*
++mono_assembly_load_publisher_policy (MonoAssemblyName *aname)
++{
++	MonoImage *image;
++	gchar *filename, *pname, *name, *culture, *version, *fullpath, *subpath;
++	gchar **paths;
++	gint32 len;
++
++	if (aname->public_key_token [0] == 0)
++		return NULL;
++
++	if (strstr (aname->name, ".dll")) {
++		len = strlen (aname->name) - 4;
++		name = g_malloc (len);
++		strncpy (name, aname->name, len);
++	} else
++		name = g_strdup (aname->name);
++	
++	if (aname->culture) {
++		culture = g_strdup (aname->culture);
++		g_strdown (culture);
++	}
++	else
++		culture = g_strdup ("");
++	
++	pname = g_strdup_printf ("policy.%d.%d.%s", aname->major, aname->minor, name);
++	version = g_strdup_printf ("0.0.0.0_%s_%s", culture, aname->public_key_token);
++	g_free (name);
++	g_free (culture);
++	
++	filename = g_strconcat (pname, ".dll", NULL);
++	subpath = g_build_path (G_DIR_SEPARATOR_S, pname, version, filename, NULL);
++	g_free (pname);
++	g_free (version);
++	g_free (filename);
++
++	image = NULL;
++	if (extra_gac_paths) {
++		paths = extra_gac_paths;
++		while (!image && *paths) {
++			fullpath = g_build_path (G_DIR_SEPARATOR_S, *paths,
++					"lib", "mono", "gac", subpath, NULL);
++			image = mono_image_open (fullpath, NULL);
++			g_free (fullpath);
++			paths++;
++		}
++	}
++
++	if (image) {
++		g_free (subpath);
++		return image;
++	}
++
++	fullpath = g_build_path (G_DIR_SEPARATOR_S, mono_assembly_getrootdir (), 
++			"mono", "gac", subpath, NULL);
++	image = mono_image_open (fullpath, NULL);
++	g_free (subpath);
++	g_free (fullpath);
++	
++	return image;
++}
++
++static MonoAssemblyName*
++mono_assembly_bind_version (AssemblyBindingInfo *info, MonoAssemblyName *aname, MonoAssemblyName *dest_name)
++{
++	memcpy (dest_name, aname, sizeof (MonoAssemblyName));
++	dest_name->major = info->new_version.major;
++	dest_name->minor = info->new_version.minor;
++	dest_name->build = info->new_version.build;
++	dest_name->revision = info->new_version.revision;
++	
++	return dest_name;
++}
++
++/* LOCKING: Assumes that we are already locked */
++static AssemblyBindingInfo*
++search_binding_loaded (MonoAssemblyName *aname)
++{
++	GSList *tmp;
++	MonoDomain *domain = mono_domain_get ();
++
++	for (tmp = domain->assembly_bindings; tmp; tmp = tmp->next) {
++		AssemblyBindingInfo *info = tmp->data;
++		if (assembly_binding_maps_name (info, aname))
++			return info;
++	}
++
++	return NULL;
++}
++
++static MonoAssemblyName*
++mono_assembly_apply_binding (MonoAssemblyName *aname, MonoAssemblyName *dest_name)
++{
++	AssemblyBindingInfo *info, *info2;
++	MonoDomain *domain = mono_domain_get ();
++	MonoImage *ppimage;
++	gboolean is_policy_valid;
++
++	if (aname->public_key_token [0] == 0)
++		return aname;
++
++	mono_loader_lock ();
++	info = search_binding_loaded (aname);
++	mono_loader_unlock ();
++	if (info) {
++		if (!check_policy_versions (info, aname))
++			return aname;
++		
++		mono_assembly_bind_version (info, aname, dest_name);
++		return dest_name;
++	}
++
++	info = g_new0 (AssemblyBindingInfo, 1);
++	ppimage = mono_assembly_load_publisher_policy (aname);
++	if (!ppimage)
++		is_policy_valid = FALSE;
++	else {
++		is_policy_valid = get_publisher_policy_info (ppimage, aname, info);
++		mono_image_close (ppimage);
++	}
++
++	/* Define default error value */
++	if (!is_policy_valid) {
++		info->name = g_strdup (aname->name);
++		info->culture = g_strdup (aname->culture);
++		info->major = aname->major;
++		info->minor = aname->minor;
++		info->new_version.major = info->new_version.minor = info->new_version.build = info->new_version.revision = -1;
++		info->old_version_bottom = info->new_version;
++		info->old_version_top = info->new_version;
++		g_strlcpy (info->public_key_token, aname->public_key_token, MONO_PUBLIC_KEY_TOKEN_LENGTH);
++	}
++	
++	mono_loader_lock ();
++	info2 = search_binding_loaded (aname);
++	if (info2) {
++		/* This binding was added by another thread 
++		 * before us */
++		assembly_binding_info_free (info);
++		g_free (info);
++		
++		info = info2;
++	} else
++		domain->assembly_bindings = g_slist_prepend (domain->assembly_bindings, info);
++		
++	mono_loader_unlock ();
++	
++	if (!is_policy_valid || !check_policy_versions (info, aname))
++		return aname;
++
++	mono_assembly_bind_version (info, aname, dest_name);
++	return dest_name;
++}
++
+ /**
+  * mono_assembly_load_from_gac
+  *
+@@ -1396,10 +1794,14 @@
+ {
+ 	MonoAssembly *result;
+ 	char *fullpath, *filename;
+-	MonoAssemblyName maped_aname;
++	MonoAssemblyName maped_aname, maped_name_pp;
+ 
+ 	aname = mono_assembly_remap_version (aname, &maped_aname);
+ 	
++	/* Reflection only assemblies don't get assembly binding */
++	if (!refonly)
++		aname = mono_assembly_apply_binding (aname, &maped_name_pp);
++	
+ 	result = mono_assembly_loaded_full (aname, refonly);
+ 	if (result)
+ 		return result;
+Index: metadata-internals.h
+===================================================================
+--- metadata-internals.h	(revisión: 47896)
++++ metadata-internals.h	(copia de trabajo)
+@@ -236,6 +236,25 @@
+ 	MonoDynamicTable tables [MONO_TABLE_NUM];
+ };
+ 
++struct version {
++	int major;
++	int minor;
++	int build;
++	int revision;
++};
++
++/* Contains information about assembly binding */
++typedef struct _AssemblyBindingInfo {
++	char *name;
++	char *culture;
++	guchar public_key_token [MONO_PUBLIC_KEY_TOKEN_LENGTH];
++	int major;
++	int minor;
++	struct version old_version_bottom;
++	struct version old_version_top;
++	struct version new_version;
++} AssemblyBindingInfo;
++
+ /* for use with allocated memory blocks (assumes alignment is to 8 bytes) */
+ guint mono_aligned_addr_hash (gconstpointer ptr);
+ 
+@@ -311,5 +330,7 @@
+ void mono_dynamic_stream_reset (MonoDynamicStream* stream);
+ void mono_assembly_addref      (MonoAssembly *assembly);
+ 
++void assembly_binding_info_free 	    (AssemblyBindingInfo   *info);
++
+ #endif /* __MONO_METADATA_INTERNALS_H__ */
+ 
+Index: domain-internals.h
+===================================================================
+--- domain-internals.h	(revisión: 47896)
++++ domain-internals.h	(copia de trabajo)
+@@ -89,6 +89,7 @@
+ 	MonoGHashTable     *env;
+ 	GSList             *domain_assemblies;
+ 	MonoAssembly       *entry_assembly;
++	GSList 		   *assembly_bindings;
+ 	MonoAppDomainSetup *setup;
+ 	char               *friendly_name;
+ 	guint32            state;

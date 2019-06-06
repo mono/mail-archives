@@ -1,0 +1,208 @@
+Index: debug-mono-symfile.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/debug-mono-symfile.h,v
+retrieving revision 1.51
+diff -u -3 -p -r1.51 debug-mono-symfile.h
+--- debug-mono-symfile.h	4 May 2003 12:24:27 -0000	1.51
++++ debug-mono-symfile.h	13 Jan 2004 10:47:31 -0000
+@@ -121,7 +121,7 @@ struct _MonoSymbolFile {
+ };
+ 
+ #define MONO_SYMBOL_FILE_VERSION		35
+-#define MONO_SYMBOL_FILE_MAGIC			0x45e82623fd7fa614
++#define MONO_SYMBOL_FILE_MAGIC			0x45e82623fd7fa614ULL
+ 
+ MonoSymbolFile *
+ mono_debug_open_mono_symbol_file   (MonoDebugHandle           *handle,
+@@ -141,7 +141,7 @@ _mono_debug_address_from_il_offset (Mono
+ 				    guint32                   il_offset);
+ 
+ MonoDebugMethodInfo *
+-mono_debug_find_method             (MonoSymbolFile           *symfile,
++mono_debug_find_method             (MonoDebugHandle           *handle,
+ 				    MonoMethod               *method);
+ 
+ #endif /* __MONO_SYMFILE_H__ */
+Index: debug-mono-symfile.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/debug-mono-symfile.c,v
+retrieving revision 1.55
+diff -u -3 -p -r1.55 debug-mono-symfile.c
+--- debug-mono-symfile.c	12 Nov 2003 13:15:34 -0000	1.55
++++ debug-mono-symfile.c	13 Jan 2004 10:47:31 -0000
+@@ -44,12 +44,9 @@ get_class_name (MonoClass *klass)
+ static int
+ load_symfile (MonoDebugHandle *handle, MonoSymbolFile *symfile)
+ {
+-	MonoSymbolFileMethodEntry *me;
+-	MonoSymbolFileMethodIndexEntry *ie;
+ 	const char *ptr, *start;
+ 	guint64 magic;
+ 	long version;
+-	int i;
+ 
+ 	ptr = start = symfile->raw_contents;
+ 	if (!ptr)
+@@ -58,7 +55,7 @@ load_symfile (MonoDebugHandle *handle, M
+ 	magic = *((guint64 *) ptr);
+ 	ptr += sizeof(guint64);
+ 	if (magic != MONO_SYMBOL_FILE_MAGIC) {
+-		g_warning ("Symbol file %s has is not a mono symbol file", handle->image_file);
++		g_warning ("Symbol file %s is not a mono symbol file", handle->image_file);
+ 		return FALSE;
+ 	}
+ 
+@@ -73,40 +70,9 @@ load_symfile (MonoDebugHandle *handle, M
+ 
+ 	symfile->offset_table = (MonoSymbolFileOffsetTable *) ptr;
+ 
+-	/*
+-	 * Read method table.
+-	 *
+-	 */
+-
+ 	symfile->method_hash = g_hash_table_new_full (g_direct_hash, g_direct_equal, NULL,
+ 							     (GDestroyNotify) free_method_info);
+ 
+-	ie = (MonoSymbolFileMethodIndexEntry *)
+-		(symfile->raw_contents + symfile->offset_table->method_table_offset);
+-
+-	for (i = 0; i < symfile->offset_table->method_count; i++, me++, ie++) {
+-		MonoMethod *method;
+-		MonoDebugMethodInfo *minfo;
+-
+-		me = (MonoSymbolFileMethodEntry *) (symfile->raw_contents + ie->file_offset);
+-
+-		method = mono_get_method (handle->image, me->token, NULL);
+-
+-		if (!method)
+-			continue;
+-
+-		minfo = g_new0 (MonoDebugMethodInfo, 1);
+-		minfo->index = i + 1;
+-		minfo->method = method;
+-		minfo->handle = handle;
+-		minfo->num_il_offsets = me->num_line_numbers;
+-		minfo->il_offsets = (MonoSymbolFileLineNumberEntry *)
+-			(symfile->raw_contents + me->line_number_table_offset);
+-		minfo->entry = me;
+-
+-		g_hash_table_insert (symfile->method_hash, method, minfo);
+-	}
+-
+ 	return TRUE;
+ }
+ 
+@@ -239,11 +205,51 @@ _mono_debug_address_from_il_offset (Mono
+ 	return -1;
+ }
+ 
++static int
++compare_method (const void *key, const void *object)
++{
++	guint32 token = GPOINTER_TO_UINT (key);
++	MonoSymbolFileMethodIndexEntry *me = (MonoSymbolFileMethodIndexEntry*)object;
++
++	return token - me->token;
++}
++
+ MonoDebugMethodInfo *
+-mono_debug_find_method (MonoSymbolFile *symfile, MonoMethod *method)
++mono_debug_find_method (MonoDebugHandle *handle, MonoMethod *method)
+ {
++	MonoSymbolFileMethodEntry *me;
++	MonoSymbolFileMethodIndexEntry *ie, *ie2;
++	MonoDebugMethodInfo *minfo;
++	MonoSymbolFile *symfile = handle->symfile;
++
+ 	if (!symfile->method_hash)
+ 		return NULL;
+-	else
+-		return g_hash_table_lookup (symfile->method_hash, method);
++
++	if (handle->image != method->klass->image)
++		return NULL;
++
++	ie = (MonoSymbolFileMethodIndexEntry *)
++		(symfile->raw_contents + symfile->offset_table->method_table_offset);
++
++	ie2 = bsearch (GUINT_TO_POINTER (method->token), ie, 
++				   symfile->offset_table->method_count,
++				   sizeof (MonoSymbolFileMethodIndexEntry), compare_method);
++
++	if (!ie2)
++		return NULL;
++
++	me = (MonoSymbolFileMethodEntry *) (symfile->raw_contents + ie->file_offset);
++
++	minfo = g_new0 (MonoDebugMethodInfo, 1);
++	minfo->index = (ie2 - ie) + 1;
++	minfo->method = method;
++	minfo->handle = handle;
++	minfo->num_il_offsets = me->num_line_numbers;
++	minfo->il_offsets = (MonoSymbolFileLineNumberEntry *)
++		(symfile->raw_contents + me->line_number_table_offset);
++	minfo->entry = me;
++
++	g_hash_table_insert (symfile->method_hash, method, minfo);
++
++	return minfo;
+ }
+Index: mono-debug.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/mono-debug.c,v
+retrieving revision 1.14
+diff -u -3 -p -r1.14 mono-debug.c
+--- mono-debug.c	11 Nov 2003 19:07:41 -0000	1.14
++++ mono-debug.c	13 Jan 2004 10:47:31 -0000
+@@ -24,6 +24,9 @@ static gboolean in_the_mono_debugger = F
+ static gboolean mono_debug_initialized = FALSE;
+ GHashTable *mono_debug_handles = NULL;
+ 
++static int num_methods = 0;
++static long memory_size = 0;
++
+ static MonoDebugHandle *mono_debug_open_image    (MonoImage *image);
+ static void             mono_debug_close_image   (MonoDebugHandle *debug);
+ 
+@@ -93,6 +96,9 @@ mono_debug_cleanup (void)
+ 	if (mono_debug_handles)
+ 		g_hash_table_destroy (mono_debug_handles);
+ 	mono_debug_handles = NULL;
++
++	g_message (G_STRLOC ": %d methods and %ld bytes of data", num_methods,
++		   memory_size);
+ }
+ 
+ static MonoDebugHandle *
+@@ -182,7 +188,7 @@ lookup_method_func (gpointer key, gpoint
+ 		return;
+ 
+ 	if (handle->symfile)
+-		data->minfo = mono_debug_find_method (handle->symfile, data->method);
++		data->minfo = mono_debug_find_method (handle, data->method);
+ }
+ 
+ static MonoDebugMethodInfo *
+@@ -291,6 +297,12 @@ mono_debug_add_method (MonoMethod *metho
+ 
+ 	domain_data->jit [minfo->index] = jit;
+ 
++	num_methods++;
++	memory_size += sizeof (MonoDebugMethodJitInfo) +
++		jit->line_numbers->len * sizeof (MonoDebugLineNumberEntry) +
++		(jit->num_params + jit->num_locals) * sizeof (MonoDebugVarInfo) +
++		(jit->this_var != NULL ? sizeof (MonoDebugVarInfo) : 0);
++
+ 	if (handle->_priv->debugger_info && (domain == mono_root_domain))
+ 		mono_debugger_add_method (handle->_priv->debugger_info, minfo, jit);
+ 
+@@ -434,6 +446,8 @@ mono_debug_get_domain_data (MonoDebugHan
+ 	data->_priv->next = handle->_priv->domain_table;
+ 	data->_priv->wrapper_info = g_hash_table_new (g_direct_hash, g_direct_equal);
+ 	handle->_priv->domain_table = data;
++
++	memory_size += sizeof (MonoDebugDomainData) + sizeof (MonoDebugDomainDataPriv);
+ 
+ 	return data;
+ }

@@ -1,0 +1,267 @@
+
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Threading;
+using System.Collections;
+using System.Globalization;
+using System.Runtime.Remoting;
+using System.Runtime.Remoting.Channels;
+using System.Runtime.Remoting.Messaging;
+using System.Runtime.Remoting.Lifetime;
+using System.Runtime.Remoting.Channels.Tcp;
+using System.Runtime.Remoting.Activation;
+using System.Runtime.Remoting.Contexts;
+using System.Runtime.Remoting.Channels.Http;
+using System.Runtime.InteropServices;
+
+public class Tests
+{
+	public static void Main (String[] args) {
+		var o = new BaseCallTest ();
+		o.Run ();
+		o.TestInterfaceProcessContextData ();
+	}
+}
+	
+	public class BaseCallTest
+	{
+		IChannelSender chs;
+		string[] remoteUris;
+		CallsDomainServer server;
+		int remoteDomId;
+
+		public void Run()
+		{
+			remoteDomId = CreateServer ();
+		}
+
+		public void End ()
+		{
+			ShutdownServer ();
+		}
+
+		public static AppDomain CreateDomain (string friendlyName)
+		{
+			// return AppDomain.CreateDomain (friendlyName);
+			return AppDomain.CreateDomain (friendlyName, null, Directory.GetCurrentDirectory (), ".", false);
+		}
+
+		AppDomain domain;
+
+		protected virtual int CreateServer ()
+		{
+			ChannelManager cm = CreateChannelManager ();
+			chs = cm.CreateClientChannel ();
+			ChannelServices.RegisterChannel (chs);
+
+			Console.WriteLine (this.GetType ());
+			domain = BaseCallTest.CreateDomain ("testdomain");
+			server = (CallsDomainServer) domain.CreateInstanceAndUnwrap(GetType().Assembly.FullName,"CallsDomainServer");
+			Console.WriteLine ("D");
+			remoteUris = server.Start (cm);
+			Console.WriteLine ("D2");
+			return server.GetDomId ();
+		}
+		
+		protected virtual void ShutdownServer ()
+		{
+			if (server != null) {
+				server.Stop ();
+				if (chs != null)
+					ChannelServices.UnregisterChannel (chs);
+			}
+		}
+
+		public virtual ChannelManager CreateChannelManager ()
+		{
+			return new HttpChannelManager ();
+		}
+
+		public void TestInterfaceProcessContextData ()
+		{
+			for (int i = 0; i < 100; ++i) {
+				CallContext.FreeNamedDataSlot ("clientData");
+				CallContext.FreeNamedDataSlot ("serverData");
+				CallContext.FreeNamedDataSlot ("mustNotPass");
+			
+				ContextData cdata = new ContextData ();
+			
+				CallContext.FreeNamedDataSlot ("clientData");
+				CallContext.FreeNamedDataSlot ("serverData");
+			
+				cdata = new ContextData ();
+				cdata.data = "hi from client";
+				cdata.id = 1123;
+				cdata.testStep = 2;
+				CallContext.SetData ("clientData", cdata);
+			
+				string mdata;
+
+				try {
+					Console.WriteLine ("1");
+
+				    var RemoteObject = (IRemoteObject) Activator.GetObject (typeof(IRemoteObject), remoteUris[2]);
+
+					DelegateProcessContextData de = new DelegateProcessContextData (RemoteObject.ProcessContextData);
+					IAsyncResult ar = de.BeginInvoke (null,null);
+					BaseCallTest.DoWork ();
+					de.EndInvoke (ar);
+				} catch (Exception ex) {
+					Console.WriteLine ("2");
+					if (ex.InnerException != null)
+						ex = ex.InnerException;
+					if (ex.Message != "exception from server")
+						throw;
+				}
+			
+				cdata = CallContext.GetData ("clientData") as ContextData;
+				mdata = CallContext.GetData ("mustNotPass") as string;
+			}
+		}
+
+		public static void DoWork ()
+		{
+			for (int n=0; n<10; n++)
+				Thread.Sleep (1);
+		}
+	}
+
+	//
+	// The server running in the remote domain
+	//
+
+	class CallsDomainServer: MarshalByRefObject
+	{
+		IChannelReceiver ch;
+
+		public string[] Start(ChannelManager cm)
+		{
+			Console.WriteLine ("BOO!");
+			try
+			{
+				ch = cm.CreateServerChannel ();
+				ChannelServices.RegisterChannel ((IChannel)ch);
+				RemotingConfiguration.RegisterWellKnownServiceType (typeof (RemoteObject), "test1", WellKnownObjectMode.SingleCall);
+				RemotingConfiguration.RegisterWellKnownServiceType (typeof (RemoteObject), "test2", WellKnownObjectMode.SingleCall);
+				RemotingConfiguration.RegisterWellKnownServiceType (typeof (RemoteObject), "test3", WellKnownObjectMode.SingleCall);
+				string[] uris = new string[3];
+				uris[0] = ch.GetUrlsForUri ("test1")[0];
+				uris[1] = ch.GetUrlsForUri ("test2")[0];
+				uris[2] = ch.GetUrlsForUri ("test3")[0];
+				return uris;
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine (ex.ToString());
+				throw;
+			}
+		}
+
+		public void Stop ()
+		{
+			if (ch != null)
+				ChannelServices.UnregisterChannel (ch);
+		}
+
+		public int GetDomId ()
+		{
+			return Thread.GetDomainID();
+		}
+	}
+	
+	[Serializable]
+	public class ContextData : ILogicalThreadAffinative
+	{
+		public string data;
+		public int id;
+		public int testStep;
+	}
+
+	[Serializable]
+	public abstract class ChannelManager
+	{
+		public abstract IChannelSender CreateClientChannel ();
+		public abstract IChannelReceiver CreateServerChannel ();
+	}
+
+
+	//
+	// Test interface
+	//
+	public interface IRemoteObject
+	{
+		void ProcessContextData ();
+	}
+
+	public abstract class InterfaceSurrogate : IRemoteObject
+	{
+		public IRemoteObject RemoteObject;
+		public abstract void ProcessContextData ();
+	}
+
+	
+	//
+	// Test abstract base class
+	//
+
+	public abstract class AbstractRemoteObject : MarshalByRefObject
+	{
+		public abstract void ProcessContextData ();
+	}
+
+	//
+	// Test class
+	//
+	
+	public class RemoteObject : AbstractRemoteObject, IRemoteObject
+	{
+		public override void ProcessContextData ()
+		{
+			Console.WriteLine ("HIT!");
+			try {
+				string mdata = CallContext.GetData ("mustNotPass") as string;
+				if (mdata != null)
+					throw new Exception ("mustNotPass is not null");
+			
+				ContextData cdata = CallContext.GetData ("clientData") as ContextData;
+				if (cdata == null) 
+					throw new Exception ("server: clientData is null");
+				if (cdata.data != "hi from client" || cdata.id != 1123)
+					throw new Exception ("server: clientData is not valid");
+			
+				if (cdata.testStep == 2)
+					throw new Exception ("exception from server2");
+
+				if (cdata.testStep != 1)
+					throw new Exception ("invalid test step");
+				
+				cdata = new ContextData ();
+				cdata.data = "hi from server";
+				cdata.id = 3211;
+				CallContext.SetData ("serverData", cdata);
+			} catch (Exception ex) {
+				Console.WriteLine (ex);
+				throw;
+			}
+		}
+	}
+
+	public delegate void DelegateProcessContextData ();
+
+	[Serializable]
+	public class HttpChannelManager : ChannelManager
+	{
+		public override IChannelSender CreateClientChannel ()
+		{
+			Hashtable options = new Hashtable ();
+			options ["timeout"] = 10000; // 10s
+			return new HttpClientChannel (options, null);
+		}
+
+		public override IChannelReceiver CreateServerChannel ()
+		{
+			return new HttpChannel (0);
+		}
+	}

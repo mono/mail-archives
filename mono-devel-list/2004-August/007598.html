@@ -1,0 +1,235 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] statistical profiler (hack)
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20statistical%20profiler%20%28hack%29&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="007596.html">
+   <LINK REL="Next"  HREF="007600.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] statistical profiler (hack)</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20statistical%20profiler%20%28hack%29&In-Reply-To="
+       TITLE="[Mono-devel-list] statistical profiler (hack)">lupus at ximian.com
+       </A><BR>
+    <I>Thu Aug 19 14:50:54 EDT 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="007596.html">[Mono-devel-list] From Orkut's Mono Forum
+</A></li>
+        <LI>Next message: <A HREF="007600.html">[Mono-devel-list] Re: [Mono-list] inlining of methods using structs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7598">[ date ]</a>
+              <a href="thread.html#7598">[ thread ]</a>
+              <a href="subject.html#7598">[ subject ]</a>
+              <a href="author.html#7598">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>People may be interested in this tool to do profiling.
+Unlike the current --profiler default profiler, this interfers
+very little with the performance of the running application,
+but doesn't provide caller info or memory allocation stats.
+It has only been tested on my Debian, but it should work on any modern
+linux box: the features required are setitimer support and
+backtrace_symbols(), a feature of libc which could be made optional.
+This tool can be used to have some info also on the time spent in the
+runtime, as opposed to just managed code, but this needs
+backtrace_symbols support and the version script in mini/Makefile.am
+needs to be disabled for more informative results.
+Best results on systems with the kernel HZ value of about 1000
+(Linux kernels 2.6 have this by default, 2.4 has 100 which is a bit low:
+it means the program is sampled only 100 times per second).
+There is no option to enable/disable: once the code has been made more
+portable I'll design an interface to be able to implement it as a
+profiler module.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+-------------- next part --------------
+Index: mini.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/mini.c,v
+retrieving revision 1.283
+diff -u -p -r1.283 mini.c
+--- mini.c	18 Aug 2004 15:30:14 -0000	1.283
++++ mini.c	19 Aug 2004 17:25:25 -0000
+@@ -56,6 +56,8 @@
+ 
+ #include &quot;jit-icalls.c&quot;
+ 
++#include &lt;sys/time.h&gt;
++
+ /* 
+  * this is used to determine when some branch optimizations are possible: we exclude FP compares
+  * because they have weird semantics with NaNs.
+@@ -65,6 +67,7 @@
+ 
+ #define MONO_CHECK_THIS(ins) (cfg-&gt;method-&gt;signature-&gt;hasthis &amp;&amp; (ins)-&gt;ssa_op == MONO_SSA_LOAD &amp;&amp; (ins)-&gt;inst_left-&gt;inst_c0 == 0)
+ 
++static void setup_profiler (void);
+ gboolean  mono_arch_print_tree(MonoInst *tree, int arity);
+ static gpointer mono_jit_compile_method_with_opt (MonoMethod *method, guint32 opt);
+ static gpointer mono_jit_compile_method (MonoMethod *method);
+@@ -6457,6 +6460,7 @@ mono_thread_start_cb (guint32 tid, gpoin
+ 	thread = mono_thread_current ();
+ 	if (thread)
+ 		thread-&gt;jit_data = jit_tls;
++	setup_profiler ();
+ }
+ 
+ void (*mono_thread_attach_aborted_cb ) (MonoObject *obj) = NULL;
+@@ -8093,6 +8107,88 @@ SIG_HANDLER_SIGNATURE (sigusr1_signal_ha
+ 	mono_arch_handle_exception (ctx, exc, FALSE);
+ }
+ 
++/* about 10 minutes of samples */
++#define MAX_PROF_SAMPLES (1000*60*10)
++static int prof_counts = 0;
++static int prof_ucounts = 0;
++static gpointer* prof_addresses = NULL;
++static GHashTable *prof_table = NULL;
++
++static int
++compare_methods_prof (gconstpointer a, gconstpointer b)
++{
++	int ca = GPOINTER_TO_UINT (g_hash_table_lookup (prof_table, a));
++	int cb = GPOINTER_TO_UINT (g_hash_table_lookup (prof_table, b));
++	return cb-ca;
++}
++
++static void
++prof_foreach (char *method, gpointer c, gpointer data)
++{
++	GList **list = data;
++	*list = g_list_insert_sorted (*list, method, compare_methods_prof);
++}
++
++static void
++stat_prof_report (void)
++{
++	MonoJitInfo *ji;
++	int count = prof_counts;
++	int i, c;
++	char *mn;
++	char **names;
++	gpointer ip;
++	GList *tmp, *sorted = NULL;
++	
++	prof_counts ++;
++	for (i = 0; i &lt; count; ++i) {
++		ip = prof_addresses [i];
++		ji = mono_jit_info_table_find (mono_domain_get (), ip);
++		if (ji) {
++			mn = mono_method_full_name (ji-&gt;method, TRUE);
++		} else {
++			char *send;
++			prof_ucounts++;
++			names = backtrace_symbols (&amp;ip, 1);
++			send = strchr (names [0], '+');
++			if (send)
++				*send = 0;
++			send = strchr (names [0], '[');
++			if (send)
++				*send = 0;
++			mn = g_strdup (names [0]);
++			free (names);
++		}
++		c = GPOINTER_TO_UINT (g_hash_table_lookup (prof_table, mn));
++		c++;
++		g_hash_table_insert (prof_table, mn, GUINT_TO_POINTER (c));
++		if (c &gt; 1)
++			g_free (mn);
++	}
++	g_print (&quot;prof counts/unmanaged: %d/%d\n&quot;, prof_counts, prof_ucounts);
++	g_hash_table_foreach (prof_table, prof_foreach, &amp;sorted);
++	for (tmp = sorted; tmp; tmp = tmp-&gt;next) {
++		double perc;
++		c = GPOINTER_TO_UINT (g_hash_table_lookup (prof_table, tmp-&gt;data));
++		perc = c*100.0/count;
++		g_print (&quot;%7d\t%5.2f %% %s\n&quot;, c, perc, tmp-&gt;data);
++	}
++	g_list_free (sorted);
++}
++
++static void
++SIG_HANDLER_SIGNATURE (sigprof_signal_handler)
++{
++	int pos;
++
++	GET_CONTEXT;
++
++	if (prof_counts &gt;= MAX_PROF_SAMPLES)
++		return;
++	pos = InterlockedIncrement (&amp;prof_counts);
++	prof_addresses [pos - 1] = mono_arch_ip_from_context (ctx);
++}
++
+ static void
+ SIG_HANDLER_SIGNATURE (sigquit_signal_handler)
+ {
+@@ -8178,6 +8274,25 @@ mono_runtime_install_handlers (void)
+ #endif /* PLATFORM_WIN32 */
+ }
+ 
++static void
++setup_profiler (void)
++{
++	struct itimerval itval;
++	static int inited = 0;
++
++	/* about 10 minutes of samples */
++	prof_addresses = g_new0 (gpointer, MAX_PROF_SAMPLES);
++	itval.it_interval.tv_usec = 1000;
++	itval.it_interval.tv_sec = 0;
++	itval.it_value = itval.it_interval;
++	setitimer (ITIMER_PROF, &amp;itval, NULL);
++	if (inited)
++		return;
++	inited = 1;
++	prof_table = g_hash_table_new (g_str_hash, g_str_equal);
++	add_signal_handler (SIGPROF, sigprof_signal_handler);
++}
++
+ /* mono_jit_create_remoting_trampoline:
+  * @method: pointer to the method info
+  *
+@@ -8403,6 +8518,7 @@ print_jit_stats (void)
+ void
+ mini_cleanup (MonoDomain *domain)
+ {
++	stat_prof_report ();
+ 	/* 
+ 	 * mono_runtime_cleanup() and mono_domain_finalize () need to
+ 	 * be called early since they need the execution engine still
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="007596.html">[Mono-devel-list] From Orkut's Mono Forum
+</A></li>
+	<LI>Next message: <A HREF="007600.html">[Mono-devel-list] Re: [Mono-list] inlining of methods using structs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#7598">[ date ]</a>
+              <a href="thread.html#7598">[ thread ]</a>
+              <a href="subject.html#7598">[ subject ]</a>
+              <a href="author.html#7598">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

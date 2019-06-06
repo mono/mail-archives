@@ -1,0 +1,635 @@
+Index: mono/mono/metadata/class.c
+===================================================================
+--- mono/mono/metadata/class.c	(revision 63591)
++++ mono/mono/metadata/class.c	(working copy)
+@@ -2656,10 +2656,13 @@
+ 
+ 	if (!MONO_CLASS_IS_INTERFACE (class)) {
+ 		/* Imported COM Objects always derive from __ComObject. */
+-		if (MONO_CLASS_IS_IMPORT (class) && parent == mono_defaults.object_class)
+-			parent = mono_defaults.com_object_class;
++		if (MONO_CLASS_IS_IMPORT (class)) {
++			if (parent == mono_defaults.object_class)
++				parent = mono_defaults.com_object_class;
++		}
+ 		class->parent = parent;
+ 
++
+ 		if (!parent)
+ 			g_assert_not_reached (); /* FIXME */
+ 
+@@ -2675,6 +2678,10 @@
+ 		class->marshalbyref = parent->marshalbyref;
+ 		class->contextbound  = parent->contextbound;
+ 		class->delegate  = parent->delegate;
++		if (MONO_CLASS_IS_IMPORT (class))
++			class->is_com_object = 1;
++		else
++			class->is_com_object = parent->is_com_object;
+ 		
+ 		if (system_namespace) {
+ 			if (*class->name == 'M' && !strcmp (class->name, "MarshalByRefObject"))
+Index: mono/mono/metadata/ChangeLog
+===================================================================
+--- mono/mono/metadata/ChangeLog	(revision 63591)
++++ mono/mono/metadata/ChangeLog	(working copy)
+@@ -1,3 +1,15 @@
++2006-08-10  Jonathan Chambers  <joncham@gmail.com>
++
++	* class.c (mono_class_setup_parent): setup is_com_object during class initialization.
++	* object.c (mono_remote_class_vtable/mono_object_new_specific): Changed checks
++	to use is_com_object instead of MONO_CLASS_IS_IMPORT() macro.
++	* class-internals.h: add is_com_object to class structure.
++	* marshal.c: Fixed marshalling for IDispatch and IUnknown, added
++	null checks to COM object marshalling. Fix .ctor call on RCW.
++	* icall.c: Added icall implementation for MonoType.IsCOMObjectImpl.
++	
++	All code is contributed under the MIT/X11 license.
++
+ 2006-08-10  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* marshal.c (cominterop_get_native_wrapper): Fix a warning.
+Index: mono/mono/metadata/object.c
+===================================================================
+--- mono/mono/metadata/object.c	(revision 63591)
++++ mono/mono/metadata/object.c	(working copy)
+@@ -1278,7 +1278,7 @@
+ 		MonoClass *klass;
+ 		type = ((MonoReflectionType *)rp->class_to_proxy)->type;
+ 		klass = mono_class_from_mono_type (type);
+-		if ((MONO_CLASS_IS_IMPORT(klass) || klass == mono_defaults.com_object_class) && !mono_class_vtable (mono_domain_get (), klass)->remote)
++		if ((klass->is_com_object || klass == mono_defaults.com_object_class) && !mono_class_vtable (mono_domain_get (), klass)->remote)
+ 			remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_COMINTEROP);
+ 		else
+ 			remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_UNKNOWN);
+@@ -2447,8 +2447,8 @@
+ 
+ 	MONO_ARCH_SAVE_REGS;
+ 	
+-	/* check for MONO_CLASS_IS_IMPORT for COM Interop */
+-	if (vtable->remote || MONO_CLASS_IS_IMPORT(vtable->klass))
++	/* check for is_com_object for COM Interop */
++	if (vtable->remote || vtable->klass->is_com_object)
+ 	{
+ 		gpointer pa [1];
+ 		MonoMethod *im = vtable->domain->create_proxy_for_type_method;
+Index: mono/mono/metadata/class-internals.h
+===================================================================
+--- mono/mono/metadata/class-internals.h	(revision 63591)
++++ mono/mono/metadata/class-internals.h	(working copy)
+@@ -268,6 +268,12 @@
+ 	/* next byte */
+ 	guint has_static_refs : 1; /* it has static fields that are GC-tracked */
+ 	guint no_special_static_fields : 1; /* has no thread/context static fields */
++	/* directly or indirectly derives from ComImport attributed class.
++	 * this means we need to create a proxy for instances of this class
++	 * for COM Interop. set this flag on loading so all we need is a quick check
++	 * during object creation rather than having to traverse supertypes
++	 */
++	guint is_com_object : 1; 
+ 
+ 	guint8     exception_type;	/* MONO_EXCEPTION_* */
+ 	void*      exception_data;	/* Additional information about the exception */
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 63591)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -271,7 +271,7 @@
+ 	guint32 offset = 7; 
+ 	guint32 slot = method->slot;
+ 	GPtrArray *ifaces;
+-	MonoClass *ic;
++	MonoClass *ic = method->klass;
+ 	int i;
+ 
+ 	ifaces = mono_class_get_implemented_interfaces (method->klass);
+@@ -290,7 +290,7 @@
+ 
+ 	if (!interface_type_attribute)
+ 		interface_type_attribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "InterfaceTypeAttribute");
+-	cinfo = mono_custom_attrs_from_class (method->klass);
++	cinfo = mono_custom_attrs_from_class (ic);
+ 	if (cinfo) {
+ 		itf_attr = (MonoInterfaceTypeAttribute*)mono_custom_attrs_get_attr (cinfo, interface_type_attribute);
+ 		if (!cinfo->cached)
+@@ -3018,8 +3018,23 @@
+ 		mono_mb_emit_i4 (mb, mono_mb_add_data (mb, method));
+ 	}
+ 
++	if (!strcmp(method->name, ".ctor"))	{
++		static MonoClass *com_interop_proxy_class = NULL;
++		static MonoMethod *cache_proxy = NULL;
++
++		if (!com_interop_proxy_class)
++			com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
++		if (!cache_proxy)
++			cache_proxy = mono_class_get_method_from_name (com_interop_proxy_class, "CacheProxy", 0);
++
++		mono_mb_emit_ldarg (mb, 0);
++		mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++		mono_mb_emit_byte (mb, CEE_LDIND_REF);
++		mono_mb_emit_managed_call (mb, cache_proxy, NULL);
++	}
++
+ 	emit_thread_interrupt_checkpoint (mb);
+-	
++
+ 	mono_mb_emit_byte (mb, CEE_RET);
+ 
+ 	res = mono_mb_create_and_cache (cache, method, mb, sig, sig->param_count + 16);
+@@ -3042,7 +3057,7 @@
+ 		return method;
+ 
+ 	/* this seems to be the best plase to put this, as all remoting invokes seem to get filtered through here */
+-	if ((MONO_CLASS_IS_IMPORT(method->klass) || method->klass == mono_defaults.com_object_class) && !mono_class_vtable (mono_domain_get (), method->klass)->remote)
++	if ((method->klass->is_com_object || method->klass == mono_defaults.com_object_class) && !mono_class_vtable (mono_domain_get (), method->klass)->remote)
+ 		return cominterop_get_invoke(method);
+ 
+ 	sig = signature_no_pinvoke (method);
+@@ -5732,10 +5747,11 @@
+ 
+ 				}
+ 			} else {
+-				static MonoMethod* GetInterface = NULL;
+-				
+-				if (!GetInterface)
+-					GetInterface = mono_class_get_method_from_name (mono_defaults.com_object_class, "GetInterface", 1);
++				guint32 pos_failed = 0;
++				mono_mb_emit_ldarg (mb, argnum);	
++				// if null just break, conv arg was already inited to 0
++				pos_failed = mono_mb_emit_branch (mb, CEE_BRFALSE);
++
+ 				mono_mb_emit_ldarg (mb, argnum);
+ 				mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
+ 				mono_mb_emit_byte (mb, CEE_LDIND_REF);
+@@ -5744,10 +5760,35 @@
+ 				mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoComInteropProxy, com_object));
+ 				mono_mb_emit_byte (mb, CEE_LDIND_REF);
+ 
+-				mono_mb_emit_ptr (mb, t);
+-				mono_mb_emit_icall (mb, type_from_handle);
+-				mono_mb_emit_managed_call (mb, GetInterface, NULL);
++				if (klass && klass != mono_defaults.object_class) {
++					static MonoMethod* GetInterface = NULL;
++					
++					if (!GetInterface)
++						GetInterface = mono_class_get_method_from_name (mono_defaults.com_object_class, "GetInterface", 1);
++					mono_mb_emit_ptr (mb, t);
++					mono_mb_emit_icall (mb, type_from_handle);
++					mono_mb_emit_managed_call (mb, GetInterface, NULL);
++				}
++				else if (spec->native == MONO_NATIVE_IUNKNOWN) {
++					static MonoProperty* iunknown = NULL;
++					
++					if (!iunknown)
++						iunknown = mono_class_get_property_from_name (mono_defaults.com_object_class, "IUnknown");
++					mono_mb_emit_managed_call (mb, iunknown->get, NULL);
++				}
++				else if (spec->native == MONO_NATIVE_IDISPATCH) {
++					static MonoProperty* idispatch = NULL;
++					
++					if (!idispatch)
++						idispatch = mono_class_get_property_from_name (mono_defaults.com_object_class, "IDispatch");
++					mono_mb_emit_managed_call (mb, idispatch->get, NULL);
++				}
++				else {
++				}
+ 				mono_mb_emit_stloc (mb, conv_arg);
++				
++				// case if null
++				mono_mb_patch_addr (mb, pos_failed, mb->pos - (pos_failed + 4));
+ 			}
+ 		}
+ 		else if (klass->delegate) {
+@@ -5866,10 +5907,22 @@
+ 				static MonoMethod* com_interop_proxy_get_proxy = NULL;
+ 				static MonoMethod* get_transparent_proxy = NULL;
+ 				int real_proxy;
+-				com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
+-				com_interop_proxy_get_proxy = mono_class_get_method_from_name_flags (com_interop_proxy_class, "GetProxy", 2, METHOD_ATTRIBUTE_PRIVATE);
+-				get_transparent_proxy = mono_class_get_method_from_name (mono_defaults.real_proxy_class, "GetTransparentProxy", 0);
++				guint32 pos_failed = 0;
+ 
++				mono_mb_emit_ldarg (mb, argnum);
++				mono_mb_emit_byte (mb, CEE_LDNULL);
++				mono_mb_emit_byte (mb, CEE_STIND_REF);
++
++				mono_mb_emit_ldloc (mb, conv_arg);
++				pos_failed = mono_mb_emit_branch (mb, CEE_BRFALSE);
++
++				if (!com_interop_proxy_class)
++					com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
++				if (!com_interop_proxy_get_proxy)
++					com_interop_proxy_get_proxy = mono_class_get_method_from_name_flags (com_interop_proxy_class, "GetProxy", 2, METHOD_ATTRIBUTE_PRIVATE);
++				if (!get_transparent_proxy)
++					get_transparent_proxy = mono_class_get_method_from_name (mono_defaults.real_proxy_class, "GetTransparentProxy", 0);
++
+ 				real_proxy = mono_mb_add_local (mb, &com_interop_proxy_class->byval_arg);
+ 
+ 				mono_mb_emit_ldloc (mb, conv_arg);
+@@ -5887,6 +5940,9 @@
+ 					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, klass));
+ 				}
+ 				mono_mb_emit_byte (mb, CEE_STIND_REF);
++
++				// case if null
++				mono_mb_patch_addr (mb, pos_failed, mb->pos - (pos_failed + 4));
+ 			}
+ 				break;
+ 		}
+@@ -9169,6 +9225,7 @@
+ {
+ 	MonoClass *klass;
+ 	MonoDomain *domain;
++	MonoObject *obj;
+ 	
+ 	MONO_ARCH_SAVE_REGS;
+ 
+@@ -9179,8 +9236,10 @@
+ 	 * because we want to actually create object. mono_object_new checks
+ 	 * to see if type is import and creates transparent proxy. this method
+ 	 * is called by the corresponding real proxy to create the real RCW.
++	 * Constructor does not need to be called. Will be called later.
+ 	*/
+-	return mono_object_new_alloc_specific (mono_class_vtable (domain, klass));
++	obj = mono_object_new_alloc_specific (mono_class_vtable (domain, klass));
++	return obj;
+ }
+ 
+ static gboolean    
+Index: mono/mono/metadata/icall.c
+===================================================================
+--- mono/mono/metadata/icall.c	(revision 63591)
++++ mono/mono/metadata/icall.c	(working copy)
+@@ -1819,6 +1819,15 @@
+ 	return type->type->byref;
+ }
+ 
++static MonoBoolean
++ves_icall_type_iscomobject (MonoReflectionType *type)
++{
++	MonoClass *klass = mono_class_from_mono_type (type->type);
++	MONO_ARCH_SAVE_REGS;
++
++	return (klass && klass->is_com_object);
++}
++
+ static MonoReflectionModule*
+ ves_icall_MonoType_get_Module (MonoReflectionType *type)
+ {
+@@ -6756,6 +6765,7 @@
+ 	{"GetPropertiesByName", ves_icall_Type_GetPropertiesByName},
+ 	{"InternalGetEvent", ves_icall_MonoType_GetEvent},
+ 	{"IsByRefImpl", ves_icall_type_isbyref},
++	{"IsCOMObjectImpl", ves_icall_type_iscomobject},
+ 	{"IsPointerImpl", ves_icall_type_ispointer},
+ 	{"IsPrimitiveImpl", ves_icall_type_isprimitive},
+ 	{"getFullName", ves_icall_System_MonoType_getFullName},
+Index: mono/mono/mini/mini.c
+===================================================================
+--- mono/mono/mini/mini.c	(revision 63591)
++++ mono/mono/mini/mini.c	(working copy)
+@@ -3733,6 +3733,7 @@
+ 	dont_verify |= method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH;
+ 	dont_verify |= method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE; /* bug #77896 */
+ 	dont_verify |= method->wrapper_type == MONO_WRAPPER_COMINTEROP;
++	dont_verify |= method->wrapper_type == MONO_WRAPPER_COMINTEROP_INVOKE;
+ 
+ 	/* still some type unsafety issues in marshal wrappers... (unknown is PtrToStructure) */
+ 	dont_verify_stloc = method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE;
+Index: mono/mono/mini/ChangeLog
+===================================================================
+--- mono/mono/mini/ChangeLog	(revision 63591)
++++ mono/mono/mini/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-08-10  Jonathan Chambers  <joncham@gmail.com>
++
++	* mini.c: Don't verify COM proxy invoke calls
++	
+ 2006-08-08  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* mini-ia64.c mini-amd64.c: Fix #79027.
+Index: mono/mono/tests/cominterop.cs
+===================================================================
+--- mono/mono/tests/cominterop.cs	(revision 63591)
++++ mono/mono/tests/cominterop.cs	(working copy)
+@@ -92,13 +92,7 @@
+     [DllImport ("libtest")]
+     public static extern int mono_test_marshal_com_object_ref_count (IntPtr pUnk);
+ 
+-	public static int Main ()
+-	{
+-		int i = Main2 ();
+-		Console.WriteLine (i);
+-		return i;
+-	}
+-	public static int Main2() {
++	public static int Main() {
+ 
+         bool isWindows = !(((int)Environment.OSVersion.Platform == 4) || 
+             ((int)Environment.OSVersion.Platform == 128));
+@@ -230,7 +224,21 @@
+ 				Marshal.ReleaseComObject (diff2) != 0)
+ 				return 41;
+ 
++			IntPtr pUnk2 = Marshal.GetIUnknownForObject (imath);
++			if (pUnk2 == IntPtr.Zero)
++				return 50;
+ 
++			if (pUnk != pUnk2)
++				return 51;
++
++			IntPtr pDisp = Marshal.GetIDispatchForObject (imath);
++			if (pDisp == IntPtr.Zero)
++				return 52;
++
++			if (pUnk != pDisp)
++				return 53;
++
++
+ 			//if (mono_test_marshal_com_object_destroy (pUnk) != 0)
+ 			//    return 31;
+ 			#endregion // Marshal COM Interop Tests
+@@ -240,7 +248,7 @@
+ 	}
+ 
+     [ComImport()]
+-    [Guid ("00000000-0000-0000-0000-000000000000")]
++    [Guid ("00000000-0000-0000-0000-000000000001")]
+     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+     public interface IMath
+     {
+@@ -253,4 +261,18 @@
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
+ 		int Different ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
+     }
++
++	[ComImport ()]
++	[Guid ("00000000-0000-0000-0000-000000000002")]
++	public class Foo : IMath
++	{
++		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
++		public extern int Add (int a, int b);
++		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
++		public extern int Subtract (int a, int b);
++		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
++		public extern int Same ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
++		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
++		public extern int Different ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
++	}
+ }
+Index: mono/mono/tests/ChangeLog
+===================================================================
+--- mono/mono/tests/ChangeLog	(revision 63591)
++++ mono/mono/tests/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2006-08-09  Jonathan Chambers  <joncham@gmail.com>
++
++	* cominterop.cs: Added COM Interop tests for accessing IUnknown and IDispatch.
++	* libtest.c: Implemented QueryInterface correctly.
++	
+ 2006-08-08  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* vararg.il: Add a test for #79027.
+Index: mono/mono/tests/libtest.c
+===================================================================
+--- mono/mono/tests/libtest.c	(revision 63591)
++++ mono/mono/tests/libtest.c	(working copy)
+@@ -7,6 +7,7 @@
+ 
+ #ifdef WIN32
+ #include <windows.h>
++#include "initguid.h"
+ #endif
+ 
+ #ifdef WIN32
+@@ -2065,10 +2066,26 @@
+ 	int m_ref;
+ };
+ 
++DEFINE_GUID(IID_IMath, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1);
++DEFINE_GUID(IID_IMonoUnknown, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46);
++DEFINE_GUID(IID_IMonoDispatch, 0x00020400, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46);
++
+ int COM_STDCALL MonoQueryInterface(MonoComObject* pUnk, gpointer riid, gpointer* ppv)
+ {
+-	*ppv = pUnk;
+-	return 0;
++	*ppv = NULL;
++	if (!memcmp(riid, &IID_IMonoUnknown, sizeof(GUID))) {
++		*ppv = pUnk;
++		return S_OK;
++	}
++	else if (!memcmp(riid, &IID_IMath, sizeof(GUID))) {
++		*ppv = pUnk;
++		return S_OK;
++	}
++	else if (!memcmp(riid, &IID_IMonoDispatch, sizeof(GUID))) {
++		*ppv = pUnk;
++		return S_OK;
++	}
++	return E_NOINTERFACE;
+ }
+ 
+ int COM_STDCALL MonoAddRef(MonoComObject* pUnk)
+Index: mcs/class/corlib/Mono.Interop/ComInteropProxy.cs
+===================================================================
+--- mcs/class/corlib/Mono.Interop/ComInteropProxy.cs	(revision 63591)
++++ mcs/class/corlib/Mono.Interop/ComInteropProxy.cs	(working copy)
+@@ -68,10 +68,18 @@
+ 		public ComInteropProxy (Type t)
+ 			: base (t)
+ 		{
+-			com_object = new __ComObject (t);
+-			iunknown_hashtable.Add (com_object.IUnknown, new ComInteropProxyEntry (1, new WeakReference(this)));
++			// object only created here
++			// .ctor is called later
++			com_object = __ComObject.CreateRCW (t);
+ 		}
+ 
++		internal void CacheProxy ()
++		{
++			// called from unmanaged code after .ctor is invoked
++			// we need .ctor to create unmanaged object and thus IUnknown property value
++			iunknown_hashtable.Add (com_object.IUnknown, new ComInteropProxyEntry (1, new WeakReference (this)));
++		}
++
+         internal ComInteropProxy (IntPtr pUnk)
+             : this (pUnk, typeof (__ComObject))
+         {
+Index: mcs/class/corlib/System/ChangeLog
+===================================================================
+--- mcs/class/corlib/System/ChangeLog	(revision 63591)
++++ mcs/class/corlib/System/ChangeLog	(working copy)
+@@ -1,3 +1,10 @@
++2006-08-10  Jonathan Chambers  <joncham@gmail.com>
++
++	* __ComObject.cs: Added defintion of IDispatch interface, and
++	property. Get CLSID of supertype for creation if class not
++	ComImport attributed (allows for inheritance of RCW).
++	* MonoType.cs: Implement IsCOMObjectImpl.
++
+ 2006-08-09  Atsushi Enomoto  <atsushi@ximian.com>
+ 
+ 	* DateTime.cs : fixed X509Certificate() case that regressed only
+Index: mcs/class/corlib/System/__ComObject.cs
+===================================================================
+--- mcs/class/corlib/System/__ComObject.cs	(revision 63591)
++++ mcs/class/corlib/System/__ComObject.cs	(working copy)
+@@ -74,6 +74,20 @@
+ 
+ 		public __ComObject ()
+ 		{
++			// call CoInitialize once per thread
++			if (!coinitialized) {
++				CoInitialize (IntPtr.Zero);
++				coinitialized = true;
++			}
++
++			hashtable = new Hashtable ();
++
++			IntPtr ppv;
++			Type t = GetType ();
++			int hr = CoCreateInstance (GetCLSID (t), IntPtr.Zero, 0x1 | 0x4 | 0x10, IID_IUnknown, out ppv);
++			Marshal.ThrowExceptionForHR (hr);
++
++			SetIUnknown (ppv);
+ 		}
+ 
+ 		internal __ComObject (Type t)
+@@ -87,12 +101,27 @@
+ 			hashtable = new Hashtable ();
+ 
+ 			IntPtr ppv;
+-			int hr = CoCreateInstance (t.GUID, IntPtr.Zero, 0x1 | 0x4 | 0x10, IID_IUnknown, out ppv);
++			int hr = CoCreateInstance (GetCLSID (t), IntPtr.Zero, 0x1 | 0x4 | 0x10, IID_IUnknown, out ppv);
+ 			Marshal.ThrowExceptionForHR (hr);
+ 
+ 			SetIUnknown (ppv);
+ 		}
+ 
++		private Guid GetCLSID (Type t)
++		{
++			if (t.IsImport)
++				return t.GUID;
++
++			// look at supertypes
++			Type super = t.BaseType;
++			while (super != typeof (object)) {
++				if (super.IsImport)
++					return super.GUID;
++				super = super.BaseType;
++			}
++			throw new COMException ("Could not find base COM type for type " + t.ToString());
++		}
++
+ 		internal __ComObject (IntPtr pItf)
+ 		{
+ 			hashtable = new Hashtable ();
+@@ -155,6 +184,17 @@
+ 			}
+ 		}
+ 
++		internal IntPtr IDispatch
++		{
++			get
++			{
++				IntPtr pUnk = GetInterface (typeof (IDispatchMono));
++				if (pUnk == IntPtr.Zero)
++					throw new InvalidComObjectException ("COM object that has been separated from its underlying RCW cannot be used.");
++				return pUnk;
++			}
++		}
++
+ 		internal static Guid IID_IUnknown
+ 		{
+ 			get
+@@ -171,6 +211,11 @@
+ 			}
+ 		}
+ 
++		[Guid ("00020400-0000-0000-C000-000000000046")]
++		internal interface IDispatchMono
++		{
++		}
++
+ 		public override bool Equals (object obj)
+ 		{
+ 			if (obj == null)
+Index: mcs/class/corlib/System/MonoType.cs
+===================================================================
+--- mcs/class/corlib/System/MonoType.cs	(revision 63591)
++++ mcs/class/corlib/System/MonoType.cs	(working copy)
+@@ -290,10 +290,8 @@
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+ 		protected extern override bool IsByRefImpl ();
+ 
+-		protected override bool IsCOMObjectImpl ()
+-		{
+-			return false;
+-		}
++		[MethodImplAttribute (MethodImplOptions.InternalCall)]
++		protected extern override bool IsCOMObjectImpl ();
+ 
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+ 		protected extern override bool IsPointerImpl ();
+Index: mcs/class/corlib/System.Runtime.Remoting.Activation/ChangeLog
+===================================================================
+--- mcs/class/corlib/System.Runtime.Remoting.Activation/ChangeLog	(revision 63591)
++++ mcs/class/corlib/System.Runtime.Remoting.Activation/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-08-09  Jonathan Chambers  <joncham@gmail.com>
++
++	* ActivationServices.cs: Check type.IsCOMObject rather than type.IsImport.
++	
+ 2006-07-15  Jonathan Chambers  <joncham@gmail.com>
+ 
+ 	* ActivationServices.cs: Begin implementing COM Interop.
+Index: mcs/class/corlib/System.Runtime.Remoting.Activation/ActivationServices.cs
+===================================================================
+--- mcs/class/corlib/System.Runtime.Remoting.Activation/ActivationServices.cs	(revision 63591)
++++ mcs/class/corlib/System.Runtime.Remoting.Activation/ActivationServices.cs	(working copy)
+@@ -204,8 +204,9 @@
+ 			if (type.IsContextful)
+ 				return RemotingServices.CreateClientProxyForContextBound (type, null);
+ 
+-            if (type.IsImport)
+-                return RemotingServices.CreateClientProxyForComInterop (type);
++			if (type.IsCOMObject) {
++				return RemotingServices.CreateClientProxyForComInterop (type);
++			}
+ 
+ 			return null;
+ 		}
+Index: mcs/class/corlib/System.Runtime.InteropServices/ChangeLog
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/ChangeLog	(revision 63591)
++++ mcs/class/corlib/System.Runtime.InteropServices/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-08-09  Jonathan Chambers  <joncham@gmail.com>
++
++	* Marshal.cs: Implement GetIDispatchForObject.
++	
+ 2006-08-07  Gert Driesen  <drieseng@users.sourceforge.net>
+ 
+ 	* Marshal.cs: Added stubs for GetTypeLibGuid (ITypeLib), GetTypeLibLcid
+Index: mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(revision 63591)
++++ mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(working copy)
+@@ -308,7 +308,14 @@
+ 		}
+ 
+ 		[MonoTODO]
+-		public static IntPtr GetIDispatchForObject (object o) {
++		public static IntPtr GetIDispatchForObject (object o)
++		{			// only handle case of RCW objects for now
++			__ComObject co = o as __ComObject;
++			if (co != null) {
++				IntPtr pUnk = co.IDispatch;
++				AddRef (pUnk);
++				return pUnk;
++			}
+ 			throw new NotImplementedException ();
+ 		}
+ 

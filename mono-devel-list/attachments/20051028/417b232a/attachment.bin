@@ -1,0 +1,285 @@
+Index: typemanager.cs
+===================================================================
+--- typemanager.cs	(revisión: 52299)
++++ typemanager.cs	(copia de trabajo)
+@@ -265,6 +265,8 @@
+ 	static Hashtable fieldbuilders_to_fields;
+ 	static Hashtable fields;
+ 
++	static PtrHashtable assembly_internals_vis_attrs;
++
+ 	struct Signature {
+ 		public string name;
+ 		public Type [] args;
+@@ -289,6 +291,8 @@
+ 		priv_fields_events = null;
+ 
+ 		type_hash = null;
++
++		assembly_internals_vis_attrs = null;
+ 		
+ 		CleanUpGenerics ();
+ 		TypeHandle.CleanUp ();
+@@ -393,6 +397,8 @@
+ 		fieldbuilders_to_fields = new Hashtable ();
+ 		fields = new Hashtable ();
+ 		type_hash = new DoubleHash ();
++
++		assembly_internals_vis_attrs = new PtrHashtable ();
+ 		
+ 		InitGenerics ();
+ 	}
+@@ -1822,6 +1828,80 @@
+ 		return false;
+ 	}
+ 
++	//
++	// Checks whether `extern_type' is friend of the output assembly
++	//
++	public static bool IsFriendAssembly (Assembly assembly)
++	{
++		if (assembly_internals_vis_attrs.Contains (assembly))
++			return (bool)(assembly_internals_vis_attrs [assembly]);
++		
++		object [] attrs = assembly.GetCustomAttributes (internals_visible_attr_type, false);
++		if (attrs.Length == 0) {
++			AddFriendAssembly (assembly, false);
++			return false;
++		}
++
++		AssemblyName this_name = CodeGen.Assembly.Name;
++		byte [] this_token = this_name.GetPublicKeyToken ();
++		bool is_friend = false;
++		foreach (object o in attrs) {
++			InternalsVisibleToAttribute attr = o as InternalsVisibleToAttribute;
++			if (attr.AssemblyName == null || attr.AssemblyName.Length == 0)
++				continue;
++			
++			AssemblyName aname = null;
++			try {
++				aname = new AssemblyName (attr.AssemblyName);
++			} catch (FileLoadException) {
++			} catch (ArgumentException) {
++			}
++
++			if (aname == null || aname.Name != this_name.Name)
++				continue;
++			
++			byte [] key_token = aname.GetPublicKeyToken ();
++			if (key_token != null) {
++				if (this_token == null) {
++					// Same name, but key token is null
++					Error_FriendAccessNameNotMatching (aname.FullName);
++					break;
++				}
++				
++				if (!CompareKeyTokens (this_token, key_token))
++					continue;
++			}
++
++			is_friend = true;
++			break;
++		}
++
++		AddFriendAssembly (assembly, is_friend);
++		return is_friend;
++	}
++
++	static bool CompareKeyTokens (byte [] token1, byte [] token2)
++	{
++		for (int i = 0; i < token1.Length; i++)
++			if (token1 [i] != token2 [i])
++				return false;
++
++		return true;
++	}
++
++	static string this_fullname;
++	
++	static void Error_FriendAccessNameNotMatching (string other_name)
++	{
++		if (this_fullname == null)
++			this_fullname = CodeGen.Assembly.Name.FullName;
++		
++		Report.Error (281, "Friend access was granted to `" + other_name + 
++				"', but the output assembly is named `" + this_fullname +
++				"'. Try adding a reference to `" + other_name + 
++				"' or change the output assembly name to match it.");
++	}
++	
+         //
+         // Do the right thing when returning the element type of an
+         // array type based on whether we are compiling corlib or not
+@@ -2646,25 +2726,38 @@
+ 				MethodBase mb = (MethodBase) m;
+ 				MethodAttributes ma = mb.Attributes & MethodAttributes.MemberAccessMask;
+ 
++				if (ma == MethodAttributes.Public)
++					return true;
++				
+ 				if (ma == MethodAttributes.Private)
+ 					return private_ok ||
+ 						IsPrivateAccessible (invocation_type, m.DeclaringType) ||
+ 						IsNestedChildOf (invocation_type, m.DeclaringType);
+ 
+-				if (invocation_assembly == mb.DeclaringType.Assembly) {
++				if (invocation_assembly == mb.DeclaringType.Assembly)
+ 					if (ma == MethodAttributes.Assembly || ma == MethodAttributes.FamORAssem)
+ 						return true;
+-				} else {
+-					if (ma == MethodAttributes.Assembly || ma == MethodAttributes.FamANDAssem)
+-						return false;
++					
++				if (ma == MethodAttributes.Family ||
++				    ma == MethodAttributes.FamANDAssem ||
++				    ma == MethodAttributes.FamORAssem) {
++					if (!CheckValidFamilyAccess (mb.IsStatic, m)) {
++						if (ma == MethodAttributes.Family || ma == MethodAttributes.FamANDAssem)
++							return false;
++					} else {
++						// We are valid
++						if (ma == MethodAttributes.Family || ma == MethodAttributes.FamORAssem)
++							return true;
++						
++						// Check for FamANDAssem
++						if (invocation_assembly == mb.DeclaringType.Assembly)
++							return true;
++					}
+ 				}
+ 
+-				if (ma == MethodAttributes.Family ||
+-				    ma == MethodAttributes.FamANDAssem ||
+-				    ma == MethodAttributes.FamORAssem)
+-					return CheckValidFamilyAccess (mb.IsStatic, m);
++				if (!IsFriendAssembly (mb.DeclaringType.Assembly))
++					return false;
+ 				
+-				// Public.
+ 				return true;
+ 			}
+ 			
+@@ -2672,25 +2765,38 @@
+ 				FieldInfo fi = (FieldInfo) m;
+ 				FieldAttributes fa = fi.Attributes & FieldAttributes.FieldAccessMask;
+ 				
++				if (fa == FieldAttributes.Public)
++					return true;
++				
+ 				if (fa == FieldAttributes.Private)
+ 					return private_ok ||
+ 						IsPrivateAccessible (invocation_type, m.DeclaringType) ||
+ 						IsNestedChildOf (invocation_type, m.DeclaringType);
+ 
+-				if (invocation_assembly == fi.DeclaringType.Assembly) {
++				if (invocation_assembly == fi.DeclaringType.Assembly)
+ 					if (fa == FieldAttributes.Assembly || fa == FieldAttributes.FamORAssem)
+ 						return true;
+-				} else {
+-					if (fa == FieldAttributes.Assembly || fa == FieldAttributes.FamANDAssem)
+-						return false;
+-				}
+ 
+ 				if (fa == FieldAttributes.Family ||
+ 				    fa == FieldAttributes.FamANDAssem ||
+-				    fa == FieldAttributes.FamORAssem)
+-					return CheckValidFamilyAccess (fi.IsStatic, m);
++				    fa == FieldAttributes.FamORAssem) {
++					if (!CheckValidFamilyAccess (fi.IsStatic, m)) {
++						if (fa == FieldAttributes.Family || fa == FieldAttributes.FamANDAssem)
++							return false;
++					} else {
++						// We are valid
++						if (fa == FieldAttributes.Family || fa == FieldAttributes.FamORAssem)
++							return true;
++
++						// Check for FamANDAssem
++						if (invocation_assembly == fi.DeclaringType.Assembly)
++							return true;
++					}
++				}
++
++				if (!IsFriendAssembly (fi.DeclaringType.Assembly))
++					return false;
+ 				
+-				// Public.
+ 				return true;
+ 			}
+ 
+@@ -2952,6 +3058,11 @@
+ 		}
+ 		return false;
+ 	}
++
++	static void AddFriendAssembly (Assembly assembly, bool is_friend)
++	{
++		assembly_internals_vis_attrs.Add (assembly, is_friend);
++	}
+ 		
+ #endregion
+ 	
+Index: ecore.cs
+===================================================================
+--- ecore.cs	(revisión: 52299)
++++ ecore.cs	(copia de trabajo)
+@@ -156,6 +156,9 @@
+ 
+ 			must_do_cs1540_check = false; // by default we do not check for this
+ 
++			if (ma == MethodAttributes.Public)
++				return true;
++			
+ 			//
+ 			// If only accessible to the current class or children
+ 			//
+@@ -163,28 +166,40 @@
+ 				return TypeManager.IsPrivateAccessible (invocation_type, mi.DeclaringType) ||
+ 					TypeManager.IsNestedChildOf (invocation_type, mi.DeclaringType);
+ 
+-			if (mi.DeclaringType.Assembly == invocation_type.Assembly) {
++			if (mi.DeclaringType.Assembly == invocation_type.Assembly)
+ 				if (ma == MethodAttributes.Assembly || ma == MethodAttributes.FamORAssem)
+ 					return true;
+-			} else {
+-				if (ma == MethodAttributes.Assembly || ma == MethodAttributes.FamANDAssem)
+-					return false;
+-			}
+ 
+ 			// Family and FamANDAssem require that we derive.
+ 			// FamORAssem requires that we derive if in different assemblies.
+ 			if (ma == MethodAttributes.Family ||
+ 			    ma == MethodAttributes.FamANDAssem ||
+ 			    ma == MethodAttributes.FamORAssem) {
+-				if (!TypeManager.IsNestedFamilyAccessible (invocation_type, mi.DeclaringType))
+-					return false;
++				if (!TypeManager.IsNestedFamilyAccessible (invocation_type, mi.DeclaringType)) {
++					// Family and FamANDAssem need this to be true
++					if (ma == MethodAttributes.Family || ma == MethodAttributes.FamANDAssem)
++						return false;
++				} else {
++					if (!TypeManager.IsNestedChildOf (invocation_type, mi.DeclaringType))
++						must_do_cs1540_check = true;
+ 
+-				if (!TypeManager.IsNestedChildOf (invocation_type, mi.DeclaringType))
+-					must_do_cs1540_check = true;
+-
+-				return true;
++					// For Family and FamORAssem it's enough to be nested family
++					if (ma == MethodAttributes.Family || ma == MethodAttributes.FamORAssem)
++						return true;
++					
++					// For FamANDAssem we need to be in the same assembly
++					if (mi.DeclaringType.Assembly == invocation_type.Assembly)
++						return true;
++				}
+ 			}
+ 
++			//
++			// Only Assembly, FamANDAssem and FamORAssem remain
++			// Check for friend access
++			//
++			if (!TypeManager.IsFriendAssembly (mi.DeclaringType.Assembly))
++				return false;
++
+ 			return true;
+ 		}
+ 

@@ -1,0 +1,372 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] _wapi_sparc_lock
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20_wapi_sparc_lock&In-Reply-To=20060324.171500.106773871.davem%40davemloft.net">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017760.html">
+   <LINK REL="Next"  HREF="017762.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] _wapi_sparc_lock</H1>
+    <B>David S. Miller</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20_wapi_sparc_lock&In-Reply-To=20060324.171500.106773871.davem%40davemloft.net"
+       TITLE="[Mono-dev] _wapi_sparc_lock">davem at davemloft.net
+       </A><BR>
+    <I>Fri Mar 24 22:08:56 EST 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017760.html">[Mono-dev] _wapi_sparc_lock
+</A></li>
+        <LI>Next message: <A HREF="017762.html">[Mono-dev] _wapi_sparc_lock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17761">[ date ]</a>
+              <a href="thread.html#17761">[ thread ]</a>
+              <a href="subject.html#17761">[ subject ]</a>
+              <a href="author.html#17761">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>From: &quot;David S. Miller&quot; &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">davem at davemloft.net</A>&gt;
+Date: Fri, 24 Mar 2006 17:15:00 -0800 (PST)
+
+&gt;<i> In any event, I can provide a patch to use the proper modern
+</I>&gt;<i> atomic instructions.  And I'll work on that while this thread
+</I>&gt;<i> discussion occurs.
+</I>
+As promised, patch is below.
+
+With this I'm down to 3 testcase failures on sparc-*-linux*, and
+from looking at them all 3 of them could very well be glibc or
+kernel issues on Sparc.
+
+I've choosen the conservative route to deal with the case of Solaris
+without gcc, falling back to the generic non-assembler pthread
+implementation.
+
+2006-03-24  David S. Miller  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">davem at sunset.davemloft.net</A>&gt;
+
+	* atomic.c (__wapi_sparc_lock): Delete
+	* atomic.h sparc: Reimplement Interlocked* primitives using CAS/CASx
+	when __GNUC__, else we will fall back to the generic pthread version.
+
+--- mono/io-layer/atomic.c.~1~	2005-04-12 10:21:43.000000000 -0700
++++ mono/io-layer/atomic.c	2006-03-24 17:21:51.000000000 -0800
+@@ -14,11 +14,7 @@
+ 
+ #include &quot;mono/io-layer/wapi.h&quot;
+ 
+-#ifdef WAPI_ATOMIC_ASM
+-#if defined(sparc) || defined (__sparc__)
+-volatile unsigned char _wapi_sparc_lock;
+-#endif
+-#else
++#ifndef WAPI_ATOMIC_ASM
+ 
+ static pthread_mutex_t spin = PTHREAD_MUTEX_INITIALIZER;
+ static mono_once_t spin_once=MONO_ONCE_INIT;
+--- mono/io-layer/atomic.h.~1~	2006-01-03 19:39:23.000000000 -0800
++++ mono/io-layer/atomic.h	2006-03-24 18:56:48.000000000 -0800
+@@ -127,152 +127,167 @@ static inline gint32 InterlockedExchange
+ 	return(ret);
+ }
+ 
+-#elif defined(sparc) || defined (__sparc__)
++#elif (defined(sparc) || defined (__sparc__)) &amp;&amp; defined(__GNUC__)
+ #define WAPI_ATOMIC_ASM
+ 
+-#ifdef __GNUC__
+-#define BEGIN_SPIN(tmp,lock) \
+-__asm__ __volatile__(&quot;1:        ldstub [%1],%0\n\t&quot;  \
+-                             &quot;          cmp %0, 0\n\t&quot; \
+-                             &quot;          bne 1b\n\t&quot; \
+-                             &quot;          nop&quot; \
+-                             : &quot;=&amp;r&quot; (tmp) \
+-                             : &quot;r&quot; (&amp;lock) \
+-                             : &quot;memory&quot;); 
+-
+-#define END_SPIN(lock) \
+-__asm__ __volatile__(&quot;stb	%%g0, [%0]&quot;  \
+-                      : /* no outputs */ \
+-                      : &quot;r&quot; (&amp;lock)\
+-                      : &quot;memory&quot;);
+-#else
+-static inline void begin_spin(volatile unsigned char *lock)
+-{
+-	asm(&quot;1: ldstub [%i0], %l0&quot;);
+-	asm(&quot;cmp %l0,0&quot;);
+-	asm(&quot;bne 1b&quot;);
+-	asm(&quot;nop&quot;);
+-}
+-#define BEGIN_SPIN(tmp,lock) begin_spin(&amp;lock);
+-#define END_SPIN(lock) ((lock) = 0);
+-#endif
+-
+-extern volatile unsigned char _wapi_sparc_lock;
+-
+ G_GNUC_UNUSED 
+-static inline gint32 InterlockedCompareExchange(volatile gint32 *dest, gint32 exch, gint32 comp)
++static inline gint32 InterlockedCompareExchange(volatile gint32 *_dest, gint32 _exch, gint32 _comp)
+ {
+-	int tmp;
++	register volatile gint32 *dest asm(&quot;g1&quot;) = _dest;
++	register gint32 comp asm(&quot;o4&quot;) = _comp;
++	register gint32 exch asm(&quot;o5&quot;) = _exch;
+ 	gint32 old;
+ 
+-	BEGIN_SPIN(tmp,_wapi_sparc_lock)
++	__asm__ __volatile__(
++		/* cas [%%g1], %%o4, %%o5 */
++		&quot;.word 0xdbe0500c&quot;
++		: &quot;=r&quot; (old)
++		: &quot;0&quot; (exch), &quot;r&quot; (dest), &quot;r&quot; (comp)
++		: &quot;memory&quot;);
+ 
+-	old = *dest;
+-	if (old==comp) {
+-		*dest=exch;
+-	}
+-
+-	END_SPIN(_wapi_sparc_lock)
+-
+-	return(old);
++	return old;
+ }
+ 
+ G_GNUC_UNUSED 
+-static inline gpointer InterlockedCompareExchangePointer(volatile gpointer *dest, gpointer exch, gpointer comp)
++static inline gpointer InterlockedCompareExchangePointer(volatile gpointer *_dest, gpointer _exch, gpointer _comp)
+ {
+-        int tmp;
+-        gpointer old;
+-
+-        BEGIN_SPIN(tmp,_wapi_sparc_lock)
+-
+-        old = *dest;
+-        if (old==comp) {
+-                *dest=exch;
+-        }
++	register volatile gpointer *dest asm(&quot;g1&quot;) = _dest;
++	register gpointer comp asm(&quot;o4&quot;) = _comp;
++	register gpointer exch asm(&quot;o5&quot;) = _exch;
++	gpointer old;
+ 
+-        END_SPIN(_wapi_sparc_lock)
++	__asm__ __volatile__(
++#ifdef SPARCV9
++		/* casx [%%g1], %%o4, %%o5 */
++		&quot;.word 0xdbf0500c&quot;
++#else
++		/* cas [%%g1], %%o4, %%o5 */
++		&quot;.word 0xdbe0500c&quot;
++#endif
++		: &quot;=r&quot; (old)
++		: &quot;0&quot; (exch), &quot;r&quot; (dest), &quot;r&quot; (comp)
++		: &quot;memory&quot;);
+ 
+-        return(old);
++	return old;
+ }
+ 
+ G_GNUC_UNUSED 
+-static inline gint32 InterlockedIncrement(volatile gint32 *dest)
++static inline gint32 InterlockedIncrement(volatile gint32 *_dest)
+ {
+-        int tmp;
+-        gint32 ret;
+-
+-        BEGIN_SPIN(tmp,_wapi_sparc_lock)
+-
+-        (*dest)++;
+-        ret = *dest;
+-
+-        END_SPIN(_wapi_sparc_lock)
++	register volatile gint32 *dest asm(&quot;g1&quot;) = _dest;
++	register gint32 tmp asm(&quot;o4&quot;);
++	register gint32 ret asm(&quot;o5&quot;);
++
++	__asm__ __volatile__(
++		&quot;1:	ld	[%%g1], %%o4\n\t&quot;
++		&quot;	add	%%o4, 1, %%o5\n\t&quot;
++		/*	cas	[%%g1], %%o4, %%o5 */
++		&quot;	.word	0xdbe0500c\n\t&quot;
++		&quot;	cmp	%%o4, %%o5\n\t&quot;
++		&quot;	bne	1b\n\t&quot;
++		&quot;	 add	%%o5, 1, %%o5&quot;
++		: &quot;=&amp;r&quot; (tmp), &quot;=&amp;r&quot; (ret)
++		: &quot;r&quot; (dest)
++		: &quot;memory&quot;);
+ 
+-        return(ret);
++        return ret;
+ }
+ 
+ G_GNUC_UNUSED 
+-static inline gint32 InterlockedDecrement(volatile gint32 *dest)
++static inline gint32 InterlockedDecrement(volatile gint32 *_dest)
+ {
+-        int tmp;
+-        gint32 ret;
+-
+-        BEGIN_SPIN(tmp,_wapi_sparc_lock)
+-
+-	(*dest)--;
+-        ret = *dest;
++	register volatile gint32 *dest asm(&quot;g1&quot;) = _dest;
++	register gint32 tmp asm(&quot;o4&quot;);
++	register gint32 ret asm(&quot;o5&quot;);
++
++	__asm__ __volatile__(
++		&quot;1:	ld	[%%g1], %%o4\n\t&quot;
++		&quot;	sub	%%o4, 1, %%o5\n\t&quot;
++		/*	cas	[%%g1], %%o4, %%o5 */
++		&quot;	.word	0xdbe0500c\n\t&quot;
++		&quot;	cmp	%%o4, %%o5\n\t&quot;
++		&quot;	bne	1b\n\t&quot;
++		&quot;	 sub	%%o5, 1, %%o5&quot;
++		: &quot;=&amp;r&quot; (tmp), &quot;=&amp;r&quot; (ret)
++		: &quot;r&quot; (dest)
++		: &quot;memory&quot;);
+ 
+-        END_SPIN(_wapi_sparc_lock)
+-
+-        return(ret);
++        return ret;
+ }
+ 
+ G_GNUC_UNUSED
+-static inline gint32 InterlockedExchange(volatile gint32 *dest, gint32 exch)
++static inline gint32 InterlockedExchange(volatile gint32 *_dest, gint32 exch)
+ {
+-        int tmp;
+-        gint32 ret;
++	register volatile gint32 *dest asm(&quot;g1&quot;) = _dest;
++	register gint32 tmp asm(&quot;o4&quot;);
++	register gint32 ret asm(&quot;o5&quot;);
++
++	__asm__ __volatile__(
++		&quot;1:	ld	[%%g1], %%o4\n\t&quot;
++		&quot;	mov	%3, %%o5\n\t&quot;
++		/*	cas	[%%g1], %%o4, %%o5 */
++		&quot;	.word	0xdbe0500c\n\t&quot;
++		&quot;	cmp	%%o4, %%o5\n\t&quot;
++		&quot;	bne	1b\n\t&quot;
++		&quot;	 nop&quot;
++		: &quot;=&amp;r&quot; (tmp), &quot;=&amp;r&quot; (ret)
++		: &quot;r&quot; (dest), &quot;r&quot; (exch)
++		: &quot;memory&quot;);
+ 
+-        BEGIN_SPIN(tmp,_wapi_sparc_lock)
+-
+-        ret = *dest;
+-        *dest = exch;
+-
+-        END_SPIN(_wapi_sparc_lock)
+-
+-        return(ret);
++        return ret;
+ }
+ 
+ G_GNUC_UNUSED
+-static inline gpointer InterlockedExchangePointer(volatile gpointer *dest, gpointer exch)
++static inline gpointer InterlockedExchangePointer(volatile gpointer *_dest, gpointer exch)
+ {
+-        int tmp;
+-        gpointer ret;
+-
+-        BEGIN_SPIN(tmp,_wapi_sparc_lock)
+-
+-        ret = *dest;
+-        *dest = exch;
+-
+-        END_SPIN(_wapi_sparc_lock)
++	register volatile gpointer *dest asm(&quot;g1&quot;) = _dest;
++	register gpointer tmp asm(&quot;o4&quot;);
++	register gpointer ret asm(&quot;o5&quot;);
++
++	__asm__ __volatile__(
++#ifdef SPARCV9
++		&quot;1:	ldx	[%%g1], %%o4\n\t&quot;
++#else
++		&quot;1:	ld	[%%g1], %%o4\n\t&quot;
++#endif
++		&quot;	mov	%3, %%o5\n\t&quot;
++#ifdef SPARCV9
++		/*	casx	[%%g1], %%o4, %%o5 */
++		&quot;	.word	0xdbf0500c\n\t&quot;
++#else
++		/*	cas	[%%g1], %%o4, %%o5 */
++		&quot;	.word	0xdbe0500c\n\t&quot;
++#endif
++		&quot;	cmp	%%o4, %%o5\n\t&quot;
++		&quot;	bne	1b\n\t&quot;
++		&quot;	 nop&quot;
++		: &quot;=&amp;r&quot; (tmp), &quot;=&amp;r&quot; (ret)
++		: &quot;r&quot; (dest), &quot;r&quot; (exch)
++		: &quot;memory&quot;);
+ 
+-        return(ret);
++        return ret;
+ }
+ 
+ G_GNUC_UNUSED
+-static inline gint32 InterlockedExchangeAdd(volatile gint32 *dest, gint32 add)
++static inline gint32 InterlockedExchangeAdd(volatile gint32 *_dest, gint32 add)
+ {
+-        int tmp;
+-        gint32 ret;
+-
+-        BEGIN_SPIN(tmp,_wapi_sparc_lock)
+-
+-        ret = *dest;
+-        *dest += add;
+-
+-        END_SPIN(_wapi_sparc_lock)
++	register volatile gint32 *dest asm(&quot;g1&quot;) = _dest;
++	register gint32 tmp asm(&quot;o4&quot;);
++	register gint32 ret asm(&quot;o5&quot;);
++
++	__asm__ __volatile__(
++		&quot;1:	ld	[%%g1], %%o4\n\t&quot;
++		&quot;	add	%%o4, %3, %%o5\n\t&quot;
++		/*	cas	[%%g1], %%o4, %%o5 */
++		&quot;	.word	0xdbe0500c\n\t&quot;
++		&quot;	cmp	%%o4, %%o5\n\t&quot;
++		&quot;	bne	1b\n\t&quot;
++		&quot;	 add	%%o5, %3, %%o5&quot;
++		: &quot;=&amp;r&quot; (tmp), &quot;=&amp;r&quot; (ret)
++		: &quot;r&quot; (dest), &quot;r&quot; (add)
++		: &quot;memory&quot;);
+ 
+-        return(ret);
++        return ret;
+ }
+ 
+ #elif __s390__
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017760.html">[Mono-dev] _wapi_sparc_lock
+</A></li>
+	<LI>Next message: <A HREF="017762.html">[Mono-dev] _wapi_sparc_lock
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17761">[ date ]</a>
+              <a href="thread.html#17761">[ thread ]</a>
+              <a href="subject.html#17761">[ subject ]</a>
+              <a href="author.html#17761">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

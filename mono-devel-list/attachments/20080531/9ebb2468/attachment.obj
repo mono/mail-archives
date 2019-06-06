@@ -1,0 +1,420 @@
+diff --git a/configure.in b/configure.in
+index afe472e..4a2f249 100644
+--- a/configure.in
++++ b/configure.in
+@@ -2065,6 +2065,53 @@ AM_CONDITIONAL(HAVE_OPROFILE, test x$OPROFILE = xyes)
+ AC_SUBST(OPROFILE_CFLAGS)
+ AC_SUBST(OPROFILE_LIBS)
+ 
++AC_MSG_CHECKING([if DTrace support is requested])
++AC_ARG_ENABLE(dtrace,[ --enable-dtrace	Enable DTrace probes], enable_dtrace=$enableval, enable_dtrace=no)
++AC_MSG_RESULT($enable_dtrace)
++dtrace_g=no
++if test x$enable_dtrace = xyes; then
++	AC_DEFINE(ENABLE_DTRACE, 1, [Enable DTrace probes])
++	AC_PATH_PROG(DTRACE, [dtrace], [no], [$PATH:/usr/sbin])
++	if test x$DTRACE = xno; then
++		AC_MSG_FAILURE([DTrace requested but not found])
++	fi
++	DTRACEFLAGS=
++	if test "x$ac_cv_sizeof_void_p" = "x8"; then
++		case "$host" in
++			powerpc-*-darwin*)
++			DTRACEFLAGS="-arch ppc64"
++			;;
++			i*86-*-darwin*)
++			DTRACEFLAGS="-arch x86_64"
++			;;
++			*)
++			DTRACEFLAGS=-64
++			;;
++		esac
++	else
++		case "$host" in
++			powerpc-*-darwin*)
++			DTRACEFLAGS="-arch ppc"
++			;;
++			i*86-*-darwin*)
++			DTRACEFLAGS="-arch i386"
++			;;
++			*)
++			DTRACEFLAGS=-32
++			;;
++		esac
++	fi
++	AC_SUBST(DTRACEFLAGS)
++	case "$host" in
++		*-*-solaris*)
++		dtrace_g=yes
++		;;
++	esac
++	AC_CHECK_HEADERS([sys/sdt.h])
++fi
++AM_CONDITIONAL(ENABLE_DTRACE, [test x$enable_dtrace = xyes])
++AM_CONDITIONAL(DTRACE_G_REQUIRED, [test x$dtrace_g = xyes])
++
+ libmono_ldflags="$libmono_ldflags $LIBS"
+ 
+ AM_CONDITIONAL(INSTALL_2_0, test x$PREVIEW = xyes)
+@@ -2195,6 +2242,7 @@ AC_CONFIG_COMMANDS([runtime/etc/mono/2.0/Browsers/Compat.browser],
+ 
+ AC_OUTPUT([
+ Makefile
++dtrace-prelink.sh
+ mono-uninstalled.pc
+ scripts/mono-nunit.pc
+ scripts/mono-find-provides
+diff --git a/data/mono.d b/data/mono.d
+new file mode 100644
+index 0000000..f5e6b5d
+--- /dev/null
++++ b/data/mono.d
+@@ -0,0 +1,24 @@
++/* 
++ * mono.d: DTrace provider for Mono
++ * 
++ * Authors:
++ *   Andreas Faerber <andreas.faerber@web.de>
++ * 
++ */
++
++provider mono {
++	/* Virtual Execution System (VES) */
++	probe ves__init__begin ();
++	probe ves__init__end ();
++
++	/* Garbage Collector (GC) */	
++	probe gc__begin (int generation);
++	probe gc__end (int generation);
++};
++
++#pragma D attributes Evolving/Evolving/Common provider mono provider
++#pragma D attributes Private/Private/Unknown provider mono module
++#pragma D attributes Private/Private/Unknown provider mono function
++#pragma D attributes Evolving/Evolving/Common provider mono name
++#pragma D attributes Evolving/Evolving/Common provider mono args
++
+diff --git a/dtrace-prelink.sh.in b/dtrace-prelink.sh.in
+new file mode 100755
+index 0000000..87a0ec4
+--- /dev/null
++++ b/dtrace-prelink.sh.in
+@@ -0,0 +1,87 @@
++#!/bin/sh
++# 
++# dtrace-prelink.sh: DTrace helper script for Mono
++# 
++# Authors:
++#   Andreas Faerber <andreas.faerber@web.de>
++# 
++
++AR="@AR@"
++DTRACE="@DTRACE@"
++DTRACEFLAGS="@DTRACEFLAGS@"
++
++# Assume that PIC object files live in .libs/, non-PIC code in ./
++PIC=no
++if test "$1" = "--pic"; then
++	PIC=yes
++	shift
++fi
++
++OBJ="$1"
++PROV="$2"
++
++shift
++shift
++
++FILES="$*"
++
++#echo PIC: ${PIC}
++#echo Output: ${OBJ}
++#echo Script: ${PROV}
++#echo Input: ${FILES}
++
++OBJS=
++TMPDIR=.dtrace
++mkdir -p "${TMPDIR}"
++
++# Extract relevant object files to temporary directories
++for FILE in ${FILES}; do
++	if echo "${FILE}" | grep .la > /dev/null; then
++		LIBDIR=`dirname ${FILE}`
++		LIB=".libs/`basename ${FILE} .la`.a"
++		DIR="${TMPDIR}/`basename ${FILE}`"
++		echo Extracting "${LIB}"...
++		mkdir -p ${DIR}
++		(cd "${DIR}" && ${AR} x "../../${LIBDIR}/${LIB}")
++		TMPOBJS=`ls -1 "${DIR}"`
++		for TMPOBJ in ${TMPOBJS}; do
++			#echo "Retrieving object file ${TMPOBJ}..."
++			LO=`basename "${TMPOBJ}" .o`.lo
++			SRCOBJ="${TMPOBJ}"
++			if test x${PIC} = xyes; then
++				SRCOBJ=".libs/${SRCOBJ}"
++			fi
++			# Overwrite with original version
++			#echo cp "${LIBDIR}/${SRCOBJ}" "${DIR}/${TMPOBJ}"
++			cp "${LIBDIR}/${SRCOBJ}" "${DIR}/${TMPOBJ}" || cp "${LIBDIR}/${TMPOBJ}" "${DIR}/${TMPOBJ}" || exit
++			# Add to list
++			OBJS="${OBJS} ${DIR}/${TMPOBJ}"
++		done
++	fi
++	if echo "${FILE}" | grep .lo > /dev/null; then
++		DIR=`dirname ${FILE}`
++		SRCOBJ=`basename ${FILE} .lo`.o
++		if test x${PIC} = xyes; then
++			SRCOBJ=".libs/${SRCOBJ}"
++		fi
++		OBJS="${OBJS} ${DIR}/${SRCOBJ}"
++	fi
++done
++
++# Run dtrace -G over the temporary objects
++${DTRACE} -G ${DTRACEFLAGS} -s "${PROV}" -o "${OBJ}" ${OBJS} || exit
++
++# Update the archives with the temporary, modified object files so that they are linked in
++for FILE in ${FILES}; do
++	if echo "${FILE}" | grep .la > /dev/null; then
++		LIBDIR=`dirname ${FILE}`
++		LIB=".libs/`basename ${FILE} .la`.a"
++		DIR="${TMPDIR}/`basename ${FILE}`"
++		echo Updating "${LIB}"...
++		(cd "${DIR}" && ${AR} r "../../${LIBDIR}/${LIB}" *.o)
++	fi
++	# .lo files were modified in-place
++done
++
++rm -rf "${TMPDIR}"
++
+diff --git a/mono/metadata/Makefile.am b/mono/metadata/Makefile.am
+index ec075aa..36c3771 100644
+--- a/mono/metadata/Makefile.am
++++ b/mono/metadata/Makefile.am
+@@ -169,11 +169,22 @@ libmonoruntimeinclude_HEADERS = \
+ 	debug-helpers.h	\
+ 	mempool.h
+ 
++if DTRACE_G_REQUIRED
++
++PEDUMP_DTRACE_OBJECT = pedump-dtrace.$(OBJEXT)
++
++pedump-dtrace.$(OBJEXT): $(top_srcdir)/data/mono.d libmonoruntime.la ../io-layer/libwapi.la ../utils/libmonoutils.la
++	$(SHELL) $(top_builddir)/dtrace-prelink.sh --pic pedump-dtrace.$(OBJEXT) $(top_srcdir)/data/mono.d libmonoruntime.la ../io-layer/libwapi.la ../utils/libmonoutils.la
++
++else
++PEDUMP_DTRACE_OBJECT = 
++endif
++
+ pedump_SOURCES =		\
+ 	pedump.c
+ 
+ pedump_LDADD = libmonoruntime.la ../io-layer/libwapi.la ../utils/libmonoutils.la \
+-	$(LIBGC_LIBS) $(GLIB_LIBS) -lm
++	$(LIBGC_LIBS) $(GLIB_LIBS) -lm $(PEDUMP_DTRACE_OBJECT)
+ 
+ EXTRA_DIST = make-bundle.pl sample-bundle
+ 
+diff --git a/mono/metadata/boehm-gc.c b/mono/metadata/boehm-gc.c
+index 409bf2d..db29f93 100644
+--- a/mono/metadata/boehm-gc.c
++++ b/mono/metadata/boehm-gc.c
+@@ -13,6 +13,7 @@
+ #include <mono/metadata/method-builder.h>
+ #include <mono/metadata/opcodes.h>
+ #include <mono/utils/mono-logger.h>
++#include <mono/utils/dtrace.h>
+ 
+ #if HAVE_BOEHM_GC
+ 
+@@ -106,7 +107,17 @@ mono_gc_base_init (void)
+ void
+ mono_gc_collect (int generation)
+ {
++	MONO_PROBE_GC_BEGIN (generation);
++	
+ 	GC_gcollect ();
++	
++	MONO_PROBE_GC_END (generation);
++#if defined(ENABLE_DTRACE) && defined(__sun__)
++	/* This works around a dtrace -G problem on Solaris.
++	   Limit its actual use to when the probe is enabled. */
++	if (MONO_PROBE_GC_END_ENABLED ())
++		sleep(0);
++#endif
+ }
+ 
+ int
+diff --git a/mono/mini/Makefile.am b/mono/mini/Makefile.am
+index a560ec0..745df38 100644
+--- a/mono/mini/Makefile.am
++++ b/mono/mini/Makefile.am
+@@ -80,6 +80,18 @@ endif
+ mono_SOURCES = \
+ 	main.c
+ 
++if DTRACE_G_REQUIRED
++LIBMONO_DTRACE_OBJECT = .libs/mono-dtrace.$(OBJEXT)
++if STATIC_MONO
++MONO_DTRACE_OBJECT = mono-dtrace.$(OBJEXT)
++else
++MONO_DTRACE_OBJECT = 
++endif
++else
++MONO_DTRACE_OBJECT = 
++LIBMONO_DTRACE_OBJECT = 
++endif
++
+ if STATIC_MONO
+ # Link libmono into mono statically
+ # This leads to higher performance, especially with TLS
+@@ -91,11 +103,22 @@ endif
+ mono_LDADD = \
+ 	$(MONO_LIB)			\
+ 	$(GLIB_LIBS)		\
+-	-lm
++	-lm	\
++	$(MONO_DTRACE_OBJECT)
+ 
+ mono_LDFLAGS = \
+ 	$(static_flags) -export-dynamic $(monobinldflags)
+ 
++if DTRACE_G_REQUIRED
++
++mono-dtrace.$(OBJEXT): $(top_srcdir)/data/mono.d mini.lo $(monodir)/mono/metadata/libmonoruntime-static.la
++	$(SHELL) $(top_builddir)/dtrace-prelink.sh $@ $(top_srcdir)/data/mono.d $(monodir)/mono/metadata/libmonoruntime-static.la mini.lo
++
++.libs/mono-dtrace.$(OBJEXT): $(top_srcdir)/data/mono.d mini.lo $(monodir)/mono/metadata/libmonoruntime.la
++	$(SHELL) $(top_builddir)/dtrace-prelink.sh --pic $@ $(top_srcdir)/data/mono.d $(monodir)/mono/metadata/libmonoruntime.la mini.lo
++
++endif
++
+ # Create monow.exe, linked for the 'windows' subsystem
+ if PLATFORM_WIN32
+ monow_LDADD = $(mono_LDADD)
+@@ -350,7 +373,7 @@ nodist_libmono_la_SOURCES = inssel.c inssel.h
+ libmono_static_la_SOURCES = $(libmono_la_SOURCES)
+ nodist_libmono_static_la_SOURCES = $(nodist_libmono_la_SOURCES)
+ libmono_static_la_LDFLAGS = -static
+-libmono_static_la_LIBADD = $(static_libs)
++libmono_static_la_LIBADD = $(static_libs) $(MONO_DTRACE_OBJECT)
+ 
+ BURGSRC= $(common_BURGSRC) $(arch_BURGSRC)
+ 
+@@ -359,7 +382,7 @@ libmonoincludedir = $(includedir)/mono-$(API_VER)/mono/jit
+ libmonoinclude_HEADERS = jit.h
+ 
+ libmono_la_LIBADD = \
+-	$(libs)
++	$(libs) $(LIBMONO_DTRACE_OBJECT)
+ 
+ generics.exe: generics.cs TestDriver.dll generics-variant-types.dll
+ 	$(MCS) -out:$@ $< -r:TestDriver.dll -r:generics-variant-types.dll
+diff --git a/mono/mini/mini.c b/mono/mini/mini.c
+index 70fcdfc..1b62296 100644
+--- a/mono/mini/mini.c
++++ b/mono/mini/mini.c
+@@ -64,6 +64,7 @@
+ #include <mono/utils/mono-counters.h>
+ #include <mono/utils/mono-logger.h>
+ #include <mono/utils/mono-mmap.h>
++#include <mono/utils/dtrace.h>
+ 
+ #include "mini.h"
+ #include <string.h>
+@@ -13524,6 +13525,8 @@ mini_init (const char *filename, const char *runtime_version)
+ {
+ 	MonoDomain *domain;
+ 
++	MONO_PROBE_VES_INIT_BEGIN ();
++
+ #ifdef __linux__
+ 	if (access ("/proc/self/maps", F_OK) != 0) {
+ 		g_print ("Mono requires /proc to be mounted.\n");
+@@ -13798,6 +13801,9 @@ mini_init (const char *filename, const char *runtime_version)
+ 	mono_generic_sharing_init ();
+ 
+ 	mono_thread_attach (domain);
++	
++	MONO_PROBE_VES_INIT_END ();
++	
+ 	return domain;
+ }
+ 
+diff --git a/mono/utils/Makefile.am b/mono/utils/Makefile.am
+index 2ecd435..5ebf845 100644
+--- a/mono/utils/Makefile.am
++++ b/mono/utils/Makefile.am
+@@ -2,6 +2,15 @@ noinst_LTLIBRARIES = libmonoutils.la
+ 
+ INCLUDES = -I$(top_srcdir) -I$(top_srcdir)/mono $(LIBGC_CFLAGS) $(GLIB_CFLAGS)
+ 
++if ENABLE_DTRACE
++
++BUILT_SOURCES = mono-dtrace.h
++
++mono-dtrace.h: $(top_srcdir)/data/mono.d
++	$(DTRACE) $(DTRACEFLAGS) -h -s $(top_srcdir)/data/mono.d -o $@
++
++endif
++
+ if EGLIB_BUILD 
+ hash_sources = mono-ehash.c
+ else
+diff --git a/mono/utils/dtrace.h b/mono/utils/dtrace.h
+new file mode 100644
+index 0000000..e69aadb
+--- /dev/null
++++ b/mono/utils/dtrace.h
+@@ -0,0 +1,51 @@
++/*
++ * dtrace.h: DTrace probes
++ * 
++ * Authors:
++ *   Andreas Faerber <andreas.faerber@web.de>
++ * 
++ */
++
++#ifndef __UTILS_DTRACE_H__
++#define __UTILS_DTRACE_H__
++
++#ifdef ENABLE_DTRACE
++
++
++#include <mono/utils/mono-dtrace.h>
++
++#define MONO_PROBE_VES_INIT_BEGIN()		MONO_VES_INIT_BEGIN ()
++#define MONO_PROBE_VES_INIT_BEGIN_ENABLED()	MONO_VES_INIT_BEGIN_ENABLED ()
++
++#define MONO_PROBE_VES_INIT_END()		MONO_VES_INIT_END ()
++#define MONO_PROBE_VES_INIT_END_ENABLED()	MONO_VES_INIT_END_ENABLED ()
++
++
++#define MONO_PROBE_GC_BEGIN(generation)	MONO_GC_BEGIN (generation)
++#define MONO_PROBE_GC_BEGIN_ENABLED()	MONO_GC_BEGIN_ENABLED ()
++
++#define MONO_PROBE_GC_END(generation)	MONO_GC_END (generation)
++#define MONO_PROBE_GC_END_ENABLED()	MONO_GC_END_ENABLED ()
++
++
++#else
++
++
++#define MONO_PROBE_VES_INIT_BEGIN()
++#define MONO_PROBE_VES_INIT_BEGIN_ENABLED() (0)
++
++#define MONO_PROBE_VES_INIT_END()
++#define MONO_PROBE_VES_INIT_END_ENABLED() (0)
++
++
++#define MONO_PROBE_GC_BEGIN(generation)
++#define MONO_PROBE_GC_BEGIN_ENABLED() (0)
++
++#define MONO_PROBE_GC_END(generation)
++#define MONO_PROBE_GC_END_ENABLED() (0)
++
++
++#endif
++
++#endif
++

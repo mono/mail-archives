@@ -1,0 +1,870 @@
+Index: mcs/cs-tokenizer.cs
+===================================================================
+--- mcs/cs-tokenizer.cs	(revision 128930)
++++ mcs/cs-tokenizer.cs	(working copy)
+@@ -152,6 +152,10 @@
+ 			}
+ 		}
+ 
++		//
++		// This is used to trigger completin generation on the parser
++		public bool CompleteOnEOF;
++		
+ 		void AddEscapedIdentifier (LocatedToken lt)
+ 		{
+ 			if (escaped_identifiers == null)
+@@ -1542,7 +1546,7 @@
+ 
+ 		public bool advance ()
+ 		{
+-			return peek_char () != -1;
++			return peek_char () != -1 || CompleteOnEOF;
+ 		}
+ 
+ 		public Object Value {
+@@ -2599,7 +2603,7 @@
+ 					}
+ 
+ 					return Token.OP_GT;
+-				
++
+ 				case '+':
+ 					d = peek_char ();
+ 					if (d == '+') {
+@@ -2870,9 +2874,19 @@
+ 				error_details = ((char)c).ToString ();
+ 				return Token.ERROR;
+ 			}
++
++			if (CompleteOnEOF){
++				if (generated)
++					return Token.COMPLETE_COMPLETION;
++				
++				generated = true;
++				return Token.GENERATE_COMPLETION;
++			}
+ 			
++
+ 			return Token.EOF;
+ 		}
++		bool generated;
+ 
+ 		int TokenizeBackslash ()
+ 		{
+Index: mcs/mcs.exe.sources
+===================================================================
+--- mcs/mcs.exe.sources	(revision 128930)
++++ mcs/mcs.exe.sources	(working copy)
+@@ -7,6 +7,7 @@
+ cfold.cs
+ class.cs
+ codegen.cs
++complete.cs
+ const.cs
+ constant.cs
+ convert.cs
+Index: mcs/eval.cs
+===================================================================
+--- mcs/eval.cs	(revision 128930)
++++ mcs/eval.cs	(working copy)
+@@ -37,6 +37,18 @@
+ 	/// </remarks>
+ 	public class Evaluator {
+ 
++		enum ParseMode {
++			// Parse silently, do not output any error messages
++			Silent,
++
++			// Report errors during parse
++			ReportErrors,
++
++			// Auto-complete, means that the tokenizer will start producing
++			// GETCOMPLETIONS tokens when it reaches a certain point.
++			GetCompletions
++		}
++
+ 		static object evaluator_lock = new object ();
+ 		
+ 		static string current_debug_name;
+@@ -190,13 +202,13 @@
+ 					Init ();
+ 				
+ 				bool partial_input;
+-				CSharpParser parser = ParseString (true, input, out partial_input);
++				CSharpParser parser = ParseString (ParseMode.Silent, input, out partial_input);
+ 				if (parser == null){
+ 					compiled = null;
+ 					if (partial_input)
+ 						return input;
+ 					
+-					ParseString (false, input, out partial_input);
++					ParseString (ParseMode.ReportErrors, input, out partial_input);
+ 					return null;
+ 				}
+ 				
+@@ -317,7 +329,69 @@
+ 
+ 			return null;
+ 		}
++
++		public static string [] GetCompletions (string input, out string prefix)
++		{
++			prefix = "";
++			if (input == null || input.Length == 0)
++				return null;
+ 			
++			lock (evaluator_lock){
++				if (!inited)
++					Init ();
++				
++				bool partial_input;
++				CSharpParser parser = ParseString (ParseMode.GetCompletions, input, out partial_input);
++				if (parser == null){
++					Console.WriteLine ("DEBUG: No completions available");
++					return null;
++				}
++				
++				Class parser_result = parser.InteractiveResult as Class;
++				
++				if (parser_result == null){
++					Console.WriteLine ("Do not know how to cope with !Class yet");
++					return null;
++				}
++
++				try {
++					RootContext.ResolveTree ();
++					if (Report.Errors != 0)
++						return null;
++					
++					RootContext.PopulateTypes ();
++					if (Report.Errors != 0)
++						return null;
++
++					MethodOrOperator method = null;
++					foreach (MemberCore member in parser_result.Methods){
++						if (member.Name != "Host")
++							continue;
++						
++						method = (MethodOrOperator) member;
++						break;
++					}
++					if (method == null)
++						throw new InternalErrorException ("did not find the the Host method");
++
++					EmitContext ec = method.CreateEmitContext (method.Parent, null);
++					ec.GetCompletions = true;
++					bool unreach;
++
++					try {
++						ec.ResolveTopBlock (null, method.Block, method.ParameterInfo, method, out unreach);
++					} catch (CompletionResult cr){
++						prefix = cr.BaseText;
++						return cr.Result;
++					}
++				} finally {
++					parser.undo.ExecuteUndo ();
++				}
++				
++			}
++			return null;
++		}
++		
+ 		/// <summary>
+ 		///   Executes the given expression or statement.
+ 		/// </summary>
+@@ -364,7 +438,7 @@
+ 
+ 			return result;
+ 		}
+-		
++	
+ 		enum InputKind {
+ 			EOF,
+ 			StatementOrExpression,
+@@ -486,7 +560,7 @@
+ 		// @partial_input: if @silent is true, then it returns whether the
+ 		// parsed expression was partial, and more data is needed
+ 		//
+-		static CSharpParser ParseString (bool silent, string input, out bool partial_input)
++		static CSharpParser ParseString (ParseMode mode, string input, out bool partial_input)
+ 		{
+ 			partial_input = false;
+ 			Reset ();
+@@ -497,14 +571,14 @@
+ 
+ 			InputKind kind = ToplevelOrStatement (seekable);
+ 			if (kind == InputKind.Error){
+-				if (!silent)
++				if (mode == ParseMode.ReportErrors)
+ 					Report.Error (-25, "Detection Parsing Error");
+ 				partial_input = false;
+ 				return null;
+ 			}
+ 
+ 			if (kind == InputKind.EOF){
+-				if (silent == false)
++				if (mode == ParseMode.ReportErrors)
+ 					Console.Error.WriteLine ("Internal error: EOF condition should have been detected in a previous call with silent=true");
+ 				partial_input = true;
+ 				return null;
+@@ -529,20 +603,23 @@
+ 				RootContext.StatementMode = false;
+ 			}
+ 
+-			if (silent)
++			if (mode == ParseMode.GetCompletions)
++				parser.Lexer.CompleteOnEOF = true;
++			
++			if (mode == ParseMode.Silent)
+ 				Report.DisableReporting ();
+ 			try {
+ 				parser.parse ();
+ 			} finally {
+ 				if (Report.Errors != 0){
+-					if (silent && parser.UnexpectedEOF)
++					if (mode != ParseMode.ReportErrors  && parser.UnexpectedEOF)
+ 						partial_input = true;
+ 
+ 					parser.undo.ExecuteUndo ();
+ 					parser = null;
+ 				}
+ 
+-				if (silent)
++				if (mode == ParseMode.Silent)
+ 					Report.EnableReporting ();
+ 			}
+ 			return parser;
+@@ -702,6 +779,13 @@
+ 			}
+ 		}
+ 
++		static internal string [] GetVarNames ()
++		{
++			lock (evaluator_lock){
++				return (string []) new ArrayList (fields.Keys).ToArray (typeof (string));
++			}
++		}
++		
+ 		static public string GetVars ()
+ 		{
+ 			lock (evaluator_lock){
+Index: mcs/gmcs.exe.sources
+===================================================================
+--- mcs/gmcs.exe.sources	(revision 128930)
++++ mcs/gmcs.exe.sources	(working copy)
+@@ -6,6 +6,7 @@
+ cfold.cs
+ class.cs
+ codegen.cs
++complete.cs
+ const.cs
+ constant.cs
+ convert.cs
+Index: mcs/Makefile
+===================================================================
+--- mcs/Makefile	(revision 128930)
++++ mcs/Makefile	(working copy)
+@@ -143,6 +143,9 @@
+ 	MONO_PATH="../class/lib/net_2_0$(PLATFORM_PATH_SEPARATOR)$$MONO_PATH" $(RUNTIME) $(RUNTIME_FLAGS) ../class/lib/net_2_0/gmcs.exe  /codepage:65001 -d:GMCS_SOURCE  -d:NET_1_1 -d:NET_2_0 -debug -target:exe -out:gmcs.exe cs-parser.cs  @gmcs.exe.sources
+ 	@ cp $(COMPILER_NAME).exe* $(topdir)/class/lib/$(PROFILE)/
+ 
++pa: cs-parser.cs
++	MONO_PATH="../class/lib/net_2_0$(PLATFORM_PATH_SEPARATOR)$$MONO_PATH" $(RUNTIME) $(RUNTIME_FLAGS) ../class/lib/net_2_0/gmcs.exe  /codepage:65001 -d:GMCS_SOURCE  -d:NET_1_1 -d:NET_2_0 -debug -target:exe -out:foo.exe cs-parser.cs foo.cs -main:X  @gmcs.exe.sources
++
+ q: cs-parser.cs qh
+ 	echo 'System.Console.WriteLine ("Hello");' | mono csharp.exe
+ 	echo -e 'using System;\nConsole.WriteLine ("hello");' | mono csharp.exe
+Index: mcs/ChangeLog
+===================================================================
+--- mcs/ChangeLog	(revision 128930)
++++ mcs/ChangeLog	(working copy)
+@@ -1,3 +1,9 @@
++2009-03-12  Miguel de Icaza  <miguel@novell.com>
++
++	* anonymous.cs (Compatible): If the exception thrown from the
++	resolved expression is a CompletionResult exception let that one
++	through. 
++
+ 2009-03-09  Marek Safar  <marek.safar@gmail.com>
+ 
+ 	* cs-tokenizer.cs: Optimized GetKeyword using an array instead of
+Index: mcs/anonymous.cs
+===================================================================
+--- mcs/anonymous.cs	(revision 128930)
++++ mcs/anonymous.cs	(working copy)
+@@ -1062,6 +1062,8 @@
+ 					compatibles.Add (type, am == null ? EmptyExpression.Null : am);
+ 
+ 				return am;
++			} catch (CompletionResult){
++				throw;
+ 			} catch (Exception e) {
+ 				throw new InternalErrorException (e, loc);
+ 			}
+Index: mcs/support.cs
+===================================================================
+--- mcs/support.cs	(revision 128930)
++++ mcs/support.cs	(working copy)
+@@ -480,4 +480,30 @@
+ 			}
+ 		}
+ 	}
++
++	public class CompletionResult : Exception {
++		string [] result;
++		string base_text;
++		
++		public CompletionResult (string base_text, string [] res)
++		{
++			if (base_text == null)
++				throw new ArgumentNullException ("base_text");
++			this.base_text = base_text;
++			
++			result = res;
++		}
++
++		public string [] Result {
++			get {
++				return result;
++			}
++		}
++
++		public string BaseText {
++			get {
++				return base_text;
++			}
++		}
++	}
+ }
+Index: mcs/complete.cs
+===================================================================
+--- mcs/complete.cs	(revision 0)
++++ mcs/complete.cs	(revision 0)
+@@ -0,0 +1,174 @@
++//
++// complete.cs: Expression that are used for completion suggestions.
++//
++// Author:
++//   Miguel de Icaza (miguel@ximian.com)
++//   Marek Safar (marek.safar@gmail.com)
++//
++// Copyright 2001, 2002, 2003 Ximian, Inc.
++// Copyright 2003-2009 Novell, Inc.
++//
++// Completion* classes derive from ExpressionStatement as this allows
++// them to pass through the parser in many conditions that require
++// statements even when the expression is incomplete (for example
++// completing inside a lambda
++//
++namespace Mono.CSharp {
++	using System;
++	using System.Collections;
++	using System.Reflection;
++	using System.Reflection.Emit;
++	using System.Text;
++
++	//
++	// A common base class for Completing expressions, it
++	// is just a very simple ExpressionStatement
++	//
++	public abstract class CompletingExpression : ExpressionStatement {
++		public override void EmitStatement (EmitContext ec)
++		{
++			// Do nothing
++		}
++
++		public override void Emit (EmitContext ec)
++		{
++			// Do nothing
++		}
++
++		public override Expression CreateExpressionTree (EmitContext ec)
++		{
++			return null;
++		}
++	}
++	
++	public class CompletionSimpleName : CompletingExpression {
++		string prefix;
++		
++		public CompletionSimpleName (string prefix, Location l)
++		{
++			this.loc = l;
++			this.prefix = prefix;
++		}
++
++		public override Expression DoResolve (EmitContext ec)
++		{
++			string [] names = Evaluator.GetVarNames ();
++
++			ArrayList results = new ArrayList ();
++			foreach (string name in names){
++				if (!name.StartsWith (prefix))
++					continue;
++
++				if (results.Contains (name))
++					continue;
++
++				results.Add (name);
++			}
++			throw new CompletionResult (prefix, (string []) results.ToArray (typeof (string)));
++		}
++
++		protected override void CloneTo (CloneContext clonectx, Expression t)
++		{
++			// Nothing
++		}
++	}
++	
++	public class CompletionMemberAccess : CompletingExpression {
++		Expression expr;
++		string partial_name;
++		TypeArguments targs;
++
++		static MemberFilter CollectingFilter = new MemberFilter (Match);
++
++		static bool Match (MemberInfo m, object filter_criteria)
++		{
++			if (m is FieldInfo){
++				if (((FieldInfo) m).IsSpecialName)
++					return false;
++				
++			}
++			if (m is MethodInfo){
++				if (((MethodInfo) m).IsSpecialName)
++					return false;
++			}
++
++			if (filter_criteria == null)
++				return true;
++			
++			string n = (string) filter_criteria;
++			if (m.Name.StartsWith (n))
++				return true;
++			
++			return false;
++		}
++		
++		public CompletionMemberAccess (Expression e, string partial_name, Location l)
++		{
++			this.expr = e;
++			this.loc = l;
++			this.partial_name = partial_name;
++		}
++
++		public CompletionMemberAccess (Expression e, string partial_name, TypeArguments targs, Location l)
++		{
++			this.expr = e;
++			this.loc = l;
++			this.partial_name = partial_name;
++			this.targs = targs;
++		}
++		
++		public override Expression DoResolve (EmitContext ec)
++		{
++			SimpleName original = expr as SimpleName;
++			Expression expr_resolved = expr.Resolve (ec,
++				ResolveFlags.VariableOrValue | ResolveFlags.Type |
++				ResolveFlags.Intermediate | ResolveFlags.DisableStructFlowAnalysis);
++
++			if (expr_resolved == null)
++				return null;
++
++			Type expr_type = expr_resolved.Type;
++			if (expr_type.IsPointer || expr_type == TypeManager.void_type || expr_type == TypeManager.null_type || expr_type == TypeManager.anonymous_method_type) {
++				Unary.Error_OperatorCannotBeApplied (loc, ".", expr_type);
++				return null;
++			}
++
++			if (targs != null) {
++				if (!targs.Resolve (ec))
++					return null;
++			}
++
++			ArrayList results = new ArrayList ();
++			MemberInfo [] result = expr_type.FindMembers (MemberTypes.All, BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public, CollectingFilter, partial_name);
++			foreach (MemberInfo r in result){
++				string name;
++
++				MethodBase rasb = r as MethodBase;
++				if (rasb != null && rasb.IsSpecialName)
++					continue;
++				
++				if (partial_name == null)
++					name = r.Name;
++				else {
++					name = r.Name.Substring (partial_name.Length);
++				}
++				
++				if (results.Contains (name))
++					continue;
++				results.Add (name);
++			}
++
++			throw new CompletionResult (partial_name == null ? "" : partial_name, (string []) results.ToArray (typeof (string)));
++		}
++
++		protected override void CloneTo (CloneContext clonectx, Expression t)
++		{
++			CompletionMemberAccess target = (CompletionMemberAccess) t;
++
++			if (targs != null)
++				target.targs = targs.Clone ();
++
++			target.expr = expr.Clone (clonectx);
++		}
++	}
++}
+\ No newline at end of file
+
+Property changes on: mcs/complete.cs
+___________________________________________________________________
+Added: svn:eol-style
+   + native
+
+Index: mcs/cs-parser.jay
+===================================================================
+--- mcs/cs-parser.jay	(revision 128930)
++++ mcs/cs-parser.jay	(working copy)
+@@ -330,6 +330,9 @@
+ %token EVAL_COMPILATION_UNIT_PARSER
+ %token EVAL_USING_DECLARATIONS_UNIT_PARSER
+ 
++%token GENERATE_COMPLETION
++%token COMPLETE_COMPLETION
++
+ /* Add precedence rules to solve dangling else s/r conflict */
+ %nonassoc IF
+ %nonassoc ELSE
+@@ -359,7 +362,7 @@
+         | outer_declarations global_attributes opt_EOF
+         | global_attributes opt_EOF
+ 	| opt_EOF /* allow empty files */
+-	| interactive_parsing opt_EOF
++	| interactive_parsing  { Lexer.CompleteOnEOF = false; } opt_EOF
+ 	;
+ 
+ opt_EOF
+@@ -2933,6 +2936,10 @@
+ 		LocatedToken lt = (LocatedToken) $1;
+ 		$$ = new SimpleName (MemberName.MakeName (lt.Value, (TypeArguments)$2), (TypeArguments)$2, lt.Location);	  
+ 	  }
++	| IDENTIFIER GENERATE_COMPLETION {
++		LocatedToken lt = (LocatedToken) $1;
++	       $$ = new CompletionSimpleName (MemberName.MakeName (lt.Value, null), lt.Location);
++	  }
+ 	| parenthesized_expression
+ 	| default_value_expression
+ 	| member_access
+@@ -3006,6 +3013,10 @@
+ 	  {
+ 		$$ = new ParenthesizedExpression ((Expression) $2);
+ 	  }
++	| OPEN_PARENS expression COMPLETE_COMPLETION
++	  {
++		$$ = new ParenthesizedExpression ((Expression) $2);
++	  }
+ 	;
+ 	
+ member_access
+@@ -3027,6 +3038,22 @@
+ 
+ 		$$ = new QualifiedAliasMember (lt1.Value, lt2.Value, (TypeArguments) $3, lt1.Location);
+ 	  }
++	| primary_expression DOT GENERATE_COMPLETION {
++		$$ = new CompletionMemberAccess ((Expression) $1, null,GetLocation ($3));
++	  }
++	| primary_expression DOT IDENTIFIER GENERATE_COMPLETION {
++		LocatedToken lt = (LocatedToken) $3;
++		$$ = new CompletionMemberAccess ((Expression) $1, lt.Value, lt.Location);
++	  }
++	| predefined_type DOT GENERATE_COMPLETION
++	  {
++		// TODO: Location is wrong as some predefined types doesn't hold a location
++		$$ = new CompletionMemberAccess ((Expression) $1, null, lexer.Location);
++	  }
++	| predefined_type DOT IDENTIFIER GENERATE_COMPLETION {
++		LocatedToken lt = (LocatedToken) $3;
++		$$ = new CompletionMemberAccess ((Expression) $1, lt.Value, lt.Location);
++ 	  }
+ 	;
+ 
+ invocation_expression
+@@ -4010,8 +4037,8 @@
+ 	;
+ 
+ expression
+-	: assignment_expression
+-	| non_assignment_expression
++	: assignment_expression 
++	| non_assignment_expression 
+ 	;
+ 	
+ non_assignment_expression
+@@ -4231,13 +4258,26 @@
+ 		++lexer.parsing_block;
+ 		start_block ((Location) $1);
+ 	  } 
+-	  opt_statement_list CLOSE_BRACE 
++	  opt_statement_list block_end
+ 	  {
++		$$ = $4;
++          }
++	;
++
++block_end 
++	: CLOSE_BRACE 
++	  {
+ 	 	--lexer.parsing_block;
+-		$$ = end_block ((Location) $4);
++		$$ = end_block ((Location) $1);
+ 	  }
++	| COMPLETE_COMPLETION
++	  {
++	 	--lexer.parsing_block;
++		$$ = end_block (lexer.Location);
++	  }
+ 	;
+ 
++
+ block_prepared
+ 	: OPEN_BRACE
+ 	  {
+@@ -4523,10 +4563,12 @@
+ 
+ expression_statement
+ 	: statement_expression SEMICOLON { $$ = $1; }
++	| statement_expression COMPLETE_COMPLETION { $$ = $1; }
+ 	;
+ 
+ interactive_expression_statement
+ 	: interactive_statement_expression SEMICOLON { $$ = $1; }
++	| interactive_statement_expression COMPLETE_COMPLETION { $$ = $1; }
+ 	;
+ 
+ 	//
+@@ -5655,7 +5697,7 @@
+ 	        ++lexer.parsing_block;
+ 		start_block (lexer.Location);
+ 	  }		
+-	  interactive_statement_list
++	  interactive_statement_list opt_COMPLETE_COMPLETION
+ 	  {
+ 		--lexer.parsing_block;
+ 		Method method = (Method) oob_stack.Pop ();
+@@ -5679,6 +5721,11 @@
+ 	| global_attributes 
+ 	| /* nothing */
+ 	;
++
++opt_COMPLETE_COMPLETION
++	: /* nothing */
++	| COMPLETE_COMPLETION
++	;
+ %%
+ 
+ // <summary>
+Index: mcs/README
+===================================================================
+--- mcs/README	(revision 128930)
++++ mcs/README	(working copy)
+@@ -1,4 +1,16 @@
++Completion support
++==================
+ 
++	Supported:
++	
++		a.<TAB>
++		a.W<TAB>
++	
++	Unsupported:
++	
++		a<TAB>
++		delegate { FOO.<TAB>
++	
+ These are the sources to the Mono C# compiler 
+ ---------------------------------------------
+ 
+Index: mcs/codegen.cs
+===================================================================
+--- mcs/codegen.cs	(revision 128930)
++++ mcs/codegen.cs	(working copy)
+@@ -15,7 +15,7 @@
+ //
+ // Only remove it if you need to debug locally on your tree.
+ //
+-#define PRODUCTION
++//#define PRODUCTION
+ 
+ using System;
+ using System.IO;
+@@ -767,7 +767,8 @@
+ 
+ 		bool resolved;
+ 		bool unreachable;
+-
++		public bool GetCompletions;
++		
+ 		public bool ResolveTopBlock (EmitContext anonymous_method_host, ToplevelBlock block,
+ 					     ParametersCompiled ip, IMethodData md, out bool unreachable)
+ 		{
+Index: tools/csharp/repl.cs
+===================================================================
+--- tools/csharp/repl.cs	(revision 128930)
++++ tools/csharp/repl.cs	(working copy)
+@@ -44,6 +44,7 @@
+ 			} else {
+ 				try {
+ 					Evaluator.Init (args);
++					Evaluator.InteractiveBaseClass = typeof (InteractiveBaseShell);
+ 				} catch {
+ 					return 1;
+ 				}
+@@ -52,6 +53,36 @@
+ 			}
+ 		}
+ 	}
++
++	public class InteractiveBaseShell : InteractiveBase {
++		static bool tab_at_start_completes;
++		
++		static InteractiveBaseShell ()
++		{
++			tab_at_start_completes = false;
++		}
++
++		internal static Mono.Terminal.LineEditor Editor;
++		
++		public static bool TabAtStartCompletes {
++			get {
++				return tab_at_start_completes;
++			}
++
++			set {
++				tab_at_start_completes = value;
++				if (Editor != null)
++					Editor.TabAtStartCompletes = value;
++			}
++		}
++
++		public static new string help {
++			get {
++				return InteractiveBase.help +
++					"  TabAtStartCompletes - Whether tab will complete even on emtpy lines\n";
++			}
++		}
++	}
+ 	
+ 	public class CSharpShell {
+ 		static bool isatty = true;
+@@ -73,6 +104,15 @@
+ 			dumb = term == "dumb" || term == null || isatty == false;
+ 			
+ 			editor = new Mono.Terminal.LineEditor ("csharp", 300);
++			InteractiveBaseShell.Editor = editor;
++
++			editor.AutoCompleteEvent += delegate (string s, int pos){
++				string prefix = null;
++				string [] completions = Evaluator.GetCompletions (s, out prefix);
++				
++				return new Mono.Terminal.LineEditor.Completion (prefix, completions);
++			};
++			
+ #if false
+ 			//
+ 			// This is a sample of how completions sould be implemented.
+Index: tools/csharp/getline.cs
+===================================================================
+--- tools/csharp/getline.cs	(revision 128930)
++++ tools/csharp/getline.cs	(working copy)
+@@ -42,8 +42,19 @@
+ 
+ 	public class LineEditor {
+ 
+-		public delegate string [] AutoCompleteHandler (string text, int pos);
++		public class Completion {
++			public string [] Result;
++			public string Prefix;
++
++			public Completion (string prefix, string [] result)
++			{
++				Prefix = prefix;
++				Result = result;
++			}
++		}
+ 		
++		public delegate Completion AutoCompleteHandler (string text, int pos);
++		
+ 		//static StreamWriter log;
+ 		
+ 		// The text being edited.
+@@ -356,22 +367,53 @@
+ 			bool complete = false;
+ 
+ 			if (AutoCompleteEvent != null){
+-				for (int i = 0; i < cursor; i++){
+-					if (!Char.IsWhiteSpace (text [i])){
+-						complete = true;
+-						break;
++				if (TabAtStartCompletes)
++					complete = true;
++				else {
++					for (int i = 0; i < cursor; i++){
++						if (!Char.IsWhiteSpace (text [i])){
++							complete = true;
++							break;
++						}
+ 					}
+ 				}
++
+ 				if (complete){
+-					string [] completions = AutoCompleteEvent (text.ToString (), cursor);
+-					if (completions == null || completions.Length == 0)
++					Completion completion = AutoCompleteEvent (text.ToString (), cursor);
++					string [] completions = completion.Result;
++					if (completions == null)
+ 						return;
+ 					
++					int ncompletions = completions.Length;
++					if (ncompletions == 0)
++						return;
++					
+ 					if (completions.Length == 1){
+ 						InsertTextAtCursor (completions [0]);
+ 					} else {
+-						Console.WriteLine ();
++						int last = -1;
++						
++						for (int p = 0; p < completions [0].Length; p++){
++							char c = completions [0][p];
++
++
++							for (int i = 1; i < ncompletions; i++){
++								if (completions [i].Length < p)
++									goto mismatch;
++							
++								if (completions [i][p] != c){
++									goto mismatch;
++								}
++							}
++							last = p;
++						}
++					mismatch:
++						if (last != -1){
++							InsertTextAtCursor (completions [0].Substring (0, last+1));
++						}
++						
+ 						foreach (string s in completions){
++							Console.Write (completion.Prefix);
+ 							Console.Write (s);
+ 							Console.Write (' ');
+ 						}
+@@ -827,6 +869,8 @@
+ 			return result;
+ 		}
+ 
++		public bool TabAtStartCompletes { get; set; }
++			
+ 		//
+ 		// Emulates the bash-like behavior, where edits done to the
+ 		// history are recorded

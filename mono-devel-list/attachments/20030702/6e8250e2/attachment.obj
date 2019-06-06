@@ -1,0 +1,236 @@
+Index: decimal.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/decimal.c,v
+retrieving revision 1.11
+diff -u -p -r1.11 decimal.c
+--- decimal.c	17 Jan 2003 23:06:38 -0000	1.11
++++ decimal.c	2 Jul 2003 15:40:55 -0000
+@@ -21,7 +21,11 @@
+ #include <math.h>
+ 
+ /* needed for building microsoft dll */
++#ifdef __GNUC__
+ #define DECINLINE __inline
++#else
++#define DECINLINE
++#endif
+ 
+ #define LIT_GUINT32(x) x
+ #define LIT_GUINT64(x) x##L
+Index: file-io.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/file-io.c,v
+retrieving revision 1.21
+diff -u -p -r1.21 file-io.c
+--- file-io.c	17 Jun 2003 14:50:30 -0000	1.21
++++ file-io.c	2 Jul 2003 15:40:55 -0000
+@@ -154,10 +154,10 @@ static guint32 convert_seekorigin(MonoSe
+ 
+ static gint64 convert_filetime (const FILETIME *filetime)
+ {
+-	gint64 *ticks;
+-
+-	ticks = (gint64 *)filetime;
+-	return *ticks;
++	guint64 ticks = filetime->dwHighDateTime;
++	ticks <<= 32;
++	ticks += filetime->dwLowDateTime;
++	return (gint64)ticks;
+ }
+ 
+ static void convert_win32_file_attribute_data (const WIN32_FILE_ATTRIBUTE_DATA *data, const gunichar2 *name, MonoIOStat *stat)
+Index: marshal.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/marshal.c,v
+retrieving revision 1.109
+diff -u -p -r1.109 marshal.c
+--- marshal.c	12 Jun 2003 16:33:38 -0000	1.109
++++ marshal.c	2 Jul 2003 15:40:56 -0000
+@@ -560,7 +560,7 @@ emit_ptr_to_str_conv (MonoMethodBuilder 
+ 	switch (conv) {
+ 	case MONO_MARSHAL_CONV_BOOL_I4:
+ 		mono_mb_emit_byte (mb, CEE_LDLOC_0);
+-		mono_mb_emit_byte (mb, CEE_LDIND_I);
++		mono_mb_emit_byte (mb, CEE_LDIND_I4);
+ 		mono_mb_emit_byte (mb, CEE_BRFALSE_S);
+ 		mono_mb_emit_byte (mb, 5);
+ 		mono_mb_emit_byte (mb, CEE_LDLOC_1);
+@@ -4056,6 +4056,10 @@ mono_class_native_size (MonoClass *klass
+ 	return klass->marshal_info->native_size;
+ }
+ 
++#ifndef __GNUC__
++#define __alignof__(type) G_STRUCT_OFFSET(struct { char c; type x; }, x)
++#endif
++
+ /*
+  * mono_type_native_stack_size:
+  * @t: the type to return the size it uses on the stack
+@@ -4087,6 +4091,8 @@ mono_type_native_stack_size (MonoType *t
+ 	case MONO_TYPE_U2:
+ 	case MONO_TYPE_I4:
+ 	case MONO_TYPE_U4:
++		*align = 4;
++		return 4;
+ 	case MONO_TYPE_I:
+ 	case MONO_TYPE_U:
+ 	case MONO_TYPE_STRING:
+@@ -4097,15 +4103,17 @@ mono_type_native_stack_size (MonoType *t
+ 	case MONO_TYPE_FNPTR:
+ 	case MONO_TYPE_ARRAY:
+ 	case MONO_TYPE_TYPEDBYREF:
+-		*align = 4;
+-		return 4;
++		*align = MAX(4, __alignof__(gpointer));
++		return sizeof(gpointer);
+ 	case MONO_TYPE_R4:
+ 		*align = 4;
+ 		return 4;
+ 	case MONO_TYPE_I8:
+ 	case MONO_TYPE_U8:
++		*align = MAX(4, __alignof__(gint64));
++		return 8;
+ 	case MONO_TYPE_R8:
+-		*align = 4;
++		*align = MAX(4, __alignof__(double));
+ 		return 8;
+ 	case MONO_TYPE_VALUETYPE: {
+ 		guint32 size;
+@@ -4114,6 +4122,8 @@ mono_type_native_stack_size (MonoType *t
+ 			return mono_type_native_stack_size (t->data.klass->enum_basetype, align);
+ 		else {
+ 			size = mono_class_native_size (t->data.klass, align);
++
++			// this doesn't look general enough to me....
+ 			*align = *align + 3;
+ 			*align &= ~3;
+ 			
+@@ -4155,13 +4165,13 @@ mono_marshal_type_size (MonoType *type, 
+ 		return 4;
+ 	case MONO_NATIVE_I8:
+ 	case MONO_NATIVE_U8:
+-		*align = 4;
++		*align = MAX(4, __alignof__(gint64));
+ 		return 8;
+ 	case MONO_NATIVE_R4:
+ 		*align = 4;
+ 		return 4;
+ 	case MONO_NATIVE_R8:
+-		*align = 4;
++		*align = MAX(4, __alignof__(double));
+ 		return 8;
+ 	case MONO_NATIVE_INT:
+ 	case MONO_NATIVE_UINT:
+@@ -4180,7 +4190,7 @@ mono_marshal_type_size (MonoType *type, 
+ 	case MONO_NATIVE_VARIANTBOOL:
+ 	case MONO_NATIVE_FUNC:
+ 	case MONO_NATIVE_LPSTRUCT:
+-		*align =  4;
++		*align = MAX(4, __alignof__(gpointer));
+ 		return sizeof (gpointer);
+ 	case MONO_NATIVE_STRUCT: 
+ 		klass = mono_class_from_mono_type (type);
+Index: metadata.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/metadata.c,v
+retrieving revision 1.121
+diff -u -p -r1.121 metadata.c
+--- metadata.c	10 Jun 2003 15:45:18 -0000	1.121
++++ metadata.c	2 Jul 2003 15:40:56 -0000
+@@ -845,7 +845,11 @@ mono_metadata_guid_heap (MonoImage *meta
+ static const char *
+ dword_align (const char *ptr)
+ {
++#if SIZEOF_VOID_P == 8
++	return (const char *) (((guint64) (ptr + 3)) & ~3);
++#else
+ 	return (const char *) (((guint32) (ptr + 3)) & ~3);
++#endif
+ }
+ 
+ /**
+Index: mono-endian.h
+===================================================================
+RCS file: /mono/mono/mono/metadata/mono-endian.h,v
+retrieving revision 1.7
+diff -u -p -r1.7 mono-endian.h
+--- mono-endian.h	30 Jun 2003 14:15:01 -0000	1.7
++++ mono-endian.h	2 Jul 2003 15:40:56 -0000
+@@ -20,9 +20,9 @@ guint32 mono_read32 (const unsigned char
+ guint64 mono_read64 (const unsigned char *x);
+ guint64 mono_read64_swap_words (const unsigned char *x);
+ 
+-#define read16(x) (mono_read16 ((x)))
+-#define read32(x) (mono_read32 ((x)))
+-#define read64(x) (mono_read64 ((x)))
++#define read16(x) (mono_read16 ((const unsigned char *)(x)))
++#define read32(x) (mono_read32 ((const unsigned char *)(x)))
++#define read64(x) (mono_read64 ((const unsigned char *)(x)))
+ 
+ #else
+ 
+Index: object.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/object.c,v
+retrieving revision 1.168
+diff -u -p -r1.168 object.c
+--- object.c	18 Jun 2003 10:30:25 -0000	1.168
++++ object.c	2 Jul 2003 15:40:56 -0000
+@@ -93,9 +93,11 @@ mono_runtime_class_init (MonoVTable *vta
+ 
+ 	if (found) {
+ 		mono_domain_lock (vtable->domain);
+-		/* double check... */
+-		if (vtable->initialized || vtable->initializing)
++		/* double check... */ /* surely we should wait if initializing is true ... */
++		if (vtable->initialized || vtable->initializing) {
++			mono_domain_unlock (vtable->domain);
+ 			return;
++		}
+ 		vtable->initializing = 1;
+ 		mono_runtime_invoke (method, NULL, NULL, (MonoObject **) &exc);
+ 		vtable->initialized = 1;
+Index: rand.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/rand.c,v
+retrieving revision 1.6
+diff -u -p -r1.6 rand.c
+--- rand.c	9 May 2003 22:40:32 -0000	1.6
++++ rand.c	2 Jul 2003 15:40:56 -0000
+@@ -105,7 +105,7 @@ ves_icall_System_Security_Cryptography_R
+ 
+ /* This needs to change when I do the Win32 support... */
+ #else
+-#ifndef _MSC_VER
++#ifdef __GNUC__
+ #warning "No Entropy Source Found"
+ #endif
+ void ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_InternalGetBytes(MonoObject *self, MonoArray *arry)
+Index: reflection.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/reflection.c,v
+retrieving revision 1.182
+diff -u -p -r1.182 reflection.c
+--- reflection.c	23 Jun 2003 14:21:41 -0000	1.182
++++ reflection.c	2 Jul 2003 15:40:57 -0000
+@@ -2220,13 +2220,13 @@ build_compressed_metadata (MonoDynamicAs
+ 	struct StreamDesc {
+ 		const char *name;
+ 		MonoDynamicStream *stream;
+-	} stream_desc [] = {
+-		{"#~", &assembly->tstream},
+-		{"#Strings", &assembly->sheap},
+-		{"#US", &assembly->us},
+-		{"#Blob", &assembly->blob},
+-		{"#GUID", &assembly->guid}
+-	};
++	} stream_desc [5];
++
++	stream_desc[0].name  = "#~"; stream_desc[0].stream = &assembly->tstream;
++	stream_desc[1].name  = "#Strings"; stream_desc[1].stream = &assembly->sheap;
++	stream_desc[2].name  = "#US"; stream_desc[2].stream = &assembly->us;
++	stream_desc[3].name  = "#Blob"; stream_desc[3].stream = &assembly->blob;
++	stream_desc[4].name  = "#GUID"; stream_desc[4].stream = &assembly->guid;
+ 	
+ 	/* tables that are sorted */
+ 	sorted_mask = ((guint64)1 << MONO_TABLE_CONSTANT) | ((guint64)1 << MONO_TABLE_FIELDMARSHAL)

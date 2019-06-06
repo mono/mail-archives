@@ -1,0 +1,151 @@
+Index: metadata/class.c
+===================================================================
+--- metadata/class.c	(revision 86211)
++++ metadata/class.c	(working copy)
+@@ -533,6 +533,11 @@
+ 
+ 		/* We can't use context->class_inst directly, since it can have more elements */
+ 		inst = mono_metadata_inflate_generic_inst (container->context.class_inst, context);
++		/*if the instantiation is the fully open one, we return NULL and the caller will
++		 *use the generic type definition instead*/
++		if (inst == container->context.class_inst)
++			return NULL;
++
+ 		gclass = mono_metadata_lookup_generic_class (klass, inst, klass->image->dynamic);
+ 
+ 		nt = mono_metadata_type_dup (NULL, type);
+@@ -3271,7 +3276,6 @@
+ 	mono_loader_lock ();
+ 	if (gclass->cached_class) {
+ 		mono_loader_unlock ();
+-		g_assert (!gclass->cached_class->generic_container);
+ 		return gclass->cached_class;
+ 	}
+ 
+@@ -6009,3 +6013,9 @@
+ 
+ 	return TRUE;
+ }
++
++gboolean
++mono_generic_class_is_generic_type_definition (MonoGenericClass *gklass)
++{
++	return gklass->context.class_inst == gklass->container_class->generic_container->context.class_inst;
++}
+Index: metadata/metadata.c
+===================================================================
+--- metadata/metadata.c	(revision 86211)
++++ metadata/metadata.c	(working copy)
+@@ -1430,6 +1430,7 @@
+ 	guint hash = mono_metadata_type_hash (&gclass->container_class->byval_arg);
+ 
+ 	hash *= 13;
++	hash += gclass->is_tb_open;
+ 	hash += mono_metadata_generic_context_hash (&gclass->context);
+ 
+ 	return hash;
+@@ -2173,7 +2174,7 @@
+ 	int i;
+ 
+ 	/* FIXME: The dynamic case */
+-	if (gclass->cached_class && !gclass->cached_class->image->dynamic) {
++	if (gclass->cached_class && !gclass->cached_class->image->dynamic && !mono_generic_class_is_generic_type_definition (gclass)) {
+ 		MonoClass *class = gclass->cached_class;
+ 
+ 		/* Allocated in mono_class_init () */
+@@ -2299,6 +2300,16 @@
+ 	return ginst;
+ }
+ 
++static gboolean
++mono_metadata_is_type_builder_generic_type_definition (MonoClass *container_class, MonoGenericInst *inst, gboolean is_dynamic)
++{
++	MonoGenericContainer *container = container_class->generic_container; 
++
++	if (!is_dynamic || container_class->wastypebuilder || container->type_argc != inst->type_argc)
++		return FALSE;
++	return inst == container->context.class_inst;
++}
++
+ /*
+  * mono_metadata_lookup_generic_class:
+  *
+@@ -2309,12 +2320,14 @@
+ mono_metadata_lookup_generic_class (MonoClass *container_class, MonoGenericInst *inst, gboolean is_dynamic)
+ {
+ 	MonoGenericClass *gclass;
++	MonoGenericClass helper;
++	gboolean is_tb_open = mono_metadata_is_type_builder_generic_type_definition (container_class, inst, is_dynamic);
+ 
+-	MonoGenericClass helper;
+ 	helper.container_class = container_class;
+ 	helper.context.class_inst = inst;
+ 	helper.context.method_inst = NULL;
+ 	helper.is_dynamic = is_dynamic; /* We use this in a hash lookup, which does not attempt to downcast the pointer */
++	helper.is_tb_open = is_tb_open;
+ 	helper.cached_class = NULL;
+ 
+ 	mono_loader_lock ();
+@@ -2337,9 +2350,12 @@
+ 		gclass = g_new0 (MonoGenericClass, 1);
+ 	}
+ 
++	gclass->is_tb_open = is_tb_open;
+ 	gclass->container_class = container_class;
+ 	gclass->context.class_inst = inst;
+ 	gclass->context.method_inst = NULL;
++	if (inst == container_class->generic_container->context.class_inst && !is_tb_open)
++		gclass->cached_class = container_class;
+ 
+ 	g_hash_table_insert (generic_class_cache, gclass, gclass);
+ 
+@@ -3746,7 +3762,7 @@
+ 		if (!do_mono_metadata_type_equal (i1->type_argv [i], i2->type_argv [i], signature_only))
+ 			return FALSE;
+ 	}
+-	return TRUE;
++	return g1->is_tb_open == g2->is_tb_open;
+ }
+ 
+ guint
+Index: metadata/class-internals.h
+===================================================================
+--- metadata/class-internals.h	(revision 86211)
++++ metadata/class-internals.h	(working copy)
+@@ -400,6 +400,7 @@
+ 	MonoClass *container_class;	/* the generic type definition */
+ 	MonoGenericContext context;	/* a context that contains the type instantiation doesn't contain any method instantiation */
+ 	guint is_dynamic  : 1;		/* We're a MonoDynamicGenericClass */
++	guint is_tb_open  : 1;		/* This is the fully open instantiation for a type_builder*/
+ 	MonoClass *cached_class;	/* if present, the MonoClass corresponding to the instantiation.  */
+ };
+ 
+@@ -847,5 +848,8 @@
+ MonoType *
+ mono_type_get_full        (MonoImage *image, guint32 type_token, MonoGenericContext *context) MONO_INTERNAL;
+ 
++gboolean
++mono_generic_class_is_generic_type_definition (MonoGenericClass *gklass) MONO_INTERNAL;
++
+ #endif /* __MONO_METADATA_CLASS_INTERBALS_H__ */
+ 
+Index: metadata/reflection.c
+===================================================================
+--- metadata/reflection.c	(revision 86211)
++++ metadata/reflection.c	(working copy)
+@@ -2428,7 +2428,6 @@
+ 	table = &assembly->tables [MONO_TABLE_METHODSPEC];
+ 
+ 	g_assert (method->is_inflated);
+-	g_assert (!method->klass->generic_container);
+ 	imethod = (MonoMethodInflated *) method;
+ 	declaring = imethod->declaring;
+ 
+@@ -8909,6 +8908,7 @@
+ 	MONO_ARCH_SAVE_REGS;
+ 
+ 	klass = mono_class_from_mono_type (type->type.type);
++	g_assert (type->type.type->type == MONO_TYPE_GENERICINST);
+ 	gclass = type->type.type->data.generic_class;
+ 
+ 	g_assert (gclass->is_dynamic);

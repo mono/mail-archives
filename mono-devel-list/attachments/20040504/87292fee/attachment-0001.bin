@@ -1,0 +1,204 @@
+from  Raja R Harinath  <rharinath@novell.com>
+
+	* attribute.cs (Attribute.CheckAttributeType, Attribute.ResolveType): 
+	Add a 'complain' parameter to silence errors.
+	(Attribute.Resolve): Update to changes.  Put in sanity check to catch
+	silently overlooked type-resolutions.
+	(Attribute.ScanForIndexerName, Attribute.DefinePInvokeMethod): Update
+	to reflect changes.
+	(Attributes.Search): New function.
+	(Attributes.Contains, Attributes.GetClsCompliantAttribute): Use Search.
+	(Attributes.GetAttributeFullName): Remove hack.
+	* class.cs (MethodCore.LabelParameters, MethodData.ApplyAttributes): 
+	Update to reflect changes.
+	* codegen.cs (CommonAssemblyModulClass.GetClsCompliantAttribute):
+	Use Attributes.Search instead of nested loops.
+
+Index: attribute.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/attribute.cs,v
+retrieving revision 1.120
+diff -u -u -r1.120 attribute.cs
+--- attribute.cs	30 Apr 2004 06:13:20 -0000	1.120
++++ attribute.cs	4 May 2004 09:53:05 -0000
+@@ -112,9 +112,9 @@
+ 		}
+ 
+ 		/// <summary>
+-                ///   Tries to resolve the type of the attribute. Flags an error if it can't.
++                ///   Tries to resolve the type of the attribute. Flags an error if it can't, and complain is true.
+                 /// </summary>
+-		private Type CheckAttributeType (DeclSpace ds) {
++		private Type CheckAttributeType (DeclSpace ds, bool complain) {
+ 			Type t1 = RootContext.LookupType (ds, Name, true, Location);
+ 
+ 			// FIXME: Shouldn't do this for quoted attributes: [@A]
+@@ -147,17 +147,18 @@
+ 				Report.Error (616, Location, err0616);
+ 				return null;
+ 			}
+-			
+-			Report.Error (
+-				246, Location, "Could not find attribute '" + Name + "' (are you" +
+-				" missing a using directive or an assembly reference ?)");
++
++			if (complain)
++				Report.Error (246, Location, 
++					      "Could not find attribute '" + Name 
++					      + "' (are you missing a using directive or an assembly reference ?)");
+ 			return null;
+ 		}
+ 
+-		public Type ResolveType (DeclSpace ds)
++		public Type ResolveType (DeclSpace ds, bool complain)
+ 		{
+ 			if (Type == null)
+-				Type = CheckAttributeType (ds);
++				Type = CheckAttributeType (ds, complain);
+ 			return Type;
+ 		}
+ 
+@@ -206,9 +207,18 @@
+ 		
+ 		public CustomAttributeBuilder Resolve (EmitContext ec)
+ 		{
+-			ResolveType (ec.DeclSpace);
+-			if (Type == null)
++			Type oldType = Type;
++			
++			// Sanity check.
++			Type = CheckAttributeType (ec.DeclSpace, true);
++			if (oldType == null && Type == null)
++				return null;
++			if (oldType != null && oldType != Type) {
++				Report.Error (-6, Location,
++					      "Attribute {0} resolved to different types at different times: {1} vs. {2}",
++					      Name, oldType, Type);
+ 				return null;
++			}
+ 
+ 			bool MethodImplAttr = false;
+ 			bool MarshalAsAttr = false;
+@@ -674,7 +684,7 @@
+ 					continue;
+ 
+ 				foreach (Attribute a in asec.Attributes){
+-					if (a.ResolveType (ec.DeclSpace) == null)
++					if (a.ResolveType (ec.DeclSpace, true) == null)
+ 						return null;
+ 					
+ 					if (a.Type != TypeManager.indexer_name_type)
+@@ -1020,7 +1036,7 @@
+ 				return null;
+ 			}
+ 
+-			ResolveType (ec.DeclSpace);
++			ResolveType (ec.DeclSpace, true);
+ 			if (Type == null)
+ 				return null;
+ 			
+@@ -1195,45 +1211,25 @@
+ 				AttributeSections.Add (a);
+ 		}
+ 
+-		public bool Contains (Type t)
++		public Attribute Search (Type t, DeclSpace ds)
+ 		{
+ 			foreach (AttributeSection attr_section in AttributeSections){
+ 				foreach (Attribute a in attr_section.Attributes){
+-					if (a.Type == t)
+-						return true;
++					if (a.ResolveType (ds, false) == t)
++						return a;
+ 				}
+ 			}
+-                        
+-			return false;
++			return null;
+ 		}
+ 
+-		public Attribute GetClsCompliantAttribute (DeclSpace ds)
++		public bool Contains (Type t, DeclSpace ds)
+ 		{
+-			foreach (AttributeSection attr_section in AttributeSections) {
+-				foreach (Attribute a in attr_section.Attributes) {
+-
+-					// Unfortunately, we have also attributes that has not been resolved yet.
+-					// We need to simulate part of ApplyAttribute method.
+-					if (a.Type == null) {
+-						Type attr_type = RootContext.LookupType (ds, GetAttributeFullName (a.Name), true, a.Location);
+-						if (attr_type == TypeManager.cls_compliant_attribute_type)
+-							return a;
+-
+-						continue;
+-					}
+-
+-					if (a.Type == TypeManager.cls_compliant_attribute_type)
+-						return a;
+-				}
+-			}
+-			return null;
++                        return Search (t, ds) != null;
+ 		}
+ 
+-		public static string GetAttributeFullName (string name)
++		public Attribute GetClsCompliantAttribute (DeclSpace ds)
+ 		{
+-			if (name.EndsWith ("Attribute"))
+-				return name;
+-			return name + "Attribute";
++			return Search (TypeManager.cls_compliant_attribute_type, ds);
+ 		}
+ 	}
+ 
+Index: class.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/class.cs,v
+retrieving revision 1.428
+diff -u -u -r1.428 class.cs
+--- class.cs	29 Apr 2004 17:05:40 -0000	1.428
++++ class.cs	4 May 2004 09:53:06 -0000
+@@ -2641,7 +2663,7 @@
+ 						Attribute.ApplyAttributes (ec, pb, p[i], attr);
+ 
+ 						if (par_attr == ParameterAttributes.Out){
+-							if (attr.Contains (TypeManager.in_attribute_type))
++							if (attr.Contains (TypeManager.in_attribute_type, ec.DeclSpace))
+ 								Report.Error (36, loc,
+                                                                     "Can not use [In] attribute on out parameter");
+ 						}
+@@ -3508,7 +3530,7 @@
+ 					continue;
+ 					
+ 				foreach (Attribute a in asec.Attributes) {
+-					Type attr_type = a.ResolveType (ds);
++					Type attr_type = a.ResolveType (ds, true);
+ 					if (attr_type == TypeManager.conditional_attribute_type) {
+ 						if (!ApplyConditionalAttribute (a))
+ 							return false;
+Index: codegen.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/codegen.cs,v
+retrieving revision 1.148
+diff -u -u -r1.148 codegen.cs
+--- codegen.cs	1 May 2004 03:00:26 -0000	1.148
++++ codegen.cs	4 May 2004 09:53:06 -0000
+@@ -816,14 +816,10 @@
+ 				Attributes attrs = (Attributes) de.Value;
+ 				temp_ec.TypeContainer.NamespaceEntry = ns;
+ 
+-				foreach (AttributeSection attr_section in attrs.AttributeSections) {
+-					foreach (Attribute a in attr_section.Attributes) {
+-						Type attributeType = RootContext.LookupType (temp_ec.DeclSpace, Attributes.GetAttributeFullName (a.Name), true, Location.Null);
+-						if (attributeType == TypeManager.cls_compliant_attribute_type) {
+-							a.Resolve (temp_ec);
+-							return a;
+-						}
+-					}
++				Attribute a = attrs.Search (TypeManager.cls_compliant_attribute_type, temp_ec.DeclSpace);
++				if (a != null) {
++					a.Resolve (temp_ec);
++					return a;
+ 				}
+ 			}
+ 			return null;

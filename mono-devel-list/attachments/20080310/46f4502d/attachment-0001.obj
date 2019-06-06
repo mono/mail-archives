@@ -1,0 +1,244 @@
+Index: eglib/ChangeLog
+===================================================================
+--- eglib/ChangeLog	(revision 97903)
++++ eglib/ChangeLog	(working copy)
+@@ -1,3 +1,24 @@
++2007-03-10  Bill Holmes  <billholmes54@gmail.com>
++
++	* src/gpath.c (g_path_is_absolute) : Adding a case for '/'
++	  on Windows.
++	
++	* src/gpath.c (g_get_user_name) : On Windows add a check for %USERNAME%
++	  when %USER% fails.
++
++	* src/gstr.c (g_strsplit, g_strsplit_set):  Change to remove truncation
++	  errors with MSVC build.
++
++	* src/gstr.c (g_filename_to_uri, g_filename_from_uri):  Fixes to handle
++	  Windows paths.
++
++	* src/gstr.c (g_ascii_strncasecmp):  Convert each character to lower case
++	  before comparing.
++
++	* src/gunicode.c (g_get_charset):  Implement for Windows.
++
++	Contributed under MIT/X11 license.
++
+ 2008-01-15  Andreas Faerber  <andreas.faerber@web.de>
+ 
+ 	* configure.ac: Add default G_BREAKPOINT implementation.
+Index: eglib/src/gpath.c
+===================================================================
+--- eglib/src/gpath.c	(revision 97903)
++++ eglib/src/gpath.c	(working copy)
+@@ -148,7 +148,7 @@
+ 	g_return_val_if_fail (filename != NULL, FALSE);
+ #ifdef G_OS_WIN32
+ 	if (filename[0] != '\0' && filename[1] != '\0' && filename[1] == ':' && 
+-		filename[2] != '\0' && filename[2] == '\\')
++		filename[2] != '\0' && (filename[2] == '\\' || filename[2] == '/'))
+ 		return TRUE;
+ 	else
+ 		return FALSE;
+@@ -315,7 +315,12 @@
+ const char *
+ g_get_user_name (void)
+ {
+-	return g_getenv ("USER");
++	const char * retName = g_getenv ("USER");
++#if defined (G_OS_WIN32)
++	if (!retName)
++		retName = g_getenv ("USERNAME");
++#endif
++	return retName;
+ }
+ 
+ static char *name;
+Index: eglib/src/gstr.c
+===================================================================
+--- eglib/src/gstr.c	(revision 97903)
++++ eglib/src/gstr.c	(working copy)
+@@ -212,7 +212,7 @@
+ 			}
+ 
+ 			if (*string) {
+-				int toklen = (string - c);
++				gsize toklen = (string - c);
+ 				token = g_strndup (c, toklen);
+ 
+ 				/* Need to leave a trailing empty
+@@ -283,7 +283,7 @@
+ 	c = string;
+ 	while (*string && !(max_tokens > 0 && size >= max_tokens)) {
+ 		if (charcmp (*string, delimiter)) {
+-			int toklen = (string - c);
++			gsize toklen = (string - c);
+ 			if (toklen == 0) {
+ 				token = g_strdup ("");
+ 			} else {
+@@ -527,29 +527,46 @@
+ 	size_t n;
+ 	char *ret, *rp;
+ 	const char *p;
++#ifdef G_OS_WIN32
++	const char *uriPrefix = "file:///";
++#else
++	const char *uriPrefix = "file://";
++#endif
+ 	
+ 	g_return_val_if_fail (filename != NULL, NULL);
+ 
+ 	if (hostname != NULL)
+ 		g_warning ("%s", "eglib: g_filename_to_uri: hostname not handled");
+ 
+-	if (*filename != '/'){
++	if (!g_path_is_absolute (filename)){
+ 		if (error != NULL)
+ 			*error = g_error_new (NULL, 2, "Not an absolute filename");
+ 		
+ 		return NULL;
+ 	}
+ 	
+-	n = strlen ("file://") + 1;
++	n = strlen (uriPrefix) + 1;
+ 	for (p = filename; *p; p++){
++#ifdef G_OS_WIN32
++		if (*p == '\\') {
++			n++;
++			continue;
++		}
++#endif
+ 		if (char_needs_encoding (*p))
+ 			n += 3;
+ 		else
+ 			n++;
+ 	}
+ 	ret = g_malloc (n);
+-	strcpy (ret, "file://");
++	strcpy (ret, uriPrefix);
+ 	for (p = filename, rp = ret + strlen (ret); *p; p++){
++#ifdef G_OS_WIN32
++		if (*p == '\\') {
++			*rp++ = '/';
++			continue;
++		}
++#endif
+ 		if (char_needs_encoding (*p)){
+ 			*rp++ = '%';
+ 			*rp++ = hx [((unsigned char)(*p)) >> 4];
+@@ -604,13 +621,21 @@
+ 		} 
+ 		flen++;
+ 	}
++#ifndef G_OS_WIN32
+ 	flen++;
+-	
++#endif
++
+ 	result = g_malloc (flen + 1);
++	result [flen-1] = 0;
++
++#ifndef G_OS_WIN32
+ 	*result = '/';
+-	result [flen] = 0;
++	r = result + 1;
++#else
++	r = result;
++#endif
+ 
+-	for (p = uri + 8, r = result + 1; *p; p++){
++	for (p = uri + 8; *p; p++){
+ 		if (*p == '%'){
+ 			*r++ = (char)((decode (p [1]) << 4) | decode (p [2]));
+ 			p += 2;
+@@ -666,8 +691,8 @@
+ 	g_return_val_if_fail (s2 != NULL, 0);
+ 
+ 	for (i = 0; i < n; i++){
+-		gchar c1 = *s1++;
+-		gchar c2 = *s2++;
++		gchar c1 = g_ascii_tolower (*s1++);
++		gchar c2 = g_ascii_tolower (*s2++);
+ 		
+ 		if (c1 == c2)
+ 			continue;
+Index: eglib/src/gunicode.c
+===================================================================
+--- eglib/src/gunicode.c	(revision 97903)
++++ eglib/src/gunicode.c	(working copy)
+@@ -39,6 +39,8 @@
+ #ifdef _MSC_VER
+ /* FIXME */
+ #define CODESET 1
++#include <Windows.h>
++
+ typedef int iconv_t;
+ #else
+ #include <langinfo.h>
+@@ -177,6 +179,10 @@
+ g_get_charset (G_CONST_RETURN char **charset)
+ {
+ #ifdef G_OS_WIN32
++	static char buf[14];
++	sprintf (buf, "CP%u", GetACP ());
++	*charset = buf;
++	is_utf8 = FALSE;
+ #else
+ 	if (my_charset == NULL){
+ 		my_charset = g_strdup (nl_langinfo (CODESET));
+Index: msvc/ChangeLog
+===================================================================
+--- msvc/ChangeLog	(revision 97903)
++++ msvc/ChangeLog	(working copy)
+@@ -1,5 +1,11 @@
+ 2007-03-10  Bill Holmes  <billholmes54@gmail.com>
+ 
++	* libmono.vcproj:  Adding a link to version.lib for the eglib targets.
++
++	Contributed under MIT/X11 license.
++
++2007-03-10  Bill Holmes  <billholmes54@gmail.com>
++
+ 	* mono.sln: Fixing configuration list to build the correct targets for the 
+ 	  specified configuration.
+ 
+Index: msvc/libmono.vcproj
+===================================================================
+--- msvc/libmono.vcproj	(revision 97903)
++++ msvc/libmono.vcproj	(working copy)
+@@ -421,7 +421,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCLinkerTool"
+-				AdditionalDependencies="libgc.lib eglib.lib ws2_32.lib Psapi.lib winmm.lib"
++				AdditionalDependencies="version.lib libgc.lib eglib.lib ws2_32.lib Psapi.lib winmm.lib"
+ 				OutputFile="$(OutDir)\mono.dll"
+ 				AdditionalLibraryDirectories="&quot;.\lib\$(PlatformName)&quot;"
+ 				ModuleDefinitionFile="mono.def"
+@@ -510,7 +510,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCLinkerTool"
+-				AdditionalDependencies="libgc.lib eglib.lib ws2_32.lib Psapi.lib winmm.lib"
++				AdditionalDependencies="version.lib libgc.lib eglib.lib ws2_32.lib Psapi.lib winmm.lib"
+ 				OutputFile="$(OutDir)\mono.dll"
+ 				AdditionalLibraryDirectories="&quot;.\lib\$(PlatformName)&quot;"
+ 				ModuleDefinitionFile="mono.def"
+@@ -596,7 +596,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCLinkerTool"
+-				AdditionalDependencies="libgc.lib eglib.lib ws2_32.lib Psapi.lib winmm.lib"
++				AdditionalDependencies="version.lib libgc.lib eglib.lib ws2_32.lib Psapi.lib winmm.lib"
+ 				OutputFile="$(OutDir)\mono.dll"
+ 				AdditionalLibraryDirectories="&quot;.\lib\$(PlatformName)&quot;"
+ 				ModuleDefinitionFile="mono.def"
+@@ -681,7 +681,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCLinkerTool"
+-				AdditionalDependencies="libgc.lib eglib.lib ws2_32.lib Psapi.lib winmm.lib"
++				AdditionalDependencies="version.lib libgc.lib eglib.lib ws2_32.lib Psapi.lib winmm.lib"
+ 				OutputFile="$(OutDir)\mono.dll"
+ 				AdditionalLibraryDirectories="&quot;.\lib\$(PlatformName)&quot;"
+ 				ModuleDefinitionFile="mono.def"

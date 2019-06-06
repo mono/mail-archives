@@ -1,0 +1,485 @@
+Index: metadata/domain.c
+===================================================================
+--- metadata/domain.c	(revision 40470)
++++ metadata/domain.c	(working copy)
+@@ -81,16 +81,17 @@
+ /* This is the list of runtime versions supported by this JIT.
+  */
+ static MonoRuntimeInfo supported_runtimes[] = {
+-	{"v1.0.3705", "1.0", 1,0,5000,0},
+-	{"v1.1.4322", "1.0", 1,0,5000,0},
+-	{"v2.0.40607","2.0", 2,0,3600,0} 
++	{"v1.0.3705", "1.0", { {1,0,5000,0}, {7,0,5000,0} }	},
++	{"v1.1.4322", "1.0", { {1,0,5000,0}, {7,0,5000,0} }	},
++	{"v2.0.40607","2.0", { {2,0,3600,0}, {8,0,3600,0} }	}
+ };
+ 
++
+ /* The stable runtime version */
+ #define DEFAULT_RUNTIME_VERSION "v1.1.4322"
+ 
+-static MonoRuntimeInfo*	
+-get_runtime_from_exe (const char *exe_file);
++static void
++get_runtimes_from_exe (const char *exe_file, MonoRuntimeInfo** runtimes);
+ 
+ static MonoRuntimeInfo*
+ get_runtime_by_version (const char *version);
+@@ -290,9 +291,10 @@
+ mono_init_internal (const char *filename, const char *exe_filename, const char *runtime_version)
+ {
+ 	static MonoDomain *domain = NULL;
+-	MonoAssembly *ass;
++	MonoAssembly *ass = NULL;
+ 	MonoImageOpenStatus status = MONO_IMAGE_OK;
+-	MonoAssemblyName corlib_aname;
++	MonoRuntimeInfo* runtimes [G_N_ELEMENTS (supported_runtimes) + 1];
++	int n;
+ 
+ 	if (domain)
+ 		g_assert_not_reached ();
+@@ -319,26 +321,30 @@
+ 
+ 	SET_APPDOMAIN (domain);
+ 	
++	/* Get a list of runtimes supported by the exe */
+ 	if (exe_filename != NULL) {
+-		current_runtime = get_runtime_from_exe (exe_filename);
++		get_runtimes_from_exe (exe_filename, runtimes);
+ 	} else if (runtime_version != NULL) {
+-		current_runtime = get_runtime_by_version (runtime_version);
++		runtimes [0] = get_runtime_by_version (runtime_version);
++		runtimes [1] = NULL;
+ 	}
+ 
+-	if (current_runtime == NULL) {
++	if (runtimes [0] == NULL) {
++		MonoRuntimeInfo *default_runtime = get_runtime_by_version (DEFAULT_RUNTIME_VERSION);
++		runtimes [0] = default_runtime;
++		runtimes [1] = NULL;
+ 		g_print ("WARNING: The runtime version supported by this application is unavailable.\n");
+-		current_runtime = get_runtime_by_version (DEFAULT_RUNTIME_VERSION);
+-		g_print ("Using default runtime: %s\n", current_runtime->runtime_version);
++		g_print ("Using default runtime: %s\n", default_runtime->runtime_version);
+ 	}
+ 
+-	/* find the corlib */
+-	corlib_aname.name = "mscorlib";
+-	corlib_aname.major = current_runtime->assembly_major;
+-	corlib_aname.minor = current_runtime->assembly_minor;
+-	corlib_aname.build = current_runtime->assembly_build;
+-	corlib_aname.revision = current_runtime->assembly_revision;
+-	
+-	ass = mono_assembly_load (&corlib_aname, NULL, &status);
++	/* The selected runtime will be the first one for which there is a mscrolib.dll */
++	for (n = 0; runtimes [n] != NULL && ass == NULL; n++) {
++		current_runtime = runtimes [n];
++		ass = mono_assembly_load_corlib (current_runtime, &status);
++		if (status != MONO_IMAGE_OK && status != MONO_IMAGE_ERROR_ERRNO)
++			break;
++	}
++
+ 	if ((status != MONO_IMAGE_OK) || (ass == NULL)) {
+ 		switch (status){
+ 		case MONO_IMAGE_ERROR_ERRNO: {
+@@ -1125,8 +1131,8 @@
+ 	return NULL;
+ }
+ 
+-static MonoRuntimeInfo*	
+-get_runtime_from_exe (const char *exe_file)
++static void
++get_runtimes_from_exe (const char *exe_file, MonoRuntimeInfo** runtimes)
+ {
+ 	AppConfigInfo* app_config;
+ 	char *version;
+@@ -1143,21 +1149,26 @@
+ 		 * If there are no such elements, look for a requiredRuntime element.
+ 		 */
+ 		if (app_config->supported_runtimes != NULL) {
++			int n = 0;
+ 			GSList *list = app_config->supported_runtimes;
+-			while (list != NULL && runtime == NULL) {
++			while (list != NULL) {
+ 				version = (char*) list->data;
+ 				runtime = get_runtime_by_version (version);
++				if (runtime != NULL)
++					runtimes [n++] = runtime;
+ 				list = g_slist_next (list);
+ 			}
++			runtimes [n] = NULL;
+ 			app_config_free (app_config);
+-			return runtime;
++			return;
+ 		}
+ 		
+ 		/* Check the requiredRuntime element. This is for 1.0 apps only. */
+ 		if (app_config->required_runtime != NULL) {
+-			runtime = get_runtime_by_version (app_config->required_runtime);
++			runtimes [0] = get_runtime_by_version (app_config->required_runtime);
++			runtimes [1] = NULL;
+ 			app_config_free (app_config);
+-			return runtime;
++			return;
+ 		}
+ 		app_config_free (app_config);
+ 	}
+@@ -1169,14 +1180,16 @@
+ 		 * a default runtime and leave to the initialization method the work of
+ 		 * reporting the error.
+ 		 */
+-		return get_runtime_by_version (DEFAULT_RUNTIME_VERSION);
++		runtimes [0] = get_runtime_by_version (DEFAULT_RUNTIME_VERSION);
++		runtimes [1] = NULL;
++		return;
+ 	}
+ 
+-	runtime = get_runtime_by_version (image->version);
+-	
+-	return runtime;
++	runtimes [0] = get_runtime_by_version (image->version);
++	runtimes [1] = NULL;
+ }
+ 
++
+ /**
+  * mono_get_framework_assembly_version:
+  *
+@@ -1191,9 +1204,12 @@
+ gchar *
+ mono_debugger_check_runtime_version (const char *filename)
+ {
++	MonoRuntimeInfo* runtimes [G_N_ELEMENTS (supported_runtimes) + 1];
+ 	MonoRuntimeInfo *rinfo;
+ 
+-	rinfo = get_runtime_from_exe (filename);
++	get_runtimes_from_exe (filename, runtimes);
++	rinfo = runtimes [0];
++
+ 	if (!rinfo)
+ 		return g_strdup_printf ("Cannot get runtime version from assembly `%s'", filename);
+ 
+Index: metadata/assembly.c
+===================================================================
+--- metadata/assembly.c	(revision 40470)
++++ metadata/assembly.c	(working copy)
+@@ -30,6 +30,12 @@
+ #include <mono/os/util.h>
+ #endif
+ 
++/* AssemblyVersionMap: an assembly name and the assembly version set on which it is based */
++typedef struct  {
++	const char* assembly_name;
++	guint8 version_set_index;
++} AssemblyVersionMap;
++
+ /* the default search path is just MONO_ASSEMBLIES */
+ static const char*
+ default_path [] = {
+@@ -46,55 +52,57 @@
+ /* The list of system assemblies what will be remapped to the running
+  * runtime version. WARNING: this list must be sorted.
+  */
+-static const char *framework_assemblies [] = {
+-	"Accessibility",
+-	"Commons.Xml.Relaxng",
+-	"I18N",
+-	"I18N.CJK",
+-	"I18N.MidEast",
+-	"I18N.Other",
+-	"I18N.Rare",
+-	"I18N.West",
+-	"Mono.Cairo",
+-	"Mono.CompilerServices.SymbolWriter",
+-	"Mono.Data",
+-	"Mono.Data.SqliteClient",
+-	"Mono.Data.SybaseClient",
+-	"Mono.Data.Tds",
+-	"Mono.Data.TdsClient",
+-	"Mono.GetOptions",
+-	"Mono.Http",
+-	"Mono.Posix",
+-	"Mono.Security",
+-	"Mono.Security.Win32",
+-	"Mono.Xml.Ext",
+-	"Novell.Directory.Ldap",
+-	"Npgsql",
+-	"PEAPI",
+-	"System",
+-	"System.Configuration.Install",
+-	"System.Data",
+-	"System.Data.OracleClient",
+-	"System.Data.SqlXml",
+-	"System.Design",
+-	"System.DirectoryServices",
+-	"System.Drawing",
+-	"System.Drawing.Design",
+-	"System.EnterpriseServices",
+-	"System.Management",
+-	"System.Messaging",
+-	"System.Runtime.Remoting",
+-	"System.Runtime.Serialization.Formatters.Soap",
+-	"System.Security",
+-	"System.ServiceProcess",
+-	"System.Web",
+-	"System.Web.Mobile",
+-	"System.Web.Services",
+-	"System.Windows.Forms",
+-	"System.Xml",
+-	"mscorlib"
++static AssemblyVersionMap framework_assemblies [] = {
++	{"Accessibility", 0},
++	{"Commons.Xml.Relaxng", 0},
++	{"I18N", 0},
++	{"I18N.CJK", 0},
++	{"I18N.MidEast", 0},
++	{"I18N.Other", 0},
++	{"I18N.Rare", 0},
++	{"I18N.West", 0},
++	{"Microsoft.VisualBasic", 1},
++	{"Microsoft.VisualC", 1},
++	{"Mono.Cairo", 0},
++	{"Mono.CompilerServices.SymbolWriter", 0},
++	{"Mono.Data", 0},
++	{"Mono.Data.SqliteClient", 0},
++	{"Mono.Data.SybaseClient", 0},
++	{"Mono.Data.Tds", 0},
++	{"Mono.Data.TdsClient", 0},
++	{"Mono.GetOptions", 0},
++	{"Mono.Http", 0},
++	{"Mono.Posix", 0},
++	{"Mono.Security", 0},
++	{"Mono.Security.Win32", 0},
++	{"Mono.Xml.Ext", 0},
++	{"Novell.Directory.Ldap", 0},
++	{"Npgsql", 0},
++	{"PEAPI", 0},
++	{"System", 0},
++	{"System.Configuration.Install", 0},
++	{"System.Data", 0},
++	{"System.Data.OracleClient", 0},
++	{"System.Data.SqlXml", 0},
++	{"System.Design", 0},
++	{"System.DirectoryServices", 0},
++	{"System.Drawing", 0},
++	{"System.Drawing.Design", 0},
++	{"System.EnterpriseServices", 0},
++	{"System.Management", 0},
++	{"System.Messaging", 0},
++	{"System.Runtime.Remoting", 0},
++	{"System.Runtime.Serialization.Formatters.Soap", 0},
++	{"System.Security", 0},
++	{"System.ServiceProcess", 0},
++	{"System.Web", 0},
++	{"System.Web.Mobile", 0},
++	{"System.Web.Services", 0},
++	{"System.Windows.Forms", 0},
++	{"System.Xml", 0},
++	{"mscorlib", 0}
+ };
+-	
++
+ /*
+  * keeps track of loaded assemblies
+  */
+@@ -376,40 +384,36 @@
+ 	if (aname->name == NULL) return aname;
+ 	current_runtime = mono_get_runtime_info ();
+ 
+-	/* remap only when the assembly is older than the expected version */
+-	
+-	if (aname->major > current_runtime->assembly_major) return aname;
+-	if (aname->major == current_runtime->assembly_major) {
+-		if (aname->minor > current_runtime->assembly_minor) return aname;
+-		if (aname->minor == current_runtime->assembly_minor) {
+-			if (aname->build > current_runtime->assembly_build) return aname;
+-			if (aname->build == current_runtime->assembly_build) {
+-				if (aname->revision >= current_runtime->assembly_revision) return aname;
+-			}
+-		}
+-	}
+-	
+ 	first = 0;
+ 	last = G_N_ELEMENTS (framework_assemblies) - 1;
+ 	
+ 	while (first <= last) {
+ 		int res;
+ 		pos = first + (last - first) / 2;
+-		res = strcmp (aname->name, framework_assemblies[pos]);
++		res = strcmp (aname->name, framework_assemblies[pos].assembly_name);
+ 		if (res == 0) {
++			AssemblyVersionSet* vset;
++			int index = framework_assemblies[pos].version_set_index;
++			g_assert (index < G_N_ELEMENTS (current_runtime->version_sets));
++			vset = &current_runtime->version_sets [index];
++
++			if (aname->major == vset->major && aname->minor == vset->minor &&
++				aname->build == vset->build && aname->revision == vset->revision)
++				return aname;
++		
+ 			if ((aname->major | aname->minor | aname->build | aname->revision) != 0)
+ 				mono_trace (G_LOG_LEVEL_WARNING, MONO_TRACE_ASSEMBLY,
+ 					"The request to load the assembly %s v%d.%d.%d.%d was remapped to v%d.%d.%d.%d",
+ 							aname->name,
+ 							aname->major, aname->minor, aname->build, aname->revision,
+-							current_runtime->assembly_major, current_runtime->assembly_minor, current_runtime->assembly_build, current_runtime->assembly_revision
++							vset->major, vset->minor, vset->build, vset->revision
+ 							);
+ 			
+ 			memcpy (dest_aname, aname, sizeof(MonoAssemblyName));
+-			dest_aname->major = current_runtime->assembly_major;
+-			dest_aname->minor = current_runtime->assembly_minor;
+-			dest_aname->build = current_runtime->assembly_build;
+-			dest_aname->revision = current_runtime->assembly_revision;
++			dest_aname->major = vset->major;
++			dest_aname->minor = vset->minor;
++			dest_aname->build = vset->build;
++			dest_aname->revision = vset->revision;
+ 			return dest_aname;
+ 		} else if (res == -1) {
+ 			last = pos - 1;
+@@ -1065,7 +1069,44 @@
+ 	return result;
+ }
+ 
++
++MonoAssembly*
++mono_assembly_load_corlib (MonoRuntimeInfo *runtime, MonoImageOpenStatus *status)
++{
++	char *corlib_file;
++
++	if (corlib) {
++		/* g_print ("corlib already loaded\n"); */
++		return corlib;
++	}
+ 	
++	if (assemblies_path) {
++		corlib = load_in_path ("mscorlib.dll", (const char**)assemblies_path, status);
++		if (corlib)
++			return corlib;
++	}
++	corlib = load_in_path ("mscorlib.dll", default_path, status);
++
++	if (corlib)
++		return corlib;
++
++	/* Load corlib from mono/<version> */
++	
++	corlib_file = g_build_filename ("mono", runtime->framework_version, "mscorlib.dll", NULL);
++	if (assemblies_path) {
++		corlib = load_in_path (corlib_file, (const char**)assemblies_path, status);
++		if (corlib) {
++			g_free (corlib_file);
++			return corlib;
++		}
++	}
++	corlib = load_in_path (corlib_file, default_path, status);
++	g_free (corlib_file);
++
++	return corlib;
++}
++
++
+ MonoAssembly*
+ mono_assembly_load (MonoAssemblyName *aname, const char *basedir, MonoImageOpenStatus *status)
+ {
+@@ -1088,36 +1129,7 @@
+ 	/* g_print ("loading %s\n", aname->name); */
+ 	/* special case corlib */
+ 	if (strcmp (aname->name, "mscorlib") == 0) {
+-		char *corlib_file;
+-		if (corlib) {
+-			/* g_print ("corlib already loaded\n"); */
+-			return corlib;
+-		}
+-		/* g_print ("corlib load\n"); */
+-		if (assemblies_path) {
+-			corlib = load_in_path ("mscorlib.dll", (const char**)assemblies_path, status);
+-			if (corlib)
+-				return corlib;
+-		}
+-		corlib = load_in_path ("mscorlib.dll", default_path, status);
+-
+-		if (corlib)
+-			return corlib;
+-	
+-		/* Load corlib from mono/<version> */
+-		
+-		corlib_file = g_build_filename ("mono", mono_get_runtime_info ()->framework_version, "mscorlib.dll", NULL);
+-		if (assemblies_path) {
+-			corlib = load_in_path (corlib_file, (const char**)assemblies_path, status);
+-			if (corlib) {
+-				g_free (corlib_file);
+-				return corlib;
+-			}
+-		}
+-		corlib = load_in_path (corlib_file, default_path, status);
+-		g_free (corlib_file);
+-	
+-		return corlib;
++		return mono_assembly_load_corlib (mono_get_runtime_info (), status);
+ 	}
+ 
+ 	if (strstr (aname->name, ".dll"))
+Index: metadata/ChangeLog
+===================================================================
+--- metadata/ChangeLog	(revision 40470)
++++ metadata/ChangeLog	(working copy)
+@@ -1,3 +1,26 @@
++2005-02-11  Lluis Sanchez Gual  <lluis@novell.com>
++
++	* domain.c: In mono_init_internal(), instead of selecting the first
++	runtime version supported by an executable, get a list of all
++	supported versions and select the one for which an mscorlib exists
++	(since even if the runtime supports a given version, it doesn't mean
++	that the framework for that version is installed).
++	Modified get_runtimes_from_exe to support this behavior.
++	In supported_runtimes, added information about additional system
++	assembly versions.
++	
++	* assembly.c: Added support for more than one system assembly version
++	per runtime version. Updated the assembly list.
++	In mono_assembly_remap_version, removed the initial version check,
++	since we don't know to which version we need to compare until we
++	get the version set on which the assembly is based.
++	Moved the code for loading corlib into the new method
++	mono_assembly_load_corlib(), so it can be used by the initialization
++	code.
++	
++	* domain-internals.h: Updated data structures and added declaration
++	for mono_assembly_load_corlib.
++
+ 2005-02-10  Sebastien Pouliot  <sebastien@ximian.com>
+ 
+ 	* metadata-internals.h: Added flags to MonoAssembly to cache the most
+Index: metadata/domain-internals.h
+===================================================================
+--- metadata/domain-internals.h	(revision 40470)
++++ metadata/domain-internals.h	(working copy)
+@@ -129,11 +129,15 @@
+ 	GHashTable         *finalizable_objects_hash;
+ };
+ 
++typedef struct  {
++	guint16 major, minor, build, revision;
++} AssemblyVersionSet;
++
+ /* MonoRuntimeInfo: Contains information about versions supported by this runtime */
+ typedef struct  {
+ 	const char* runtime_version;
+ 	const char* framework_version;
+-	guint16 assembly_major, assembly_minor, assembly_build, assembly_revision;
++	AssemblyVersionSet version_sets [2];
+ } MonoRuntimeInfo;
+ 
+ #define mono_domain_lock(domain)   EnterCriticalSection(&(domain)->lock)
+@@ -229,6 +233,9 @@
+ MonoString *
+ ves_icall_System_AppDomain_InternalGetProcessGuid (MonoString* newguid);
+ 
++MonoAssembly *
++mono_assembly_load_corlib (MonoRuntimeInfo *runtime, MonoImageOpenStatus *status);
++
+ MonoRuntimeInfo*
+ mono_get_runtime_info (void);
+ 

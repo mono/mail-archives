@@ -1,0 +1,317 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Reducing startup time.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Reducing%20startup%20time.&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004922.html">
+   <LINK REL="Next"  HREF="004923.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Reducing startup time.</H1>
+    <B>Miguel de Icaza</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Reducing%20startup%20time.&In-Reply-To="
+       TITLE="[Mono-devel-list] Reducing startup time.">miguel at novell.com
+       </A><BR>
+    <I>Fri Apr  9 14:27:22 EDT 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004922.html">[Mono-devel-list] System.Data.OracleClient - RAW support -	patch
+</A></li>
+        <LI>Next message: <A HREF="004923.html">[Mono-devel-list] Reducing startup time.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4917">[ date ]</a>
+              <a href="thread.html#4917">[ thread ]</a>
+              <a href="subject.html#4917">[ subject ]</a>
+              <a href="author.html#4917">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hey guys,
+
+    I noticed that Mono was JITing too much on startup, and part of the
+cause are my previous bug fixes to problems.  I took the easy way out in
+some cases, but that triggered more code to be JITed when we did not
+really need to.
+
+    The following patch keeps the full behavior that we have today for
+codepages on startup, but reduces the JIT methods to be called in
+roughly 100 methods.
+
+    I have booted my system completely twice, but I would appreciate
+some input (in particular ASP.NET people).
+
+Miguel.
+-------------- next part --------------
+? mono/metadata/.reflection.c.swp
+? mono/metadata/r.c
+? mono/metadata/r.h
+? mono/metadata/runtime-patch
+? mono/metadata/x
+? mono/metadata/y
+Index: mono/metadata/icall.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/icall.c,v
+retrieving revision 1.456
+diff -u -u -r1.456 icall.c
+--- mono/metadata/icall.c	8 Apr 2004 11:55:44 -0000	1.456
++++ mono/metadata/icall.c	9 Apr 2004 17:51:33 -0000
+@@ -13,6 +13,7 @@
+ #include &lt;glib.h&gt;
+ #include &lt;stdarg.h&gt;
+ #include &lt;string.h&gt;
++#include &lt;ctype.h&gt;
+ #include &lt;sys/time.h&gt;
+ #include &lt;unistd.h&gt;
+ #if defined (PLATFORM_WIN32)
+@@ -4324,23 +4325,82 @@
+ 	return mono_string_new (mono_domain_get (), MONO_ASSEMBLIES);
+ }
+ 
++static const char *encodings [] = {
++	(char *) 1,
++		&quot;ascii&quot;, &quot;us_ascii&quot;, &quot;us&quot;, &quot;ansi_x3.4_1968&quot;,
++		&quot;ansi_x3.4_1986&quot;, &quot;cp367&quot;, &quot;csascii&quot;, &quot;ibm367&quot;,
++		&quot;iso_ir_6&quot;, &quot;iso646_us&quot;, &quot;iso_646.irv:1991&quot;,
++	(char *) 2,
++		&quot;utf_7&quot;, &quot;csunicode11utf7&quot;, &quot;unicode_1_1_utf_7&quot;,
++		&quot;unicode_2_0_utf_7&quot;, &quot;x_unicode_1_1_utf_7&quot;,
++		&quot;x_unicode_2_0_utf_7&quot;,
++	(char *) 3,
++		&quot;utf_8&quot;, &quot;unicode_1_1_utf_8&quot;, &quot;unicode_2_0_utf_8&quot;,
++		&quot;x_unicode_1_1_utf_8&quot;, &quot;x_unicode_2_0_utf_8&quot;,
++	(char *) 4,
++		&quot;utf_16&quot;, &quot;UTF_16LE&quot;, &quot;ucs_2&quot;, &quot;unicode&quot;,
++		&quot;iso_10646_ucs2&quot;,
++	(char *) 5,
++		&quot;unicodefffe&quot;, &quot;utf_16be&quot;,
++	(char *) 6,
++		&quot;iso_8859_1&quot;,
++	(char *) 0
++};
++
++/*
++ * Returns the internal codepage, if the value of &quot;int_code_page&quot; is
++ * 1 at entry, and we can not compute a suitable code page number,
++ * returns the code page as a string
++ */
+ static MonoString*
+-ves_icall_System_Text_Encoding_InternalCodePage (void) 
++ves_icall_System_Text_Encoding_InternalCodePage (gint32 *int_code_page) 
+ {
+ 	const char *cset;
+-
++	char *p;
++	char *codepage = NULL;
++	int code;
++	int want_name = *int_code_page;
++	int i;
++	
++	*int_code_page = -1;
+ 	MONO_ARCH_SAVE_REGS;
+ 
+ 	g_get_charset (&amp;cset);
++	p = codepage = strdup (cset);
++	for (p = codepage; *p; p++){
++		if (isascii (*p) &amp;&amp; isalpha (*p))
++			*p = tolower (*p);
++		if (*p == '-')
++			*p = '_';
++	}
+ 	/* g_print (&quot;charset: %s\n&quot;, cset); */
++	
+ 	/* handle some common aliases */
+-	switch (*cset) {
+-	case 'A':
+-		if (strcmp (cset, &quot;ANSI_X3.4-1968&quot;) == 0)
+-			cset = &quot;us-ascii&quot;;
+-		break;
++	p = encodings [0];
++	code = 0;
++	for (i = 0; p != 0; ){
++		if ((int) p &lt; 7){
++			code = (int) p;
++			p = encodings [++i];
++			continue;
++		}
++		if (strcmp (p, codepage) == 0){
++			*int_code_page = code;
++			break;
++		}
++		p = encodings [++i];
+ 	}
+-	return mono_string_new (mono_domain_get (), cset);
++	
++	if (p - codepage &gt; 5){
++		if (strstr (codepage, &quot;utf_8&quot;) != -1)
++			*int_code_page |= 0x10000000;
++	}
++	free (codepage);
++	
++	if (want_name &amp;&amp; *int_code_page == -1)
++		return mono_string_new (mono_domain_get (), cset);
++	else
++		return NULL;
+ }
+ 
+ static MonoBoolean
+Index: mono/metadata/loader.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/loader.c,v
+retrieving revision 1.143
+diff -u -u -r1.143 loader.c
+--- mono/metadata/loader.c	2 Apr 2004 02:15:16 -0000	1.143
++++ mono/metadata/loader.c	9 Apr 2004 17:51:33 -0000
+@@ -1093,5 +1093,10 @@
+ 	}
+ 
+ 	g_module_symbol (module, &quot;SharedWineInit&quot;, &amp;shared_wine_init);
++	if (shared_wine_init == NULL)
++		return;
++
+ 	shared_wine_init ();
++
++	return;
+ }
+-------------- next part --------------
+? class/corlib/cls.log
+? class/corlib/dashboard.ppt
+? class/corlib/regular.log
+? class/corlib/x
+? class/corlib/y
+? class/corlib/Mono.Math/t.cs
+? class/corlib/Mono.Math/x
+? class/corlib/System/Screenshooter.cs
+? class/corlib/System/a.cs
+? class/corlib/System/l
+? class/corlib/System/x
+? class/corlib/System/y
+? class/corlib/System.Collections/A.cs
+? class/corlib/System.IO/x
+? class/corlib/System.Reflection/x
+? class/corlib/System.Reflection.Emit/log
+? class/corlib/System.Text/x
+? class/corlib/System.Threading/WaitCallback.dll
+? class/corlib/Test/.BinaryWriterTest.1
+? class/corlib/Test/.DirectoryTest.AccessTime.1
+? class/corlib/Test/.DirectoryTest.CreationTime.1
+? class/corlib/Test/.DirectoryTest.SetCreationTime.1
+? class/corlib/Test/.DirectoryTest.SetLastAccessTime.1
+? class/corlib/Test/.DirectoryTest.SetLastAccessTimeUtc.1
+? class/corlib/Test/.DirectoryTest.SetLastWriteTime.1
+? class/corlib/Test/.DirectoryTest.SetLastWriteTimeUtc.1
+? class/corlib/Test/.DirectoryTest.Test.10
+? class/corlib/Test/.DirectoryTest.Test.13
+? class/corlib/Test/.DirectoryTest.Test.15
+? class/corlib/Test/.DirectoryTest.Test.16
+? class/corlib/Test/.DirectoryTest.Test.17
+? class/corlib/Test/.DirectoryTest.Test.6
+? class/corlib/Test/.DirectoryTest.WriteTime.1
+? class/corlib/Test/.testFileStream.Test.1
+? class/corlib/Test/TestResult.xml
+? class/corlib/Test/library-deps.stamp
+? class/corlib/Test/System.IO/TextReaderTest.cs
+? class/corlib/Test/resources/CreationTimeIOException1
+? class/corlib/Test/resources/LastAccessIOException1
+? class/corlib/Test/resources/LastWriteTimeIOException1
+? class/corlib/Test/resources/SetCreationTimeArgumentOutOfRangeException1
+? class/corlib/Test/resources/SetCreationTimeUtcArgumentOutOfRangeException1
+? class/corlib/Test/resources/SetCreationTimeUtcIOException1
+? class/corlib/Test/resources/SetLastAccessTimeUtcArgumentOutOfRangeException1
+? class/corlib/Test/resources/SetLastAccessTimeUtcIOException1
+? class/corlib/Test/resources/SetLastTimeArgumentOutOfRangeException1
+? class/corlib/Test/resources/SetLastWriteTimeArgumentOutOfRangeException1
+? class/corlib/Test/resources/SetLastWriteTimeUtcArgumentOutOfRangeException1
+? class/corlib/Test/resources/SetLastWriteTimeUtcIOException1
+? class/corlib/Test/resources/bar
+? class/corlib/Test/resources/creationTime
+? class/corlib/Test/resources/foo
+? class/corlib/Test/resources/lastAccessTime
+? class/corlib/Test/resources/lastWriteTime
+Index: class/corlib/System/Console.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System/Console.cs,v
+retrieving revision 1.21
+diff -u -u -r1.21 Console.cs
+--- class/corlib/System/Console.cs	29 Mar 2004 22:07:24 -0000	1.21
++++ class/corlib/System/Console.cs	9 Apr 2004 17:51:00 -0000
+@@ -20,7 +20,8 @@
+ 
+ 		static Console ()
+ 		{
+-			string codepage = Encoding.InternalCodePage ();
++			int code_page = 0;
++			Encoding.InternalCodePage (ref code_page);
+ 			Encoding encoding;
+ 
+ 			if (((int) Environment.Platform) == 128){
+@@ -28,7 +29,7 @@
+ 				// On Unix systems (128), do not output the
+ 				// UTF-8 ZWNBSP (zero-width non-breaking space).
+ 				//
+-				if (codepage.ToUpper ().Replace ('-', '_').IndexOf (&quot;UTF_8&quot;) != -1)
++				if (code_page == UTF8Encoding.UTF8_CODE_PAGE || ((code_page &amp; 0x10000000) != 0))
+ 					encoding = Encoding.UTF8Unmarked;
+ 				else
+ 					encoding = Encoding.Default;
+Index: class/corlib/System.Text/Encoding.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.Text/Encoding.cs,v
+retrieving revision 1.28
+diff -u -u -r1.28 Encoding.cs
+--- class/corlib/System.Text/Encoding.cs	14 Nov 2003 02:47:53 -0000	1.28
++++ class/corlib/System.Text/Encoding.cs	9 Apr 2004 17:51:00 -0000
+@@ -616,7 +616,7 @@
+ 	}
+ 
+ 	[MethodImpl (MethodImplOptions.InternalCall)]
+-	extern internal static string InternalCodePage ();
++	extern internal static string InternalCodePage (ref int code_page);
+ 	
+ 	// Get the default encoding object.
+ 	public static Encoding Default
+@@ -627,9 +627,16 @@
+ 					if (defaultEncoding == null) {
+ 						// See if the underlying system knows what
+ 						// code page handler we should be using.
+-						string codePage = InternalCodePage ();
++						int code_page = 1;
++						
++						string code_page_name = InternalCodePage (ref code_page);
+ 						try {
+-							defaultEncoding = GetEncoding (codePage);
++							if (code_page == -1)
++								defaultEncoding = GetEncoding (code_page_name);
++							else {
++								code_page = code_page &amp; 0x0fffffff;
++								defaultEncoding = GetEncoding (code_page);
++							}
+ 						} catch (NotSupportedException) {
+ 							defaultEncoding = UTF8Unmarked;
+ 						}
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004922.html">[Mono-devel-list] System.Data.OracleClient - RAW support -	patch
+</A></li>
+	<LI>Next message: <A HREF="004923.html">[Mono-devel-list] Reducing startup time.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4917">[ date ]</a>
+              <a href="thread.html#4917">[ thread ]</a>
+              <a href="subject.html#4917">[ subject ]</a>
+              <a href="author.html#4917">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

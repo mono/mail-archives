@@ -1,0 +1,127 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Why does .NET object lifetime not extend into an instance method call?
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=Re%3A%20%5BMono-dev%5D%20Why%20does%20.NET%20object%20lifetime%20not%20extend%20into%20an%0A%20instance%20method%20call%3F&In-Reply-To=%3CBBDE2441-513F-40C5-A5B1-1120D2101FA1%40vt.edu%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="039561.html">
+   <LINK REL="Next"  HREF="039563.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Why does .NET object lifetime not extend into an instance method call?</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=Re%3A%20%5BMono-dev%5D%20Why%20does%20.NET%20object%20lifetime%20not%20extend%20into%20an%0A%20instance%20method%20call%3F&In-Reply-To=%3CBBDE2441-513F-40C5-A5B1-1120D2101FA1%40vt.edu%3E"
+       TITLE="[Mono-dev] Why does .NET object lifetime not extend into an instance method call?">jonpryor at vt.edu
+       </A><BR>
+    <I>Sat Aug 25 03:31:14 UTC 2012</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="039561.html">[Mono-dev] Why does .NET object lifetime not extend into an instance method call?
+</A></li>
+        <LI>Next message: <A HREF="039563.html">[Mono-dev] Why does .NET object lifetime not extend into an instance method call?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#39564">[ date ]</a>
+              <a href="thread.html#39564">[ thread ]</a>
+              <a href="subject.html#39564">[ subject ]</a>
+              <a href="author.html#39564">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Aug 24, 2012, at 4:26 PM, David Jeske &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">davidj at gmail.com</A>&gt; wrote:
+&gt;<i> Thanks very mych for the detailed reply. It seems to me there is a race that has nothing to do with native code.
+</I>
+Native code just makes it easier to reason about, but as you mention it is quite applicable to managed code. My apologies for not considering that angle.
+
+The answer is largely the same, though; you have two threads using the same instance, one of which (the finalizer) is disposing of the instance, and one of which is invoking a method on that instance.
+
+If you weren't dealing with the GC but still had the same scenario -- two threads using the same instance -- how would you it? By introducing locking, or otherwise ordering the operations so that they can't overlap.
+
+The same is true with the GC, i.e. you ned to ensure that the threads don't stomp on each other, via manual programmer assistance.
+
+	void Problem()
+	{
+		mo.doSomething();
+		GC.KeepAlive(this);
+	}
+
+The above GC.KeepAlive() will prevent the GC from finalizing the Foo instance (and thus the Foo.mo instance) until after `mo.doSomething()` completes.
+
+That's the fix, but why is it necessary? Why can't the GC figure this out?
+
+Because auto-parallelism is hard, and the GC isn't fully involved, _you_ are; consider your previous sample app, but let's provide an implementation for ManagedObject:
+
+	class ManagedObject : IDisposable {
+		static readonly List&lt;ManagedObject&gt; instances = new List&lt;ManagedObject&gt;();
+
+		public ManagedObject ()
+		{
+			lock (instances)
+				instances.Add(this);
+		}
+
+		public static ManagedObject[] GetInstances ()
+		{
+			lock (instances)
+				return instances.ToArray ();
+		}
+
+		public void Dispose()
+		{
+			// remove? eh...
+		}
+	}
+
+This is for illustrative purposes only; the point is that ManagedObject could do _anything_, and the above implementation will result in &quot;disposed&quot; instances within the static ManagedObject.instances list (and, depending on timing, any callers of the GetInstances() method). The GC will _never_ collect them -- they're rooted! -- but they've been &quot;invalided&quot; via your Dispose() call. (Sure, ManagedObject.Dispose() could remove itself from the list; complicate the implementation as appropriate to make that infeasible. ;-)
+
+All the GC does is track which instances are still &quot;live&quot; and which are &quot;collectible.&quot; That's (mostly) it. The fact that the GC may introduce multi-threaded access to member variables is largely beyond it's purview; as such, the onus is on the developer to clear it up.
+
+But here's the real rub: even if the GC weren't introducing multi-threaded access to a member variable, it _still_ can't be held responsible for &quot;complicated&quot; object graphics like the above. Foo isn't referenced by anything, and thus is disposed -- even if it's not at the same time that Foo.Problem() is executing -- but the side effects of the finalizer invocation are WAY beyond the scope of the GC. It's all too easy for an instance to be disposed/finalized while other code is still holding it. The GC doesn't protect you from this; you, the developer, have to protect your code against it.
+
+Given that you the programmer are on the hook once you introduce Dispose() and finalizers, having the GC be more proactive at freeing resources doesn't greatly change the game. If you want things to be easy, avoid IDisposable and finalizers entirely.
+
+&gt;<i> I'm sorry for my naivety. Why does allowing unused function arguments to be collected before a function returns have such important effects on memory usage? 
+</I>
+Java. :-)
+
+The context is the JVM, and &quot;large&quot; methods. Many JVM implementations used to do as you suggested, and wouldn't collect a variable until the method referencing the variable returned. This even applied to local variables! Instead of having &quot;precise lifetime&quot; semantics (as determined by the instruction pointer), it only cared about stack frames.
+
+The result of this behavior is that developers would write &quot;huge&quot; methods which allocated &quot;lots&quot; of objects, all of which would be considered &quot;live&quot; even when a local was no longer being used. Thus came a body of guidelines that you should null out instance/local variables so that the GC could actually collect intra-method garbage:
+
+	<A HREF="http://stackoverflow.com/questions/473685">http://stackoverflow.com/questions/473685</A>
+	<A HREF="http://stackoverflow.com/a/503714/83444">http://stackoverflow.com/a/503714/83444</A>
+
+Needing to null out a local variable is, of course, insane -- &quot;why can't the GC figure this out!&quot; -- so .NET (and modern JVMs!) now precisely track which variables are in-scope and out-of-scope, and will allow collection of any-and-all out-of-scope variables even within the method.
+
+ - Jon
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="039561.html">[Mono-dev] Why does .NET object lifetime not extend into an instance method call?
+</A></li>
+	<LI>Next message: <A HREF="039563.html">[Mono-dev] Why does .NET object lifetime not extend into an instance method call?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#39564">[ date ]</a>
+              <a href="thread.html#39564">[ thread ]</a>
+              <a href="subject.html#39564">[ subject ]</a>
+              <a href="author.html#39564">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

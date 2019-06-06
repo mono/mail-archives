@@ -1,0 +1,172 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] [PATCH] Reworked unified Locale classes
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5BPATCH%5D%20Reworked%20unified%20Locale%20classes&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="012731.html">
+   <LINK REL="Next"  HREF="012735.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] [PATCH] Reworked unified Locale classes</H1>
+    <B>Korn&#233;l P&#225;l</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5BPATCH%5D%20Reworked%20unified%20Locale%20classes&In-Reply-To="
+       TITLE="[Mono-devel-list] [PATCH] Reworked unified Locale classes">kornelpal at hotmail.com
+       </A><BR>
+    <I>Thu Jun 23 05:18:39 EDT 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="012731.html">[Mono-devel-list] [PATCH] Reworked unified Locale classes
+</A></li>
+        <LI>Next message: <A HREF="012735.html">[Mono-devel-list] Re: Patch for standardizing Mainsoft DataSetTest	tests for System.Data
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12736">[ date ]</a>
+              <a href="thread.html#12736">[ thread ]</a>
+              <a href="subject.html#12736">[ subject ]</a>
+              <a href="author.html#12736">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&gt;<i> From: Miguel de Icaza
+</I>&gt;<i> The patch only has one bug as it stands today: it uses a double check
+</I>&gt;<i> lock, which is race prone:
+</I>&gt;<i>
+</I>&gt;<i> if (x == null){
+</I>&gt;<i> lock (...){
+</I>&gt;<i> if (x == null){
+</I>&gt;<i> x = Allocate ();
+</I>&gt;<i> }
+</I>&gt;<i> }
+</I>&gt;<i> }
+</I>
+The actual code:
+private static ResourceManager GetResourceManager ()
+{
+ if (resources == null)
+  lock (resourcesLock) {
+   if (resources == null)
+    resources = new GetTextResourceManager (typeof (Locale).Assembly.GetName
+().Name, typeof (Locale).Assembly);
+  }
+ return resources;
+}
+
+I think this is good, because it is intended to initialize resources only
+once. I did not wanted to use static constructor because of the thing
+explained in the source code. (I don't want any TypeInitializationException,
+and it even could not be catched by SafeGetText) If resources is already
+initialized it does not lock at all that results in faster execution. But
+the second check is required because when two threads are waiting to acrique
+resourcesLock one of the will initialize resources while the other should
+not replace the existing one.
+
+If you still think that this is a race prone, please tell me why because I
+don't know the reason.
+
+&gt;<i> I have a few more questions: what happens if a translation does not
+</I>&gt;<i> exist, or a catalog does not exist, do we have a fast-path?
+</I>&gt;<i>
+</I>&gt;<i> So probably that variable needs to be allocated statically.
+</I>
+The ResourceManager does not load anything at the time of construction. It
+loads ResourceSets when they are needed by a GetString or GetObject call.
+Furthermore it falls back to InvariantCulture whose ResourceSet is
+GetTextResourceSet that simply retrurns the string passed as argument and
+uses no Hashtable to cache string resources. It's better to use a custom
+ResourceSet because this let us to take advantage all the features of
+ResourceManager.
+
+&gt;<i> Also, to apply this kind of patch that will affect everything, I would
+</I>&gt;<i> like to know in advance the memory footprint (running mono --profile
+</I>&gt;<i> before/after should tell us this) and how much extra code is JITed at
+</I>&gt;<i> startup (how much slower this becomes for a sample program).
+</I>
+I agree with Ben that string are localized only several time and the little
+performance overhead caused by localization can be ignored. (The overhead
+should be little.)
+
+And also note that currently there will be little difference because there
+are no other languages just English that is in the code of assemblies so not
+caching will be done. MWF uses object resources as well but it will not
+result in overhead because it currently uses the same ResourceManager and
+ResourceSet that will be used by this Locale.cs.
+
+And as I told several times in this topic the current ResourceSet is not
+efficient. ResourceManager of MS.NET uses a custom resource set called
+RuntimeResourceSet (private type, ResourceSet of MS.NET does the same as
+Mono's one) that loads each resource (either string or object) when it is
+needed instead of loading all of them at construction. It caches resource
+once they was loaded. This could be used in Mono as well or if we want we
+could use a ResourceSet that does no caching at all. But the advantages and
+disadvantages of using no cache should be compared in real life before
+making a decission.
+
+Note that the above problem will not cause any CPU or memory overhead yet
+because we have only English texts yet without .resources files.
+
+&gt;<i> Am starting to understand your point of view on the translation
+</I>&gt;<i> technique, and it might be worth switching to the key/string translation
+</I>&gt;<i> scheme.
+</I>
+It's good.:) By the way, the most important thing: key/string technique will
+have the same performance and memory requirements if you use the same
+ResourceManager and ResourceSet classes. The only difference will be that it
+will look up even English resources in a file that means some performance
+overhead but I think it's so little that it can be ignored.
+
+The problem of resource caching is the same for both techniques: If you
+cache resources they will be faster to retrieve the next time but will need
+memory to cache them. And of course neither of these techniques require
+caching at all.
+
+And of course ResourceManager can use both techniques. Andreas Nahr was
+talking about a custom infrastructure instead of ResourceManager but I think
+it's useless to use different resource format because .resources files are
+efficient.
+
+The most important difference is that while identifiers are permanent
+English texts may change that requires new satellite assemblies for all of
+the languages altough the texts of the other languages are not changed.
+
+&gt;<i> From: Ben Maurer
+</I>&gt;<i> Anyways, the biggest source of jit'ing that i can see in that code is
+</I>&gt;<i> due to:
+</I>&gt;<i>
+</I>&gt;<i> typeof (Locale).Assembly.GetName ().Name
+</I>&gt;<i>
+</I>&gt;<i> Which, IIRC does a relatively wide range of stuff.
+</I>
+This is required to can use the same name for .resources file as the
+assembly has. If you have a better code please let me know. By the way this
+is called only once so I think if it has no critical drawbacks it's not a
+big problem.
+
+Korn&#233;l
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="012731.html">[Mono-devel-list] [PATCH] Reworked unified Locale classes
+</A></li>
+	<LI>Next message: <A HREF="012735.html">[Mono-devel-list] Re: Patch for standardizing Mainsoft DataSetTest	tests for System.Data
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#12736">[ date ]</a>
+              <a href="thread.html#12736">[ thread ]</a>
+              <a href="subject.html#12736">[ subject ]</a>
+              <a href="author.html#12736">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

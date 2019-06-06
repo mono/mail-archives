@@ -1,0 +1,1270 @@
+Index: mono/mono/metadata/class.c
+===================================================================
+--- mono/mono/metadata/class.c	(revision 61873)
++++ mono/mono/metadata/class.c	(working copy)
+@@ -2653,6 +2653,9 @@
+ 	}
+ 
+ 	if (!MONO_CLASS_IS_INTERFACE (class)) {
++		/* Imported COM Objects always derive from __ComObject. */
++		if (MONO_CLASS_IS_IMPORT (class) && parent == mono_defaults.object_class)
++			parent = mono_defaults.com_object_class;
+ 		class->parent = parent;
+ 
+ 		if (!parent)
+Index: mono/mono/metadata/domain.c
+===================================================================
+--- mono/mono/metadata/domain.c	(revision 61873)
++++ mono/mono/metadata/domain.c	(working copy)
+@@ -800,6 +800,9 @@
+ 	mono_defaults.variant_class = mono_class_from_name (
+ 	        mono_defaults.corlib, "System", "Variant");
+ 
++	mono_defaults.com_object_class = mono_class_from_name (
++	        mono_defaults.corlib, "System", "__ComObject");
++
+ 	/*
+ 	 * Note that mono_defaults.generic_*_class is only non-NULL if we're
+ 	 * using the 2.0 corlib.
+Index: mono/mono/metadata/image.c
+===================================================================
+--- mono/mono/metadata/image.c	(revision 61873)
++++ mono/mono/metadata/image.c	(working copy)
+@@ -619,6 +619,7 @@
+ 	image->managed_wrapper_cache = g_hash_table_new (mono_aligned_addr_hash, NULL);
+ 	image->native_wrapper_cache = g_hash_table_new (mono_aligned_addr_hash, NULL);
+ 	image->remoting_invoke_cache = g_hash_table_new (mono_aligned_addr_hash, NULL);
++	image->cominterop_invoke_cache = g_hash_table_new (mono_aligned_addr_hash, NULL);
+ 	image->synchronized_cache = g_hash_table_new (mono_aligned_addr_hash, NULL);
+ 	image->unbox_wrapper_cache = g_hash_table_new (mono_aligned_addr_hash, NULL);
+ 
+@@ -1162,6 +1163,7 @@
+ 	g_hash_table_destroy (image->runtime_invoke_cache);
+ 	g_hash_table_destroy (image->synchronized_cache);
+ 	g_hash_table_destroy (image->unbox_wrapper_cache);
++	g_hash_table_destroy (image->cominterop_invoke_cache);
+ 	g_hash_table_destroy (image->typespec_cache);
+ 	g_hash_table_destroy (image->ldfld_wrapper_cache);
+ 	g_hash_table_destroy (image->ldflda_wrapper_cache);
+Index: mono/mono/metadata/metadata-internals.h
+===================================================================
+--- mono/mono/metadata/metadata-internals.h	(revision 61873)
++++ mono/mono/metadata/metadata-internals.h	(working copy)
+@@ -169,6 +169,7 @@
+ 	GHashTable *remoting_invoke_cache;
+ 	GHashTable *synchronized_cache;
+ 	GHashTable *unbox_wrapper_cache;
++	GHashTable *cominterop_invoke_cache;
+ 
+ 	/*
+ 	 * indexed by MonoClass pointers
+Index: mono/mono/metadata/metadata.h
+===================================================================
+--- mono/mono/metadata/metadata.h	(revision 61873)
++++ mono/mono/metadata/metadata.h	(working copy)
+@@ -31,6 +31,8 @@
+ 
+ #define MONO_CLASS_IS_INTERFACE(c) ((c->flags & TYPE_ATTRIBUTE_INTERFACE) || (c->byval_arg.type == MONO_TYPE_VAR) || (c->byval_arg.type == MONO_TYPE_MVAR))
+ 
++#define MONO_CLASS_IS_IMPORT(c) ((c->flags & TYPE_ATTRIBUTE_IMPORT))
++
+ typedef struct _MonoClass MonoClass;
+ typedef struct _MonoDomain MonoDomain;
+ typedef struct _MonoMethod MonoMethod;
+Index: mono/mono/metadata/debug-helpers.c
+===================================================================
+--- mono/mono/metadata/debug-helpers.c	(revision 61873)
++++ mono/mono/metadata/debug-helpers.c	(working copy)
+@@ -40,7 +40,8 @@
+ 	"unbox",
+ 	"ldflda",
+ 	"write-barrier",
+-	"unknown"
++	"unknown",
++	"cominterop"
+ };
+ 
+ static void
+Index: mono/mono/metadata/object.c
+===================================================================
+--- mono/mono/metadata/object.c	(revision 61873)
++++ mono/mono/metadata/object.c	(working copy)
+@@ -1261,8 +1261,16 @@
+ 		mono_domain_unlock (domain);
+ 		return remote_class->xdomain_vtable;
+ 	}
+-	if (remote_class->default_vtable == NULL)
+-		remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_UNKNOWN);
++	if (remote_class->default_vtable == NULL) {
++		MonoType *type;
++		MonoClass *klass;
++		type = ((MonoReflectionType *)rp->class_to_proxy)->type;
++		klass = mono_class_from_mono_type (type);
++		if (MONO_CLASS_IS_IMPORT(klass) && !mono_class_vtable (mono_domain_get (), klass)->remote)
++			remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_COMINTEROP);
++		else
++			remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_UNKNOWN);
++	}
+ 	
+ 	mono_domain_unlock (domain);
+ 	return remote_class->default_vtable;
+@@ -2427,7 +2435,7 @@
+ 
+ 	MONO_ARCH_SAVE_REGS;
+ 	
+-	if (vtable->remote)
++	if (vtable->remote || MONO_CLASS_IS_IMPORT(vtable->klass))
+ 	{
+ 		gpointer pa [1];
+ 		MonoMethod *im = vtable->domain->create_proxy_for_type_method;
+Index: mono/mono/metadata/class-internals.h
+===================================================================
+--- mono/mono/metadata/class-internals.h	(revision 61873)
++++ mono/mono/metadata/class-internals.h	(working copy)
+@@ -47,7 +47,8 @@
+ 	MONO_WRAPPER_UNBOX,
+ 	MONO_WRAPPER_LDFLDA,
+ 	MONO_WRAPPER_WRITE_BARRIER,
+-	MONO_WRAPPER_UNKNOWN
++	MONO_WRAPPER_UNKNOWN,
++	MONO_WRAPPER_COMINTEROP
+ } MonoWrapperType;
+ 
+ typedef enum {
+@@ -59,7 +60,8 @@
+ 
+ typedef enum {
+ 	MONO_REMOTING_TARGET_UNKNOWN,
+-	MONO_REMOTING_TARGET_APPDOMAIN
++	MONO_REMOTING_TARGET_APPDOMAIN,
++	MONO_REMOTING_TARGET_COMINTEROP
+ } MonoRemotingTarget;
+ 
+ struct _MonoMethod {
+@@ -692,6 +694,7 @@
+ 	MonoClass *generic_array_class;
+ 	MonoClass *generic_nullable_class;
+ 	MonoClass *variant_class;
++	MonoClass *com_object_class;
+ } MonoDefaults;
+ 
+ extern MonoDefaults mono_defaults MONO_INTERNAL;
+Index: mono/mono/metadata/object-internals.h
+===================================================================
+--- mono/mono/metadata/object-internals.h	(revision 61873)
++++ mono/mono/metadata/object-internals.h	(working copy)
+@@ -186,9 +186,17 @@
+ 	MonoObject *unwrapped_server;
+ 	gint32      target_domain_id;
+ 	MonoString *target_uri;
++	MonoObject *object_identity;
++	MonoObject *obj_TP;
++	MonoObject *stub_data;
+ } MonoRealProxy;
+ 
+ typedef struct {
++	MonoRealProxy real_proxy;
++	MonoObject *com_object;
++} MonoComInteropProxy;
++
++typedef struct {
+ 	MonoObject	 object;
+ 	MonoRealProxy	*rp;	
+ 	MonoRemoteClass *remote_class;
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 61873)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -2270,6 +2270,27 @@
+ 	return res;
+ }
+ 
++/* Place method in the cache */
++static inline MonoMethod*
++mono_marshal_cache (GHashTable *cache, gpointer key,
++							   MonoMethod *method)
++{
++	MonoMethod *res;
++
++	mono_loader_lock ();
++	mono_marshal_lock ();
++	res = g_hash_table_lookup (cache, key);
++	if (!res) {
++		/* This does not acquire any locks */
++		g_hash_table_insert (cache, key, method);
++		g_hash_table_insert (wrapper_hash, method, key);
++	}
++	mono_marshal_unlock ();
++	mono_loader_unlock ();
++
++	return res;
++}	
++
+ /* Create the method from the builder and place it in the cache */
+ static inline MonoMethod*
+ mono_mb_create_and_cache (GHashTable *cache, gpointer key,
+@@ -2293,8 +2314,43 @@
+ 	return res;
+ }		
+ 
++static inline MonoMethod*
++mono_marshal_cominterop_find_in_cache (MonoMethod *method)
++{
++	MonoMethod *res = NULL;
+ 
++	mono_marshal_lock ();
++	res = g_hash_table_lookup (method->klass->image->cominterop_invoke_cache, method);
++	mono_marshal_unlock ();
++	return res;
++}
++
++/* Create the method from the builder and place it in the cache */
+ static inline MonoMethod*
++mono_cominterop_mb_create_and_cache (MonoMethod *key, MonoMethodBuilder *mb, 
++								MonoMethodSignature *sig, int max_stack)
++{
++	MonoMethod *res = NULL;
++	GHashTable *cache = key->klass->image->cominterop_invoke_cache;
++
++	mono_loader_lock ();
++	mono_marshal_lock ();
++	res = g_hash_table_lookup (cache, key);
++	
++	if (res == NULL) {
++		/* This does not acquire any locks */
++		res = mono_mb_create_method (mb, sig, max_stack);
++		g_hash_table_insert (cache, key, res);
++		g_hash_table_insert (wrapper_hash, res, key);
++	}
++
++	mono_marshal_unlock ();
++	mono_loader_unlock ();
++
++	return res;
++}	
++
++static inline MonoMethod*
+ mono_marshal_remoting_find_in_cache (MonoMethod *method, int wrapper_type)
+ {
+ 	MonoMethod *res = NULL;
+@@ -2619,6 +2675,110 @@
+ 	return res;
+ } 
+ 
++
++static MonoMethod *
++mono_marshal_component_get_native_wrapper (MonoMethod *method)
++{
++	MonoMethod *res;
++	GHashTable *cache;
++	g_assert (method);
++
++	cache = method->klass->image->native_wrapper_cache;
++	if ((res = mono_marshal_find_in_cache (cache, method)))
++		return res;
++
++	/* if method klass is import, that means method
++	 * is really a com call. let interop system emit it.
++	*/
++	if (MONO_CLASS_IS_IMPORT(method->klass)) {
++		static MonoClass * ComInterop = NULL;
++		static MonoMethod * EmitMethod = NULL;
++		MonoMethod * emitted_method = NULL;
++		MonoObject* ret = NULL;
++		MonoMethodSignature *sig, *csig;
++		gpointer args[1];
++		sig = mono_method_signature (method);
++
++		if (!ComInterop)
++			ComInterop = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInterop");
++		if (!EmitMethod)
++			EmitMethod = mono_class_get_method_from_name (ComInterop, "EmitMethod", 1);
++		args[0] = mono_method_get_object(mono_domain_get (), method, NULL);
++
++		ret = mono_runtime_invoke (EmitMethod, NULL, args, NULL);
++		emitted_method = *(MonoMethod**)mono_object_unbox (ret);
++		mono_marshal_cache (cache, method, emitted_method);
++		return emitted_method;
++	}
++	/* Does this case ever get hit? */
++	else {
++		g_assert(0);
++	}
++}
++
++
++static MonoMethod *
++mono_marshal_get_cominterop_invoke (MonoMethod *method)
++{
++	MonoMethodSignature *sig;
++	MonoMethodBuilder *mb;
++	MonoMethod *res;
++	int i, temp_obj;
++
++	g_assert (method);
++
++	sig = signature_no_pinvoke (method);
++
++	/* we cant remote methods without this pointer */
++	if (!sig->hasthis)
++		return method;
++
++	if ((res = mono_marshal_cominterop_find_in_cache (method)))
++		return res;
++
++	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_COMINTEROP);
++	mb->method->save_lmf = 1;
++
++	/* get real proxy object, which is a ComInteropProxy in this case*/
++	temp_obj = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
++	mono_mb_emit_ldarg (mb, 0);
++	mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++	mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++	/* load the RCW from the ComInteropProxy*/
++	mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoComInteropProxy, com_object));
++	mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++	/* load args and make the call on the RCW */
++	for (i = 1; i <= sig->param_count; i++)
++		mono_mb_emit_ldarg (mb, i);
++
++	if (method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) {
++		MonoMethod * native_wrapper = mono_marshal_component_get_native_wrapper(method);
++		//if (method->flags & METHOD_ATTRIBUTE_VIRTUAL)
++		//	mono_mb_emit_byte (mb, CEE_CALLVIRT);
++		//else
++			mono_mb_emit_byte (mb, CEE_CALL);
++		mono_mb_emit_i4 (mb, mono_mb_add_data (mb, native_wrapper));
++	}
++	else {
++		if (method->flags & METHOD_ATTRIBUTE_VIRTUAL)
++			mono_mb_emit_byte (mb, CEE_CALLVIRT);
++		else
++			mono_mb_emit_byte (mb, CEE_CALL);
++		mono_mb_emit_i4 (mb, mono_mb_add_data (mb, method));
++	}
++
++	emit_thread_interrupt_checkpoint (mb);
++	
++	mono_mb_emit_byte (mb, CEE_RET);
++
++	res = mono_cominterop_mb_create_and_cache (method, mb, sig, sig->param_count + 16);
++	mono_mb_free (mb);
++
++	return res;
++}
++
+ MonoMethod *
+ mono_marshal_get_remoting_invoke (MonoMethod *method)
+ {
+@@ -2632,6 +2792,10 @@
+ 	if (method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE || method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE)
+ 		return method;
+ 
++	/* this seems to be the best plase to put this, as all remoting invokes seem to get filtered through here */
++	if (MONO_CLASS_IS_IMPORT(method->klass) && !mono_class_vtable (mono_domain_get (), method->klass)->remote)
++		return mono_marshal_get_cominterop_invoke(method);
++
+ 	sig = signature_no_pinvoke (method);
+ 
+ 	/* we cant remote methods without this pointer */
+@@ -3472,6 +3636,8 @@
+ {
+ 	if (target_type == MONO_REMOTING_TARGET_APPDOMAIN)
+ 		return mono_marshal_get_xappdomain_invoke (method);
++	else if (target_type == MONO_REMOTING_TARGET_COMINTEROP)
++		return mono_marshal_get_cominterop_invoke (method);
+ 	else
+ 		return mono_marshal_get_remoting_invoke (method);
+ }
+@@ -6785,6 +6951,7 @@
+ 	mono_mb_emit_byte (mb, CEE_RET);
+ }
+ 
++
+ /**
+  * mono_marshal_get_native_wrapper:
+  * @method: The MonoMethod to wrap.
+@@ -6813,6 +6980,9 @@
+ 	if ((res = mono_marshal_find_in_cache (cache, method)))
+ 		return res;
+ 
++	if (MONO_CLASS_IS_IMPORT (method->klass))
++		return mono_marshal_component_get_native_wrapper (method);
++
+ 	sig = mono_method_signature (method);
+ 
+ 	if (!(method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) &&
+Index: mono/mono/metadata/icall.c
+===================================================================
+--- mono/mono/metadata/icall.c	(revision 61873)
++++ mono/mono/metadata/icall.c	(working copy)
+@@ -6273,6 +6273,26 @@
+ 	return method->method->token;
+ }
+ 
++/* Only used for COM RCWs */
++static MonoObject *
++ves_icall_System_ComInteropProxy_CreateRCW (MonoReflectionType *type)
++{
++	MonoClass *klass;
++	MonoDomain *domain;
++	
++	MONO_ARCH_SAVE_REGS;
++
++	domain = mono_object_domain (type);
++	klass = mono_class_from_mono_type (type->type);
++
++	/* call mono_object_new_alloc_specific instead of mono_object_new
++	 * because we want to actually create object. mono_object_new checks
++	 * to see if type is import and creates transparent proxy. this method
++	 * is called by the corresponding real proxy to create the real RCW.
++	*/
++	return mono_object_new_alloc_specific (mono_class_vtable (domain, klass));
++}
++
+ static MonoBoolean
+ custom_attrs_defined_internal (MonoObject *obj, MonoReflectionType *attr_type)
+ {
+@@ -7305,6 +7325,10 @@
+ 	{"GetGenericValueImpl", ves_icall_System_Array_InternalArray_GetGenericValueImpl}
+ };
+ 
++static const IcallEntry cominteropproxy_icalls [] = {
++	{"CreateRCW", ves_icall_System_ComInteropProxy_CreateRCW}
++};
++
+ /* proto
+ static const IcallEntry array_icalls [] = {
+ };
+@@ -7313,6 +7337,7 @@
+ 
+ /* keep the entries all sorted */
+ static const IcallMap icall_entries [] = {
++	{"Mono.Interop.ComInteropProxy", cominteropproxy_icalls, G_N_ELEMENTS (cominteropproxy_icalls)},
+ 	{"Mono.Runtime", runtime_icalls, G_N_ELEMENTS (runtime_icalls)},
+ 	{"Mono.Security.Cryptography.KeyPairPersistence", keypair_icalls, G_N_ELEMENTS (keypair_icalls)},
+ 	{"System.Activator", activator_icalls, G_N_ELEMENTS (activator_icalls)},
+Index: mono/mono/mini/mini.c
+===================================================================
+--- mono/mono/mini/mini.c	(revision 61873)
++++ mono/mono/mini/mini.c	(working copy)
+@@ -10115,7 +10115,7 @@
+ 		MonoMethod *nm;
+ 		MonoMethodPInvoke* piinfo = (MonoMethodPInvoke *) method;
+ 
+-		if (method->iflags & METHOD_IMPL_ATTRIBUTE_NATIVE)
++		if (method->iflags & METHOD_IMPL_ATTRIBUTE_NATIVE && !MONO_CLASS_IS_IMPORT(method->klass))
+ 			g_error ("Method '%s' in assembly '%s' contains native code and mono can't run it. The assembly was probably created by Managed C++.\n", mono_method_full_name (method, TRUE), method->klass->image->name);
+ 
+ 		if (!piinfo->addr) {
+Index: mcs/class/corlib/Mono.Interop/IComInteropSystem.cs
+===================================================================
+--- mcs/class/corlib/Mono.Interop/IComInteropSystem.cs	(revision 0)
++++ mcs/class/corlib/Mono.Interop/IComInteropSystem.cs	(revision 0)
+@@ -0,0 +1,41 @@
++//
++// Mono.Interop.IComInteropSystem
++//
++// Authors:
++//   Jonathan Chambers <jonathan.chambers@ansys.com>
++//
++// Copyright (C) 2006 Novell (http://www.novell.com)
++//
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.Reflection;
++
++namespace Mono.Interop
++{
++	internal interface IComInteropSystem
++	{
++		IntPtr EmitMethod (MethodInfo mi);
++		bool CanCastTo (Type fromType, Object o);
++	}
++}
+\ No newline at end of file
+
+Property changes on: mcs/class/corlib/Mono.Interop/IComInteropSystem.cs
+___________________________________________________________________
+Name: svn:executable
+   + *
+
+Index: mcs/class/corlib/Mono.Interop/ComInterop.cs
+===================================================================
+--- mcs/class/corlib/Mono.Interop/ComInterop.cs	(revision 0)
++++ mcs/class/corlib/Mono.Interop/ComInterop.cs	(revision 0)
+@@ -0,0 +1,72 @@
++//
++// Mono.Interop.ComInterop
++//
++// Authors:
++//   Jonathan Chambers <jonathan.chambers@ansys.com>
++//
++// Copyright (C) 2006 Novell (http://www.novell.com)
++//
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.Collections;
++using System.Runtime.Remoting;
++using System.Runtime.Remoting.Messaging;
++using System.Runtime.Remoting.Proxies;
++
++namespace Mono.Interop
++{
++	internal static class ComInterop
++	{
++		static Hashtable component_systems;
++		static ComInterop ()
++		{
++			component_systems = new Hashtable ();
++		}
++
++		static IComInteropSystem GetComInteropSystem (Type t)
++		{
++			Type component_system_type = typeof (MSComInterop);
++			object[] attrs = t.GetCustomAttributes (typeof (ComInteropSystemAttribute), true);
++			if (attrs.Length > 0)
++				component_system_type = ((ComInteropSystemAttribute)attrs[0]).ComponentSystemType;
++			object obj = component_systems[component_system_type];
++			if (obj == null) {
++				obj = Activator.CreateInstance (component_system_type);
++				component_systems[component_system_type] = obj;
++			}
++			return obj as IComInteropSystem;
++		}
++
++		static IntPtr EmitMethod (System.Reflection.MethodInfo mi)
++		{
++			IComInteropSystem ics = GetComInteropSystem (mi.DeclaringType);
++			return ics.EmitMethod (mi);
++		}
++		static bool CanCastTo (Type fromType, Object o)
++		{
++			IComInteropSystem ics = GetComInteropSystem (o.GetType());
++			return ics.CanCastTo (fromType, o);
++		}
++	}
++}
+\ No newline at end of file
+
+Property changes on: mcs/class/corlib/Mono.Interop/ComInterop.cs
+___________________________________________________________________
+Name: svn:executable
+   + *
+
+Index: mcs/class/corlib/Mono.Interop/MSComInterop.cs
+===================================================================
+--- mcs/class/corlib/Mono.Interop/MSComInterop.cs	(revision 0)
++++ mcs/class/corlib/Mono.Interop/MSComInterop.cs	(revision 0)
+@@ -0,0 +1,249 @@
++//
++// Mono.Interop.MSComInterop
++//
++// Authors:
++//   Jonathan Chambers <jonathan.chambers@ansys.com>
++//
++// Copyright (C) 2006 Novell (http://www.novell.com)
++//
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.Collections;
++using System.Reflection;
++using System.Reflection.Emit;
++using System.Runtime.InteropServices;
++
++namespace Mono.Interop
++{
++	internal class MSComInterop : IComInteropSystem
++	{
++		static ModuleBuilder module_builder;
++		static string str_iunknown = "00000000-0000-0000-C000-000000000046";
++		static Guid iid_iunknown = new Guid ("00000000-0000-0000-C000-000000000046");
++
++		internal static string IUnknown
++		{
++			get
++			{
++				return "00000000-0000-0000-C000-000000000046";
++			}
++		}
++
++		internal static string IDispatch
++		{
++			get
++			{
++				return "00020400-0000-0000-C000-000000000046";
++			}
++		}
++
++		static MSComInterop ()
++		{
++			CoInitialize (IntPtr.Zero);
++
++			AssemblyName name = new AssemblyName ();
++			name.Name = "MSComInterop";
++			AssemblyBuilder ab = AppDomain.CurrentDomain.DefineDynamicAssembly (
++				name, AssemblyBuilderAccess.Run);
++			module_builder = ab.DefineDynamicModule ("MSComInterop");
++		}
++
++		public IntPtr EmitMethod (System.Reflection.MethodInfo mi)
++		{
++			Console.WriteLine ("EmitMethod {0}", mi.Name);
++			IntPtr ptr = IntPtr.Zero;
++			if (mi.Name == ".ctor")
++				ptr = EmitConstructor (mi);
++			else
++				ptr = EmitComMethod (mi);
++			return ptr;
++		}
++
++		public bool CanCastTo (Type fromType, Object o)
++		{
++			return false;
++		}
++
++		delegate IntPtr CreateMethodDelegate ();
++
++		static IntPtr EmitConstructor (MethodInfo mi)
++		{
++#if NET_2_0
++			DynamicMethod dm = new DynamicMethod (mi.DeclaringType.ToString () + mi.Name, typeof (void), new Type[] { typeof (__ComObject) }, module_builder);
++			ILGenerator ig = dm.GetILGenerator ();
++			ig.Emit (OpCodes.Ldarg_0);
++			ig.Emit (OpCodes.Call, typeof (__ComObject).GetConstructor (Type.EmptyTypes));
++			ig.Emit (OpCodes.Ldarg_0);
++			ig.Emit (OpCodes.Call, typeof (MSComInterop).GetMethod ("Constructor"));
++			ig.Emit (OpCodes.Ret);
++			CreateMethodDelegate d = (CreateMethodDelegate)Delegate.CreateDelegate (typeof (CreateMethodDelegate), dm, "GetMethodHandle");
++			return d ();
++#else
++			throw new NotSupportedException();
++#endif
++		}
++
++		public static void Constructor (object obj)
++		{
++			IntPtr ptr;
++			uint hr = CoCreateInstance (obj.GetType ().GUID, IntPtr.Zero, 0x1 | 0x4 | 0x10, iid_iunknown, out ptr);
++
++			__ComObject co = obj as __ComObject;
++			Marshal.SetComObjectData (co, str_iunknown, ptr);
++			Console.WriteLine ("After CoCreateInstance hr = {0}, ptr = {1}", hr, ptr);
++		}
++
++		public static IntPtr EmitComMethod (MethodInfo mi)
++		{
++#if NET_2_0
++			System.Reflection.ParameterInfo[] paramInfos = mi.GetParameters ();
++			Type[] paramTypes = new Type[paramInfos.Length+1];
++			int i = 0;
++			paramTypes[0] = typeof (__ComObject);
++			Console.WriteLine ("Parameter Count = {0}", paramInfos.Length);
++			for (i = 0; i < paramInfos.Length; i++) {
++				Console.WriteLine ("Parameter {0} Type = {1}", i, paramInfos[i].ParameterType);
++				paramTypes[i+1] = paramInfos[i].ParameterType;
++			}
++			System.Reflection.Emit.DynamicMethod dm = new System.Reflection.Emit.DynamicMethod (mi.DeclaringType.ToString () + mi.Name, mi.ReturnType, paramTypes, module_builder);
++			System.Reflection.Emit.ILGenerator ig = dm.GetILGenerator ();
++			ig.EmitWriteLine ("In Emitted Com Wrapper " + mi.Name);
++			System.Reflection.Emit.LocalBuilder itf = ig.DeclareLocal (typeof (IntPtr));
++			System.Reflection.Emit.LocalBuilder fptr = ig.DeclareLocal (typeof (IntPtr));
++			System.Reflection.Emit.LocalBuilder hr = ig.DeclareLocal (typeof (int));
++			System.Reflection.Emit.LocalBuilder slot = ig.DeclareLocal (typeof (int));
++			System.Reflection.Emit.LocalBuilder retval = null;
++			if (mi.ReturnType != typeof (void))
++				retval = ig.DeclareLocal (mi.ReturnType);
++
++			// get method slot
++			int mslot = 0;
++			string iid;
++			GetMethodSlot (mi, out mslot, out iid);
++			ig.EmitWriteLine ("Calling Com Method");
++
++			ig.Emit (OpCodes.Ldarg_0);
++			ig.Emit (OpCodes.Ldc_I4, mslot);
++			ig.Emit (OpCodes.Ldstr, iid);
++			ig.Emit (OpCodes.Ldloca, itf);
++			ig.Emit (OpCodes.Ldloca, fptr);
++			ig.Emit (OpCodes.Call, typeof (MSComInterop).GetMethod ("GetItfAndFuncPtr"));
++			ig.Emit (OpCodes.Ldloc, itf);
++			Type[] args = new Type[paramInfos.Length + 1 + (retval == null ? 0 : 1)];
++			args[0] = typeof (IntPtr);
++			i = 0;
++			for (i = 0; i < paramInfos.Length; i++) {
++				ig.Emit (OpCodes.Ldarg, i + 1);
++				args[i + 1] = paramInfos[i].ParameterType;
++			}
++			if (retval != null) {
++				ig.Emit (OpCodes.Ldloca, retval);
++				args[i + 1] = mi.ReturnType.MakeByRefType ();
++			}
++
++			ig.Emit (OpCodes.Ldloc, fptr);
++			ig.EmitCalli (OpCodes.Calli, CallingConvention.StdCall, typeof (int), args);
++			ig.Emit (OpCodes.Stloc, hr);
++
++			if (retval != null) {
++				ig.Emit (OpCodes.Ldloc, retval);
++			}
++			ig.Emit (OpCodes.Ret);
++	
++			CreateMethodDelegate d = (CreateMethodDelegate)Delegate.CreateDelegate (typeof (CreateMethodDelegate), dm, "GetMethodHandle");
++			return d ();
++#else
++			throw new NotImplementedException ();
++#endif
++		}
++
++#if NET_2_0
++		public static void GetMethodSlot (System.Reflection.MethodInfo mi, out int slot, out string guid)
++		{
++			slot = 0;
++			guid = Guid.Empty.ToString ();
++			foreach (Type itf in mi.DeclaringType.GetInterfaces ()) {
++				if (itf == typeof(IEnumerable))
++					continue;
++				System.Reflection.InterfaceMapping im = mi.DeclaringType.GetInterfaceMap (itf);
++				for (int i = 0; i < im.TargetMethods.Length; i++) {
++					if (im.TargetMethods[i] == mi) {
++						slot = Marshal.GetComSlotForMethodInfo (im.InterfaceMethods[i]);
++						guid = im.InterfaceType.GUID.ToString ();
++						return;
++					}
++				}
++			}
++			Console.WriteLine ("mi.DeclaringType {0} is interface {1}", mi.DeclaringType, mi.DeclaringType.IsInterface);
++			if (mi.DeclaringType.IsInterface) {
++				slot = Marshal.GetComSlotForMethodInfo (mi);
++				guid = mi.DeclaringType.GUID.ToString ();
++				return;
++			}
++			Console.WriteLine ("Didn't find slot for method {0}", mi.Name);
++		}
++
++		[UnmanagedFunctionPointer(CallingConvention.StdCall)]
++		public delegate uint QueryInterface (IntPtr pItf, [In, MarshalAs (UnmanagedType.LPStruct)] Guid iid, out IntPtr ptr);
++
++		public unsafe static void GetItfAndFuncPtr (object obj, int slot, string iid, out IntPtr itf, out IntPtr pfunc)
++		{
++			__ComObject co = obj as __ComObject;
++			System.Collections.Hashtable hash_table = co.Hashtable;
++			object val = hash_table[iid];
++			if (val == null) {
++				itf = (IntPtr)Marshal.GetComObjectData (co, str_iunknown);
++				//itf = (IntPtr)hash_table["00000000-0000-0000-C000-000000000046"];
++				IntPtr pqi = *(IntPtr*)itf;
++				pqi = *(IntPtr*)pqi;
++				Console.WriteLine("Before");
++				QueryInterface qi = (QueryInterface)Marshal.GetDelegateForFunctionPointer (pqi, typeof (QueryInterface));
++				Console.WriteLine("After");
++				IntPtr ptr2;
++				uint hr = qi (itf, new Guid (iid), out ptr2);
++				itf = ptr2;
++				Console.WriteLine ("QueryInterface hr = {0}, ptr = {1}", hr, itf);
++				hash_table.Add (iid, itf);
++			}
++			else {
++				itf = (IntPtr)val;
++			}
++			IntPtr pmeth = *(IntPtr*)itf;
++			pmeth = (IntPtr)(pmeth.ToInt32 () + IntPtr.Size * slot);
++			pfunc = *(IntPtr*)pmeth;
++		}
++#endif
++
++		[DllImport ("ole32.dll", CallingConvention = CallingConvention.StdCall)]
++		static extern int CoInitialize (IntPtr pvReserved);
++
++		[DllImport ("ole32.dll", CallingConvention = CallingConvention.StdCall, ExactSpelling = true, PreserveSig = true)]
++		static extern uint CoCreateInstance (
++		   [In, MarshalAs (UnmanagedType.LPStruct)] Guid rclsid,
++		   IntPtr pUnkOuter,
++		   uint dwClsContext,
++		  [In, MarshalAs (UnmanagedType.LPStruct)] Guid riid,
++			out IntPtr pUnk);
++	}
++}
+\ No newline at end of file
+
+Property changes on: mcs/class/corlib/Mono.Interop/MSComInterop.cs
+___________________________________________________________________
+Name: svn:executable
+   + *
+
+Index: mcs/class/corlib/Mono.Interop/ComInteropProxy.cs
+===================================================================
+--- mcs/class/corlib/Mono.Interop/ComInteropProxy.cs	(revision 0)
++++ mcs/class/corlib/Mono.Interop/ComInteropProxy.cs	(revision 0)
+@@ -0,0 +1,84 @@
++//
++// Mono.Interop.ComInteropProxy
++//
++// Authors:
++//   Jonathan Chambers <jonathan.chambers@ansys.com>
++//
++// Copyright (C) 2006 Novell (http://www.novell.com)
++//
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.Reflection;
++using System.Runtime.CompilerServices;
++using System.Runtime.Remoting;
++using System.Runtime.Remoting.Messaging;
++using System.Runtime.Remoting.Proxies;
++
++
++namespace Mono.Interop
++{
++	internal class ComInteropProxy : RealProxy, IRemotingTypeInfo
++	{
++		private __ComObject com_object;
++		private string type_name;
++		public ComInteropProxy (Type t)
++			: base (t)
++		{
++			Console.WriteLine ("ComInteropProxy");
++			com_object = CreateRCW (t) as __ComObject;
++			Console.WriteLine ("com_object = {0}", com_object);
++		}
++
++		[MethodImplAttribute (MethodImplOptions.InternalCall)]
++		private static extern object CreateRCW (Type t);
++
++		public override IMessage Invoke (IMessage msg)
++		{
++			Console.WriteLine ("Invoke");
++
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public string TypeName
++		{
++			get { return type_name; }
++			set { type_name = value; }
++		}
++
++		public bool CanCastTo (Type fromType, object o)
++		{
++			Console.WriteLine ("CanCastTo");
++			Console.WriteLine (fromType);
++			Console.WriteLine (o);
++			if ((fromType.Attributes & TypeAttributes.Import) != 0) {
++				Console.WriteLine ("true");
++				return true;
++			}
++			else {
++				Console.WriteLine ("false");
++				return false;
++			}
++		}
++	}
++}
+\ No newline at end of file
+
+Property changes on: mcs/class/corlib/Mono.Interop/ComInteropProxy.cs
+___________________________________________________________________
+Name: svn:executable
+   + *
+
+Index: mcs/class/corlib/Mono.Interop/XPComInterop.cs
+===================================================================
+--- mcs/class/corlib/Mono.Interop/XPComInterop.cs	(revision 0)
++++ mcs/class/corlib/Mono.Interop/XPComInterop.cs	(revision 0)
+@@ -0,0 +1,46 @@
++//
++// Mono.Interop.XPComInterop
++//
++// Authors:
++//   Jonathan Chambers <jonathan.chambers@ansys.com>
++//
++// Copyright (C) 2006 Novell (http://www.novell.com)
++//
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++using System;
++using System.Reflection;
++
++namespace Mono.Interop
++{
++	internal class XPComInterop : IComInteropSystem
++	{
++		public IntPtr EmitMethod (MethodInfo mi)
++		{
++			throw new NotImplementedException();
++		}
++		public bool CanCastTo (Type fromType, Object o)
++		{
++			throw new NotImplementedException();
++		}
++	}
++}
+\ No newline at end of file
+
+Property changes on: mcs/class/corlib/Mono.Interop/XPComInterop.cs
+___________________________________________________________________
+Name: svn:executable
+   + *
+
+Index: mcs/class/corlib/Mono.Interop/ComInteropSystemAttribute.cs
+===================================================================
+--- mcs/class/corlib/Mono.Interop/ComInteropSystemAttribute.cs	(revision 0)
++++ mcs/class/corlib/Mono.Interop/ComInteropSystemAttribute.cs	(revision 0)
+@@ -0,0 +1,52 @@
++//
++// Mono.Interop.ComInteropSystemAttribute
++//
++// Authors:
++//   Jonathan Chambers <jonathan.chambers@ansys.com>
++//
++// Copyright (C) 2006 Novell (http://www.novell.com)
++//
++
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++using System.Reflection;
++
++namespace Mono.Interop
++{
++	internal class ComInteropSystemAttribute : Attribute
++	{
++		Type component_system_type;
++		public ComInteropSystemAttribute (Type system)
++		{
++			component_system_type = system;
++		}
++
++		public Type ComponentSystemType
++		{
++			get
++			{
++				return component_system_type;
++			}
++		}
++	}
++}
+\ No newline at end of file
+
+Property changes on: mcs/class/corlib/Mono.Interop/ComInteropSystemAttribute.cs
+___________________________________________________________________
+Name: svn:executable
+   + *
+
+Index: mcs/class/corlib/corlib.dll.sources
+===================================================================
+--- mcs/class/corlib/corlib.dll.sources	(revision 61873)
++++ mcs/class/corlib/corlib.dll.sources	(working copy)
+@@ -17,6 +17,12 @@
+ Mono.Globalization.Unicode/SortKey.cs
+ Mono.Globalization.Unicode/SortKeyBuffer.cs
+ Mono/Runtime.cs
++Mono.Interop/ComInterop.cs
++Mono.Interop/ComInteropProxy.cs
++Mono.Interop/ComInteropSystemAttribute.cs
++Mono.Interop/IComInteropSystem.cs
++Mono.Interop/MSComInterop.cs
++Mono.Interop/XPComInterop.cs
+ Mono.Math/BigInteger.cs
+ Mono.Math.Prime/ConfidenceFactor.cs
+ Mono.Math.Prime/PrimalityTests.cs
+Index: mcs/class/corlib/System/__ComObject.cs
+===================================================================
+--- mcs/class/corlib/System/__ComObject.cs	(revision 61873)
++++ mcs/class/corlib/System/__ComObject.cs	(working copy)
+@@ -30,6 +30,8 @@
+ // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ //
+ 
++using System.Collections;
++
+ namespace System
+ {
+ 	// This is a private class that is used as a generic wrapper class
+@@ -45,8 +47,21 @@
+ 
+ 	internal class __ComObject : MarshalByRefObject
+ 	{
+-		private __ComObject ()
++		// this is used internally and for the the methods
++		// Marshal.GetComObjectData and Marshal.SetComObjectData
++		Hashtable hashtable;
++		public __ComObject ()
+ 		{
++			Console.WriteLine ("__ComObject");
++			hashtable = new Hashtable ();
+ 		}
++
++		public Hashtable Hashtable
++		{
++			get
++			{
++				return hashtable;
++			}
++		}
+ 	}
+ }
+Index: mcs/class/corlib/System.Runtime.Remoting.Activation/ActivationServices.cs
+===================================================================
+--- mcs/class/corlib/System.Runtime.Remoting.Activation/ActivationServices.cs	(revision 61873)
++++ mcs/class/corlib/System.Runtime.Remoting.Activation/ActivationServices.cs	(working copy)
+@@ -67,14 +67,14 @@
+ 
+ 		public static IMessage RemoteActivate (IConstructionCallMessage ctorCall)
+ 		{
+-			try 
++			try 
+ 			{
+ 				return ctorCall.Activator.Activate (ctorCall);
+ 			}
+-			catch (Exception ex) 
++			catch (Exception ex) 
+ 			{
+ 				return new ReturnMessage (ex, ctorCall);
+-			}		
++			}		
+ 		}
+ 
+ 		public static object CreateProxyFromAttributes (Type type, object[] activationAttributes)
+@@ -204,6 +204,9 @@
+ 			if (type.IsContextful)
+ 				return RemotingServices.CreateClientProxyForContextBound (type, null);
+ 
++			if ((type.Attributes & TypeAttributes.Import) != 0)
++				return RemotingServices.CreateClientProxyForComInterop (type);
++
+ 			return null;
+ 		}
+ 
+Index: mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(revision 61873)
++++ mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(working copy)
+@@ -232,9 +232,17 @@
+ 		}
+ #endif
+ 
+-		[MonoTODO]
+ 		public static object GetComObjectData (object obj, object key) {
+-			throw new NotImplementedException ();
++			if (obj == null)
++				throw new ArgumentNullException ("obj");
++			if (key == null)
++				throw new ArgumentNullException ("key");
++
++			__ComObject com_object = obj as __ComObject;
++			if (com_object == null)
++				throw new ArgumentException ("obj is not a COM object", "obj");
++
++			return com_object.Hashtable[key];
+ 		}
+ 
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+@@ -298,8 +306,14 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO]
+ 		public static IntPtr GetIUnknownForObject (object o) {
++			// only handle case of RCW objects for now
++			__ComObject co = o as __ComObject;
++			if (co != null) {
++				IntPtr pUnk = (IntPtr)GetComObjectData (co, Mono.Interop.MSComInterop.IUnknown);
++				AddRef (pUnk);
++				return pUnk;
++			}
+ 			throw new NotImplementedException ();
+ 		}
+ 
+@@ -416,9 +430,10 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO]
+ 		public static bool IsComObject (object o) {
+-			throw new NotImplementedException ();
++			Type t = o.GetType ();
++			object[] attrs = t.GetCustomAttributes (typeof (ComImportAttribute), true);
++			return (attrs != null && attrs.Length > 0);
+ 		}
+ 
+ 		[MonoTODO]
+@@ -588,9 +603,18 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO]
+ 		public static bool SetComObjectData (object obj, object key, object data) {
+-			throw new NotImplementedException ();
++			if (obj == null)
++				throw new ArgumentNullException ("obj");
++			if (key == null)
++				throw new ArgumentNullException ("key");
++
++			__ComObject com_object = obj as __ComObject;
++			if (com_object == null)
++				throw new ArgumentException ("obj is not a COM object", "obj");
++
++			com_object.Hashtable[key] = data;
++			return true;
+ 		}
+ 
+ 		public static int SizeOf (object structure) {
+Index: mcs/class/corlib/System.Reflection.Emit/DynamicMethod.cs
+===================================================================
+--- mcs/class/corlib/System.Reflection.Emit/DynamicMethod.cs	(revision 61873)
++++ mcs/class/corlib/System.Reflection.Emit/DynamicMethod.cs	(working copy)
+@@ -337,6 +337,12 @@
+ 			nrefs += 2;
+ 			return nrefs - 1;
+ 		}
++
++		internal IntPtr GetMethodHandle()
++		{
++			CreateDynMethod();
++			return mhandle.Value;
++		}
+ 	}
+ 
+ 	internal class DynamicMethodTokenGenerator : TokenGenerator {
+Index: mcs/class/corlib/System.Runtime.Remoting/RemotingServices.cs
+===================================================================
+--- mcs/class/corlib/System.Runtime.Remoting/RemotingServices.cs	(revision 61873)
++++ mcs/class/corlib/System.Runtime.Remoting/RemotingServices.cs	(working copy)
+@@ -529,6 +529,12 @@
+ 			RemotingProxy proxy = new RemotingProxy (type, ChannelServices.CrossContextUrl, activationAttributes);
+ 			return proxy.GetTransparentProxy();
+ 		}
++
++		internal static object CreateClientProxyForComInterop (Type type)
++		{
++			Mono.Interop.ComInteropProxy proxy = new Mono.Interop.ComInteropProxy (type);
++			return proxy.GetTransparentProxy ();
++		}
+ 	
+ 		internal static Identity GetIdentityForUri (string uri)
+ 		{

@@ -1,0 +1,677 @@
+Index: metadata/class.c
+===================================================================
+--- metadata/class.c	(revision 113656)
++++ metadata/class.c	(working copy)
+@@ -3320,6 +3320,15 @@
+ 		class->vtable_size = cur_slot;
+ 	}
+ 
++	/* FIXME: only do this if the class is actually sharable */
++	if (class->valuetype && (class->generic_class || class->generic_container) &&
++			mono_class_generic_sharing_enabled (class)) {
++		for (i = 0; i < max_vtsize; ++i) {
++			if (vtable [i] && vtable [i]->wrapper_type == MONO_WRAPPER_NONE)
++				vtable [i] = mono_marshal_get_static_rgctx_invoke (vtable [i]);
++		}
++	}
++
+ 	/* Try to share the vtable with our parent. */
+ 	if (class->parent && (class->parent->vtable_size == class->vtable_size) && (memcmp (class->parent->vtable, vtable, sizeof (gpointer) * class->vtable_size) == 0)) {
+ 		mono_memory_barrier ();
+Index: metadata/icall.c
+===================================================================
+--- metadata/icall.c	(revision 113656)
++++ metadata/icall.c	(working copy)
+@@ -5818,7 +5818,8 @@
+ 	/* FIXME: only do this for methods which can be shared! */
+ 	if ((method->is_inflated && mono_method_get_context (method)->method_inst &&
+ 					mono_class_generic_sharing_enabled (method->klass)) ||
+-			((method->flags & METHOD_ATTRIBUTE_STATIC) && method->klass->generic_class)) {
++			(((method->flags & METHOD_ATTRIBUTE_STATIC) || method->klass->valuetype) &&
++					method->klass->generic_class)) {
+ 		method = mono_marshal_get_static_rgctx_invoke (method);
+ 		func = mono_compile_method (method);
+ 	} else if (method->dynamic) {
+Index: mini/method-to-ir.c
+===================================================================
+--- mini/method-to-ir.c	(revision 113656)
++++ mini/method-to-ir.c	(working copy)
+@@ -105,10 +105,6 @@
+ 			goto exception_exit;	\
+ 		}			\
+ 	} while (0)
+-#define GENERIC_SHARING_FAILURE_IF_VALUETYPE_METHOD(opcode) do {			\
+-		if (method->klass->valuetype)	\
+-			GENERIC_SHARING_FAILURE ((opcode)); \
+-	} while (0)
+ 
+ /* Determine whenever 'ins' represents a load of the 'this' argument */
+ #define MONO_CHECK_THIS(ins) (mono_method_signature (cfg->method)->hasthis && ((ins)->opcode == OP_MOVE) && ((ins)->sreg1 == cfg->args [0]->dreg))
+@@ -2239,12 +2235,17 @@
+ {
+ #ifdef MONO_ARCH_RGCTX_REG
+ 	MonoCallInst *call;
+-	int rgctx_reg = mono_alloc_preg (cfg);
++	int rgctx_reg;
+ 
+-	MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, rgctx_reg, rgctx_arg->dreg);
++	if (rgctx_arg) {
++		rgctx_reg = mono_alloc_preg (cfg);
++		MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, rgctx_reg, rgctx_arg->dreg);
++	}
+ 	call = (MonoCallInst*)mono_emit_calli (cfg, sig, args, addr);
+-	mono_call_inst_add_outarg_reg (cfg, call, rgctx_reg, MONO_ARCH_RGCTX_REG, FALSE);
+-	cfg->uses_rgctx_reg = TRUE;
++	if (rgctx_arg) {
++		mono_call_inst_add_outarg_reg (cfg, call, rgctx_reg, MONO_ARCH_RGCTX_REG, FALSE);
++		cfg->uses_rgctx_reg = TRUE;
++	}
+ 	return (MonoInst*)call;
+ #else
+ 	g_assert_not_reached ();
+@@ -2377,6 +2378,34 @@
+ 	return (MonoInst*)call;
+ }
+ 
++static MonoInst*
++mono_emit_rgctx_method_call_full (MonoCompile *cfg, MonoMethod *method, MonoMethodSignature *sig,
++		MonoInst **args, MonoInst *this, MonoInst *imt_arg, MonoInst *vtable_arg)
++{
++#ifdef MONO_ARCH_RGCTX_REG
++	int rgctx_reg;
++	MonoInst *ins;
++	MonoCallInst *call;
++
++	if (vtable_arg) {
++		rgctx_reg = mono_alloc_preg (cfg);
++		MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, rgctx_reg, vtable_arg->dreg);
++	}
++	ins = mono_emit_method_call_full (cfg, method, sig, args, this, imt_arg);
++
++	call = (MonoCallInst*)ins;
++	if (vtable_arg) {
++		mono_call_inst_add_outarg_reg (cfg, call, rgctx_reg, MONO_ARCH_RGCTX_REG, FALSE);
++		cfg->uses_rgctx_reg = TRUE;
++	}
++
++	return ins;
++#else
++	NOT_IMPLEMENTED;
++	return NULL;
++#endif
++}
++
+ static inline MonoInst*
+ mono_emit_method_call (MonoCompile *cfg, MonoMethod *method, MonoInst **args, MonoInst *this)
+ {
+@@ -2523,9 +2552,11 @@
+ {
+ 	MonoInst *this = NULL;
+ 
+-	g_assert (!method->klass->valuetype);
++	g_assert (cfg->generic_sharing_context);
+ 
+-	if (!(method->flags & METHOD_ATTRIBUTE_STATIC) && !(context_used & MONO_GENERIC_CONTEXT_USED_METHOD))
++	if (!(method->flags & METHOD_ATTRIBUTE_STATIC) &&
++			!(context_used & MONO_GENERIC_CONTEXT_USED_METHOD) &&
++			!method->klass->valuetype)
+ 		EMIT_NEW_ARGLOAD (cfg, this, 0);
+ 
+ 	if (context_used & MONO_GENERIC_CONTEXT_USED_METHOD) {
+@@ -2538,7 +2569,7 @@
+ 		EMIT_NEW_TEMPLOAD (cfg, mrgctx_var, mrgctx_loc->inst_c0);
+ 
+ 		return mrgctx_var;
+-	} else if (method->flags & METHOD_ATTRIBUTE_STATIC) {
++	} else if (method->flags & METHOD_ATTRIBUTE_STATIC || method->klass->valuetype) {
+ 		MonoInst *vtable_loc, *vtable_var;
+ 
+ 		g_assert (!this);
+@@ -2568,7 +2599,6 @@
+ }
+ 
+ #define EMIT_GET_RGCTX(rgctx, context_used) do {				\
+-		GENERIC_SHARING_FAILURE_IF_VALUETYPE_METHOD(*ip);	\
+ 		(rgctx) = emit_get_rgctx (cfg, method, (context_used)); \
+ 	} while (0)
+ 
+@@ -2629,8 +2659,11 @@
+ 	MonoMethod* method = mono_class_get_method_from_name (klass, "Unbox", 1);
+ 
+ 	if (context_used) {
++		/* FIXME: What if the class is shared?  We might not
++		   have to get the address of the method from the
++		   RGCTX. */
+ 		MonoInst *addr = emit_get_rgctx_method (cfg, context_used, rgctx, method,
+-												MONO_RGCTX_INFO_GENERIC_METHOD_CODE);
++			MONO_RGCTX_INFO_GENERIC_METHOD_CODE);
+ 
+ 		return mono_emit_rgctx_calli (cfg, mono_method_signature (method), &val, addr, rgctx);
+ 	} else {
+@@ -2782,8 +2815,10 @@
+ 
+ 	if (mono_class_is_nullable (klass)) {
+ 		MonoMethod* method = mono_class_get_method_from_name (klass, "Box", 1);
++		/* FIXME: What if the class is shared?  We might not
++		   have to get the method address from the RGCTX. */
+ 		MonoInst *addr = emit_get_rgctx_method (cfg, context_used, rgctx, method,
+-												MONO_RGCTX_INFO_GENERIC_METHOD_CODE);
++			MONO_RGCTX_INFO_GENERIC_METHOD_CODE);
+ 
+ 		return mono_emit_rgctx_calli (cfg, mono_method_signature (method), &val, addr, rgctx);
+ 	} else {
+@@ -5080,7 +5115,8 @@
+ 				 * methods) are live.
+ 				 */
+ 				if ((method->flags & METHOD_ATTRIBUTE_STATIC) ||
+-						mini_method_get_context (method)->method_inst) {
++						mini_method_get_context (method)->method_inst ||
++						method->klass->valuetype) {
+ 					mono_get_vtable_var (cfg);
+ 				} else {
+ 					MonoInst *dummy_use;
+@@ -5780,7 +5816,7 @@
+ 				UNVERIFIED;
+ 
+ 
+-			if (cmethod && (cmethod->flags & METHOD_ATTRIBUTE_STATIC) &&
++			if (cmethod && ((cmethod->flags & METHOD_ATTRIBUTE_STATIC) || cmethod->klass->valuetype) &&
+ 					(cmethod->klass->generic_class || cmethod->klass->generic_container)) {
+ 				gboolean sharing_enabled = mono_class_generic_sharing_enabled (cmethod->klass);
+ 				MonoGenericContext *context = mini_class_get_context (cmethod->klass);
+@@ -5835,7 +5871,8 @@
+ 				 * should be a flag in the cfg to
+ 				 * request a generic sharing context.
+ 				 */
+-				if (context_used && method->flags & METHOD_ATTRIBUTE_STATIC)
++				if (context_used &&
++						((method->flags & METHOD_ATTRIBUTE_STATIC) || method->klass->valuetype))
+ 					mono_get_vtable_var (cfg);
+ 			}
+ 
+@@ -6067,14 +6104,11 @@
+ 			/* Generic sharing */
+ 			/* FIXME: only do this for generic methods if
+ 			   they are not shared! */
+-			if (context_used &&
+-					(cmethod->klass->valuetype ||
+-					(cmethod->is_inflated && mono_method_get_context (cmethod)->method_inst && !pass_mrgctx) ||
+-					((cmethod->flags & METHOD_ATTRIBUTE_STATIC) &&
+-						mono_class_generic_sharing_enabled (cmethod->klass)) ||
+-					(!imt_arg && !mono_method_is_generic_sharable_impl (cmethod, TRUE) &&
+-						(!virtual || cmethod->flags & METHOD_ATTRIBUTE_FINAL ||
+-						!(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL))))) {
++			if (context_used && !imt_arg &&
++					(!mono_method_is_generic_sharable_impl (cmethod, TRUE) ||
++						!mono_class_generic_sharing_enabled (cmethod->klass)) &&
++					(!virtual || cmethod->flags & METHOD_ATTRIBUTE_FINAL ||
++						!(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL))) {
+ 				MonoInst *rgctx;
+ 
+ 				INLINE_FAILURE;
+@@ -6219,18 +6253,8 @@
+ 			/* Common call */
+ 			INLINE_FAILURE;
+ 			if (vtable_arg) {
+-#ifdef MONO_ARCH_RGCTX_REG
+-				MonoCallInst *call;
+-				int rgctx_reg = mono_alloc_preg (cfg);
+-
+-				MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, rgctx_reg, vtable_arg->dreg);
+-				ins = (MonoInst*)mono_emit_method_call_full (cfg, cmethod, fsig, sp, virtual ? sp [0] : NULL, NULL);
+-				call = (MonoCallInst*)ins;
+-				mono_call_inst_add_outarg_reg (cfg, call, rgctx_reg, MONO_ARCH_RGCTX_REG, FALSE);
+-				cfg->uses_rgctx_reg = TRUE;
+-#else
+-				NOT_IMPLEMENTED;
+-#endif
++				ins = mono_emit_rgctx_method_call_full (cfg, cmethod, fsig, sp, virtual ? sp [0] : NULL,
++					NULL, vtable_arg);
+ 			} else if (imt_arg) {
+ 				ins = (MonoInst*)mono_emit_method_call_full (cfg, cmethod, fsig, sp, virtual ? sp [0] : NULL, imt_arg);
+ 			} else {
+@@ -6934,7 +6958,8 @@
+ 			MonoMethodSignature *fsig;
+ 			MonoInst this_ins;
+ 			MonoInst *alloc;
+-			
++			MonoInst *vtable_arg = NULL;
++
+ 			CHECK_OPSIZE (5);
+ 			token = read32 (ip + 1);
+ 			cmethod = mini_get_method (cfg, method, token, NULL, generic_context);
+@@ -6958,6 +6983,40 @@
+ 				ensure_method_is_allowed_to_call_method (cfg, method, cmethod, bblock, ip);
+  			}
+ 
++			if (cmethod->klass->valuetype && mono_class_generic_sharing_enabled (cmethod->klass) &&
++					mono_method_is_generic_sharable_impl (cmethod, TRUE)) {
++				if (cmethod->is_inflated && mono_method_get_context (cmethod)->method_inst) {
++					if (context_used) {
++						MonoInst *rgctx;
++
++						rgctx = emit_get_rgctx (cfg, method, context_used);
++						vtable_arg = emit_get_rgctx_method (cfg, context_used, rgctx,
++							cmethod, MONO_RGCTX_INFO_METHOD_RGCTX);
++					} else {
++						MonoVTable *vtable = mono_class_vtable (cfg->domain, cmethod->klass);
++						MonoMethodRuntimeGenericContext *mrgctx;
++
++						mrgctx = mono_method_lookup_rgctx (vtable,
++							mini_method_get_context (cmethod)->method_inst);
++
++						EMIT_NEW_PCONST (cfg, vtable_arg, mrgctx);
++					}
++				} else {
++					if (context_used) {
++						MonoInst *rgctx;
++
++						rgctx = emit_get_rgctx (cfg, method, context_used);
++						vtable_arg = emit_get_rgctx_klass (cfg, context_used, rgctx,
++							cmethod->klass, MONO_RGCTX_INFO_VTABLE);
++					} else {
++						MonoVTable *vtable = mono_class_vtable (cfg->domain, cmethod->klass);
++
++						CHECK_TYPELOAD (cmethod->klass);
++						EMIT_NEW_VTABLECONST (cfg, vtable_arg, vtable);
++					}
++				}
++			}
++
+ 			n = fsig->param_count;
+ 			CHECK_STACK (n);
+ 
+@@ -6969,7 +7028,9 @@
+ 				((n < 1) || (!fsig->params [0]->byref && fsig->params [0]->type == MONO_TYPE_STRING)) && 
+ 				((n < 2) || (!fsig->params [1]->byref && fsig->params [1]->type == MONO_TYPE_STRING))) {
+ 				MonoInst *iargs [3];
+-				
++
++				g_assert (!vtable_arg);
++
+ 				sp -= n;
+ 
+ 				EMIT_NEW_ICONST (cfg, iargs [0], cmethod->klass->type_token);
+@@ -7011,6 +7072,7 @@
+ 
+ 			if (mini_class_is_system_array (cmethod->klass)) {
+ 				g_assert (!context_used);
++				g_assert (!vtable_arg);
+ 				EMIT_NEW_METHODCONST (cfg, *sp, cmethod);
+ 
+ 				/* Avoid varargs in the common case */
+@@ -7022,6 +7084,7 @@
+ 					alloc = handle_array_new (cfg, fsig->param_count, sp, ip);
+ 			} else if (cmethod->string_ctor) {
+ 				g_assert (!context_used);
++				g_assert (!vtable_arg);
+ 				/* we simply pass a null pointer */
+ 				EMIT_NEW_PCONST (cfg, *sp, NULL); 
+ 				/* now call the string ctor */
+@@ -7082,8 +7145,8 @@
+ 				/* Avoid virtual calls to ctors if possible */
+ 				if (cmethod->klass->marshalbyref)
+ 					callvirt_this_arg = sp [0];
+-				
+-				if ((cfg->opt & MONO_OPT_INLINE) && cmethod && !context_used &&
++
++				if ((cfg->opt & MONO_OPT_INLINE) && cmethod && !context_used && !vtable_arg &&
+ 				    mono_method_check_inlining (cfg, cmethod) &&
+ 				    !mono_class_is_subclass_of (cmethod->klass, mono_defaults.exception_class, FALSE) &&
+ 				    !g_list_find (dont_inline, cmethod)) {
+@@ -7099,8 +7162,8 @@
+ 						mono_emit_method_call_full (cfg, cmethod, fsig, sp, callvirt_this_arg, NULL);
+ 					}
+ 				} else if (context_used &&
+-						(cmethod->klass->valuetype ||
+-						 !mono_method_is_generic_sharable_impl (cmethod, TRUE))) {
++						(!mono_method_is_generic_sharable_impl (cmethod, TRUE) ||
++							!mono_class_generic_sharing_enabled (cmethod->klass))) {
+ 					MonoInst *rgctx, *cmethod_addr;
+ 
+ 					g_assert (!callvirt_this_arg);
+@@ -7109,10 +7172,11 @@
+ 					cmethod_addr = emit_get_rgctx_method (cfg, context_used, rgctx,
+ 														  cmethod, MONO_RGCTX_INFO_GENERIC_METHOD_CODE);
+ 
+-					mono_emit_calli (cfg, fsig, sp, cmethod_addr);
++					mono_emit_rgctx_calli (cfg, fsig, sp, cmethod_addr, vtable_arg);
+ 				} else {
+ 					INLINE_FAILURE;
+-					mono_emit_method_call_full (cfg, cmethod, fsig, sp, callvirt_this_arg, NULL);
++					mono_emit_rgctx_method_call_full (cfg, cmethod, fsig, sp,
++							callvirt_this_arg, NULL, vtable_arg);
+ 				}
+ 			}
+ 
+@@ -7261,8 +7325,6 @@
+ 				if (context_used) {
+ 					MonoInst *iargs [2];
+ 
+-					GENERIC_SHARING_FAILURE_IF_VALUETYPE_METHOD (*ip);
+-
+ 					/* obj */
+ 					iargs [0] = *sp;
+ 					/* klass */
+@@ -8782,7 +8844,7 @@
+ 					context_used = mono_method_check_context_used (cmethod);
+ 
+ 				if (mono_class_generic_sharing_enabled (cmethod->klass)) {
+-					if ((cmethod->flags & METHOD_ATTRIBUTE_STATIC) &&
++					if (((cmethod->flags & METHOD_ATTRIBUTE_STATIC) || cmethod->klass->valuetype) &&
+ 							(cmethod->klass->generic_class ||
+ 							cmethod->klass->generic_container)) {
+ 						is_shared = TRUE;
+Index: mini/mini.c
+===================================================================
+--- mini/mini.c	(revision 113656)
++++ mini/mini.c	(working copy)
+@@ -115,16 +115,12 @@
+ 			goto exception_exit;	\
+ 		}			\
+ 	} while (0)
+-#define GENERIC_SHARING_FAILURE_IF_VALUETYPE_METHOD(opcode) do {			\
+-		if (method->klass->valuetype)	\
+-			GENERIC_SHARING_FAILURE ((opcode)); \
+-	} while (0)
+ #define GET_RGCTX(rgctx, context_used) do {						\
+ 		MonoInst *this = NULL;					\
+ 		g_assert (context_used);				\
+-		GENERIC_SHARING_FAILURE_IF_VALUETYPE_METHOD(*ip);	\
+ 		if (!(method->flags & METHOD_ATTRIBUTE_STATIC) &&	\
+-				!((context_used) & MONO_GENERIC_CONTEXT_USED_METHOD)) \
++				!((context_used) & MONO_GENERIC_CONTEXT_USED_METHOD) &&	\
++				!method->klass->valuetype)		\
+ 			NEW_ARGLOAD (cfg, this, 0);			\
+ 		(rgctx) = get_runtime_generic_context (cfg, method, (context_used), this, ip); \
+ 	} while (0)
+@@ -4895,8 +4891,11 @@
+ static MonoInst*
+ get_runtime_generic_context (MonoCompile *cfg, MonoMethod *method, int context_used, MonoInst *this, unsigned char *ip)
+ {
+-	g_assert (!method->klass->valuetype);
++	g_assert (cfg->generic_sharing_context);
+ 
++	if (method->klass->valuetype)
++		g_assert (!this);
++
+ 	if (context_used & MONO_GENERIC_CONTEXT_USED_METHOD) {
+ 		MonoInst *mrgctx_loc, *mrgctx_var;
+ 
+@@ -4907,7 +4906,7 @@
+ 		NEW_TEMPLOAD (cfg, mrgctx_var, mrgctx_loc->inst_c0);
+ 
+ 		return mrgctx_var;
+-	} else if (method->flags & METHOD_ATTRIBUTE_STATIC) {
++	} else if ((method->flags & METHOD_ATTRIBUTE_STATIC) || method->klass->valuetype) {
+ 		MonoInst *vtable_loc, *vtable_var;
+ 
+ 		g_assert (!this);
+@@ -5023,6 +5022,9 @@
+ 	MonoMethodSignature *signature = mono_method_signature (method);
+ 
+ 	if (rgctx) {
++		/* FIXME: What if the class is shared?  We might not
++		   have to get the address of the method from the
++		   RGCTX. */
+ 		MonoInst *addr = get_runtime_generic_context_method (cfg, caller_method, context_used, bblock, method,
+ 			generic_context, rgctx, MONO_RGCTX_INFO_GENERIC_METHOD_CODE, ip);
+ 
+@@ -5042,6 +5044,8 @@
+ 
+ 	g_assert (mono_class_is_nullable (klass));
+ 
++	/* FIXME: What if the class is shared?  We might not have to
++	   get the method address from the RGCTX. */
+ 	method_addr = get_runtime_generic_context_method (cfg, caller_method, context_used, bblock, method,
+ 			generic_context, rgctx, MONO_RGCTX_INFO_GENERIC_METHOD_CODE, ip);
+ 	temp = mono_emit_rgctx_calli_spilled (cfg, bblock, mono_method_signature (method), &val,
+@@ -5139,9 +5143,6 @@
+ 	*_inline_costs = inline_costs;
+ 	*_real_offset = real_offset;
+ 	return return_value;
+-exception_exit:
+-	return_value = -2;
+-	goto do_return;
+ unverified:
+ 	return_value = -1;
+ 	goto do_return;
+@@ -5198,16 +5199,12 @@
+ 	add->klass = klass;
+ 	*sp = add;
+ 
+-do_return:
+ 	*_bblock = bblock;
+ 	*_ip = ip;
+ 	*_sp = sp;
+ 	*_inline_costs = inline_costs;
+ 	*_real_offset = real_offset;
+ 	return return_value;
+-exception_exit:
+-	return_value = -2;
+-	goto do_return;
+ }
+ 
+ gboolean
+@@ -5489,7 +5486,8 @@
+ 				 * methods) are live.
+ 				 */
+ 				if ((method->flags & METHOD_ATTRIBUTE_STATIC) ||
+-						mini_method_get_context (method)->method_inst) {
++						mini_method_get_context (method)->method_inst ||
++						method->klass->valuetype) {
+ 					mono_get_vtable_var (cfg);
+ 				} else {
+ 					MonoInst *this, *dummy_use;
+@@ -6188,7 +6186,7 @@
+ 			if (*ip != CEE_CALLI && check_call_signature (cfg, fsig, sp))
+ 				UNVERIFIED;
+ 
+-			if (cmethod && (cmethod->flags & METHOD_ATTRIBUTE_STATIC) &&
++			if (cmethod && ((cmethod->flags & METHOD_ATTRIBUTE_STATIC) || cmethod->klass->valuetype) &&
+ 					(cmethod->klass->generic_class || cmethod->klass->generic_container)) {
+ 				gboolean sharing_enabled = mono_class_generic_sharing_enabled (cmethod->klass);
+ 				MonoGenericContext *context = mini_class_get_context (cmethod->klass);
+@@ -6243,7 +6241,7 @@
+ 				 * should be a flag in the cfg to
+ 				 * request a generic sharing context.
+ 				 */
+-				if (context_used && method->flags & METHOD_ATTRIBUTE_STATIC)
++				if (context_used && ((method->flags & METHOD_ATTRIBUTE_STATIC) || method->klass->valuetype))
+ 					mono_get_vtable_var (cfg);
+ 			}
+ 
+@@ -6511,16 +6509,11 @@
+ 			else
+ 				no_spill = FALSE;
+ 
+-			/* FIXME: only do this for generic methods if
+-			   they are not shared! */
+-			if (context_used &&
+-					(cmethod->klass->valuetype ||
+-					(cmethod->is_inflated && mono_method_get_context (cmethod)->method_inst && !pass_mrgctx) ||
+-					((cmethod->flags & METHOD_ATTRIBUTE_STATIC) &&
+-						mono_class_generic_sharing_enabled (cmethod->klass)) ||
+-					(!imt_arg && !mono_method_is_generic_sharable_impl (cmethod, TRUE) &&
+-						(!virtual || cmethod->flags & METHOD_ATTRIBUTE_FINAL ||
+-						!(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL))))) {
++			if (context_used && !imt_arg &&
++					(!mono_method_is_generic_sharable_impl (cmethod, TRUE) ||
++						!mono_class_generic_sharing_enabled (cmethod->klass)) &&
++					(!virtual || cmethod->flags & METHOD_ATTRIBUTE_FINAL ||
++						!(cmethod->flags & METHOD_ATTRIBUTE_VIRTUAL))) {
+ 				MonoInst *rgctx;
+ 
+ 				INLINE_FAILURE;
+@@ -7323,6 +7316,7 @@
+ 			MonoMethodSignature *fsig;
+ 			MonoInst this_ins;
+ 			int temp;
++			MonoInst *vtable_arg = NULL;
+ 
+ 			CHECK_OPSIZE (5);
+ 			token = read32 (ip + 1);
+@@ -7347,6 +7341,41 @@
+ 				ensure_method_is_allowed_to_call_method (cfg, method, cmethod, bblock, ip);
+ 			}
+ 
++			if (cmethod->klass->valuetype && mono_class_generic_sharing_enabled (cmethod->klass) &&
++					mono_method_is_generic_sharable_impl (cmethod, TRUE)) {
++				if (cmethod->is_inflated && mono_method_get_context (cmethod)->method_inst) {
++					if (context_used) {
++						MonoInst *rgctx;
++
++						GET_RGCTX (rgctx, context_used);
++						vtable_arg = get_runtime_generic_context_method_rgctx (cfg, method,
++							context_used, bblock, cmethod, generic_context, rgctx, ip);
++					} else {
++						MonoVTable *vtable = mono_class_vtable (cfg->domain, cmethod->klass);
++						MonoMethodRuntimeGenericContext *mrgctx;
++
++						mrgctx = mono_method_lookup_rgctx (vtable,
++							mini_method_get_context (cmethod)->method_inst);
++
++						NEW_PCONST (cfg, vtable_arg, mrgctx);
++					}
++				} else {
++					if (context_used) {
++						MonoInst *rgctx;
++
++						GET_RGCTX (rgctx, context_used);
++						vtable_arg = get_runtime_generic_context_ptr (cfg, method, context_used,
++							bblock, cmethod->klass, generic_context,
++							rgctx, MONO_RGCTX_INFO_VTABLE, ip);
++					} else {
++						MonoVTable *vtable = mono_class_vtable (cfg->domain, cmethod->klass);
++
++						CHECK_TYPELOAD (cmethod->klass);
++						NEW_VTABLECONST (cfg, vtable_arg, vtable);
++					}
++				}
++			}
++
+ 			n = fsig->param_count;
+ 			CHECK_STACK (n);
+  
+@@ -7359,7 +7388,9 @@
+ 				((n < 2) || (!fsig->params [1]->byref && fsig->params [1]->type == MONO_TYPE_STRING))) {
+ 				MonoInst *iargs [3];
+ 				int temp;
+-				
++
++				g_assert (!vtable_arg);
++
+ 				sp -= n;
+ 
+ 				NEW_ICONST (cfg, iargs [0], cmethod->klass->type_token);
+@@ -7403,6 +7434,7 @@
+ 
+ 			if (mini_class_is_system_array (cmethod->klass)) {
+ 				g_assert (!context_used);
++				g_assert (!vtable_arg);
+ 
+ 				NEW_METHODCONST (cfg, *sp, cmethod);
+ 
+@@ -7413,6 +7445,7 @@
+ 					temp = handle_array_new (cfg, bblock, fsig->param_count, sp, ip);
+ 			} else if (cmethod->string_ctor) {
+ 				g_assert (!context_used);
++				g_assert (!vtable_arg);
+ 
+ 				/* we simply pass a null pointer */
+ 				NEW_PCONST (cfg, *sp, NULL); 
+@@ -7471,7 +7504,7 @@
+ 				if (cmethod->klass->marshalbyref)
+ 					callvirt_this_arg = sp [0];
+ 				
+-				if ((cfg->opt & MONO_OPT_INLINE) && cmethod && !context_used &&
++				if ((cfg->opt & MONO_OPT_INLINE) && cmethod && !context_used && !vtable_arg &&
+ 				    mono_method_check_inlining (cfg, cmethod) &&
+ 				    !mono_class_is_subclass_of (cmethod->klass, mono_defaults.exception_class, FALSE) &&
+ 				    !g_list_find (dont_inline, cmethod)) {
+@@ -7502,8 +7535,8 @@
+ 						mono_emit_method_call_spilled (cfg, bblock, cmethod, fsig, sp, ip, callvirt_this_arg);
+ 					}
+ 				} else if (context_used &&
+-						(cmethod->klass->valuetype ||
+-						!mono_method_is_generic_sharable_impl (cmethod, TRUE))) {
++						(!mono_method_is_generic_sharable_impl (cmethod, TRUE) ||
++							!mono_class_generic_sharing_enabled (cmethod->klass))) {
+ 					MonoInst *rgctx, *cmethod_addr;
+ 
+ 					g_assert (!callvirt_this_arg);
+@@ -7513,12 +7546,13 @@
+ 							bblock, cmethod,
+ 							generic_context, rgctx, MONO_RGCTX_INFO_GENERIC_METHOD_CODE, ip);
+ 
+-					mono_emit_calli_spilled (cfg, bblock, fsig, sp, cmethod_addr, ip);
++					mono_emit_rgctx_calli_spilled (cfg, bblock, fsig, sp, cmethod_addr, vtable_arg, ip);
+ 				} else {
+ 					/* Prevent inlining of methods which call other methods */
+ 					INLINE_FAILURE;
+ 					/* now call the actual ctor */
+-					mono_emit_method_call_spilled (cfg, bblock, cmethod, fsig, sp, ip, callvirt_this_arg);
++					mono_emit_rgctx_method_call_spilled (cfg, bblock, cmethod, fsig, sp,
++						vtable_arg, NULL, ip, callvirt_this_arg);
+ 				}
+ 			}
+ 
+@@ -9378,7 +9412,7 @@
+ 					context_used = mono_method_check_context_used (cmethod);
+ 
+ 				if (mono_class_generic_sharing_enabled (cmethod->klass)) {
+-					if ((cmethod->flags & METHOD_ATTRIBUTE_STATIC) &&
++					if (((cmethod->flags & METHOD_ATTRIBUTE_STATIC) || cmethod->klass->valuetype) &&
+ 							(cmethod->klass->generic_class ||
+ 							cmethod->klass->generic_container)) {
+ 						is_shared = TRUE;
+@@ -12956,11 +12990,13 @@
+ 		 */
+ 		if (cfg->rgctx_var ||
+ 				(!(method_to_compile->flags & METHOD_ATTRIBUTE_STATIC) &&
+-				!mini_method_get_context (method_to_compile)->method_inst)) {
++				!mini_method_get_context (method_to_compile)->method_inst &&
++				!method_to_compile->klass->valuetype)) {
+ 			gi->has_this = 1;
+ 
+ 			if ((method_to_compile->flags & METHOD_ATTRIBUTE_STATIC) ||
+-					mini_method_get_context (method_to_compile)->method_inst) {
++					mini_method_get_context (method_to_compile)->method_inst ||
++					method_to_compile->klass->valuetype) {
+ 				inst = cfg->rgctx_var;
+ 				g_assert (inst->opcode == OP_REGOFFSET);
+ 			} else {
+@@ -13517,6 +13553,7 @@
+ 	}
+ 
+ 	if (((method->flags & METHOD_ATTRIBUTE_STATIC) ||
++				method->klass->valuetype ||
+ 				(method->is_inflated && mono_method_get_context (method)->method_inst)) &&
+ 			mono_class_generic_sharing_enabled (method->klass) &&
+ 			mono_method_is_generic_sharable_impl (method, FALSE)) {
+Index: mini/mini-exceptions.c
+===================================================================
+--- mini/mini-exceptions.c	(revision 113656)
++++ mini/mini-exceptions.c	(working copy)
+@@ -735,7 +735,7 @@
+ 		class = mrgctx->class_vtable->klass;
+ 		context.method_inst = mrgctx->method_inst;
+ 		g_assert (context.method_inst);
+-	} else if (ji->method->flags & METHOD_ATTRIBUTE_STATIC) {
++	} else if ((ji->method->flags & METHOD_ATTRIBUTE_STATIC) || ji->method->klass->valuetype) {
+ 		MonoVTable *vtable = info;
+ 
+ 		class = vtable->klass;
+Index: mini/mini-trampolines.c
+===================================================================
+--- mini/mini-trampolines.c	(revision 113656)
++++ mini/mini-trampolines.c	(working copy)
+@@ -178,7 +178,7 @@
+ #else
+ 			g_assert_not_reached ();
+ #endif
+-		} else if (m->flags & METHOD_ATTRIBUTE_STATIC) {
++		} else if ((m->flags & METHOD_ATTRIBUTE_STATIC) || m->klass->valuetype) {
+ #ifdef MONO_ARCH_RGCTX_REG
+ 			MonoVTable *vtable = mono_arch_find_static_call_vtable ((gpointer*)regs, code);
+ 

@@ -1,0 +1,388 @@
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/tools/corcompare/ChangeLog,v
+retrieving revision 1.9
+diff -u -r1.9 ChangeLog
+--- ChangeLog	14 Nov 2003 08:12:13 -0000	1.9
++++ ChangeLog	2 Jun 2004 19:07:39 -0000
+@@ -1,3 +1,9 @@
++2004-06-02  Gert Driesen <drieseng@users.sourceforge.net>
++
++	* mono-api-diff.cs: also report mismatches in protected members
++	* mono-api-info.cs: fixed issue where counters were not output
++	for missing attributes if there were no other mismatches
++
+ 2003-11-14  Gonzalo Paniagua Javier <gonzalo@ximian.com>
+ 
+ 	* mono-api.xsl: handle <interface>, which is different from
+Index: mono-api-diff.cs
+===================================================================
+RCS file: /cvs/public/mcs/tools/corcompare/mono-api-diff.cs,v
+retrieving revision 1.7
+diff -u -r1.7 mono-api-diff.cs
+--- mono-api-diff.cs	16 Dec 2003 03:19:10 -0000	1.7
++++ mono-api-diff.cs	2 Jun 2004 19:07:42 -0000
+@@ -952,7 +952,7 @@
+ 					att = new XMLAttributes ();
+ 
+ 				att.CompareTo (document, parent, oatt);
+-				counters.AddPartialToTotal (att.Counters);
++				counters.AddPartialToPartial(att.Counters);
+ 				if (oatt != null && oatt.IsTodo) {
+ 					counters.Todo++;
+ 					counters.ErrorTotal++;
+@@ -1039,6 +1039,9 @@
+ 
+ 		protected override void CompareToInner (string name, XmlNode parent, XMLNameGroup other)
+ 		{
++			Counters copy = counters;
++			counters = new Counters();
++
+ 			XMLProperties oprop = other as XMLProperties;
+ 			if (oprop != null) {
+ 				XMLMethods m = nameToMethod [name] as XMLMethods;
+@@ -1047,17 +1050,16 @@
+ 					if (m == null)
+ 						m = new XMLMethods ();
+ 
+-					Counters copy = counters;
+-					m.CompareTo (document, parent, om);
+-					counters = new Counters ();
+-					counters.AddPartialToPartial (m.Counters);
+-					AddCountersAttributes (parent);
+-					counters = copy;
+-					counters.AddPartialToPartial (m.Counters);
++					m.CompareTo(document, parent, om);
++					counters.AddPartialToPartial(m.Counters);
+ 				}
+ 			}
+ 
+ 			base.CompareToInner (name, parent, other);
++			AddCountersAttributes(parent);
++
++			copy.AddPartialToPartial(counters);
++			counters = copy;
+ 		}
+ 
+ 		protected override void LoadExtraData (string name, XmlNode node)
+@@ -1167,17 +1169,35 @@
+ 
+ 		protected override void CompareToInner (string name, XmlNode parent, XMLNameGroup other)
+ 		{
+-			base.CompareToInner (name, parent, other);
+-			if (returnTypes == null)
+-				return;
+-
+-			XMLMethods methods = (XMLMethods) other;
+-			string rtype = returnTypes [name] as string;
+-			string ortype = null;
+-			if (methods.returnTypes != null)
+-				ortype = methods.returnTypes [name] as string;
++			// create backup of actual counters
++			Counters copy = counters;
++			// initialize counters for current method
++			counters = new Counters();
++
++			try
++			{
++				base.CompareToInner(name, parent, other);
++				if (returnTypes == null)
++					return;
+ 
+-			AddWarning (parent, "Event type is {0} and should be {1}", ortype, rtype);
++				XMLMethods methods = (XMLMethods)other;
++				string rtype = returnTypes[name] as string;
++				string ortype = null;
++				if (methods.returnTypes != null)
++					ortype = methods.returnTypes[name] as string;
++
++				AddWarning(parent, "Event type is {0} and should be {1}", ortype, rtype);
++			}
++			finally
++			{
++				// output counter attributes in result document
++				AddCountersAttributes(parent);
++
++				// add temporary counters to actual counters
++				copy.AddPartialToPartial(counters);
++				// restore backup of actual counters
++				counters = copy;
++			}
+ 		}
+ 
+ 		protected override string ConvertToString (int att)
+Index: mono-api-info.cs
+===================================================================
+RCS file: /cvs/public/mcs/tools/corcompare/mono-api-info.cs,v
+retrieving revision 1.5
+diff -u -r1.5 mono-api-info.cs
+--- mono-api-info.cs	16 Dec 2003 03:19:10 -0000	1.5
++++ mono-api-info.cs	2 Jun 2004 19:07:42 -0000
+@@ -160,7 +160,7 @@
+ 					continue;
+ 
+ 				if (t.IsNestedPublic || t.IsNestedAssembly || t.IsNestedFamANDAssem ||
+-				    t.IsNestedFamORAssem || t.IsNestedPrivate)
++					t.IsNestedFamORAssem || t.IsNestedPrivate)
+ 					continue;
+ 
+ 				if (t.DeclaringType != null)
+@@ -242,7 +242,8 @@
+ 	{
+ 		Type type;
+ 		const BindingFlags flags = BindingFlags.Public | BindingFlags.Static |
+-					   BindingFlags.Instance | BindingFlags.DeclaredOnly;
++						BindingFlags.Instance | BindingFlags.DeclaredOnly | 
++						BindingFlags.NonPublic;
+ 		
+ 		public TypeData (XmlDocument document, XmlNode parent, Type type)
+ 			: base (document, parent, null)
+@@ -282,49 +283,44 @@
+ 
+ 			ArrayList members = new ArrayList ();
+ 
+-			FieldInfo [] fields = type.GetFields (flags);
+-			if (fields != null && fields.Length > 0) {
+-				fields = FieldRemoveSpecials (fields);
+-				if (fields != null) {
+-					Array.Sort (fields, MemberInfoComparer.Default);
+-					FieldData fd = new FieldData (document, nclass, fields);
+-					// Special case for enum fields
+-					if (classType == "enum") {
+-						string etype = fields [0].GetType ().FullName;
+-						AddAttribute (nclass, "enumtype", etype);
+-					}
+-
+-					members.Add (fd);
++			FieldInfo[] fields = GetFields (type);
++			if (fields.Length > 0) {
++				Array.Sort (fields, MemberInfoComparer.Default);
++				FieldData fd = new FieldData (document, nclass, fields);
++				// Special case for enum fields
++				if (classType == "enum") {
++					string etype = fields [0].GetType ().FullName;
++					AddAttribute (nclass, "enumtype", etype);
+ 				}
++				members.Add (fd);
+ 			}
+ 
+-			// No .cctor
+-			ConstructorInfo [] ctors = type.GetConstructors (flags);
+-
+-			if (ctors.Length > 0) {
+-				Array.Sort (ctors, MethodBaseComparer.Default);
++			ConstructorInfo [] ctors = GetConstructors (type);
++			if (ctors.Length > 0)
++			{
++				Array.Sort (ctors, MemberInfoComparer.Default);
+ 				members.Add (new ConstructorData (document, nclass, ctors));
+ 			}
+ 
+-			PropertyInfo [] props = type.GetProperties (flags);
+-			if (props != null && props.Length > 0) {
+-				Array.Sort (props, MemberInfoComparer.Default);
+-				members.Add (new PropertyData (document, nclass, props));
++			PropertyInfo[] properties = GetProperties (type);
++			if (properties.Length > 0)
++			{
++				Array.Sort (properties, MemberInfoComparer.Default);
++				members.Add (new PropertyData (document, nclass, properties));
+ 			}
+ 
+-			EventInfo [] events = type.GetEvents (flags);
+-			if (events != null && events.Length > 0) {
++			EventInfo [] events = GetEvents (type);
++			if (events.Length > 0) 
++			{
+ 				Array.Sort (events, MemberInfoComparer.Default);
+ 				members.Add (new EventData (document, nclass, events));
+ 			}
+ 
+-			MethodInfo [] methods = type.GetMethods (flags);
+-			if (methods != null && methods.Length > 0) {
+-				methods = MethodRemoveSpecials (methods);
+-				if (methods != null) {
+-					Array.Sort (methods, MethodBaseComparer.Default);
+-					members.Add (new MethodData (document, nclass, methods));
+-				}
++			MethodInfo [] methods = GetMethods (type);
++			if (methods.Length > 0)
++			{
++				Array.Sort (methods, MemberInfoComparer.Default);
++				members.Add (new MethodData (document, nclass, methods));
+ 			}
+ 
+ 			foreach (MemberData md in members)
+@@ -349,42 +345,72 @@
+ 			return ((int) type.Attributes).ToString ();
+ 		}
+ 
+-		static MethodInfo [] MethodRemoveSpecials (MethodInfo [] methods)
++		private MethodInfo[] GetMethods (Type type)
+ 		{
+-			ArrayList list = null;
+-			foreach (MethodInfo method in methods) {
++			ArrayList list = new ArrayList ();
++
++			MethodInfo[] methods = type.GetMethods (flags);
++			foreach (MethodInfo method in methods)
++			{
+ 				if (method.IsSpecialName)
+ 					continue;
+ 
+-				if (list == null)
+-					list = new ArrayList ();
++				// we're only interested in public or protected members
++				if (!method.IsPublic && !method.IsFamily)
++				{
++					continue;
++				}
+ 
+ 				list.Add (method);
+ 			}
+ 
+-			if (list == null)
+-				return null;
+-
+-			return (MethodInfo []) list.ToArray (typeof (MethodInfo));
++			return (MethodInfo[]) list.ToArray (typeof (MethodInfo));
+ 		}
+ 
+-		static FieldInfo [] FieldRemoveSpecials (FieldInfo [] fields)
++		private ConstructorInfo[] GetConstructors (Type type)
+ 		{
+-			ArrayList list = null;
+-			foreach (FieldInfo field in fields) {
+-				if (field.IsSpecialName)
++			ArrayList list = new ArrayList ();
++
++			// No .cctor
++			ConstructorInfo[] ctors = type.GetConstructors (flags);
++			foreach (ConstructorInfo constructor in ctors)
++			{
++				// we're only interested in public or protected members
++				if (!constructor.IsPublic && !constructor.IsFamily)
++				{
+ 					continue;
++				}
++
++				list.Add (constructor);
++			}
+ 
+-				if (list == null)
+-					list = new ArrayList ();
++			return (ConstructorInfo[]) list.ToArray (typeof (ConstructorInfo));
++		}
+ 
+-				list.Add (field);
++		private EventInfo[] GetEvents (Type type)
++		{
++			ArrayList list = new ArrayList ();
++
++			EventInfo[] events = type.GetEvents (flags);
++			foreach (EventInfo eventInfo in events)
++			{
++				MethodInfo addMethod = eventInfo.GetAddMethod(true);
++
++				if (addMethod == null || !MustDocumentMethod (addMethod))
++				{
++					continue;
++				}
++
++				list.Add (eventInfo);
+ 			}
+ 
+-			if (list == null)
+-				return null;
++			return (EventInfo[]) list.ToArray (typeof (EventInfo));
++		}
+ 
+-			return (FieldInfo []) list.ToArray (typeof (FieldInfo));
++		public static bool MustDocumentMethod(MethodBase method)
++		{
++			// All other methods
++			return (method.IsPublic || method.IsFamily || method.IsFamilyOrAssembly);
+ 		}
+ 
+ 		static string GetClassType (Type t)
+@@ -403,6 +429,65 @@
+ 
+ 			return "class";
+ 		}
++
++		private FieldInfo[] GetFields (Type type)
++		{
++			ArrayList list = new ArrayList ();
++
++			FieldInfo[] fields = type.GetFields (flags);
++			foreach (FieldInfo field in fields)
++			{
++				if (field.IsSpecialName)
++					continue;
++
++				// we're only interested in public or protected members
++				if (!field.IsPublic && !field.IsFamily)
++				{
++					continue;
++				}
++
++				list.Add (field);
++			}
++
++			return (FieldInfo[]) list.ToArray (typeof (FieldInfo));
++		}
++
++		private PropertyInfo[] GetProperties (Type type)
++		{
++			ArrayList list = new ArrayList ();
++
++			PropertyInfo[] properties = type.GetProperties (flags);
++			foreach (PropertyInfo property in properties)
++			{
++				MethodInfo getMethod = null;
++				MethodInfo setMethod = null;
++
++				if (property.CanRead)
++				{
++					try { getMethod = property.GetGetMethod (true); }
++					catch (System.Security.SecurityException) { }
++				}
++				if (property.CanWrite)
++				{
++					try { setMethod = property.GetSetMethod (true); }
++					catch (System.Security.SecurityException) { }
++				}
++
++				bool hasGetter = (getMethod != null) && MustDocumentMethod (getMethod);
++				bool hasSetter = (setMethod != null) && MustDocumentMethod (setMethod);
++
++				// if neither the getter or setter should be documented, then
++				// skip the property
++				if (!hasGetter && !hasSetter)
++				{
++					continue;
++				}
++
++				list.Add (property);
++			}
++
++			return (PropertyInfo[]) list.ToArray (typeof (PropertyInfo));
++		}
+ 	}
+ 
+ 	class FieldData : MemberData
+@@ -458,10 +543,10 @@
+ 			base.AddExtraData (p, member);
+ 			PropertyInfo prop = (PropertyInfo) member;
+ 			AddAttribute (p, "ptype", prop.PropertyType.FullName);
+-			MethodInfo _get = prop.GetGetMethod ();
+-			MethodInfo _set = prop.GetSetMethod ();
+-			bool haveGet = (_get != null);
+-			bool haveSet = (_set != null);
++			MethodInfo _get = prop.GetGetMethod (true);
++			MethodInfo _set = prop.GetSetMethod (true);
++			bool haveGet = (_get != null && TypeData.MustDocumentMethod(_get));
++			bool haveSet = (_set != null && TypeData.MustDocumentMethod(_set));
+ 			MethodInfo [] methods;
+ 
+ 			if (haveGet && haveSet) {

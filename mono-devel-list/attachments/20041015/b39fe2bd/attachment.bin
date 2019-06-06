@@ -1,0 +1,234 @@
+Index: class/corlib/System.Runtime.Remoting/RemotingServices.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.Runtime.Remoting/RemotingServices.cs,v
+retrieving revision 1.51
+diff -u -r1.51 RemotingServices.cs
+--- class/corlib/System.Runtime.Remoting/RemotingServices.cs	28 Sep 2004 08:18:29 -0000	1.51
++++ class/corlib/System.Runtime.Remoting/RemotingServices.cs	15 Oct 2004 19:20:54 -0000
+@@ -46,6 +46,7 @@
+ using System.Runtime.Remoting.Lifetime;
+ using System.Runtime.CompilerServices;
+ using System.Runtime.Serialization;
++using System.Runtime.Serialization.Formatters.Binary;
+ using System.IO;
+ 
+ namespace System.Runtime.Remoting
+@@ -55,12 +56,27 @@
+ 		// Holds the identities of the objects, using uri as index
+ 		static Hashtable uri_hash = new Hashtable ();		
+ 
++		static BinaryFormatter _serializationFormatter;
++		static BinaryFormatter _deserializationFormatter;
++		
+ 		internal static string app_id;
+ 		static int next_id = 1;
+ 		static readonly BindingFlags methodBindings = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+ 		
++		// Holds information in xdomain calls. Names are short to minimize serialized size.
++		[Serializable]
++		class CACD {
++			public object d;	/* call data */
++			public object c;	/* call context */
++		}
++		
+ 		static RemotingServices ()
+ 		{
++			RemotingSurrogateSelector surrogateSelector = new RemotingSurrogateSelector ();
++			StreamingContext context = new StreamingContext (StreamingContextStates.Remoting, null);
++			_serializationFormatter = new BinaryFormatter (surrogateSelector, context);
++			_deserializationFormatter = new BinaryFormatter (null, context);
++			
+ 			RegisterInternalChannels ();
+ 			app_id = Guid.NewGuid().ToString().Replace('-', '_') + "/";
+ 			CreateWellKnownServerIdentity (typeof(RemoteActivator), "RemoteActivationService.rem", WellKnownObjectMode.Singleton);
+@@ -108,7 +124,7 @@
+ 						returnArgs [n++] = null; 
+ 				}
+ 				
+-				result = new ReturnMessage (rval, returnArgs, n, CallContext.CreateLogicalCallContext(), reqMsg);
++				result = new ReturnMessage (rval, returnArgs, n, CallContext.CreateLogicalCallContext (true), reqMsg);
+ 			} 
+ 			catch (Exception e) 
+ 			{
+@@ -534,6 +550,10 @@
+ 				if (proxyType != null)
+ 				{
+ 					RemotingProxy proxy = new RemotingProxy (proxyType, identity);
++					CrossAppDomainSink cds = sink as CrossAppDomainSink;
++					if (cds != null)
++						proxy.SetTargetDomain (cds.TargetDomainId);
++
+ 					clientProxy = proxy.GetTransparentProxy();
+ 					identity.ClientProxy = (MarshalByRefObject) clientProxy;
+ 				}
+@@ -614,7 +634,50 @@
+ 			GetOrCreateClientIdentity (objRef, proxyType, out proxy);
+ 			return proxy;
+ 		}
++		
++		// This method is called by the runtime
++		internal static object GetServerObject (string uri)
++		{
++			ClientActivatedIdentity identity = GetIdentityForUri (uri) as ClientActivatedIdentity;
++			if (identity == null) throw new RemotingException ("Server for uri '" + uri + "' not found");
++			return identity.GetServerObject ();
++		}
++
++		// This method is called by the runtime
++		internal static byte[] SerializeCallData (object obj)
++		{
++			LogicalCallContext ctx = CallContext.CreateLogicalCallContext (false);
++			if (ctx != null) {
++				CACD cad = new CACD ();
++				cad.d = obj;
++				cad.c = ctx;
++				obj = cad;
++			}
++			
++			if (obj == null) return null;
++//			Console.WriteLine ("Serializing " + obj + " in domain " + System.Threading.Thread.GetDomainID ());
++			MemoryStream ms = new MemoryStream ();
++			_serializationFormatter.Serialize (ms, obj);
++			return ms.ToArray ();
++		}
+ 
++		// This method is called by the runtime
++		internal static object DeserializeCallData (byte[] array)
++		{
++			if (array == null) return null;
++			
++			MemoryStream ms = new MemoryStream (array);
++			object obj = _deserializationFormatter.Deserialize (ms);
++			
++			if (obj is CACD) {
++				CACD cad = (CACD) obj;
++				obj = cad.d;
++				CallContext.UpdateCurrentCallContext ((LogicalCallContext) cad.c);
++			}
++//			Console.WriteLine ("Deserializing " + obj + " in domain " + System.Threading.Thread.GetDomainID ());
++			return obj;
++		}
++		
+ 		internal static object GetDomainProxy(AppDomain domain) 
+ 		{
+ 			byte[] data = null;
+Index: class/corlib/System.Runtime.Remoting.Channels/CrossAppDomainChannel.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.Runtime.Remoting.Channels/CrossAppDomainChannel.cs,v
+retrieving revision 1.11
+diff -u -r1.11 CrossAppDomainChannel.cs
+--- class/corlib/System.Runtime.Remoting.Channels/CrossAppDomainChannel.cs	28 Sep 2004 08:16:41 -0000	1.11
++++ class/corlib/System.Runtime.Remoting.Channels/CrossAppDomainChannel.cs	15 Oct 2004 19:20:54 -0000
+@@ -173,6 +173,10 @@
+ 					return sink;
+ 				}
+ 			}
++		}
++		
++		internal int TargetDomainId {
++			get { return _domainID; }
+ 		}
+ 
+ 		private struct ProcessMessageRes {
+Index: class/corlib/System.Runtime.Remoting.Messaging/CallContext.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.Runtime.Remoting.Messaging/CallContext.cs,v
+retrieving revision 1.8
+diff -u -r1.8 CallContext.cs
+--- class/corlib/System.Runtime.Remoting.Messaging/CallContext.cs	12 Sep 2004 02:01:39 -0000	1.8
++++ class/corlib/System.Runtime.Remoting.Messaging/CallContext.cs	15 Oct 2004 19:20:54 -0000
+@@ -45,7 +45,7 @@
+ 	public sealed class CallContext 
+ 	{
+ 		[ThreadStatic] static Header [] Headers;
+-		[ThreadStatic] static Hashtable datastore;
++		[ThreadStatic] static Hashtable datastore = new Hashtable ();
+ 		
+ 		private CallContext ()
+ 		{
+@@ -77,16 +77,21 @@
+ 			Headers = headers;
+ 		}
+ 
+-		internal static LogicalCallContext CreateLogicalCallContext ()
++		internal static LogicalCallContext CreateLogicalCallContext (bool createEmpty)
+ 		{
+-			LogicalCallContext ctx = new LogicalCallContext ();
+-			
+-			if (datastore != null)
++			LogicalCallContext ctx = null;
++			if (datastore != null) {
+ 				foreach (DictionaryEntry entry in datastore)
+-					if (entry.Value is ILogicalThreadAffinative)
++					if (entry.Value is ILogicalThreadAffinative) {
++						if (ctx == null) ctx = new LogicalCallContext ();
+ 						ctx.SetData ((string)entry.Key, entry.Value);
++					}
++			}
+ 
+-			return ctx;
++			if (ctx == null && createEmpty)
++				return new LogicalCallContext ();
++			else
++				return ctx;
+ 		}
+ 
+ 		internal static object SetCurrentCallContext (LogicalCallContext ctx)
+Index: class/corlib/System.Runtime.Remoting.Proxies/RealProxy.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.Runtime.Remoting.Proxies/RealProxy.cs,v
+retrieving revision 1.25
+diff -u -r1.25 RealProxy.cs
+--- class/corlib/System.Runtime.Remoting.Proxies/RealProxy.cs	11 Jun 2004 02:06:28 -0000	1.25
++++ class/corlib/System.Runtime.Remoting.Proxies/RealProxy.cs	15 Oct 2004 19:20:54 -0000
+@@ -52,9 +52,14 @@
+ 	
+ 	public abstract class RealProxy {
+ 
++		#region Sync with object-internals.h
+ 		Type class_to_proxy;
+ 		internal Context _targetContext;
+ 		MarshalByRefObject _server;
++		int _targetDomainId = -1;
++		internal string _targetUri;
++		#endregion
++		
+ 		internal Identity _objectIdentity;
+ 		Object _objTP;
+ 		object _stubData;
+@@ -147,7 +152,7 @@
+ 						      out object [] out_args)
+ 		{
+ 			MonoMethodMessage mMsg = (MonoMethodMessage) msg;
+-			mMsg.LogicalCallContext = CallContext.CreateLogicalCallContext();
++			mMsg.LogicalCallContext = CallContext.CreateLogicalCallContext (true);
+ 			CallType call_type = mMsg.CallType;
+ 			bool is_remproxy = (rp as RemotingProxy) != null;
+ 
+@@ -257,6 +262,11 @@
+ 		protected MarshalByRefObject GetUnwrappedServer()
+ 		{
+ 			return _server;
++		}
++		
++		internal void SetTargetDomain (int domainId)
++		{
++			_targetDomainId = domainId;
+ 		}
+ 
+ 		static object[] ProcessResponse (IMethodReturnMessage mrm, IMethodCallMessage call)
+Index: class/corlib/System.Runtime.Remoting.Proxies/RemotingProxy.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.Runtime.Remoting.Proxies/RemotingProxy.cs,v
+retrieving revision 1.25
+diff -u -r1.25 RemotingProxy.cs
+--- class/corlib/System.Runtime.Remoting.Proxies/RemotingProxy.cs	27 Sep 2004 20:05:06 -0000	1.25
++++ class/corlib/System.Runtime.Remoting.Proxies/RemotingProxy.cs	15 Oct 2004 19:20:54 -0000
+@@ -52,7 +52,6 @@
+ 		IMessageSink _sink;
+ 		bool _hasEnvoySink;
+ 		ConstructionCall _ctorCall;
+-		string _targetUri;
+ 
+ 		internal RemotingProxy (Type type, ClientIdentity identity) : base (type, identity)
+ 		{

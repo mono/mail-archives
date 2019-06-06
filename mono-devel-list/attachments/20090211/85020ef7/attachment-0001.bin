@@ -1,0 +1,269 @@
+diff --git a/mono/metadata/monitor.c b/mono/metadata/monitor.c
+index 022495a..73d5253 100644
+--- a/mono/metadata/monitor.c
++++ b/mono/metadata/monitor.c
+@@ -23,6 +23,7 @@
+ #include <mono/metadata/debug-helpers.h>
+ #include <mono/metadata/tabledefs.h>
+ #include <mono/metadata/marshal.h>
++#include <mono/metadata/profiler-private.h>
+ #include <mono/utils/mono-time.h>
+ 
+ /*
+@@ -391,6 +392,8 @@ mono_monitor_try_enter_internal (MonoObject *obj, guint32 ms, gboolean allow_int
+ 		mono_raise_exception (mono_get_exception_argument_null ("obj"));
+ 		return FALSE;
+ 	}
++	
++	mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_ENTER);
+ 
+ retry:
+ 	mon = obj->synchronisation;
+@@ -403,6 +406,7 @@ retry:
+ 			mono_gc_weak_link_add (&mon->data, obj);
+ 			mono_monitor_allocator_unlock ();
+ 			/* Successfully locked */
++			mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_ENTER|MONO_PROFILER_MONITOR_SUCCESS);
+ 			return 1;
+ 		} else {
+ #ifdef HAVE_MOVING_COLLECTOR
+@@ -418,10 +422,12 @@ retry:
+ 					mono_gc_weak_link_add (&mon->data, obj);
+ 					mono_monitor_allocator_unlock ();
+ 					/* Successfully locked */
++					mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_ENTER|MONO_PROFILER_MONITOR_SUCCESS);
+ 					return 1;
+ 				} else {
+ 					mon_finalize (mon);
+ 					mono_monitor_allocator_unlock ();
++					mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_RETRY);
+ 					goto retry;
+ 				}
+ 			} else if (lw.lock_word & LOCK_WORD_FAT_HASH) {
+@@ -457,10 +463,12 @@ retry:
+ 				mono_gc_weak_link_add (&mon->data, obj);
+ 				mono_monitor_allocator_unlock ();
+ 				/* Successfully locked */
++				mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_ENTER|MONO_PROFILER_MONITOR_SUCCESS);
+ 				return 1;
+ 			} else {
+ 				mon_finalize (mon);
+ 				mono_monitor_allocator_unlock ();
++				mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_RETRY);
+ 				goto retry;
+ 			}
+ 		}
+@@ -489,9 +497,11 @@ retry:
+ 		if (G_LIKELY (InterlockedCompareExchangePointer ((gpointer *)&mon->owner, (gpointer)id, 0) == 0)) {
+ 			/* Success */
+ 			g_assert (mon->nest == 1);
++			mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_ENTER|MONO_PROFILER_MONITOR_SUCCESS);
+ 			return 1;
+ 		} else {
+ 			/* Trumped again! */
++			mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_RETRY);
+ 			goto retry;
+ 		}
+ 	}
+@@ -499,6 +509,7 @@ retry:
+ 	/* If the object is currently locked by this thread... */
+ 	if (mon->owner == id) {
+ 		mon->nest++;
++		mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_ENTER|MONO_PROFILER_MONITOR_SUCCESS|MONO_PROFILER_MONITOR_ENTER_NEST);
+ 		return 1;
+ 	}
+ 
+@@ -508,6 +519,7 @@ retry:
+ 	/* If ms is 0 we don't block, but just fail straight away */
+ 	if (ms == 0) {
+ 		LOCK_DEBUG (g_message (G_GNUC_PRETTY_FUNCTION ": (%d) timed out, returning FALSE", id));
++		mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_ENTER|MONO_PROFILER_MONITOR_ENTER_TIMEOUT);
+ 		return 0;
+ 	}
+ 
+@@ -588,6 +600,7 @@ retry:
+ 
+ 		if ((ret == WAIT_TIMEOUT || (ret == WAIT_IO_COMPLETION && !allow_interruption)) && ms > 0) {
+ 			/* More time left */
++			mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_RETRY|MONO_PROFILER_MONITOR_RETRY_MORE_TIME);
+ 			goto retry;
+ 		}
+ 	} else {
+@@ -597,21 +610,26 @@ retry:
+ 				 * We have to obey a stop request even if allow_interruption is
+ 				 * FALSE to avoid hangs at shutdown.
+ 				 */
++				mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_ENTER|MONO_PROFILER_MONITOR_ENTER_SHUTDOWN);
+ 				return -1;
+ 			}
+ 			/* Infinite wait, so just try again */
++			mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_RETRY|MONO_PROFILER_MONITOR_RETRY_INFINITE_WAIT);
+ 			goto retry;
+ 		}
+ 	}
+ 	
+ 	if (ret == WAIT_OBJECT_0) {
+ 		/* retry from the top */
++		mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_RETRY|MONO_PROFILER_MONITOR_RETRY_CONTENTION_LOOP);
+ 		goto retry;
+ 	}
+ 	
+ 	/* We must have timed out */
+ 	LOCK_DEBUG (g_message (G_GNUC_PRETTY_FUNCTION ": (%d) timed out waiting, returning FALSE", id));
+ 
++	mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_ENTER|MONO_PROFILER_MONITOR_ENTER_TIMEOUT);
++	
+ 	if (ret == WAIT_IO_COMPLETION)
+ 		return -1;
+ 	else 
+@@ -657,9 +675,11 @@ mono_monitor_exit (MonoObject *obj)
+ #endif
+ 	if (G_UNLIKELY (mon == NULL)) {
+ 		/* No one ever used Enter. Just ignore the Exit request as MS does */
++		mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_EXIT|MONO_PROFILER_MONITOR_EXIT_NOT_LOCKED);
+ 		return;
+ 	}
+ 	if (G_UNLIKELY (mon->owner != GetCurrentThreadId ())) {
++		mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_EXIT|MONO_PROFILER_MONITOR_EXIT_NOT_OWNER);
+ 		return;
+ 	}
+ 	
+@@ -688,6 +708,8 @@ mono_monitor_exit (MonoObject *obj)
+ 			  ": (%d) Object %p is now locked %d times", GetCurrentThreadId (), obj, nest));
+ 		mon->nest = nest;
+ 	}
++	
++	mono_profiler_monitor_event (obj, MONO_PROFILER_MONITOR_EXIT|MONO_PROFILER_MONITOR_SUCCESS);
+ }
+ 
+ static void
+diff --git a/mono/metadata/profiler-private.h b/mono/metadata/profiler-private.h
+index f85da9b..ddbbc17 100644
+--- a/mono/metadata/profiler-private.h
++++ b/mono/metadata/profiler-private.h
+@@ -32,6 +32,7 @@ void mono_profiler_method_free     (MonoMethod *method) MONO_INTERNAL;
+ 
+ void mono_profiler_code_transition (MonoMethod *method, int result) MONO_INTERNAL;
+ void mono_profiler_allocation      (MonoObject *obj, MonoClass *klass) MONO_INTERNAL;
++void mono_profiler_monitor_event   (MonoObject *obj, MonoProfilerMonitorEvent event) MONO_INTERNAL;
+ void mono_profiler_stat_hit        (guchar *ip, void *context) MONO_INTERNAL;
+ void mono_profiler_stat_call_chain (int call_chain_depth, guchar **ips, void *context) MONO_INTERNAL;
+ #define MONO_PROFILER_MAX_STAT_CALL_CHAIN_DEPTH 16
+diff --git a/mono/metadata/profiler.c b/mono/metadata/profiler.c
+index 0194693..34120fa 100644
+--- a/mono/metadata/profiler.c
++++ b/mono/metadata/profiler.c
+@@ -58,6 +58,7 @@ static MonoProfileJitResult    jit_end2;
+ static MonoProfileMethodFunc   method_free;
+ static MonoProfileMethodResult man_unman_transition;
+ static MonoProfileAllocFunc    allocation_cb;
++static MonoProfileMonitorFunc  monitor_event_cb;
+ static MonoProfileStatFunc     statistical_cb;
+ static MonoProfileStatCallChainFunc statistical_call_chain_cb;
+ static int                     statistical_call_chain_depth;
+@@ -201,6 +202,12 @@ mono_profiler_install_allocation (MonoProfileAllocFunc callback)
+ 	allocation_cb = callback;
+ }
+ 
++void
++mono_profiler_install_monitor  (MonoProfileMonitorFunc callback)
++{
++	monitor_event_cb = callback;
++}
++
+ void 
+ mono_profiler_install_statistical (MonoProfileStatFunc callback)
+ {
+@@ -333,6 +340,13 @@ mono_profiler_allocation (MonoObject *obj, MonoClass *klass)
+ }
+ 
+ void
++mono_profiler_monitor_event      (MonoObject *obj, MonoProfilerMonitorEvent event) {
++	if ((mono_profiler_events & MONO_PROFILE_MONITOR_EVENTS) && monitor_event_cb) {
++		monitor_event_cb (current_profiler, obj, event);
++	}
++}
++
++void
+ mono_profiler_stat_hit (guchar *ip, void *context)
+ {
+ 	if ((mono_profiler_events & MONO_PROFILE_STATISTICAL) && statistical_cb)
+diff --git a/mono/metadata/profiler.h b/mono/metadata/profiler.h
+index dafbb17..f61a4a7 100644
+--- a/mono/metadata/profiler.h
++++ b/mono/metadata/profiler.h
+@@ -24,7 +24,8 @@ typedef enum {
+ 	MONO_PROFILE_COVERAGE         = 1 << 13,
+ 	MONO_PROFILE_INS_COVERAGE     = 1 << 14,
+ 	MONO_PROFILE_STATISTICAL      = 1 << 15,
+-	MONO_PROFILE_METHOD_EVENTS    = 1 << 16
++	MONO_PROFILE_METHOD_EVENTS    = 1 << 16,
++	MONO_PROFILE_MONITOR_EVENTS   = 1 << 17
+ } MonoProfileFlags;
+ 
+ typedef enum {
+@@ -57,6 +58,48 @@ typedef struct {
+ 
+ typedef struct _MonoProfiler MonoProfiler;
+ 
++/* The values are organized as flags to eventually allow fast filtering of unwanted events. */
++typedef enum {
++	/* At least one of "ENTER", "EXIT" or "RETRY" must be set. */
++	/* "ENTER" means the event happened while getting a lock */
++	/* (with no other flags it is the start of "monitor_enter"). */
++	MONO_PROFILER_MONITOR_ENTER = 1,
++	/* "EXIT" means the event happened while releasing a lock. */
++	MONO_PROFILER_MONITOR_EXIT = 2,
++	/* If neither "ENTER" nor "EXIT" are set this is an internal event */
++	/* inside "ENTER", where the code loops back to retry to take the lock. */
++	MONO_PROFILER_MONITOR_RETRY = 0,
++	
++	/* "SUCCESS" means we properly got or released the lock */
++	/* (if this is not set the lock did not change state). */
++	MONO_PROFILER_MONITOR_SUCCESS = 4,
++	
++	/* All the following flags are just "descriptive": */
++	/* They are not needed to measure the time spent inside locks, */
++	/* but they explain what was going on (or the reason of the event). */
++	
++	/* Flags used when "ENTER" is set: */
++	/* The lock was already ours (we just incremented the count). */
++	MONO_PROFILER_MONITOR_ENTER_NEST = 8,
++	/* We had to give up because of a timeout. */
++	MONO_PROFILER_MONITOR_ENTER_TIMEOUT = 16,
++	/* We had to give up because of a shutdown. */
++	MONO_PROFILER_MONITOR_ENTER_SHUTDOWN = 32,
++	
++	/* Flags used when "RETRY" is set: */
++	/* We retry because we timed out but we have more to wait. */
++	MONO_PROFILER_MONITOR_RETRY_MORE_TIME = 8,
++	/* We retry because we timed out but we want to wait forever. */
++	MONO_PROFILER_MONITOR_RETRY_INFINITE_WAIT = 16,
++	/* We waited successfully and now we try to really get the lock. */
++	MONO_PROFILER_MONITOR_RETRY_CONTENTION_LOOP = 32,
++	
++	/* Flags used when "EXIT" is set: */
++	/* We tried to unlock an object which we had not locked. */
++	MONO_PROFILER_MONITOR_EXIT_NOT_OWNER = 8,
++	/* We tried to unlock an object which was not locked at all. */
++	MONO_PROFILER_MONITOR_EXIT_NOT_LOCKED = 32
++} MonoProfilerMonitorEvent;
+ 
+ /*
+  * Functions that the runtime will call on the profiler.
+@@ -69,6 +112,7 @@ typedef void (*MonoProfileMethodFunc)   (MonoProfiler *prof, MonoMethod   *metho
+ typedef void (*MonoProfileClassFunc)    (MonoProfiler *prof, MonoClass    *klass);
+ typedef void (*MonoProfileModuleFunc)   (MonoProfiler *prof, MonoImage    *module);
+ typedef void (*MonoProfileAssemblyFunc) (MonoProfiler *prof, MonoAssembly *assembly);
++typedef void (*MonoProfileMonitorFunc)  (MonoProfiler *prof, MonoObject *obj, MonoProfilerMonitorEvent event);
+ 
+ typedef void (*MonoProfileExceptionFunc) (MonoProfiler *prof, MonoObject *object);
+ typedef void (*MonoProfileExceptionClauseFunc) (MonoProfiler *prof, MonoMethod *method, int clause_type, int clause_num);
+@@ -117,6 +161,7 @@ void mono_profiler_install_enter_leave (MonoProfileMethodFunc enter, MonoProfile
+ void mono_profiler_install_thread      (MonoProfileThreadFunc start, MonoProfileThreadFunc end);
+ void mono_profiler_install_transition  (MonoProfileMethodResult callback);
+ void mono_profiler_install_allocation  (MonoProfileAllocFunc callback);
++void mono_profiler_install_monitor     (MonoProfileMonitorFunc callback);
+ void mono_profiler_install_statistical (MonoProfileStatFunc callback);
+ void mono_profiler_install_statistical_call_chain (MonoProfileStatCallChainFunc callback, int call_chain_depth);
+ void mono_profiler_install_exception   (MonoProfileExceptionFunc throw_callback, MonoProfileMethodFunc exc_method_leave, MonoProfileExceptionClauseFunc clause_callback);

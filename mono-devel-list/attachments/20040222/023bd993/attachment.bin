@@ -1,0 +1,176 @@
+Index: System/String.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System/String.cs,v
+retrieving revision 1.101
+diff -u -r1.101 String.cs
+--- System/String.cs	12 Jan 2004 22:06:53 -0000	1.101
++++ System/String.cs	22 Feb 2004 17:14:45 -0000
+@@ -27,7 +27,8 @@
+ 
+ 		public static readonly String Empty = "";
+ 
+-		public static bool Equals(String str1, String str2) {
++		public static unsafe bool Equals (string str1, string str2)
++		{
+ 			if ((str1 as object) == (str2 as object))
+ 				return true;
+ 	    
+@@ -38,12 +39,30 @@
+ 			
+ 			if (len != str2.length)
+ 				return false;
+-
+-			for (int i = 0; i < len; i++)
+-				if (str1 [i] != str2 [i])
+-					return false;
+-
+-			return true;
++			
++			if (len == 0)
++				return true;
++			
++			fixed (char * s1 = &str1.start_char, s2 = &str2.start_char) {
++				// it must be one char, because 0 len is done above
++				if (len < 2)
++					return *s1 == *s2;
++				
++				// check by twos
++				int * sint1 = (int *) s1, sint2 = (int *) s2;
++				int n2 = len >> 1;
++				do {
++					if (*sint1++ != *sint2++)
++						return false;
++				} while (--n2 != 0);
++				
++				// nothing left
++				if ((len & 1) == 0)
++					return true;
++				
++				// check the last one
++				return *(char *) sint1 == *(char *) sint2;
++			}
+ 		}
+ 
+ 		public static bool operator == (String str1, String str2) {
+@@ -1213,11 +1232,7 @@
+ 
+ 		internal unsafe void InternalSetChar(int idx, char val) 
+ 		{
+-			if ((uint) idx >= (uint) Length)
+-				throw new ArgumentOutOfRangeException("idx");
+-
+-			fixed (char * pStr = &start_char) 
+-			{
++			fixed (char * pStr = &start_char) {
+ 				pStr [idx] = val;
+ 			}
+ 		}
+@@ -1307,6 +1322,9 @@
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+ 		internal extern static void InternalStrcpy(String dest, int destPos, String src);
+ 
++		[MethodImplAttribute(MethodImplOptions.InternalCall)]
++		internal extern static void InternalStrcpy(String dest, int destPos, char [] src, int startPos, int count);
++		
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+ 		internal extern static void InternalStrcpy(String dest, int destPos, String src, int startPos, int count);
+ 
+Index: System.Text/StringBuilder.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.Text/StringBuilder.cs,v
+retrieving revision 1.30
+diff -u -r1.30 StringBuilder.cs
+--- System.Text/StringBuilder.cs	23 Jan 2004 06:39:17 -0000	1.30
++++ System.Text/StringBuilder.cs	22 Feb 2004 17:14:45 -0000
+@@ -273,8 +273,7 @@
+ 			if (null != _cached_str || _str.Length < needed_cap)
+ 				InternalEnsureCapacity (needed_cap);
+ 			
+-			for (int i = 0; i != value.Length; i++)
+-				_str.InternalSetChar (i + _length, value[i]);		
++			String.InternalStrcpy (_str, _length, value, 0, value.Length);
+ 
+ 			_length += value.Length;
+ 
+@@ -290,11 +289,9 @@
+ 			if (null != _cached_str || _str.Length < needed_cap)
+ 				InternalEnsureCapacity (needed_cap);
+ 
+-			if (value != null) 
+-			{
+-				String.InternalStrcpy (_str, _length, value);
+-				_length += value.Length;
+-			}
++			String.InternalStrcpy (_str, _length, value);
++			_length += value.Length;
++
+ 
+ 			return this;
+ 		}
+@@ -397,10 +394,9 @@
+ 			
+ 			
+ 			InternalEnsureCapacity (_length + charCount);
++			String.InternalStrcpy (_str, _length, value, startIndex, charCount);
+ 			
+-			int endPos = charCount + startIndex;
+-			for (int i = startIndex; i != endPos; i++)
+-				_str.InternalSetChar (_length++, value[i]);
++			this._length += charCount;
+ 
+ 			return this;
+ 		}
+@@ -472,7 +468,7 @@
+ 			String.InternalStrcpy (_str, index + value.Length, _str, index, _length - index);
+ 			
+ 			// Copy in stuff from the insert buffer
+-			String.InternalStrcpy (_str, index, value.ToString());
++			String.InternalStrcpy (_str, _length, value, 0, value.Length);
+ 			
+ 			_length += value.Length;
+ 
+@@ -493,7 +489,7 @@
+ 			String.InternalStrcpy (_str, index + value.Length, _str, index, _length - index);
+ 			
+ 			// Copy in stuff from the insert buffer
+-			String.InternalStrcpy (_str, index, value);
++			String.InternalStrcpy (_str, index, value, 0, value.Length);
+ 			
+ 			_length += value.Length;
+ 
+@@ -589,18 +585,24 @@
+ 			return this;
+ 		}
+ 
+-		public StringBuilder Insert( int index, char[] value, int startIndex, int charCount ) {
+-			if (value != null) 
+-			{
+-				if( charCount < 0 || startIndex < 0 || startIndex + charCount > value.Length )
+-					throw new ArgumentOutOfRangeException();
+-
+-				char[] insertChars = new char[ charCount  ];
+-				Array.Copy( value, startIndex, insertChars, 0, charCount );
+-
+-				return Insert( index, insertChars );
+-			}
++		public StringBuilder Insert (int index, char [] value, int startIndex, int charCount)
++		{
++			if (value == null || charCount == 0)
++				return this;
++			
++			if (charCount < 0 || startIndex < 0 || startIndex + charCount > value.Length)
++				throw new ArgumentOutOfRangeException ();
++				
++			InternalEnsureCapacity (_length + value.Length);
+ 
++			// Move everything to the right of the insert point across
++			String.InternalStrcpy (_str, index + value.Length, _str, index, _length - index);
++			
++			// Copy in stuff from the insert buffer
++			String.InternalStrcpy (_str, index, value, startIndex, charCount);
++			
++			_length += charCount;
++			
+ 			return this;
+ 		}
+ 	

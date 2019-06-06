@@ -1,0 +1,197 @@
+Index: mono/mono/metadata/string-icalls.c
+===================================================================
+--- mono/mono/metadata/string-icalls.c	(revision 62694)
++++ mono/mono/metadata/string-icalls.c	(working copy)
+@@ -239,6 +239,14 @@
+ 	return s;
+ }
+ 
++/* This function is redirected to String.CreateString ()
++   by mono_marshal_get_native_wrapper () */
++void
++ves_icall_System_String_ctor_RedirectToCreateString ()
++{
++	g_assert_not_reached ();
++}
++
+ MonoString * 
+ ves_icall_System_String_InternalJoin (MonoString *separator, MonoArray * value, gint32 sindex, gint32 count)
+ {
+Index: mono/mono/metadata/security-manager.c
+===================================================================
+--- mono/mono/metadata/security-manager.c	(revision 62694)
++++ mono/mono/metadata/security-manager.c	(working copy)
+@@ -259,7 +259,7 @@
+ {
+ 	MonoMethod *method = m->method;
+ 	/* we want the original as the wrapper is "free" of the security informations */
+-	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
++	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE || method->wrapper_type == MONO_WRAPPER_MANAGED_TO_MANAGED) {
+ 		method = mono_marshal_method_from_wrapper (method);
+ 	}
+ 
+Index: mono/mono/metadata/string-icalls.h
+===================================================================
+--- mono/mono/metadata/string-icalls.h	(revision 62694)
++++ mono/mono/metadata/string-icalls.h	(working copy)
+@@ -37,6 +37,9 @@
+ MonoString *
+ ves_icall_System_String_ctor_encoding (gpointer dummy, gint8 *value, gint32 sindex, gint32 length, MonoObject *enc);
+ 
++void
++ves_icall_System_String_ctor_RedirectToCreateString ();
++
+ MonoString * 
+ ves_icall_System_String_InternalJoin (MonoString *separator, MonoArray * value, gint32 sindex, gint32 count);
+ 
+Index: mono/mono/metadata/debug-helpers.c
+===================================================================
+--- mono/mono/metadata/debug-helpers.c	(revision 62694)
++++ mono/mono/metadata/debug-helpers.c	(working copy)
+@@ -23,6 +23,7 @@
+ 	"runtime-invoke",
+ 	"native-to-managed",
+ 	"managed-to-native",
++	"managed-to-managed",
+ 	"remoting-invoke",
+ 	"remoting-invoke-with-check",
+ 	"xdomain-invoke",
+Index: mono/mono/metadata/class-internals.h
+===================================================================
+--- mono/mono/metadata/class-internals.h	(revision 62694)
++++ mono/mono/metadata/class-internals.h	(working copy)
+@@ -30,6 +30,7 @@
+ 	MONO_WRAPPER_RUNTIME_INVOKE,
+ 	MONO_WRAPPER_NATIVE_TO_MANAGED,
+ 	MONO_WRAPPER_MANAGED_TO_NATIVE,
++	MONO_WRAPPER_MANAGED_TO_MANAGED,
+ 	MONO_WRAPPER_REMOTING_INVOKE,
+ 	MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK,
+ 	MONO_WRAPPER_XDOMAIN_INVOKE,
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 62694)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -23,6 +23,7 @@
+ #include "mono/metadata/domain-internals.h"
+ #include "mono/metadata/gc-internal.h"
+ #include "mono/metadata/threads-types.h"
++#include "mono/metadata/string-icalls.h"
+ #include <mono/os/gc_wrapper.h>
+ #include <string.h>
+ #include <errno.h>
+@@ -7245,6 +7246,7 @@
+ 	MonoMethod *res;
+ 	GHashTable *cache;
+ 	gboolean pinvoke = FALSE;
++	gpointer iter;
+ 	int i;
+ 	const char *exc_class = "MissingMethodException";
+ 	const char *exc_arg = NULL;
+@@ -7272,6 +7274,45 @@
+ 			piinfo->addr = mono_lookup_internal_call (method);
+ 	}
+ 
++	/* hack - redirect certain string constructors to CreateString */
++	if (piinfo->addr == ves_icall_System_String_ctor_RedirectToCreateString) {
++		g_assert (!pinvoke);
++		g_assert (method->string_ctor);
++
++		/* CreateString returns a value */
++		csig = signature_dup (method->klass->image, sig);
++		csig->ret = &mono_defaults.string_class->byval_arg;
++		csig->pinvoke = 0;
++
++		iter = NULL;
++		while ((res = mono_class_get_methods (mono_defaults.string_class, &iter))) {
++			if (!strcmp ("CreateString", res->name) &&
++				mono_metadata_signature_equal (csig, mono_method_signature (res))) {
++
++				g_assert (!(res->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL));
++				g_assert (!(res->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL));
++
++				/* create a wrapper to preserve .ctor in stack trace */
++				mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_MANAGED_TO_MANAGED);
++
++				mono_mb_emit_byte (mb, CEE_JMP);
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, res));
++
++				/* use native_wrapper_cache because internal calls are looked up there */
++				res = mono_mb_create_and_cache (cache, method,
++					mb, csig, 0);
++
++				mono_mb_free (mb);
++
++				return res;
++			}
++		}
++
++		/* exception will be thrown */
++		piinfo->addr = NULL;
++		g_warning ("cannot find CreateString for .ctor");
++	}
++
+ 	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_MANAGED_TO_NATIVE);
+ 
+ 	mb->method->save_lmf = 1;
+Index: mono/mono/metadata/icall.c
+===================================================================
+--- mono/mono/metadata/icall.c	(revision 62694)
++++ mono/mono/metadata/icall.c	(working copy)
+@@ -7075,9 +7075,9 @@
+ 	{".ctor(char,int)", ves_icall_System_String_ctor_char_int},
+ 	{".ctor(char[])", ves_icall_System_String_ctor_chara},
+ 	{".ctor(char[],int,int)", ves_icall_System_String_ctor_chara_int_int},
+-	{".ctor(sbyte*)", ves_icall_System_String_ctor_sbytep},
+-	{".ctor(sbyte*,int,int)", ves_icall_System_String_ctor_sbytep_int_int},
+-	{".ctor(sbyte*,int,int,System.Text.Encoding)", ves_icall_System_String_ctor_encoding},
++	{".ctor(sbyte*)", ves_icall_System_String_ctor_RedirectToCreateString},
++	{".ctor(sbyte*,int,int)", ves_icall_System_String_ctor_RedirectToCreateString},
++	{".ctor(sbyte*,int,int,System.Text.Encoding)", ves_icall_System_String_ctor_RedirectToCreateString},
+ 	{"InternalAllocateStr", ves_icall_System_String_InternalAllocateStr},
+ 	{"InternalCharCopy", ves_icall_System_String_InternalCharCopy},
+ 	{"InternalCopyTo", ves_icall_System_String_InternalCopyTo},
+Index: mono/mono/metadata/reflection.c
+===================================================================
+--- mono/mono/metadata/reflection.c	(revision 62694)
++++ mono/mono/metadata/reflection.c	(working copy)
+@@ -10023,7 +10023,7 @@
+ 		return FALSE;
+ 
+ 	/* we want the original as the wrapper is "free" of the security informations */
+-	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
++	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE || method->wrapper_type == MONO_WRAPPER_MANAGED_TO_MANAGED) {
+ 		method = mono_marshal_method_from_wrapper (method);
+ 		if (!method)
+ 			return FALSE;
+@@ -10071,7 +10071,7 @@
+ 		return FALSE;
+ 
+ 	/* we want the original as the wrapper is "free" of the security informations */
+-	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
++	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE || method->wrapper_type == MONO_WRAPPER_MANAGED_TO_MANAGED) {
+ 		method = mono_marshal_method_from_wrapper (method);
+ 		if (!method)
+ 			return FALSE;
+@@ -10146,7 +10146,7 @@
+ 		return FALSE;
+ 
+ 	/* we want the original as the wrapper is "free" of the security informations */
+-	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
++	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE || method->wrapper_type == MONO_WRAPPER_MANAGED_TO_MANAGED) {
+ 		method = mono_marshal_method_from_wrapper (method);
+ 		if (!method)
+ 			return FALSE;
+Index: mono/mono/mini/declsec.c
+===================================================================
+--- mono/mono/mini/declsec.c	(revision 62694)
++++ mono/mono/mini/declsec.c	(working copy)
+@@ -19,7 +19,7 @@
+ {
+ 	mono_jit_stats.cas_declsec_check++;
+ 
+-	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
++	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE || method->wrapper_type == MONO_WRAPPER_MANAGED_TO_MANAGED) {
+ 		method = mono_marshal_method_from_wrapper (method);
+ 		if (!method)
+ 			return FALSE;

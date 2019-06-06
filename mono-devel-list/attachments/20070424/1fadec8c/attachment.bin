@@ -1,0 +1,1169 @@
+Index: System.dll.sources
+===================================================================
+--- System.dll.sources	(revision 76183)
++++ System.dll.sources	(working copy)
+@@ -471,9 +471,11 @@
+ System.Diagnostics/EventSourceCreationData.cs
+ System.Diagnostics/FileVersionInfo.cs
+ System.Diagnostics/ICollectData.cs
++System.Diagnostics/IProcessAPI.cs
+ System.Diagnostics/InstanceDataCollectionCollection.cs
+ System.Diagnostics/InstanceDataCollection.cs
+ System.Diagnostics/InstanceData.cs
++System.Diagnostics/LinuxProcessAPI.cs
+ System.Diagnostics/LocalFileEventLog.cs
+ System.Diagnostics/MonitoringDescriptionAttribute.cs
+ System.Diagnostics/NullEventLog.cs
+@@ -514,6 +516,7 @@
+ System.Diagnostics/TraceSource.cs
+ System.Diagnostics/TraceSwitch.cs
+ System.Diagnostics/Win32EventLog.cs
++System.Diagnostics/Win32ProcessAPI.cs
+ System.Diagnostics/XmlWriterTraceListener.cs
+ System/FileStyleUriParser.cs
+ System/FtpStyleUriParser.cs
+Index: System.Diagnostics/Win32ProcessAPI.cs
+===================================================================
+--- System.Diagnostics/Win32ProcessAPI.cs	(revision 0)
++++ System.Diagnostics/Win32ProcessAPI.cs	(revision 0)
+@@ -0,0 +1,299 @@
++using System;
++using System.Collections;
++using System.Text;
++using System.Diagnostics;
++using System.Runtime.InteropServices;
++#if NET_2_0
++using COMNamespace = System.Runtime.InteropServices.ComTypes;
++#else
++using COMNamespace = System.Runtime.InteropServices;
++#endif
++
++namespace System.Diagnostics
++{
++	class Win32ProcessAPI : IProcessAPI
++	{
++		#region IProcessAPI Members
++		
++		[DllImport ("psapi.dll", CharSet = CharSet.Auto)]
++		static extern int EnumProcesses (IntPtr pProcessIds, uint cb, out uint pBytesReturned);
++
++		public int[] GetProcessIDs () {
++			uint bytesRequested = 5 * (uint)Marshal.SizeOf (typeof (uint));
++			uint bytesReturned;
++			IntPtr pids = Marshal.AllocHGlobal ((int)bytesRequested);
++			EnumProcesses (pids, bytesRequested, out bytesReturned);
++			while (bytesRequested == bytesReturned) {
++				Marshal.FreeHGlobal (pids);
++				bytesRequested <<= 2;
++				pids = Marshal.AllocHGlobal ((int)bytesRequested);
++				EnumProcesses (pids, bytesRequested, out bytesReturned);
++			}
++
++			int[] pids_array = new int[bytesReturned/Marshal.SizeOf (typeof (uint))];
++			Marshal.Copy (pids, pids_array, 0, pids_array.Length);
++			Marshal.FreeHGlobal (pids);
++
++			return pids_array;
++		}
++
++		// See link for mapping between PriorityClass and BasePriority
++		// http://msdn2.microsoft.com/en-us/library/system.diagnostics.process.basepriority.aspx
++		public int BasePriority (Process process) {
++			switch (PriorityClass (process)) {
++			case ProcessPriorityClass.Idle:
++				return 4;
++			case ProcessPriorityClass.Normal:
++				return 8;
++			case ProcessPriorityClass.High:
++				return 13;
++			case ProcessPriorityClass.RealTime:
++				return 24;
++			default:
++				return 0;
++			}
++		}
++
++		[DllImport ("kernel32.dll", CharSet = CharSet.Auto)]
++		static extern uint GetProcessHandleCount (IntPtr hProcess, out int pdwHandleCount);
++
++		public int HandleCount (Process process) {
++			int dwHandleCount;
++			GetProcessHandleCount (process.Handle, out dwHandleCount);
++			return dwHandleCount;
++		}
++
++		[DllImport ("user32.dll", CharSet = CharSet.Auto)]
++		static extern uint GetWindowThreadProcessId (IntPtr hWnd, out uint lpdwProcessId);
++
++		delegate bool EnumWindowsCallback (IntPtr hWnd, IntPtr lParam);
++
++		[DllImport ("user32.dll", CharSet = CharSet.Auto)]
++		static extern bool EnumWindows (EnumWindowsCallback lpEnumFunc, IntPtr lParam);
++
++		[DllImport ("user32.dll", CharSet = CharSet.Auto)]
++		public static extern IntPtr GetParent (IntPtr hWnd);
++
++		static bool MainWindowHandleCallback (IntPtr hWnd, IntPtr lParam) {
++			uint process_id;
++			GetWindowThreadProcessId (hWnd, out process_id);
++			int target_process_id = Marshal.ReadInt32 (lParam);
++			if (target_process_id != process_id)
++				return true;
++
++			IntPtr hParent = GetParent (hWnd);
++
++			if (hParent != IntPtr.Zero)
++				return true;
++
++			// we have the top level window for the app
++			Marshal.WriteIntPtr (lParam, hWnd);
++
++			return false;
++		}
++
++		public IntPtr MainWindowHandle (Process process) {
++			IntPtr lparam = Marshal.AllocHGlobal (IntPtr.Size);
++			Marshal.WriteInt32(lparam, process.Id);
++			EnumWindowsCallback callback = new EnumWindowsCallback (MainWindowHandleCallback);
++			EnumWindows (callback, lparam);
++			IntPtr hMainWnd = Marshal.ReadIntPtr (lparam);
++			Marshal.FreeHGlobal (lparam);
++			return hMainWnd;
++		}
++
++		[DllImport ("user32.dll", CharSet = CharSet.Auto)]
++		static extern int GetWindowTextLength (IntPtr hWnd);
++
++		[DllImport ("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
++		static extern int GetWindowText (IntPtr hWnd, StringBuilder lpString, int nMaxCount);
++
++		public string MainWindowTitle (Process process) {
++			IntPtr hMainWnd = MainWindowHandle (process);
++			if (hMainWnd == IntPtr.Zero)
++				return string.Empty;
++
++			StringBuilder text = new StringBuilder (GetWindowTextLength (hMainWnd) + 1);
++			GetWindowText (hMainWnd, text, text.Capacity);
++			return text.ToString();
++		}
++
++		public long NonpagedSystemMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long PagedMemorySize64 (Process process) {
++			PROCESS_MEMORY_COUNTERS counters;
++			counters.cb = Marshal.SizeOf (typeof (PROCESS_MEMORY_COUNTERS));
++			GetProcessMemoryInfo (process.Handle, out counters, counters.cb);
++			return (long)counters.PagefileUsage;
++		}
++
++		public long PagedSystemMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long PeakPagedMemorySize64 (Process process) {
++			PROCESS_MEMORY_COUNTERS counters;
++			counters.cb = Marshal.SizeOf (typeof (PROCESS_MEMORY_COUNTERS));
++			GetProcessMemoryInfo (process.Handle, out counters, counters.cb);
++			return (long)counters.PeakPagefileUsage;
++		}
++
++		public long PeakVirtualMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long PeakWorkingSet64 (Process process) {
++			PROCESS_MEMORY_COUNTERS counters;
++			counters.cb = Marshal.SizeOf (typeof (PROCESS_MEMORY_COUNTERS));
++			GetProcessMemoryInfo (process.Handle, out counters, counters.cb);
++			return (long)counters.PeakWorkingSetSize;
++		}
++
++		[DllImport ("kernel32.dll", CharSet = CharSet.Auto)]
++		static extern bool GetProcessPriorityBoost (IntPtr hProcess,
++		   out bool pDisablePriorityBoost);
++
++		[DllImport ("kernel32.dll", CharSet = CharSet.Auto)]
++		static extern bool SetProcessPriorityBoost (IntPtr hProcess,
++		   bool DisablePriorityBoost);
++
++		public bool PriorityBoostEnabled (Process process) {
++			bool disable_priority_boost;
++			GetProcessPriorityBoost (process.Handle, out disable_priority_boost);
++			return !disable_priority_boost;
++		}
++
++		public void PriorityBoostEnabled (Process process, bool value) {
++			SetProcessPriorityBoost (process.Handle, !value);
++		}
++
++		[DllImport ("kernel32.dll", CharSet = CharSet.Auto)]
++		static extern uint GetPriorityClass (IntPtr hProcess);
++
++		[DllImport ("kernel32.dll", CharSet = CharSet.Auto)]
++		static extern bool SetPriorityClass (IntPtr hProcess, uint dwPriorityClass);
++
++		public ProcessPriorityClass PriorityClass (Process process) {
++			return (ProcessPriorityClass)GetPriorityClass (process.Handle);
++		}
++
++		public void PriorityClass (Process process, ProcessPriorityClass value) {
++			SetPriorityClass (process.Handle, (uint)value);
++		}
++
++		public long PrivateMemorySize64 (Process process) {
++			PROCESS_MEMORY_COUNTERS counters;
++			counters.cb = Marshal.SizeOf (typeof (PROCESS_MEMORY_COUNTERS));
++			GetProcessMemoryInfo (process.Handle, out counters, counters.cb);
++			return (long)counters.PrivateUsage;
++		}
++
++		public TimeSpan PrivilegedProcessorTime (Process process) {
++			COMNamespace.FILETIME creation;
++			COMNamespace.FILETIME exit;
++			COMNamespace.FILETIME kernel;
++			COMNamespace.FILETIME user;
++			GetProcessTimes (process.Handle, out creation, out exit, out kernel, out user);
++			long ticks = ((long)kernel.dwLowDateTime) + (((long)kernel.dwHighDateTime) << 32);
++			return new TimeSpan (ticks);
++		}
++
++		[DllImport ("kernel32.dll", CharSet = CharSet.Auto)]
++		static extern bool GetProcessAffinityMask (IntPtr hProcess,
++		   out IntPtr lpProcessAffinityMask, out IntPtr lpSystemAffinityMask);
++
++		[DllImport ("kernel32.dll", CharSet = CharSet.Auto)]
++		static extern bool SetProcessAffinityMask (IntPtr hProcess,
++		   IntPtr dwProcessAffinityMask);
++
++		public IntPtr ProcessorAffinity (Process process) {
++			IntPtr process_affinity_mask;
++			IntPtr system_affinity_mask;
++			GetProcessAffinityMask (process.Handle, out process_affinity_mask, out system_affinity_mask);
++			return process_affinity_mask;
++		}
++		public void ProcessorAffinity (Process process, IntPtr value) {
++			if (!SetProcessAffinityMask (process.Handle, value))
++				throw new System.ComponentModel.Win32Exception ();
++		}
++
++		public string ProcessName (Process process) {
++			if (process.Id == 0)
++				return "Idle";
++			else {
++				int system_id = 8;
++				Version version = System.Environment.OSVersion.Version;
++				if (version.Major >= 5) {
++					system_id = (version.Minor == 0) ? 2 : 4;
++				}
++				if (process.Id == system_id)
++					return "System";
++			}
++			return null;
++		}
++
++		public bool Responding (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public TimeSpan TotalProcessorTime (Process process) {
++			COMNamespace.FILETIME creation;
++			COMNamespace.FILETIME exit;
++			COMNamespace.FILETIME kernel;
++			COMNamespace.FILETIME user;
++			GetProcessTimes (process.Handle, out creation, out exit, out kernel, out user);
++			long kernel_tick = ((long)kernel.dwLowDateTime) + (((long)kernel.dwHighDateTime) << 32);
++			long user_tick = ((long)user.dwLowDateTime) + (((long)user.dwHighDateTime) << 32);
++			return new TimeSpan (kernel_tick + user_tick);
++		}
++
++		public TimeSpan UserProcessorTime (Process process) {
++			COMNamespace.FILETIME creation;
++			COMNamespace.FILETIME exit;
++			COMNamespace.FILETIME kernel;
++			COMNamespace.FILETIME user;
++			GetProcessTimes (process.Handle, out creation, out exit, out kernel, out user);
++			long ticks = ((long)user.dwLowDateTime) + (((long)user.dwHighDateTime) << 32);
++			return new TimeSpan (ticks);
++		}
++
++		public long VirtualMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long WorkingSet64 (Process process) {
++			PROCESS_MEMORY_COUNTERS counters;
++			counters.cb = Marshal.SizeOf (typeof (PROCESS_MEMORY_COUNTERS));
++			GetProcessMemoryInfo (process.Handle, out counters, counters.cb);
++			return (long)counters.WorkingSetSize;
++		}
++
++		[DllImport ("kernel32.dll", CharSet = CharSet.Auto)]
++		static extern bool GetProcessTimes (IntPtr hProcess, out COMNamespace.FILETIME
++		   lpCreationTime, out COMNamespace.FILETIME lpExitTime, out COMNamespace.FILETIME lpKernelTime,
++		   out COMNamespace.FILETIME lpUserTime);
++
++		[DllImport ("psapi.dll", CharSet = CharSet.Auto)]
++		static extern bool GetProcessMemoryInfo (IntPtr hProcess,
++			out PROCESS_MEMORY_COUNTERS lpCreationTime, int cb);
++
++		struct PROCESS_MEMORY_COUNTERS
++		{
++			public int cb;
++			public int PageFaultCount;
++			public IntPtr PeakWorkingSetSize;
++			public IntPtr WorkingSetSize;
++			public IntPtr QuotaPeakPagedPoolUsage;
++			public IntPtr QuotaPagedPoolUsage;
++			public IntPtr QuotaPeakNonPagedPoolUsage;
++			public IntPtr QuotaNonPagedPoolUsage;
++			public IntPtr PagefileUsage;
++			public IntPtr PeakPagefileUsage;
++			public IntPtr PrivateUsage;
++		};
++
++		#endregion
++	}
++}
+
+Property changes on: System.Diagnostics/Win32ProcessAPI.cs
+___________________________________________________________________
+Name: svn:eol-style
+   + native
+
+Index: System.Diagnostics/IProcessAPI.cs
+===================================================================
+--- System.Diagnostics/IProcessAPI.cs	(revision 0)
++++ System.Diagnostics/IProcessAPI.cs	(revision 0)
+@@ -0,0 +1,60 @@
++using System;
++using System.Text;
++using System.Diagnostics;
++
++namespace System.Diagnostics
++{
++
++	internal interface IProcessAPI
++	{
++		int[] GetProcessIDs ();
++
++		int BasePriority (Process process);
++
++		int HandleCount (Process process);
++
++		IntPtr MainWindowHandle (Process process);
++
++		string MainWindowTitle (Process process);
++
++		long NonpagedSystemMemorySize64 (Process process);
++
++		long PagedMemorySize64 (Process process);
++
++		long PagedSystemMemorySize64 (Process process);
++
++		long PeakPagedMemorySize64 (Process process);
++
++		long PeakVirtualMemorySize64 (Process process);
++
++		long PeakWorkingSet64 (Process process);
++
++		bool PriorityBoostEnabled (Process process);
++
++		void PriorityBoostEnabled (Process process, bool value);
++
++		ProcessPriorityClass PriorityClass (Process process);
++
++		void PriorityClass (Process process, ProcessPriorityClass value);
++
++		long PrivateMemorySize64 (Process process);
++
++		TimeSpan PrivilegedProcessorTime (Process process);
++
++		IntPtr ProcessorAffinity (Process process);
++
++		void ProcessorAffinity (Process process, IntPtr value);
++
++		string ProcessName (Process process);
++
++		bool Responding (Process process);
++
++		TimeSpan TotalProcessorTime (Process process);
++
++		TimeSpan UserProcessorTime (Process process);
++
++		long VirtualMemorySize64 (Process process);
++
++		long WorkingSet64 (Process process);
++	}
++}
+
+Property changes on: System.Diagnostics/IProcessAPI.cs
+___________________________________________________________________
+Name: svn:eol-style
+   + native
+
+Index: System.Diagnostics/Process.cs
+===================================================================
+--- System.Diagnostics/Process.cs	(revision 76183)
++++ System.Diagnostics/Process.cs	(working copy)
+@@ -64,7 +64,17 @@
+ 			public int tid;
+ 			public string [] envKeys;
+ 			public string [] envValues;
+-		};
++		};
++
++		static readonly IProcessAPI ProcessAPI;
++
++		static Process () {
++			int platform = (int)Environment.OSVersion.Platform;
++			if ((platform == 4) || (platform == 128))
++				ProcessAPI = new LinuxProcessAPI ();
++			else
++				ProcessAPI = new Win32ProcessAPI ();
++		}
+ 		
+ 		IntPtr process_handle;
+ 		int pid;
+@@ -73,12 +83,15 @@
+ 		ISynchronizeInvoke synchronizingObject;
+ 		EventHandler exited_event;
+ 		IntPtr stdout_rd;
+-		IntPtr stderr_rd;
++		IntPtr stderr_rd;
++		bool owned_process;
+ 		
+ 		/* Private constructor called from other methods */
+-		private Process(IntPtr handle, int id) {
++		internal Process(IntPtr handle, int id) : this(){
+ 			process_handle=handle;
+-			pid=id;
++			pid=id;
++			if (process_handle != IntPtr.Zero)
++				owned_process = true;
+ 		}
+ 		
+ 		public Process ()
+@@ -89,8 +102,8 @@
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("Base process priority.")]
+ 		public int BasePriority {
+-			get {
+-				return(0);
++			get {
++				return ProcessAPI.BasePriority (this);
+ 			}
+ 		}
+ 
+@@ -171,9 +184,9 @@
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("Handles for this process.")]
+-		public int HandleCount {
+-			get {
+-				return(0);
++		public int HandleCount {
++			get {
++				return ProcessAPI.HandleCount (this);
+ 			}
+ 		}
+ 
+@@ -227,18 +240,18 @@
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The handle of the main window of the process.")]
+-		public IntPtr MainWindowHandle {
+-			get {
+-				return((IntPtr)0);
++		public IntPtr MainWindowHandle {
++			get {
++				return ProcessAPI.MainWindowHandle (this);
+ 			}
+ 		}
+ 
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The title of the main window of the process.")]
+-		public string MainWindowTitle {
+-			get {
+-				return("null");
++		public string MainWindowTitle {
++			get {
++				return ProcessAPI.MainWindowTitle (this);
+ 			}
+ 		}
+ 
+@@ -332,9 +345,9 @@
+ #endif
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The number of bytes that are not pageable.")]
+-		public int NonpagedSystemMemorySize {
+-			get {
+-				return(0);
++		public int NonpagedSystemMemorySize {
++			get {
++				return (int)ProcessAPI.NonpagedSystemMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -344,9 +357,9 @@
+ #endif
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The number of bytes that are paged.")]
+-		public int PagedMemorySize {
+-			get {
+-				return(0);
++		public int PagedMemorySize {
++			get {
++				return (int)ProcessAPI.PagedMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -356,9 +369,9 @@
+ #endif
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The amount of paged system memory in bytes.")]
+-		public int PagedSystemMemorySize {
+-			get {
+-				return(0);
++		public int PagedSystemMemorySize {
++			get {
++				return (int)ProcessAPI.PagedSystemMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -368,9 +381,9 @@
+ #endif
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The maximum amount of paged memory used by this process.")]
+-		public int PeakPagedMemorySize {
+-			get {
+-				return(0);
++		public int PeakPagedMemorySize {
++			get {
++				return (int)ProcessAPI.PeakPagedMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -380,9 +393,9 @@
+ #endif
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The maximum amount of virtual memory used by this process.")]
+-		public int PeakVirtualMemorySize {
+-			get {
+-				return(0);
++		public int PeakVirtualMemorySize {
++			get {
++				return (int)ProcessAPI.PeakVirtualMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -392,9 +405,9 @@
+ #endif
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The maximum amount of system memory used by this process.")]
+-		public int PeakWorkingSet {
+-			get {
+-				return(0);
++		public int PeakWorkingSet {
++			get {
++				return (int)ProcessAPI.PeakWorkingSet64 (this);
+ 			}
+ 		}
+ 
+@@ -403,8 +416,8 @@
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The number of bytes that are not pageable.")]
+ 		public long NonpagedSystemMemorySize64 {
+-			get {
+-				return(0);
++			get {
++				return ProcessAPI.NonpagedSystemMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -412,8 +425,8 @@
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The number of bytes that are paged.")]
+ 		public long PagedMemorySize64 {
+-			get {
+-				return(0);
++			get {
++				return ProcessAPI.PagedMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -421,8 +434,8 @@
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The amount of paged system memory in bytes.")]
+ 		public long PagedSystemMemorySize64 {
+-			get {
+-				return(0);
++			get {
++				return ProcessAPI.PagedSystemMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -430,8 +443,8 @@
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The maximum amount of paged memory used by this process.")]
+ 		public long PeakPagedMemorySize64 {
+-			get {
+-				return(0);
++			get {
++				return ProcessAPI.PeakPagedMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -439,8 +452,8 @@
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The maximum amount of virtual memory used by this process.")]
+ 		public long PeakVirtualMemorySize64 {
+-			get {
+-				return(0);
++			get {
++				return ProcessAPI.PeakVirtualMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -448,49 +461,65 @@
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The maximum amount of system memory used by this process.")]
+ 		public long PeakWorkingSet64 {
+-			get {
+-				return(0);
++			get {
++				return ProcessAPI.PeakWorkingSet64 (this);
+ 			}
+ 		}
+-#endif
+-
++#endif
++
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("Process will be of higher priority while it is actively used.")]
+-		public bool PriorityBoostEnabled {
+-			get {
+-				return(false);
++		public bool PriorityBoostEnabled {
++			get {
++				return ProcessAPI.PriorityBoostEnabled (this);
+ 			}
+-			set {
++			set {
++				ProcessAPI.PriorityBoostEnabled (this, value);
+ 			}
+ 		}
+ 
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The relative process priority.")]
+-		public ProcessPriorityClass PriorityClass {
+-			get {
+-				return(ProcessPriorityClass.Normal);
++		public ProcessPriorityClass PriorityClass {
++			get {
++				return ProcessAPI.PriorityClass (this);
+ 			}
+-			set {
++			set {
++				ProcessAPI.PriorityClass (this, value);
+ 			}
+-		}
+-
+-		[MonoTODO]
++		}
++
++		[MonoTODO]
++#if NET_2_0
++		[Obsolete ("Use PrivateMemorySize64")]
++#endif
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The amount of memory exclusively used by this process.")]
+-		public int PrivateMemorySize {
+-			get {
+-				return(0);
+-			}
++		public int PrivateMemorySize {
++			get {
++				return (int)ProcessAPI.PrivateMemorySize64 (this);
++			}
++		}
++		
++#if NET_2_0
++		[MonoTODO]
++		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
++		[MonitoringDescription ("The amount of memory exclusively used by this process.")]
++		public long PrivateMemorySize64 {
++			get {
++				return ProcessAPI.PrivateMemorySize64 (this);
++			}
+ 		}
+-
++#endif
++
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The amount of processing time spent in the OS core for this process.")]
+-		public TimeSpan PrivilegedProcessorTime {
+-			get {
+-				return(new TimeSpan(0));
++		public TimeSpan PrivilegedProcessorTime {
++			get {
++				return ProcessAPI.PrivilegedProcessorTime (this);
+ 			}
+ 		}
+ 
+@@ -503,8 +532,14 @@
+ 		[MonitoringDescription ("The name of this process.")]
+ 		public string ProcessName {
+ 			get {
+-				if(process_name==null) {
+-					process_name=ProcessName_internal(process_handle);
++				if(process_name==null) {
++					process_name = MainModule.ModuleName;
++
++					/* Check processes we didn't start
++					 */
++					if (process_name == null)
++						process_name = ProcessAPI.ProcessName (this);
++
+ 					/* If process_name is _still_
+ 					 * null, assume the process
+ 					 * has exited
+@@ -533,20 +568,21 @@
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("Allowed processor that can be used by this process.")]
+-		public IntPtr ProcessorAffinity {
+-			get {
+-				return((IntPtr)0);
++		public IntPtr ProcessorAffinity {
++			get {
++				return ProcessAPI.ProcessorAffinity (this);
+ 			}
+-			set {
++			set {
++				ProcessAPI.ProcessorAffinity (this, value);
+ 			}
+ 		}
+ 
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("Is this process responsive.")]
+-		public bool Responding {
+-			get {
+-				return(false);
++		public bool Responding {
++			get {
++				return ProcessAPI.Responding (this);
+ 			}
+ 		}
+ 
+@@ -658,18 +694,18 @@
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The total CPU time spent for this process.")]
+-		public TimeSpan TotalProcessorTime {
+-			get {
+-				return(new TimeSpan(0));
++		public TimeSpan TotalProcessorTime {
++			get {
++				return ProcessAPI.TotalProcessorTime (this);
+ 			}
+ 		}
+ 
+ 		[MonoTODO]
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The CPU time spent for this process in user mode.")]
+-		public TimeSpan UserProcessorTime {
+-			get {
+-				return(new TimeSpan(0));
++		public TimeSpan UserProcessorTime {
++			get {
++				return ProcessAPI.UserProcessorTime (this);
+ 			}
+ 		}
+ 
+@@ -679,9 +715,9 @@
+ #endif
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The amount of virtual memory currently used for this process.")]
+-		public int VirtualMemorySize {
+-			get {
+-				return(0);
++		public int VirtualMemorySize {
++			get {
++				return (int)ProcessAPI.VirtualMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -691,9 +727,9 @@
+ #endif
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The amount of physical memory currently used for this process.")]
+-		public int WorkingSet {
+-			get {
+-				return(0);
++		public int WorkingSet {
++			get {
++				return (int)ProcessAPI.WorkingSet64 (this);
+ 			}
+ 		}
+ 
+@@ -702,8 +738,8 @@
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The amount of virtual memory currently used for this process.")]
+ 		public long VirtualMemorySize64 {
+-			get {
+-				return(0);
++			get {
++				return ProcessAPI.VirtualMemorySize64 (this);
+ 			}
+ 		}
+ 
+@@ -711,12 +747,12 @@
+ 		[DesignerSerializationVisibility (DesignerSerializationVisibility.Hidden)]
+ 		[MonitoringDescription ("The amount of physical memory currently used for this process.")]
+ 		public long WorkingSet64 {
+-			get {
+-				return(0);
++			get {
++				return ProcessAPI.WorkingSet64 (this);
+ 			}
+ 		}
+-#endif
+-
++#endif
++
+ 		public void Close()
+ 		{
+ 			Dispose (true);
+@@ -767,7 +803,10 @@
+ 
+ 		public static Process GetProcessById(int processId)
+ 		{
+-			IntPtr proc = GetProcess_internal(processId);
++			IntPtr proc = GetProcess_internal(processId);
++
++			if (Array.IndexOf (ProcessAPI.GetProcessIDs (), processId) != -1)
++				return (new Process (IntPtr.Zero, processId));
+ 			
+ 			if (proc == IntPtr.Zero) {
+ 				throw new ArgumentException ("Can't find process with ID " + processId.ToString ());
+@@ -791,8 +830,9 @@
+ 		private extern static int[] GetProcesses_internal();
+ 
+ 		public static Process[] GetProcesses()
+-		{
+-			int [] pids = GetProcesses_internal ();
++		{
++			int[] pids = ProcessAPI.GetProcessIDs ();
++			//int [] pids = GetProcesses_internal ();
+ 			ArrayList proclist = new ArrayList ();
+ 			
+ 			for (int i = 0; i < pids.Length; i++) {
+@@ -1034,8 +1074,9 @@
+ 			if(startInfo.FileName == null ||
+ 			   startInfo.FileName == "") {
+ 				throw new InvalidOperationException("File name has not been set");
+-			}
+-			
++			}
++
++			process.owned_process = true;
+ 			if (startInfo.UseShellExecute) {
+ 				return (Start_shell (startInfo, process));
+ 			} else {
+Index: System.Diagnostics/LinuxProcessAPI.cs
+===================================================================
+--- System.Diagnostics/LinuxProcessAPI.cs	(revision 0)
++++ System.Diagnostics/LinuxProcessAPI.cs	(revision 0)
+@@ -0,0 +1,280 @@
++using System;
++using System.Collections;
++using System.Text;
++using System.Diagnostics;
++
++namespace process_impl
++{
++
++	class LinuxProcessAPI : IProcessAPI
++	{
++		enum ProcInfo
++		{
++			pid,
++			comm,
++			state,
++			ppid,
++			pgrp,
++			session,
++			tty_nr,
++			tpgid,
++			flags,
++			minflt,
++			cminflt,
++			majflt,
++			cmajflt,
++			utime,
++			stime,
++			cutime,
++			cstime,
++			priority,
++			nice,
++			zero,
++			itrealvalue,
++			starttime,
++			vsize,
++			rss,
++			rlim,
++			startcode,
++			endcode,
++			startstack,
++			kstkesp,
++			kstkeip,
++			signal,
++			blocked,
++			sigignore,
++			sigcatch,
++			wchan,
++			nswap,
++			cnswap,
++			exit_signal,
++			processor,
++			rt_priority,
++			policy
++		}
++
++		/* We could just use String.Split, but
++		 * that would create a lot of unnecessary
++		 * string objects.
++		 */
++		string GetProcToken (string s, int index) {
++			int start = 0;
++			int end = s.IndexOf (' ');
++			while (index > 0) {
++				start = end + 1;
++				end = s.IndexOf (' ', start);
++				index--;
++			}
++			return s.Substring (start, end-start);
++		}
++
++		object ParseProc (Process process, ProcInfo proc_info) {
++			string statm;
++			using (System.IO.StreamReader reader = new System.IO.StreamReader ("/proc/" + process.Id + "/stat")) {
++				statm = reader.ReadToEnd ();
++			}
++
++			if (proc_info == ProcInfo.pid) {
++				return int.Parse (statm.Substring (0, statm.IndexOf (' ')));
++			}
++			else if (proc_info == ProcInfo.comm) {
++				int start = statm.IndexOf ('(') + 1;
++				int end = statm.IndexOf (')');
++				return statm.Substring (start, end-start);
++			}
++			else {
++				// TODO: Can we just make all of these a long or ulong except ProcInfo.state?
++				string string_val = GetProcToken (statm.Substring (statm.IndexOf (')') + 2), (int)proc_info - 2);
++				switch (proc_info)
++				{
++				case ProcInfo.state:
++					return char.Parse (string_val);
++				case ProcInfo.ppid:
++				case ProcInfo.pgrp:
++				case ProcInfo.session:
++				case ProcInfo.tty_nr:
++				case ProcInfo.tpgid:
++					return int.Parse (string_val);
++				case ProcInfo.flags:
++				case ProcInfo.minflt:
++				case ProcInfo.cminflt:
++				case ProcInfo.majflt:
++				case ProcInfo.cmajflt:
++				case ProcInfo.utime:
++				case ProcInfo.stime:
++					return ulong.Parse (string_val);
++				case ProcInfo.cutime:
++				case ProcInfo.cstime:
++				case ProcInfo.priority:
++				case ProcInfo.nice:
++				case ProcInfo.zero:
++				case ProcInfo.itrealvalue:
++					return long.Parse (string_val);
++				case ProcInfo.starttime:
++				case ProcInfo.vsize:
++					return ulong.Parse (string_val);
++				case ProcInfo.rss:
++					return long.Parse (string_val);
++				case ProcInfo.rlim:
++				case ProcInfo.startcode:
++				case ProcInfo.endcode:
++				case ProcInfo.startstack:
++				case ProcInfo.kstkesp:
++				case ProcInfo.kstkeip:
++				case ProcInfo.signal:
++				case ProcInfo.blocked:
++				case ProcInfo.sigignore:
++				case ProcInfo.sigcatch:
++				case ProcInfo.wchan:
++				case ProcInfo.nswap:
++				case ProcInfo.cnswap:
++					return ulong.Parse (string_val);
++				case ProcInfo.exit_signal:
++				case ProcInfo.processor:
++					return int.Parse (string_val);
++				case ProcInfo.rt_priority:
++				case ProcInfo.policy:
++					return ulong.Parse (string_val);
++				default:
++					return null;
++				}
++			}
++
++		}
++
++		#region IProcessAPI Members
++
++		public int[] GetProcessIDs () {
++			string[] files = System.IO.Directory.GetDirectories ("/proc");
++			ArrayList proclist = new ArrayList ();
++			foreach (string file in files) {
++				int pid;
++				// better way to do this in NET_1_0?
++#if NET_2_0
++				if (int.TryParse (file.Substring(6), out pid))
++					proclist.Add (pid);
++#else
++				try {
++					pid = int.Parse (file.Substring (6));
++					proclist.Add (pid);
++				}
++				catch {
++					continue;
++				}
++#endif
++			}
++			return ((int[])proclist.ToArray (typeof (int)));
++		}
++
++		public int BasePriority (Process process) {
++			return (int)ParseProc (process, ProcInfo.priority);
++		}
++
++		public int HandleCount (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public IntPtr MainWindowHandle (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public string MainWindowTitle (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long NonpagedSystemMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long PagedMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long PagedSystemMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long PeakPagedMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long PeakVirtualMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long PeakWorkingSet64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public bool PriorityBoostEnabled (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public void PriorityBoostEnabled (Process process, bool value) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public ProcessPriorityClass PriorityClass (Process process) {
++			int priority = BasePriority (process);
++			// Arbitrary division of BasePriority value range [-5, 34]
++			if (priority < 1)
++				return System.Diagnostics.ProcessPriorityClass.RealTime;
++			else if (priority < 8)
++				return System.Diagnostics.ProcessPriorityClass.High;
++			else if (priority < 15)
++				return System.Diagnostics.ProcessPriorityClass.AboveNormal;
++			else if (priority < 22)
++				return System.Diagnostics.ProcessPriorityClass.Normal;
++			else if (priority < 34)
++				return System.Diagnostics.ProcessPriorityClass.BelowNormal;
++			else
++				return System.Diagnostics.ProcessPriorityClass.Idle;
++		}
++
++		public void PriorityClass (Process process, System.Diagnostics.ProcessPriorityClass value) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long PrivateMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public TimeSpan PrivilegedProcessorTime (Process process) {
++			return new TimeSpan ((long)(ulong)ParseProc (process, ProcInfo.stime));
++		}
++
++		public IntPtr ProcessorAffinity (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public void ProcessorAffinity (Process process, IntPtr value) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public string ProcessName (Process process) {
++			return (string)ParseProc (process, ProcInfo.comm);
++		}
++
++		public bool Responding (Process process) {
++			return ((char)ParseProc (process, ProcInfo.state) != 'Z');
++		}
++
++		public TimeSpan TotalProcessorTime (Process process) {
++			return UserProcessorTime (process) + PrivilegedProcessorTime (process);
++		}
++
++		public TimeSpan UserProcessorTime (Process process) {
++			return new TimeSpan ((long)(ulong)ParseProc (process, ProcInfo.utime));
++		}
++
++		public long VirtualMemorySize64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		public long WorkingSet64 (Process process) {
++			throw new Exception ("The method or operation is not implemented.");
++		}
++
++		#endregion
++	}
++}
+
+Property changes on: System.Diagnostics/LinuxProcessAPI.cs
+___________________________________________________________________
+Name: svn:eol-style
+   + native

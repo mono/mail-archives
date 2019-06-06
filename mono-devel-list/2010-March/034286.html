@@ -1,0 +1,186 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH] Fix Sparc/Linux build.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Fix%20Sparc/Linux%20build.&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034285.html">
+   <LINK REL="Next"  HREF="034294.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH] Fix Sparc/Linux build.</H1>
+    <B>David Miller</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Fix%20Sparc/Linux%20build.&In-Reply-To="
+       TITLE="[Mono-dev] [PATCH] Fix Sparc/Linux build.">davem at davemloft.net
+       </A><BR>
+    <I>Thu Mar  4 06:14:02 EST 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034285.html">[Mono-dev] [PATCH] Improve compiler generated class handling and ReferenceEquality comparer.
+</A></li>
+        <LI>Next message: <A HREF="034294.html">[Mono-dev] [PATCH] Fix Sparc/Linux build.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34286">[ date ]</a>
+              <a href="thread.html#34286">[ thread ]</a>
+              <a href="subject.html#34286">[ subject ]</a>
+              <a href="author.html#34286">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+This was the minimal set of changes I needed to get mainline
+to build for me.
+
+libgc/
+
+2010-03-04  David S. Miller  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">davem at davemloft.net</A>&gt;
+
+	* include/private/gc_locks.h: Add SPARC implementations of
+	GC_compare_and_exchange and GC_memory_barrier.
+
+mono/mini/
+
+2010-03-04  David S. Miller  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">davem at davemloft.net</A>&gt;
+
+	* mini-sparc.h: Always use MONO_ARCH_USE_SIGACTION.  Linux kernels
+	that don't provide the siginfo in the second signal handler argument
+	are buggy, and this has been fixed for years.
+	* mini.h (GET_CONTEXT): Remove __sparc__ special case.
+	(SIG_HANDLER_SIGNATURE, SIG_HANDLER_PARMS): Likewise.
+
+diff --git a/libgc/include/private/gc_locks.h b/libgc/include/private/gc_locks.h
+index 23a506a..1cbcbd6 100644
+--- a/libgc/include/private/gc_locks.h
++++ b/libgc/include/private/gc_locks.h
+@@ -500,6 +500,51 @@
+         }
+ #     endif /* POWERPC */
+ 
++#     if defined(SPARC)
++#      if !defined(GENERIC_COMPARE_AND_SWAP)
++#       if CPP_WORDSZ == 64
++        /* Returns TRUE if the comparison succeeded. */
++        inline static GC_bool GC_compare_and_exchange(volatile GC_word *addr,
++            GC_word old, GC_word new_val) 
++        {
++            unsigned long result;
++            __asm__ __volatile__(
++		&quot;casx [%2], %3, %0&quot;
++                :  &quot;=r&quot; (result)
++                :  &quot;0&quot; (new_val), &quot;r&quot; (addr), &quot;r&quot; (old)
++                : &quot;memory&quot;);
++            return (GC_bool) (result == old);
++        }
++#       else
++        /* Returns TRUE if the comparison succeeded. */
++        inline static GC_bool GC_compare_and_exchange(volatile GC_word *_addr,
++            GC_word _old, GC_word _new_val) 
++        {
++	    register unsigned long result asm(&quot;o0&quot;);
++	    register unsigned long old asm(&quot;o1&quot;);
++	    register volatile GC_word *addr asm(&quot;o2&quot;);
++	    result = _new_val;
++	    old = _old;
++	    addr = _addr;
++            __asm__ __volatile__(
++		/* We encode the instruction directly so that it
++		   doesn't taint the whole binary as v9-only.  */
++		&quot;.word 0xd1e29009&quot; /* cas [%o2], %o1, %o0 */
++                :  &quot;=r&quot; (result)
++                :  &quot;0&quot; (result), &quot;r&quot; (addr), &quot;r&quot;(old)
++                : &quot;memory&quot;);
++            return (GC_bool) (result == old);
++        }
++#       endif
++#      endif /* !GENERIC_COMPARE_AND_SWAP */
++        inline static void GC_memory_barrier()
++        {
++	    /* All sparc v9 chips provice procesor consistent ordering. */
++	    /* Thus a compiler barrier should suffice.			*/
++            __asm__ __volatile__(&quot;&quot; : : : &quot;memory&quot;);
++        }
++#     endif /* SPARC */
++
+ #     if defined(IA64)
+ #      if !defined(GENERIC_COMPARE_AND_SWAP)
+          inline static GC_bool GC_compare_and_exchange(volatile GC_word *addr,
+diff --git a/mono/mini/mini-sparc.h b/mono/mini/mini-sparc.h
+index 5cc2ec4..3f3eefd 100644
+--- a/mono/mini/mini-sparc.h
++++ b/mono/mini/mini-sparc.h
+@@ -100,14 +100,7 @@ typedef struct MonoCompileArch {
+ 		MONO_CONTEXT_SET_SP ((ctx), __builtin_frame_address (0));	\
+ 	} while (0)
+ 
+-#ifndef __linux__
+-/* 
+- * Can't use sigaction on sparc/linux, since it doesn't support SA_SIGINFO. Instead, we
+- * have to use the obsolete sigcontext parameter:
+- * <A HREF="http://www.ussg.iu.edu/hypermail/linux/kernel/0110.3/1531.html.">http://www.ussg.iu.edu/hypermail/linux/kernel/0110.3/1531.html.</A>
+- */
+ #define MONO_ARCH_USE_SIGACTION 1
+-#endif
+ 
+ #ifdef HAVE_WORKING_SIGALTSTACK
+ /*#define MONO_ARCH_SIGSEGV_ON_ALTSTACK*/
+diff --git a/mono/mini/mini.h b/mono/mini/mini.h
+index 2410f7b..17432be 100644
+--- a/mono/mini/mini.h
++++ b/mono/mini/mini.h
+@@ -2061,9 +2061,6 @@ gboolean mono_gdb_render_native_backtraces (void) MONO_INTERNAL;
+ #ifdef MONO_ARCH_USE_SIGACTION
+ #define GET_CONTEXT \
+     void *ctx = context;
+-#elif defined(__sparc__)
+-#define GET_CONTEXT \
+-    void *ctx = sigctx;
+ #else
+ #define GET_CONTEXT \
+ 	void **_p = (void **)&amp;_dummy; \
+@@ -2078,9 +2075,6 @@ gboolean mono_gdb_render_native_backtraces (void) MONO_INTERNAL;
+ #elif defined(HOST_WIN32)
+ #define SIG_HANDLER_SIGNATURE(ftn) ftn (int _dummy, EXCEPTION_RECORD *info, void *context)
+ #define SIG_HANDLER_PARAMS _dummy, info, context
+-#elif defined(__sparc__)
+-#define SIG_HANDLER_SIGNATURE(ftn) ftn (int _dummy, void *sigctx)
+-#define SIG_HANDLER_PARAMS _dummy, sigctx
+ #else
+ #define SIG_HANDLER_SIGNATURE(ftn) ftn (int _dummy)
+ #define SIG_HANDLER_PARAMS _dummy
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034285.html">[Mono-dev] [PATCH] Improve compiler generated class handling and ReferenceEquality comparer.
+</A></li>
+	<LI>Next message: <A HREF="034294.html">[Mono-dev] [PATCH] Fix Sparc/Linux build.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34286">[ date ]</a>
+              <a href="thread.html#34286">[ thread ]</a>
+              <a href="subject.html#34286">[ subject ]</a>
+              <a href="author.html#34286">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

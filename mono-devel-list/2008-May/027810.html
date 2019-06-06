@@ -1,0 +1,311 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] How To Convince Mono To Allocate Big Arrays
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20How%20To%20Convince%20Mono%20To%20Allocate%20Big%20Arrays&In-Reply-To=755C0F44-B391-4EC6-863B-06435D73AD3D%40Verizon.Net">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027776.html">
+   <LINK REL="Next"  HREF="027816.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] How To Convince Mono To Allocate Big Arrays</H1>
+    <B>Rodrigo Kumpera</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20How%20To%20Convince%20Mono%20To%20Allocate%20Big%20Arrays&In-Reply-To=755C0F44-B391-4EC6-863B-06435D73AD3D%40Verizon.Net"
+       TITLE="[Mono-dev] How To Convince Mono To Allocate Big Arrays">kumpera at gmail.com
+       </A><BR>
+    <I>Wed May  7 22:50:57 EDT 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027776.html">[Mono-dev] How To Convince Mono To Allocate Big Arrays
+</A></li>
+        <LI>Next message: <A HREF="027816.html">[Mono-dev] How To Convince Mono To Allocate Big Arrays
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27810">[ date ]</a>
+              <a href="thread.html#27810">[ thread ]</a>
+              <a href="subject.html#27810">[ subject ]</a>
+              <a href="author.html#27810">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi Luis,
+
+To have your patch integrated, some changes are needed. First, we want to
+default to 32bits sized arrays on 64bits machines, so your changes must be
+conditionally compiled. To help with that some changed to your patch are
+due. Next are some comments about it:
+
+Instead of replacing guint32 for gsize, it's better to create a new type,
+let's say array_size_t. This would reduce conditional compilation to fewer
+places.
+
+ /* helper macros to check for overflow when calculating the size of arrays
+*/
+-#define MYGUINT32_MAX 4294967295U
++#if (GLIB_SIZEOF_SIZE_T &lt; 4 )
++#define MYGUINT32_MAX 0xFFFFFFFFUL
++#define MYGUINT_MAX MYGUINT32_MAX
+
+This #if seens bogus, don't you mean &quot;if ((GLIB_SIZEOF_SIZE_T == 4 )&quot; as
+mono never supported 16bits machines.
+The macros can be unified by using MYGUINT_MAX and the 'array_size_t' type I
+talked before. The definition of MYGUINT_MAX
+should be put together in the same place we define 'array_size_t'. And we
+could go with a meaningful name, don't you think?
+
+
+-    if (CHECK_MUL_OVERFLOW_UN (n, elem_size))
+-        mono_gc_out_of_memory (MYGUINT32_MAX);
++    if (CHECK_MUL_OVERFLOW_UN (n, elem_size)) {
++        g_print(&quot;CHECK_MUL_OVERFLOW_UN(%zd,%zd) failed\n&quot;,n, elem_size);
++        mono_gc_out_of_memory (MYGUINT_MAX);
++        }
+
+If you find that keeping such debug code is really important, you should
+follow the same pattern of the rest of the project. Take a look at how
+DEBUG_IMT is used on object.c.
+
+
+@@ -3548,34 +3559,30 @@
+     /* A single dimensional array with a 0 lower bound is the same as an
+szarray */
+     if (array_class-&gt;rank == 1 &amp;&amp; ((array_class-&gt;byval_arg.type ==
+MONO_TYPE_SZARRAY) || (lower_bounds &amp;&amp; lower_bounds [0] == 0))) {
+         len = lengths [0];
+-        if ((int) len &lt; 0)
+-            arith_overflow ();
+
+
+Why are you removing overflow checks here?
+
+
+@@ -562,6 +607,26 @@
+     if (this-&gt;bounds == NULL)
+         return this-&gt;max_length;
+
++    length = this-&gt;bounds [dimension].length;
++    if (length &gt; G_MAXINT32)
++            mono_raise_exception (mono_get_exception_overflow ());
++
++    return length;
++}
+
+Why throwing an exception here? I'm not sure this is the way to go,
+unfortunately this is an area underspecified on ecma. Not that truncating is
+a good option either.
+
+Changes to amd64 code I'll leave to Zoltan.
+
+
+Cheers,
+Rodrigo
+
+
+2008/5/5 Luis F. Ortiz &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">LuisOrtiz at verizon.net</A>&gt;:
+
+&gt;<i> Back in September (&quot;Big Arrays, Many Changes --- Request for Advice&quot;) I
+</I>&gt;<i> asked folks for advice on how to go about adding the capability to Mono to
+</I>&gt;<i> allocate arrays with more than Int32.MaxValue elements.  After playing
+</I>&gt;<i> around with it for a few months, I'm at the point where I have an
+</I>&gt;<i> implementation that mostly works, with a couple of warts which could
+</I>&gt;<i> probably be quickly fixed by someone who knows more than I do about Mono
+</I>&gt;<i> internals. I spoke with Miguel about these patches, and he encouraged me to
+</I>&gt;<i> post them to mono-dev as soon as I got them to pass the &quot;make check&quot; test
+</I>&gt;<i> suite.  So here I am a week later.
+</I>&gt;<i> I want to start by going over the changes themselves, what alternatives
+</I>&gt;<i> there might be to what I had done and what flaws I know to exist in the
+</I>&gt;<i> implementation.
+</I>&gt;<i>
+</I>&gt;<i> First off, though Microsoft chose for some reason NOT to implement large
+</I>&gt;<i> array allocation, the necessary APIs are in the .NET specification.  For
+</I>&gt;<i> example, in the System.Array class, we find:
+</I>&gt;<i>
+</I>&gt;<i> public long GetLongLength&lt;<A HREF="http://msdn.microsoft.com/en-us/library/system.array.getlonglength.aspx">http://msdn.microsoft.com/en-us/library/system.array.getlonglength.aspx</A>&gt;(int
+</I>&gt;<i> dimension);
+</I>&gt;<i> public long LongLength&lt;<A HREF="http://msdn.microsoft.com/en-us/library/system.array.longlength.aspx">http://msdn.microsoft.com/en-us/library/system.array.longlength.aspx</A>&gt; {
+</I>&gt;<i> get; }
+</I>&gt;<i> public static Array CreateInstance&lt;<A HREF="http://msdn.microsoft.com/en-us/library/1z8w3at5.aspx">http://msdn.microsoft.com/en-us/library/1z8w3at5.aspx</A>&gt;(Type
+</I>&gt;<i> elementType, params long[] lengths);
+</I>&gt;<i> public Object GetValue&lt;<A HREF="http://msdn.microsoft.com/en-us/library/2zexc3z9.aspx">http://msdn.microsoft.com/en-us/library/2zexc3z9.aspx</A>&gt;(long
+</I>&gt;<i> index);
+</I>&gt;<i> public void SetValue&lt;<A HREF="http://msdn.microsoft.com/en-us/library/czx562xz.aspx">http://msdn.microsoft.com/en-us/library/czx562xz.aspx</A>&gt;(Object
+</I>&gt;<i> value, long index);
+</I>&gt;<i> ... (other overloads omitted, but there)
+</I>&gt;<i> and we find that the Newarr&lt;<A HREF="http://msdn.microsoft.com/en-us/library/system.reflection.emit.opcodes.newarr%28VS.71%29.aspx">http://msdn.microsoft.com/en-us/library/system.reflection.emit.opcodes.newarr%28VS.71%29.aspx</A>&gt;  opcode
+</I>&gt;<i> takes a natural int or an Int32 as the length, so the bytecode level is
+</I>&gt;<i> ready too.
+</I>&gt;<i>
+</I>&gt;<i> Mono as of 1.2.6 already implemented most (all?) of the necessary
+</I>&gt;<i> interfaces in mcs/class/corlib/System/Array.cs, but they all cast down their
+</I>&gt;<i> long arguments down to integers as the underlying implementation was not
+</I>&gt;<i> there.
+</I>&gt;<i>
+</I>&gt;<i> So the first set of changes were to:
+</I>&gt;<i> * **mono/metadata/object.c*
+</I>&gt;<i> * **mono/metadata/object.h*
+</I>&gt;<i> * **mono/metadata/icall-def.h*
+</I>&gt;<i> * **mono/metadata/icall.c*
+</I>&gt;<i> * **mono/metadata/socket-io.c*
+</I>&gt;<i>
+</I>&gt;<i> In object.h I made three changes:
+</I>&gt;<i>
+</I>&gt;<i> 1) Changed MonoArrayBounds to use gsize instead of guint32 as the type for
+</I>&gt;<i> length and lower_bound,
+</I>&gt;<i> 2) Changed MonoArray to use gsize instead of guint32 as the type of
+</I>&gt;<i> max_length,
+</I>&gt;<i> 3) Changed the prototypes for mono_array_new(), mono_array_new_full(), and
+</I>&gt;<i> mono_array_new_specific() to
+</I>&gt;<i> take gsize's instead of guint32's for their size and bounds parameters.
+</I>&gt;<i> I.e.:
+</I>&gt;<i> MonoArray*
+</I>&gt;<i> -mono_array_new (MonoDomain *domain, MonoClass *eclass, guint32 n);
+</I>&gt;<i> +mono_array_new (MonoDomain *domain, MonoClass *eclass, gsize n);
+</I>&gt;<i>
+</I>&gt;<i>   MonoArray*
+</I>&gt;<i>  mono_array_new_full        (MonoDomain *domain, MonoClass *array_class,
+</I>&gt;<i> -                            guint32 *lengths, guint32 *lower_bounds);
+</I>&gt;<i> +                            gsize *lengths, gsize *lower_bounds);
+</I>&gt;<i>
+</I>&gt;<i>   MonoArray *
+</I>&gt;<i> -mono_array_new_specific            (MonoVTable *vtable, guint32 n);
+</I>&gt;<i> +mono_array_new_specific            (MonoVTable *vtable, gsize n);
+</I>&gt;<i>
+</I>&gt;<i> This is the first place an alternative shows up.  &#191;Which type is better:
+</I>&gt;<i> gsize or gssize?  The unsigned type gsize better matches the type memory
+</I>&gt;<i> allocation functions use (size_t or some variant) and the existing guint32,
+</I>&gt;<i> but the signed type better matches the interface presented at the top level
+</I>&gt;<i> (i.e. CreateInstance).  I chose the unsigned alternative, but an argument
+</I>&gt;<i> could be made for the signed type.  Another alternative would be to create
+</I>&gt;<i> 64 bit versions of the mono_array_new(), mono_array_new_full(), and
+</I>&gt;<i> mono_array_new_specific() functions, but that seemed to be too much work.
+</I>&gt;<i>
+</I>&gt;<i> The changes in *object.c* add the implementations of the
+</I>&gt;<i> modified mono_array_new(), mono_array_new_full(), and
+</I>&gt;<i> mono_array_new_specific() functions.  There was some confusing #defines
+</I>&gt;<i> around MYGUINT32_MAX that I did not like, but rather than replace that
+</I>&gt;<i> cruft, I extended it.
+</I>&gt;<i>
+</I>&gt;<i> The changes in *icall-def.h* add two new method calls to the array
+</I>&gt;<i> object, CreateInstanceImpl64() and GetLongLength().  It might be possible to
+</I>&gt;<i> avoid the CreateInstanceImpl64() definition and make it an overload
+</I>&gt;<i> of CreateInstanceImpl() with long parameters, if I was sure on how to do
+</I>&gt;<i> that.
+</I>&gt;<i>
+</I>&gt;<i> The changes to *icall.c* tweak the implementation
+</I>&gt;<i> of ves_icall_System_Array_CreateInstanceImpl() to change the type of the
+</I>&gt;<i> sizes array and add the implementations
+</I>&gt;<i> of ves_icall_System_Array_CreateInstanceImpl64()
+</I>&gt;<i> and ves_icall_System_Array_GetLongLength().
+</I>&gt;<i>
+</I>&gt;<i> The change to *socket-io.c* was to tweak its usage of mono_array_new_full
+</I>&gt;<i> to use gssize instead of int for for the array of lengths.
+</I>&gt;<i>
+</I>&gt;<i> So all these changes get us to the point where the basic foundation
+</I>&gt;<i> is laid down, but there is still the JIT to contend with.  It requires a few
+</I>&gt;<i> more files to be changed:
+</I>&gt;<i> * **mono/mini/mini.c*
+</I>&gt;<i> * **mono/mini/jit-icalls.c*
+</I>&gt;<i> * **mono/mini/exceptions.cs*
+</I>&gt;<i>
+</I>&gt;<i> The changes in *mini.c* change the signature of mono_array_new
+</I>&gt;<i> and mono_array_new_specific to take &quot;int&quot; instead of &quot;int32&quot;.
+</I>&gt;<i>
+</I>&gt;<i> The changes in *jit-calls.c* do the boring change of guint32's into
+</I>&gt;<i> gsize's.
+</I>&gt;<i>
+</I>&gt;<i> The changes in *exceptions.cs* split the test case for test_0_array_size
+</I>&gt;<i> into a 32 and 64 bit variant, because an allocation of Int32.MaxValue can
+</I>&gt;<i> succeed after these changes are applied.
+</I>&gt;<i>
+</I>&gt;<i> There was only one touch-up needed in the the C# compiler:  the GetLength
+</I>&gt;<i> property code special-inlined code-generation needed to be tweaked since it
+</I>&gt;<i> is now possible to get an array length that will not fit into an I4.
+</I>&gt;<i>  Changing *mcs/mcs/ecore.cs* and *mcs/mcs/expression.cs* to use *
+</I>&gt;<i> OpCodes.Conv_Ovf_I4* after *OpCodes.Ldlen* instead of *OpCodes.Conv_I4*  fixed
+</I>&gt;<i> that.
+</I>&gt;<i>
+</I>&gt;<i> Oh, yeah, and ALL the long method calls in *
+</I>&gt;<i> mcs/class/corlib/System/Array.cs* needed to be converted over to
+</I>&gt;<i> use CreateInstanceImpl64() and GetLongLength().  The SetValue() and
+</I>&gt;<i> GetValue() implementations still need work, but since there are no unit
+</I>&gt;<i> tests for those methods, I put them off.
+</I>&gt;<i>
+</I>&gt;<i> That gets us to the point where we can allocate a large array, but it does
+</I>&gt;<i> not let us index a large array.   I changed the following files to start the
+</I>&gt;<i> process of converting the indexing operations to do bounds checking against
+</I>&gt;<i> the now 32/64 bit length of arrays and to index using a 64/32 bit index:
+</I>&gt;<i> * **mono/mini/inssel-amd64.brg*
+</I>&gt;<i> * **mono/mini/mini-amd64.c*
+</I>&gt;<i> * **mono/mini/mini-ops.h*
+</I>&gt;<i> * **mono/mini/cpu-amd64.md*
+</I>&gt;<i>
+</I>&gt;<i> In *inssel-amd64.brg*, I changed the
+</I>&gt;<i> macro MONO_EMIT_NEW_AMD64_ICOMPARE_MEMBASE_REG to use a new
+</I>&gt;<i> opcode OP_AMD64_COMPARE_MEMBASE_REG_I8 instead
+</I>&gt;<i> of OP_AMD64_ICOMPARE_MEMBASE_REG and hacked CEE_LDELEMA to no longer use
+</I>&gt;<i>  the faster OP_X86_LEA because I was not sure how to generalize it.
+</I>&gt;<i> Perhaps MONO_EMIT_NEW_AMD64_ICOMPARE_MEMBASE_REG should be retired and
+</I>&gt;<i> explicit I4 and I8 versions substituted where appropriate.
+</I>&gt;<i>
+</I>&gt;<i> In *mini-amd64.c* I added the OP_AMD64_COMPARE_MEMBASE_REG_I8 opcode as
+</I>&gt;<i> being the same as OP_AMD64_ICOMPARE_MEMBASE_REG, except with an operand size
+</I>&gt;<i> of 8 bytes instead of 4.
+</I>&gt;<i>
+</I>&gt;<i> In *mini-ops.h* and *cpu-amd64.md* I added an entries
+</I>&gt;<i> for OP_AMD64_COMPARE_MEMBASE_REG_I8 and amd64_compare_membase_reg_i8.
+</I>&gt;<i>
+</I>&gt;<i> These changes seem to get 64 bit indexing working, and passed all the
+</I>&gt;<i> regression tests in 1.2.6, but in 1.9.1 a regression test
+</I>&gt;<i> called test_0_regress_75832() breaks.  It could be that the changes I made
+</I>&gt;<i> in mono/mini are incorrect.  I am sure the changes are incomplete, and I
+</I>&gt;<i> have not considered what to do to other architectures.
+</I>&gt;<i>
+</I>&gt;<i> Advice or assistance is greatly appreciated.
+</I>&gt;<i>
+</I>&gt;<i> Luis F. Ortiz
+</I>&gt;<i> Official Mono Modifier
+</I>&gt;<i> Interactive Supercomputing,  Inc.
+</I>&gt;<i>
+</I>&gt;<i> PS:  Here are the changes proper:
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>&gt;<i> _______________________________________________
+</I>&gt;<i> Mono-devel-list mailing list
+</I>&gt;<i> <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">Mono-devel-list at lists.ximian.com</A>
+</I>&gt;<i> <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">http://lists.ximian.com/mailman/listinfo/mono-devel-list</A>
+</I>&gt;<i>
+</I>&gt;<i>
+</I>-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20080507/5eb7952e/attachment-0001.html">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20080507/5eb7952e/attachment-0001.html</A> 
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027776.html">[Mono-dev] How To Convince Mono To Allocate Big Arrays
+</A></li>
+	<LI>Next message: <A HREF="027816.html">[Mono-dev] How To Convince Mono To Allocate Big Arrays
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27810">[ date ]</a>
+              <a href="thread.html#27810">[ thread ]</a>
+              <a href="subject.html#27810">[ subject ]</a>
+              <a href="author.html#27810">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

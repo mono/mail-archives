@@ -1,0 +1,213 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Generic sharing: Good news, bad news, how to win big
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Generic%20sharing%3A%20Good%20news%2C%20bad%20news%2C%20how%20to%20win%20big&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="027541.html">
+   <LINK REL="Next"  HREF="027503.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Generic sharing: Good news, bad news, how to win big</H1>
+    <B>Mark Probst</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Generic%20sharing%3A%20Good%20news%2C%20bad%20news%2C%20how%20to%20win%20big&In-Reply-To="
+       TITLE="[Mono-dev] Generic sharing: Good news, bad news, how to win big">mark.probst at gmail.com
+       </A><BR>
+    <I>Mon Apr 14 08:33:46 EDT 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="027541.html">[Mono-dev] Mono 1.9 and dll.config files in ~/.mono/assemblies
+</A></li>
+        <LI>Next message: <A HREF="027503.html">[Mono-dev] Generic sharing: Good news, bad news, how to win big
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27502">[ date ]</a>
+              <a href="thread.html#27502">[ thread ]</a>
+              <a href="subject.html#27502">[ subject ]</a>
+              <a href="author.html#27502">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi everybody!
+
+Last week we hit an important milestone in implementing sharing of
+generic code: We can finally share every opcode.  That means that we
+can now always share all (non-generic) methods of instantiations of
+generic classes with certain properties.  If all of the type arguments
+of an instantiation of a generic class are reference types and the
+type arguments have no constraints, we can share all (non-generic)
+methods of that instantiation with all other instantiations which also
+satisfy those properties.  Unfortunately some of that code is still
+only in my private branch, but we're working on committing it piece by
+piece.
+
+Now for some interesting statistics.  Apart from the runtime's test
+suite I've used three other test suites/benchmarks, namely IronPython
+(running pystone), Nemerle (compiling its own compiler) and FSharp
+(compiling and running a Hello World program).  Here are the
+Good-News-statistics.  The numbers given are &quot;no sharing / sharing&quot;
+and have been collected on a 32 bit system:
+
+IronPython
+  Methods compiled: 3614 / 3368
+  native code space used: 719k / 691k
+
+Nemerle
+  Method compiled: 7210 / 6302
+  native code space used: 2001k / 1943k
+
+FSharp
+  Methods compiled: 15529 / 11431
+  native code space used: 2193k / 2062k
+
+Here are the Bad-News-statistics:
+
+IronPython
+  Memory allocated for runtime generic contexts: 0k / 10k
+
+Nemerle:
+  Memory allocated for runtime generic contexts: 0k / 230k
+
+FSharp:
+  Memory allocated for runtime generic contexts: 0k / 600k
+
+We are clearly using way too much memory for runtime generic contexts.
+ If you're curious what the RGCTX is, why we need it, and what's in
+it, then you can read up on it on my blog:
+
+  <A HREF="http://schani.wordpress.com/2008/01/29/other-types/">http://schani.wordpress.com/2008/01/29/other-types/</A>
+  <A HREF="http://schani.wordpress.com/2008/02/25/generic-types-are-lazy/">http://schani.wordpress.com/2008/02/25/generic-types-are-lazy/</A>
+  <A HREF="http://schani.wordpress.com/2008/03/10/sharing-static-methods/">http://schani.wordpress.com/2008/03/10/sharing-static-methods/</A>
+
+There are two main reasons why we use so much memory for RGCTXs:
+
+* We allocate one for every class which might potentially need it at
+some point, even though it might not.
+
+* We put a lot of type information in there which might never get
+used.  For example, we put three pointers for every superclass and the
+class itself and three pointers for every type argument of the class
+in there, as well as three pointers for the extensible part.
+
+I investigated a bit to see how many classes actually do need a RGCTX
+and how much information they require from it.
+
+IronPython:
+  Total RGCTXs allocated: 124
+  Number of RGCTXs ever used: 51
+  Number of different slots queried: 224
+
+Nemerle:
+  Total RGCTXs allocated: 1506
+  Number of RGCTXs ever used: 163
+  Number of different slots queried: 589
+
+FSharp:
+  Total RGCTXs allocated: 6100
+  Number of RGCTXs ever used: 651
+  Number of different slots queried: 1467
+
+It seems that only a small number of RGCTXs is ever used, and the ones
+that are used could make do with 2 to 5 slots on average.  For FSharp,
+for instance, if we used an optimal allocation strategy (i.e. only
+allocate RGCTXs if needed, only allocate as many slots as needed and
+don't use any meta-data) we could get the 600k down to about 6k, which
+would be more than acceptable.
+
+There is a problem with allocating a RGCTX lazily, though.  Allocating
+a RGCTX requires some information.  Specifically, it requires the
+MonoVTable* for the class for which to allocate the RGCTX.  This is
+not an issue for non-static methods because the vtable is accessible
+through the &quot;this&quot; argument.  Static methods don't have that argument,
+though.  In fact, the RGCTX must contain a pointer to the vtable
+because we need it in static methods for some purposes, like exception
+handling.  So I think we'll need to switch to passing not the RGCTX,
+but the vtable to static methods, since the latter contains a pointer
+to the RGCTX anyway, which, for lazy allocation, could be NULL.  This
+would give us the additional advantage of not having to store the
+vtable in the RGCTX, saving us 4/8 bytes per RGCTX.
+
+As for how to arrange the RGCTX itself I have the following proposal:
+Let's get rid of all the superclass and type argument type information
+and just concentrate on the extensible part.  I'd like to implement
+two different kinds of RGCTX - small ones and large ones.  Small
+RGCTXs would have space for up to some constant number of slots,
+preferably 3 or 7.  The layout would look like this on a 32-bit
+system:
+
+struct small_rgctx {
+  guint8 size;
+  guint8 slot_numbers[3];
+  gpointer slots[0];
+}
+
+size would be the number of slots in the RGCTX.  slot_numbers would
+identify the type information stored in the slots array.
+
+To fetch an item out of the RGCTX we'd have to search through the
+slot_numbers array to find the required type information and then
+fetch the corresponding pointer from the slots array.  If the type
+information is not found we'd jump into unmanaged code and extend the
+RGCTX by allocating a new one with space for one more slot or, if the
+maximum number of slots is reached, upgrading to a large RGCTX.
+Another reason for using a large RGCTX would be if the values of the
+slot numbers exceeded 255, which should be very unlikely, though.
+
+We could keep free lists per domain of the RGCTXs we've thrown away.
+It might be necessary to use hazard pointers for access to the RGCTX
+so as to avoid reusing memory of a thrown-away RGCTX if another thread
+is still accessing it.
+
+A large RGCTX could be some kind of small hash table.
+
+With such data structures we could also do another optimization.
+Right now every class that is either a generic class or is a direct or
+indirect subclass of a generic class has its own RGCTX.  Non-generic
+classes can never give rise to the need for another piece of type
+information in a RGCTX, so they could share the RGCTXs of their
+generic superclasses.
+
+Does this sound like a sensible plan?  Am I missing something crucial?
+ Does anybody have any suggestions or better ideas?
+
+Mark
+
+-- 
+Mark Probst
+ <A HREF="http://www.complang.tuwien.ac.at/schani/">http://www.complang.tuwien.ac.at/schani/</A>
+ <A HREF="http://www.flickr.com/photos/schani/">http://www.flickr.com/photos/schani/</A>
+ <A HREF="http://schani.wordpress.com/">http://schani.wordpress.com/</A>
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="027541.html">[Mono-dev] Mono 1.9 and dll.config files in ~/.mono/assemblies
+</A></li>
+	<LI>Next message: <A HREF="027503.html">[Mono-dev] Generic sharing: Good news, bad news, how to win big
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#27502">[ date ]</a>
+              <a href="thread.html#27502">[ thread ]</a>
+              <a href="subject.html#27502">[ subject ]</a>
+              <a href="author.html#27502">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

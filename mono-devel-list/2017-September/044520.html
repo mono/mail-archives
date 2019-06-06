@@ -1,0 +1,177 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Solving the profiler loading problem
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.dot.net?Subject=Re%3A%20%5BMono-dev%5D%20Solving%20the%20profiler%20loading%20problem&In-Reply-To=%3CCAH9TF6N__shJ3Ma1fcjgO%3D0-8pbP1Do_QGEo-30K46tHnR1c3w%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="044519.html">
+   <LINK REL="Next"  HREF="044521.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Solving the profiler loading problem</H1>
+    <B>Alex Rønne Petersen</B> 
+    <A HREF="mailto:mono-devel-list%40lists.dot.net?Subject=Re%3A%20%5BMono-dev%5D%20Solving%20the%20profiler%20loading%20problem&In-Reply-To=%3CCAH9TF6N__shJ3Ma1fcjgO%3D0-8pbP1Do_QGEo-30K46tHnR1c3w%40mail.gmail.com%3E"
+       TITLE="[Mono-dev] Solving the profiler loading problem">alex at alexrp.com
+       </A><BR>
+    <I>Wed Sep 27 13:02:32 UTC 2017</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="044519.html">[Mono-dev] Mono 5 branches
+</A></li>
+        <LI>Next message (by thread): <A HREF="044521.html">[Mono-dev] Solving the profiler loading problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#44520">[ date ]</a>
+              <a href="thread.html#44520">[ thread ]</a>
+              <a href="subject.html#44520">[ subject ]</a>
+              <a href="author.html#44520">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+I was recently taking a look at this bug:
+<A HREF="https://bugzilla.xamarin.com/show_bug.cgi?id=16785">https://bugzilla.xamarin.com/show_bug.cgi?id=16785</A>
+
+The problem is that we link libmono-profiler-log.so to
+libmonosgen-2.0.so, even when the mono executable is statically
+linked. What happens is that, when we load libmono-profiler-log.so
+into the process of a statically linked mono, libmonosgen-2.0.so is
+loaded in addition to the mono executable (which already contains all
+the libmono code). The dynamic linker helpfully figures out that all
+of the libmono symbols that the profiler uses are already present in
+the mono executable, so none of the code or data in the newly loaded
+libmonosgen-2.0.so is actually used. However, this no longer holds
+true when library constructors enter the mix. When libmonosgen-2.0.so
+is loaded, any library constructors that it contains, or which are
+present in any libraries it links to, will be executed.
+
+C code rarely makes use of library constructors (which is why this
+hasn't been a problem for a 'normally' built libmonosgen-2.0.so so
+far), but they're very common in C++ code; constructors for global C++
+objects are implemented with them. LLVM, for example, makes use of
+them in many places. So, when we've already loaded libLLVM*.so from
+the static mono executable and therefore executed the library
+constructors contained within, running those library constructors
+again when we load libmono-profiler-log.so just kinda breaks
+everything.
+
+Below are a few different ways we can solve this problem.
+
+-----
+
+# Always build a dynamically linked mono executable
+
+If we never statically link mono with libmonosgen-2.0.so, we can
+simply keep linking libmono-profiler-log.so to libmonosgen-2.0.so and
+everything will just work. When the profiler is loaded, the dynamic
+linker realizes that libmonosgen-2.0.so is already loaded, so it'll do
+the right thing.
+
+The downside of this approach is that working with a dynamically
+linked executable can be a pain. In particular, you need to mess with
+LD_LIBRARY_PATH to get mono to use a libmonosgen-2.0.so in your
+working tree rather than the one from your prefix. libtool tries to
+alleviate this problem by turning the mono file in the working tree
+into a script that invokes the actual executable with the right
+dynamic linker setup to use the in-tree libraries. It's also possible
+to use libtool --mode=execute gdb mono ... to run in-tree mono in a
+debugger.
+
+If we go this route, we'd probably need to enhance
+runtime/mono-wrapper to support all of our in-tree use cases (such as
+running in a debugger) since nobody wants to type out the libtool
+commands by hand.
+
+There may be performance considerations with this approach, but from
+what I've seen, there's already some interest in always building
+libmonosgen-2.0.so as PIC to speed up the build process (no need for
+building a separate static version of everything). So, I'm not too
+worried about this aspect.
+
+# Link libmono-profiler-log.so to libmonosgen-2.0.so only when needed
+
+The idea here is that, in our build system, we can easily determine
+whether we're building a statically or dynamically linked mono
+executable. So, if we're building a statically linked mono (which is
+the norm currently), we can simply avoid linking
+libmono-profiler-log.so to libmonosgen-2.0.so. This leaves the
+profiler with some undefined symbols, but the dynamic linker will sort
+that out by resolving them to the symbols in the mono executable.
+
+This is definitely the simplest approach and it's probably what I'll
+end up doing at least as a temporary fix. However, it's a pretty poor
+solution for third-party users of the profiler API. Those developers
+cannot possibly know whether their profiler module will end up being
+used with a statically or dynamically linked mono executable. So,
+effectively, they have to build two separate profiler modules, one for
+each case. This is wasteful for obvious reasons.
+
+I care a great deal about making profiler development for Mono as
+simple and painless as possible (see the new profiler API, for
+example). This approach goes completely counter to that, so I'm not a
+big fan of it.
+
+# Pass an API vtable to a profiler module's init function
+
+This would basically be JNI. Just like how JNI passes a JNIEnv pointer
+to native functions, we'd pass a MonoEnv pointer to
+mono_profiler_init_&lt;name&gt; (). The profiler would do all Mono API calls
+through this vtable. Long term, we could even transition the entire
+Mono API to use this mechanism instead of exposing functions directly
+from the library.
+
+I do like this idea since it would mean that profiler modules would
+never have to explicitly link to libmonosgen-2.0.so, but there are at
+least three potential issues with it:
+
+1. Having all API calls go through a vtable could have some serious
+performance implications. We use a lot of low-level functions from
+libmono in the profiler (e.g. mono_memory_barrier (),
+mono_hazard_pointer_get (), MONO_LLS_FOREACH, etc).
+2. Macros such as MONO_LLS_FOREACH (which integrates closely with C's
+break/continue statements) can't be expressed in such a vtable.
+3. The log profiler uses around 160 functions from the Mono API.
+That's just the amount of API functions that would need to be added to
+this vtable for the log profiler to work; exposing the entire Mono API
+through this vtable would be a ton of work.
+
+-----
+
+This list is by no means exhaustive; there are probably solutions I
+haven't thought of, and pros/cons of the above solutions that I
+haven't considered. Please let me know your thoughts.
+
+Regards,
+Alex
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="044519.html">[Mono-dev] Mono 5 branches
+</A></li>
+	<LI>Next message (by thread): <A HREF="044521.html">[Mono-dev] Solving the profiler loading problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#44520">[ date ]</a>
+              <a href="thread.html#44520">[ thread ]</a>
+              <a href="subject.html#44520">[ subject ]</a>
+              <a href="author.html#44520">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.dot.net/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

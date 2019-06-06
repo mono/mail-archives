@@ -1,0 +1,121 @@
+Index: mono/mini/ChangeLog
+===================================================================
+--- mono/mini/ChangeLog	(revision 108191)
++++ mono/mini/ChangeLog	(working copy)
+@@ -1,3 +1,14 @@
++2008-07-17  Bill Holmes  <billholmes54@gmail.com>
++
++	* mini-x86.c (mono_arch_emit_epilog):  Fixing some Win32 calling convention problems
++	  with structs as return values when calling managed from native code.  Fixes pinvoke3
++	  runtime test on Win32.
++
++	* mini-x86.c (mono_arch_emit_prolog):  Increase bb->max_offset by the
++	  maximum epilog size for out of line bblocks.
++
++	Contributed under MIT/X11 license.
++
+ 2008-07-17  Rodrigo Kumpera  <rkumpera@novell.com>
+ 
+ 	* mini.c: Use mono_runtime_class_init_full to avoid leaking memory
+Index: mono/mini/mini-x86.c
+===================================================================
+--- mono/mini/mini-x86.c	(revision 108178)
++++ mono/mini/mini-x86.c	(working copy)
+@@ -3480,6 +3480,17 @@
+ 	}
+ }
+ 
++static int
++get_max_epilog_size (MonoCompile *cfg)
++{
++	int max_epilog_size = 16;
++	
++	if (cfg->method->save_lmf)
++		max_epilog_size += 128;
++
++	return max_epilog_size;
++}
++
+ guint8 *
+ mono_arch_emit_prolog (MonoCompile *cfg)
+ {
+@@ -3669,6 +3680,9 @@
+ 				
+ 				max_offset += ((guint8 *)ins_get_spec (ins->opcode))[MONO_INST_LEN];
+ 			}
++
++			if (bb->out_of_line)
++				bb->max_offset += get_max_epilog_size (cfg);
+ 		}
+ 	}
+ 
+@@ -3711,12 +3725,11 @@
+ 	int quad, pos;
+ 	guint32 stack_to_pop;
+ 	guint8 *code;
+-	int max_epilog_size = 16;
++	int max_epilog_size;
+ 	CallInfo *cinfo;
+-	
+-	if (cfg->method->save_lmf)
+-		max_epilog_size += 128;
+ 
++	max_epilog_size = get_max_epilog_size (cfg);
++
+ 	while (cfg->code_len + max_epilog_size > (cfg->code_size - 16)) {
+ 		cfg->code_size *= 2;
+ 		cfg->native_code = g_realloc (cfg->native_code, cfg->code_size);
+@@ -3819,7 +3832,13 @@
+ 				x86_fld_membase (code, cfg->ret->inst_basereg, cfg->ret->inst_offset + (quad * sizeof (gpointer)), FALSE);
+ 				break;
+ 			case ArgOnDoubleFpStack:
++#ifndef PLATFORM_WIN32
+ 				x86_fld_membase (code, cfg->ret->inst_basereg, cfg->ret->inst_offset + (quad * sizeof (gpointer)), TRUE);
++#else
++				/* Structs that contain only a double are stored spanning eax and edx. */
++				x86_mov_reg_membase (code, return_regs[0], cfg->ret->inst_basereg, cfg->ret->inst_offset, 4);
++				x86_mov_reg_membase (code, return_regs[1], cfg->ret->inst_basereg, cfg->ret->inst_offset + sizeof (gpointer), 4);
++#endif
+ 				break;
+ 			case ArgNone:
+ 				break;
+@@ -3829,6 +3848,13 @@
+ 		}
+ 	}
+ 
++#ifdef PLATFORM_WIN32
++	if (MONO_TYPE_ISSTRUCT (mono_method_signature (cfg->method)->ret) && (cinfo->ret.storage == ArgOnStack) && (cfg->vret_addr)) {
++		/* When return structs are passed on the stack the address needs to be stored in eax. */
++		x86_mov_reg_membase (code, X86_EAX, cfg->vret_addr->sreg1, cfg->vret_addr->inst_offset, sizeof (gpointer));
++	}
++#endif
++
+ 	x86_leave (code);
+ 
+ 	if (CALLCONV_IS_STDCALL (sig)) {
+Index: mono/tests/ChangeLog
+===================================================================
+--- mono/tests/ChangeLog	(revision 108191)
++++ mono/tests/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2008-07-17  Bill Holmes  <billholmes54@gmail.com>
++	* libtest.c:  Fixing a calling convention error on Win32.
++
++	Contributed under MIT/X11 license.
++
+ 2008-07-17  Rodrigo Kumpera  <rkumpera@novell.com>
+ 
+ 	* generics-sharing.2.cs: Fix the build.
+Index: mono/tests/libtest.c
+===================================================================
+--- mono/tests/libtest.c	(revision 108178)
++++ mono/tests/libtest.c	(working copy)
+@@ -2033,7 +2033,7 @@
+ 	return 0;
+ }
+ 
+-typedef char** (*ReturnStringArrayDelegate) (int i);
++typedef char** (STDCALL *ReturnStringArrayDelegate) (int i);
+ 
+ LIBTEST_API int STDCALL 
+ mono_test_marshal_return_string_array_delegate (ReturnStringArrayDelegate d)

@@ -1,0 +1,245 @@
+Index: mono/metadata/object-internals.h
+===================================================================
+--- mono/metadata/object-internals.h	(revision 127107)
++++ mono/metadata/object-internals.h	(working copy)
+@@ -1284,6 +1284,15 @@
+ void
+ mono_method_clear_object (MonoDomain *domain, MonoMethod *method) MONO_INTERNAL;
+ 
++
++gboolean
++mono_method_has_custom_attr (MonoMethod *method, const char *attr_assembly, const char *attr_name_space, const char *attr_name) MONO_INTERNAL;
++
++gboolean
++mono_class_has_custom_attr (MonoClass *klass, const char *attr_assembly, const char *attr_name_space, const char *attr_name) MONO_INTERNAL;
++
++gboolean
++mono_assembly_has_custom_attr (MonoAssembly *assembly, const char *attr_assembly, const char *attr_name_space, const char *attr_name) MONO_INTERNAL;
+ #endif /* __MONO_OBJECT_INTERNALS_H__ */
+ 
+ 
+Index: mono/metadata/reflection.c
+===================================================================
+--- mono/metadata/reflection.c	(revision 127107)
++++ mono/metadata/reflection.c	(working copy)
+@@ -8215,6 +8215,35 @@
+ 	return FALSE;
+ }
+ 
++/** added start **/
++
++static gboolean
++mono_custom_attrs_has_attr_partial (MonoCustomAttrInfo *ainfo, const char *attr_assembly, const char *attr_name_space, const char *attr_name)
++{
++	int i;
++	MonoClass *klass;
++
++	if (attr_name == NULL)
++		return FALSE;
++
++	for (i = 0; i < ainfo->num_attrs; ++i) {
++		klass = ainfo->attrs [i].ctor->klass;
++		if (attr_assembly != NULL)
++			if (strcmp (klass->image->assembly_name, attr_assembly) )
++				continue;
++			
++		if (attr_name_space != NULL)
++			if (strcmp (klass->name_space, attr_name_space) )
++				continue;
++
++		if (!strcmp (klass->name, attr_name) )
++				return TRUE;
++	}
++	return FALSE;
++}
++
++/** added end **/
++
+ MonoObject*
+ mono_custom_attrs_get_attr (MonoCustomAttrInfo *ainfo, MonoClass *attr_klass)
+ {
+@@ -8240,6 +8269,165 @@
+ 		return NULL;
+ }
+ 
++/** added start **/
++/*NOTE, this doesn't work with dynamic assemblies*/
++static gboolean
++mono_image_has_assembly_ref (MonoImage *image, const char *target_assembly)
++{
++        MonoTableInfo *t;
++        int i;
++
++	//TODO: Fix this to work with dynamic assemblies.
++        if (image->dynamic)
++            return FALSE;
++
++        t = &image->tables [MONO_TABLE_ASSEMBLYREF];
++        for (i = 0; i < t->rows; i++) {
++            const char *ref_name = mono_metadata_string_heap (image, mono_metadata_decode_row_col (t, i, MONO_ASSEMBLYREF_NAME));
++            if (!strcmp (target_assembly, ref_name))
++                return TRUE;
++        }
++        return FALSE;
++}
++
++
++static gboolean
++mono_index_has_custom_attr (MonoImage *image, guint32 idx, const char *attr_assembly, const char *attr_name_space, const char *attr_name)
++{
++	guint32 mtoken, i, x;
++	guint32 cols [MONO_CUSTOM_ATTR_SIZE];
++	MonoTableInfo *ca;
++	MonoMethod* attr_ctor;
++
++	ca = &image->tables [MONO_TABLE_CUSTOMATTRIBUTE];
++
++	if (attr_name == NULL)
++		return FALSE;
++
++	if (attr_assembly != NULL)
++		if (!mono_image_has_assembly_ref(image, attr_assembly))
++			return FALSE;
++
++	i = mono_metadata_custom_attrs_from_index (image, idx);
++	if (!i)
++		return FALSE;
++	i --;
++
++	for (x = i; i < ca->rows; x++) {
++		mono_metadata_decode_row (ca, x, cols, MONO_CUSTOM_ATTR_SIZE);
++		if (cols[MONO_CUSTOM_ATTR_PARENT] != idx)
++			break;
++		
++		mtoken = cols [MONO_CUSTOM_ATTR_TYPE] >> MONO_CUSTOM_ATTR_TYPE_BITS;
++		switch (cols [MONO_CUSTOM_ATTR_TYPE] & MONO_CUSTOM_ATTR_TYPE_MASK) {
++		case MONO_CUSTOM_ATTR_TYPE_METHODDEF:
++			mtoken |= MONO_TOKEN_METHOD_DEF;
++			break;
++		case MONO_CUSTOM_ATTR_TYPE_MEMBERREF:
++			mtoken |= MONO_TOKEN_MEMBER_REF;
++			break;
++		default:
++			g_error ("Unknown table for custom attr type %08x", cols [MONO_CUSTOM_ATTR_TYPE]);
++			break;
++		}
++		attr_ctor = mono_get_method (image, mtoken, NULL);
++		if (!attr_ctor) {
++			g_warning ("Can't find custom attr constructor image: %s mtoken: 0x%08x", image->name, mtoken);
++			return FALSE;
++		} else {
++			if (attr_assembly != NULL)
++				if (strcmp (attr_ctor->klass->image->assembly_name, attr_assembly) )
++					continue;
++			
++			if (attr_name_space != NULL)
++				if (strcmp (attr_ctor->klass->name_space, attr_name_space) )
++					continue;
++
++			if (!strcmp (attr_ctor->klass->name, attr_name) )
++				return TRUE;
++		}
++	}
++
++	return FALSE;
++}
++
++static gboolean
++dynamic_has_custom_attr_partial (MonoImage* image, void *key, const char *attr_assembly, const char *attr_name_space, const char *attr_name)
++{
++	gboolean result;
++	MonoCustomAttrInfo *ainfo = lookup_custom_attr (image, key);
++
++	if (ainfo != NULL) {
++		result = mono_custom_attrs_has_attr_partial (ainfo, attr_assembly, attr_name_space, attr_name);
++		mono_custom_attrs_free (ainfo);
++		return result;	
++	}
++
++	return FALSE;
++}
++
++gboolean
++mono_method_has_custom_attr (MonoMethod *method, const char *attr_assembly, const char *attr_name_space, const char *attr_name)
++{
++	guint32 idx;
++
++	/*
++	 * An instantiated method has the same cattrs as the generic method definition.
++	 *
++	 * LAMESPEC: The .NET SRE throws an exception for instantiations of generic method builders
++	 *           Note that this stanza is not necessary for non-SRE types, but it's a micro-optimization
++	 */
++	if (method->is_inflated)
++		method = ((MonoMethodInflated *) method)->declaring;
++	
++	if (method->dynamic || method->klass->image->dynamic) 
++		return dynamic_has_custom_attr_partial (method->klass->image, method, attr_assembly, attr_name_space, attr_name); 
++
++	idx = mono_method_get_index (method);
++	idx <<= MONO_CUSTOM_ATTR_BITS;
++	idx |= MONO_CUSTOM_ATTR_METHODDEF;
++	return mono_index_has_custom_attr (method->klass->image, idx, attr_assembly, attr_name_space, attr_name);
++}
++
++gboolean
++mono_class_has_custom_attr (MonoClass *klass, const char *attr_assembly, const char *attr_name_space, const char *attr_name)
++{
++	guint32 idx;
++
++	if (klass->generic_class)
++		klass = klass->generic_class->container_class;
++
++	if (klass->image->dynamic)
++		return dynamic_has_custom_attr_partial (klass->image, klass, attr_assembly, attr_name_space, attr_name);
++
++	if (klass->byval_arg.type == MONO_TYPE_VAR || klass->byval_arg.type == MONO_TYPE_MVAR) {
++		idx = mono_metadata_token_index (klass->sizes.generic_param_token);
++		idx <<= MONO_CUSTOM_ATTR_BITS;
++		idx |= MONO_CUSTOM_ATTR_GENERICPAR;
++	} else {
++		idx = mono_metadata_token_index (klass->type_token);
++		idx <<= MONO_CUSTOM_ATTR_BITS;
++		idx |= MONO_CUSTOM_ATTR_TYPEDEF;
++	}
++	return mono_index_has_custom_attr (klass->image, idx, attr_assembly, attr_name_space, attr_name);
++}
++
++gboolean
++mono_assembly_has_custom_attr (MonoAssembly *assembly, const char *attr_assembly, const char *attr_name_space, const char *attr_name)
++{
++	guint32 idx;
++	
++	if (assembly->image->dynamic)
++		return dynamic_has_custom_attr_partial (assembly->image, assembly, attr_assembly, attr_name_space, attr_name);
++
++	idx = 1; /* there is only one assembly */
++	idx <<= MONO_CUSTOM_ATTR_BITS;
++	idx |= MONO_CUSTOM_ATTR_ASSEMBLY;
++	return mono_index_has_custom_attr (assembly->image, idx, attr_assembly, attr_name_space, attr_name);
++}
++
++/** added end **/
++
+ /*
+  * mono_reflection_get_custom_attrs_info:
+  * @obj: a reflection object handle
+Index: mono/mini/method-to-ir.c
+===================================================================
+--- mono/mini/method-to-ir.c	(revision 127107)
++++ mono/mini/method-to-ir.c	(working copy)
+@@ -3337,6 +3337,14 @@
+ 	    !header || header->num_clauses)
+ 		return FALSE;
+ 
++	/*if ( (mono_assembly_has_custom_attr (method->klass->image->assembly, "Mono.Runtime", "Mono.Runtime", "MonoInlineAtteribute") )|
++		(mono_class_has_custom_attr (method->klass, "Mono.Runtime", "Mono.Runtime", "MonoInlineAtteribute") ) |
++		(mono_method_has_custom_attr (method, "Mono.Runtime", "Mono.Runtime", "MonoInlineAtteribute") ) ) {
++		if (cfg->verbose_level > 2)
++			printf ("Inline Hint: %s\n", method->name);
++	}*/
++
++
+ 	/* also consider num_locals? */
+ 	/* Do the size check early to avoid creating vtables */
+ 	if (!inline_limit_inited) {

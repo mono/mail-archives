@@ -1,0 +1,218 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] IMT patch
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20IMT%20patch&In-Reply-To=1180604542.4329.61.camel%40matrix.ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="023766.html">
+   <LINK REL="Next"  HREF="023764.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] IMT patch</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20IMT%20patch&In-Reply-To=1180604542.4329.61.camel%40matrix.ximian.com"
+       TITLE="[Mono-dev] IMT patch">lupus at ximian.com
+       </A><BR>
+    <I>Thu May 31 07:58:52 EDT 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="023766.html">[Mono-dev] IMT patch
+</A></li>
+        <LI>Next message: <A HREF="023764.html">[Mono-dev] System.Globalization/Era patch
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23768">[ date ]</a>
+              <a href="thread.html#23768">[ thread ]</a>
+              <a href="subject.html#23768">[ subject ]</a>
+              <a href="author.html#23768">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 05/31/07 Massimiliano Mantione wrote:
+&gt;<i> Initially it looked &quot;mildly unstable&quot;: when rebuilding the whole Mono
+</I>&gt;<i> I got a couple of NRE in the mcs symbol writer while compiling some
+</I>&gt;<i> library; just typing make again worked, so the problem was very hard
+</I>&gt;<i> to reproduce.
+</I>
+Does it run the corlib tests for you? It fails here:
+.Unhandled Exception:
+System.InvalidCastException: Value is not a convertible object:
+NUnit.Core.NormalTestCase to NUnit.Core.ITest  at (wrapper
+xdomain-invoke) EventCollector:TestFinished (NUnit.Core.TestCaseResult)
+  at NUnit.Core.RemoteTestRunner.NUnit.Core.EventListener.TestFinished
+  (NUnit.Core.TestCaseResult result) [0x00000] in
+  /opt/lupus/svn/mcs/nunit20/core/RemoteTestRunner.cs:533
+
+This is likely related to handling of collisions for transparent proxies
+vtables: the bitmap used to flag collisions in the imt table needs to be
+stored in the tproxy data structures and checked there instead of in the
+MonoClass in that case.
+
+&gt;<i>   BTW, do you think some of the print statements can stay there anyway?
+</I>
+They may be useful while porting the code to other architectures, but
+after that most or all should be removed. Note that all the #if commands
+should be aligned on column 0.
+
+&gt;<i> - Move &quot;mono_convert_imt_slot_to_vtable_slot&quot; elsewhere (mini.c?).
+</I>
+mini-trampolines.c is likely better.
+
+&gt;<i> - Does setting &quot;MonoClass.imt_collisions_bitmap&quot; need locking?
+</I>&gt;<i>   If yes, it should be the loader lock, but does acquiring it with the
+</I>&gt;<i>   domain lock held (we are building the MonoVTable) risk a deadlock?
+</I>
+You should add an assert so that the size of the imt table is never set
+to a value bigger than the bitmap field.
+
+&gt;<i> - Add cumulative size of thunks to mono stats.
+</I>
+The IMT table should also be avoided for types that don't implement
+interfaces. It is also likely a good idea to limit the size to the
+highest used slot.
+
+&gt;<i> - Also add general &quot;performance&quot; of the hash function to the stats?
+</I>&gt;<i>   I mean, collision ratio and things like that...
+</I>
+A counter for number of collisions, the max number of chained methods
+and the mean number of chained methods in collisions.
+
+&gt;<i> - Maybe rewrite the thunks to do binary search instead of linear.
+</I>
+Yes, it should do a binary search, at least for n &gt; 3 or 4.
+
+&gt;<i> Do you think this should be committed before the other archs are ported,
+</I>&gt;<i> or should we wait for the port to be complete and commit without the
+</I>&gt;<i> current code path?
+</I>
+Let's finish the other todos and make tests work first.
+
+&gt;<i> Index: mono/metadata/object.c
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- mono/metadata/object.c	(revision 78299)
+</I>&gt;<i> +++ mono/metadata/object.c	(working copy)
+</I>[...]
+&gt;<i> +guint32
+</I>&gt;<i> +mono_compute_imt_slot (MonoMethod *method) {
+</I>
+A better name is mono_method_get_imt_slot (). Also, since this needs to
+be called only on the abstract methods of an interface it's useful to
+add the proper asserts here. This may also be one of the causes of the
+bugs that show up running the nunit tests (think about explicit iface
+implementations: the method name is different from the name of the
+method in the iface, so it will result in the wrong imt slot).
+
+&gt;<i> +	MonoMethodSignature *sig = mono_method_signature (method);
+</I>&gt;<i> +	int hashes_count = sig-&gt;param_count + 4;
+</I>&gt;<i> +	guint32 *hashes = alloca (hashes_count * sizeof (guint32));
+</I>
+We should try to avoid the use of alloca in the runtime, especially
+where it is trivially avoidable like here.
+
+&gt;<i> Index: mono/metadata/object-internals.h
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- mono/metadata/object-internals.h	(revision 78299)
+</I>&gt;<i> +++ mono/metadata/object-internals.h	(working copy)
+</I>&gt;<i> @@ -1130,5 +1130,22 @@
+</I>&gt;<i>  MonoObject*
+</I>&gt;<i>  mono_nullable_box (guint8 *buf, MonoClass *klass) MONO_INTERNAL;
+</I>&gt;<i>  
+</I>&gt;<i> +#define MONO_IMT_SIZE 4
+</I>&gt;<i> +typedef struct _MonoImtBuilderEntry {
+</I>&gt;<i> +	MonoMethod *method;
+</I>&gt;<i> +	int vtable_slot;
+</I>&gt;<i> +	struct _MonoImtBuilderEntry *next;
+</I>&gt;<i> +	int children;
+</I>&gt;<i> +} MonoImtBuilderEntry;
+</I>&gt;<i> +typedef struct _MonoImtBuilderEntry** MonoImtBuilder;
+</I>&gt;<i> +
+</I>&gt;<i> +typedef void (*MonoImtSlotInitializer) (gpointer **slot, MonoVTable *vtable, MonoDomain *domain, MonoImtBuilderEntry *imt_builder_entry);
+</I>
+Why don't we just return the slot value from the function instead of
+passing a pointer?
+
+&gt;<i> Index: mono/mini/mini-x86.c
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- mono/mini/mini-x86.c	(revision 78299)
+</I>&gt;<i> +++ mono/mini/mini-x86.c	(working copy)
+</I>&gt;<i> @@ -4085,6 +4085,85 @@
+</I>&gt;<i>  	}
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i> +#define DEBUG_IMT 0
+</I>&gt;<i> +#define MONO_ARCH_IMT_REG X86_EDX
+</I>&gt;<i> +void
+</I>&gt;<i> +mono_arch_emit_imt_argument (MonoCompile *cfg, MonoCallInst *call)
+</I>&gt;<i> +{
+</I>&gt;<i> +	MonoInst *inst;
+</I>&gt;<i> +	MONO_INST_NEW (cfg, inst, OP_PCONST);
+</I>&gt;<i> +	//MONO_INST_NEW (cfg, inst, CEE_LDIND_I);
+</I>
+Remove this commented line.
+
+&gt;<i> +	inst-&gt;inst_p0 = call-&gt;method;
+</I>&gt;<i> +	inst-&gt;dreg = mono_regstate_next_int (cfg-&gt;rs);
+</I>&gt;<i> +	mono_bblock_add_inst (cfg-&gt;cbb, inst);
+</I>&gt;<i> +
+</I>&gt;<i> +	mono_call_inst_add_outarg_reg (cfg, call, inst-&gt;dreg, MONO_ARCH_IMT_REG, FALSE);
+</I>&gt;<i> +}
+</I>
+mono_arch_emit_imt_argument() is likely going to be the same for most of the
+architectures, so it should be in common code.
+
+&gt;<i> +
+</I>&gt;<i> +//[1 + 4] x86_alu_reg_imm (code, X86_CMP, ins-&gt;sreg1, ins-&gt;inst_imm);
+</I>&gt;<i> +//[1 + 1] x86_branch8(inst,cond,imm,is_signed)
+</I>&gt;<i> +//        x86_patch(ins,target)
+</I>&gt;<i> +//[1 + 5] x86_jump_mem(inst,mem)
+</I>&gt;<i> +#define IMT_THUNK_SLOT_HANDLER_LENGTH 14
+</I>&gt;<i> +#define IMT_THUNK_END_HANDLER_LENGTH 1
+</I>&gt;<i> +void
+</I>&gt;<i> +mono_arch_initialize_imt_slot (gpointer **slot, MonoVTable *vtable, MonoDomain *domain, MonoImtBuilderEntry *imt_builder_entry) {
+</I>
+Most of this function is arch-indep code: only the chaining codegen
+should be implemented by the different architectures, to minimize code
+duplication.
+
+&gt;<i> +/*
+</I>&gt;<i> + * FIXME:
+</I>&gt;<i> + * The following function is arch-independent, and should go in another
+</I>&gt;<i> + * file to be reused (as object.c, with prototype in object-internals.h)
+</I>
+mini-trampolines.c is more appropriate, since this function is
+jit-specific.
+
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="023766.html">[Mono-dev] IMT patch
+</A></li>
+	<LI>Next message: <A HREF="023764.html">[Mono-dev] System.Globalization/Era patch
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23768">[ date ]</a>
+              <a href="thread.html#23768">[ thread ]</a>
+              <a href="subject.html#23768">[ subject ]</a>
+              <a href="author.html#23768">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

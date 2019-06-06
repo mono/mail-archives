@@ -1,0 +1,478 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] New profiler (work in progress)
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20New%20profiler%20%28work%20in%20progress%29&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="025236.html">
+   <LINK REL="Next"  HREF="025243.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] New profiler (work in progress)</H1>
+    <B>Massimiliano Mantione</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20New%20profiler%20%28work%20in%20progress%29&In-Reply-To="
+       TITLE="[Mono-dev] New profiler (work in progress)">massi at ximian.com
+       </A><BR>
+    <I>Thu Oct 11 17:16:18 EDT 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="025236.html">[Mono-dev] Marshalling (Segmentation fault)
+</A></li>
+        <LI>Next message: <A HREF="025243.html">[Mono-dev] New profiler (work in progress)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25242">[ date ]</a>
+              <a href="thread.html#25242">[ thread ]</a>
+              <a href="subject.html#25242">[ subject ]</a>
+              <a href="author.html#25242">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+Hello,
+we decided to overhaul the current mono profiler.
+It is not a revolution, because the profiling API stays the same,
+just a reimplementation of the current default profiler.
+
+In the attached files you can find some documentation, and the work
+I've done so far.
+Note that you will need at least svn r87098, otherwise the needed
+events will not be called by the runtime.
+
+Status:
+
+Everything implemented is working, except the statistical profiler.
+Currently I have problems getting the jit info, I just commented
+the line so that all events appear to have hit unmanaged code.
+However, I still don't handle mapping of unmanaged function names,
+so the statistical profiler is useless for now.
+Moreover, I still don't implement parsing of arguments, so the
+flags are hardcoded into &quot;setup_user_options&quot;.
+
+Then, the reader program is still to be refined.
+
+And I sort of ported it to Windows, but never tested it there.
+
+Apart from that, the thing works, but it produces *huge* files.
+Running the &quot;bench.exe&quot; program in mono/mini generates almost one
+GB of data.
+The nice thing is that it works :-)
+
+Have fun,
+  Massimiliano
+
+
+-------------- next part --------------
+
+The logging profiler.
+
+
+Motivations:
+
+The main issues the current profiler has:
+- It stores all events in memory, and the events still point to
+  the internal data structures (mainly MonoMethod* and MonoClass*)
+  so that it cannot really work when dynamic methods are freed
+  and-or appdomains are unloaded.
+  For now a couple of gross hacks are in place (basically, if
+  &quot;mono_profiler_get_events () != 0&quot; methods are never freed),
+  but we should get rid of them.
+- Since it stores everything in memory, its memory usage grows
+  with time.
+- It processes all the data at the end of the process execution,
+  so these things are not feasible-easy:
+  - getting profiling data while the process is still running,
+  - having the data presented better by different front ends.
+
+The main differences of this new profiler:
+- It does not &quot;process&quot; the profiling events, it just logs them
+  into a file. They are as packed as possible (a few bytes per
+  event).
+- Therefore:
+  - its memory usage is lower,
+  - it can &quot;survive&quot; when data structures are freed, and
+  - one can write front ends that examine the log and show the
+    data without being tied to the Mono runtime and without
+    having to wait for the process to end,
+  - but... it will produce large log files.
+
+
+
+Implementation strategy:
+
+The idea is to keep a limited number of events in memory, and
+write them on disk periodically.
+To minimize overhead, we use one event buffer per thread, so
+that in the general case (the buffer still has space) no locks
+are used.
+However, we need to use a global lock while writing the events,
+and while managing shared data strucures.
+
+Another important issue is the following: when we write each
+event to disk, how do we identify the item (method or class)
+it refers to? In memory we have pointers to MonoMethod structs
+(or MonoClass, MonoImage, whatever...), but what makes sense
+for the end user is just the item name.
+As rewriting the item name at every event would be insane, we
+map each item into a number (an ID), and write the ID.
+Therefore, we need to keep in memory a map from the pointers
+(MonoMethod* and friends) to the IDs.
+Since this map is a global data structure, accesses to it must
+be guarded by locks.
+
+In practice we write the map on the file before writing the
+events, so that any reader program will be able to decode the
+IDs as it finds them.
+
+To simplify the internal representation of events in the per
+thread memory buffers, we decided to allow only three kind of
+events in them:
+- method related ones (carrying a MonoMethod*),
+- class related ones (carrying a MonoClass*), and
+- simple ones (like GC related events) which do not refer to
+  runtime data structures.
+On the other hand, events related to assemblies, images and
+application domains are handled separately, without the per
+thread buffers. The rationale is that the locking overhead
+would not be significant anyway (these events are relatively
+rare), so complicating the event representation in the buffers
+was not a good idea.
+
+Also the statistical events are handled differently, with a
+buffer of their own, because they happen in signal context
+and therefore could interfere with the regular ones.
+When the buffer for statistical events is full, since we
+cannot acquire a mutex in signal context an helper thread is
+used to write the data (this thread can use the global lock).
+
+In the end, the output file is organized in blocks:
+- One intro block, carrying basic info like the start time,
+  the runtime name, and so on.
+- Mapping blocks
+- Per thread event blocks.
+- Statistical event blocks.
+- Other events (related to assemblies, images and appdomains).
+- Clock blocks (to sync the time with the ticks used inside
+  events).
+- And end block.
+The reader program should expect any number of the &quot;middle&quot;
+blocks (everything but intro and end) in any order, and be
+able to process them.
+The only constraint is that it is guaranteed that every ID
+is defined in a mapping block before it is used in an event
+block (so that the file can be read sequentially in a single
+pass).
+
+
+
+Implementation details:
+
+Internally, we want to make event storage as fast and compact
+as possible.
+To make it fast, we use per thread buffers to avoid locks,
+and we do not lookup the item ID (again, because accessing
+the global map would require locking), but we store the item
+pointer directly instead (MonoMethod* or MonoClass*).
+To make it compact, we stuff the info in two fields: one
+pointer sized one, for the MonoMethod*, MonoClass* or an
+integer value, and other 32 bits for all the remaining info
+(see ProfilerEventData in the code).
+Moreover, if the value is a timestamp, we only store it as a
+delta relative to the previous value, so that the value will
+be very small.
+To keep processing time low, we never convert counter values
+into proper time values, and leave this job to the post
+processing program, that can do it easily using the initial
+and final time stored in the intro and end blocks (or any of
+the &quot;clock&quot; blocks in the middle of the file).
+
+When writing to disk, we use the following strategy:
+- Block codes are written as simple bytes.
+- Integer values (IDs, timestamps, sizes...) are written in
+  a compact encoding similar to BER, which takes little
+  space and is easy to decode while reading sequentially.
+- Strings are written as ASCII null terminated strings.
+  We could/should look into supporting proper unicode item
+  names in the future.
+Inside event blocks, for now the event &quot;stream&quot; is encoded
+with each event taking the following:
+- One byte for the event type.
+- Two integers for the event data, which typically are an ID
+  and a value but in special cases can be other things.
+This means that each event takes at least three bytes, and
+its size is larger if the values are larger.
+In the typical case, the timestamp (being relative) is very
+small and takes one byte, while the ID takes one or two
+bytes. It is very rare having common events taking more than
+five bytes.
+With some effort we could find a more compact encoding for
+the &quot;middle&quot; cases (like, taking only two bytes when three
+are needed, or only three when four are needed), by making
+better use of the available bits, but we don't think it is
+worth doing it for now.
+
+Other interesting implementation details are related to how
+the writing of events is done, and how we deal with the case
+when internal runtime structures are freed.
+
+The main concept is that once a structure is in the maps
+(it has an ID), we also extract its name from the runtime,
+and put it in the map as well.
+&gt;<i>From then on, the profiler will actually never access the
+</I>runtime data structure again, it will simply use the pointer
+value as an internal ID for the item (and a key in the hash
+table which is the map).
+Moreover, once the map has been flushed to disk, the names
+can be safely freed, because we will never need to write
+them again (of course the item must still be in the map,
+because handling the events we must be able to map its
+pointer into its ID, only the *name* can be freed).
+
+Of course we cannot build the maps while receiving the events
+because this would require access to the global lock.
+So we build (and flush) them just before writing event data
+blocks into the output file.
+
+The typical sequence of actions is the following:
+- An event happens, but the per thread buffer is full.
+- The lock is taken.
+- We scan the buffer, putting all unmapped pointers into the
+  maps. Here it is convenient that the events can only be
+  related to MonoMethod and MonoClass structures, because the
+  scanning pass only looks at a couple of bits to know what
+  the pointer is, without wasting time understanding the
+  actual event. So we have exactly two maps of this kind, one
+  for methods and one for classes.
+  All the new map elements are also appended to a list of
+  unwritten items.
+- Flushing a map to disk is then just a matter of walking
+  its &quot;unwritten items&quot; list.
+- Once the maps have been updated and flushed, we can safely
+  flush the events, knowing that every pointer will have its
+  ID in the maps.
+- We then flush the file and release the lock.
+- This per thread buffer is now considered empty, so we take
+  its first slot and use it to store the current event.
+Note that during all these actions all the other threads are
+not blocked and can continue storing events in their buffers.
+They need to block only in the following cases:
+- their buffer is full (so they need the lock), or
+- a &quot;global&quot; event occurs (related to an image, assembly or
+  application domain, which also need the lock).
+
+Handling global events is tricky (and therefore separated
+from the &quot;common&quot; ones) for two reasons:
+- When loading an item, the profiler API emits two events,
+  one to signal the load start and another for the load end.
+  However, at load start the name of the item is not
+  available. If we had the event in the per thread buffer,
+  and the buffer filled requiring a flush between a load
+  start and a load end, we would have no name to put in the
+  map. This could be solvable, but would make the sequence of
+  actions described above more complex for no good reason.
+  Instead, we handle maps of loaded global items separately.
+- When unloading an image or appdomain, it can happen that
+  many MonoClass and MonoMethod items will be freed.
+  This is an event that affects all threads, not just the
+  current one: pointers to those items could still be stored
+  in the per thread buffers of other threads.
+  It is true that no *new* events can happen related to the
+  freed items, nevertheless we must make sure that the other
+  threads can continue to operate on their buffers without
+  problems even if they contain pointers to freed items.
+
+The easy and safe way to handle the unload scenario is to
+update the maps scanning *all* the per thread buffers, and
+not just the current one.
+Remember that one an item is &quot;mapped&quot;, we have its name and
+we never need to follow the item pointer again, but we
+could still use the pointer value to access the map.
+Scanning the buffers of other threads is safe as long as we
+stop before the first unwritten event: the thread can go
+on storing new events safely, because it writes past that
+point and because the new events cannot be related to the
+items that will be freed (and therefore need to be mapped).
+If, eventually, the thread will finish its buffer, it will
+just block on the lock and wait its turn to write its
+remaining events.
+
+For now, to keep the code simple and be on the safe side,
+we also flush to disk the portion of each buffer that we
+have mapped, and keep track of it (see first_unwritten_event
+field in ProfilerPerThreadData).
+We also do not free the map items, even if we could.
+
+
+
+Output file format
+
+We'll describe each block as a sequence of fields, where
+three data types are allowed:
+- BYTE (used only for block codes),
+- INT, and
+- STRING.
+We write strings as null terminated ASCII strings.
+We store integers one byte at a time, seven bits per byte,
+starting from the least significant bits.
+We put the eight bit in the byte to 1 when we write the
+last byte.
+
+Here is the description of the various blocks:
+
+Intro block:
+BYTE: block code = 1.
+INTEGER: file format version, for now 1.
+STRING: runtime file image.
+INTEGER: start counter value.
+INTEGER: start time. # Time is in microseconds from the Unix epoch.
+
+Clock block:
+BYTE: block code = 2.
+INTEGER: current counter value.
+INTEGER: current time value.
+
+
+# The loaded block kind is stored as a bit field, where the bits have
+# the following values:
+# LOADED_EVENT_MODULE =     1;
+# LOADED_EVENT_ASSEMBLY =   2;
+# LOADED_EVENT_APPDOMAIN =  4;
+# LOADED_EVENT_SUCCESS =    8;
+# LOADED_EVENT_FAILURE =   16;
+
+Loaded element block:
+BYTE: block code = 3.
+BYTE: block kind.
+INTEGER: start counter value.
+INTEGER: end counter value.
+INTEGER: thread id.
+STRING: item name.
+
+Unloaded element block:
+BYTE: block code = 4.
+BYTE: block kind.
+INTEGER: start counter value.
+INTEGER: end counter value.
+INTEGER: thread id.
+STRING: item name.
+
+Mapping block:
+BYTE: block code = 5.
+INTEGER: start counter value.
+INTEGER: thread id.
+# A sequence of the following (class mapping):
+INTEGER: class ID.
+STRING: class name.
+# And finally, a 0, which is the end because no ID can be 0.
+BYTE: 0.
+# A sequence of the following (method mapping):
+INTEGER: method ID.
+INTEGER: class ID.
+STRING: method name. # The &quot;class&quot; portion of the name is omitted
+# And finally, a 0, which is the end because no ID can be 0.
+BYTE: 0.
+INTEGER: end counter value.
+
+Event block, for common &quot;per thread&quot; events:
+BYTE: block code = 6.
+INTEGER: start counter value.
+INTEGER: thread id.
+INTEGER: base counter value. # All counter values in events are deltas
+# A sequence of the following (events):
+BYTE: event code.
+INTEGER: main event value.
+INTEGER: secondary event value.
+# And finally, a 0, which is the end because no event code can be 0.
+BYTE: 0.
+INTEGER: end counter value.
+
+Statistical block, for statistical events (work in progress, because
+we still do not handle mapping names of unmanaged functions):
+BYTE: block code = 7.
+INTEGER: start counter value.
+# A sequence of the following (hits in managed code):
+INTEGER: ID of a method that got a statistical hit.
+# And finally, a 0, which is the end because no method ID can be 0.
+# A sequence of the following (hits in unmanaged code):
+INTEGER: ID of a function that got a statistical hit.
+# And finally, a 0, which is the end because no method ID can be 0.
+INTEGER: end counter value.
+
+End block:
+BYTE: block code = 8.
+INTEGER: file format version, for now 1.
+INTEGER: end counter value.
+INTEGER: end time.
+
+This is all, now let's see how events are encoded.
+We count the bits from 1 (least significant) upwards.
+In the event code, here are the bits:
+- Bit 6 is 1 if the event is related to a method.
+- Bit 5 is 1 if the event is related to a class.
+- Bit 4 is 1 if the event &quot;kind&quot; (0 is start, 1 is end).
+- Bits 3, 2 and 1 are the event code.
+
+In case of class or method events, the code is actually only
+stored in bits 1 and 2, as following:
+- method event codes:
+  - call = 0
+  - jit = 1
+  - statistical hit = 2
+  - dynamic method freed = 3
+- class event codes:
+  - load = 0
+  - unload = 1
+  - allocation = 2
+  - exception = 3
+Bit 3 is used in the case when the profiling API has a &quot;result&quot;
+parameter, it is 1 in case of failure.
+For method events, the main event value is always the method ID,
+and the secondary event value is always a timestamp (remember that
+timestamps are always encoded as delta relative to the previous
+timestamp in the current event stream).
+For class events, the main event value is always the class ID,
+and the secondary event value is always a timestamp, except for
+the case of allocations where it is the size in bytes of the
+allocated object.
+
+If both bits 6 and 5 are 0, the event code and values are used
+as following:
+- code 1: statistical hit unmanaged (main: IP, secondary: timestamp)
+- code 2: thread event (main: thread id, secondary: timestamp)
+- code 3: GC collection (main: generation, secondary: timestamp)
+- code 4: GC mark (main: generation, secondary: timestamp)
+- code 5: GC sweep (main: generation, secondary: timestamp)
+- code 6: GC resize (main: new size, secondary: timestamp)
+
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: mono-profiler-logging.patch
+Type: text/x-patch
+Size: 63247 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20071011/619c5127/attachment.bin">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20071011/619c5127/attachment.bin</A> 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="025236.html">[Mono-dev] Marshalling (Segmentation fault)
+</A></li>
+	<LI>Next message: <A HREF="025243.html">[Mono-dev] New profiler (work in progress)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25242">[ date ]</a>
+              <a href="thread.html#25242">[ thread ]</a>
+              <a href="subject.html#25242">[ subject ]</a>
+              <a href="author.html#25242">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

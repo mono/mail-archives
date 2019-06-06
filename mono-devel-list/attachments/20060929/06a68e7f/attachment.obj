@@ -1,0 +1,392 @@
+Index: mono/mono/metadata/domain.c
+===================================================================
+--- mono/mono/metadata/domain.c	(revision 66109)
++++ mono/mono/metadata/domain.c	(working copy)
+@@ -803,6 +803,10 @@
+ 	mono_defaults.com_object_class = mono_class_from_name (
+ 	        mono_defaults.corlib, "System", "__ComObject");
+ 
++	mono_defaults.com_interop_proxy_class = mono_class_from_name (
++	        mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
++
++
+ 	/*
+ 	 * Note that mono_defaults.generic_*_class is only non-NULL if we're
+ 	 * using the 2.0 corlib.
+Index: mono/mono/metadata/ChangeLog
+===================================================================
+--- mono/mono/metadata/ChangeLog	(revision 66109)
++++ mono/mono/metadata/ChangeLog	(working copy)
+@@ -1,3 +1,12 @@
++2006-09-0  Jonathan Chambers  <joncham@gmail.com>
++
++	* domain.c, class-internals.h: Added ComInteropProxy class to MonoDefaults.
++	* marshal.c: Return correct unmanaged size for object when MarshalAs.Struct.
++	Emit exception rather than crash in case of COM Callable Wrapper (not yet implemented).
++	Handle marshalling of interfaces and VARIANTs contained in structs.
++	
++	Code is contributed under MIT/X11 license.
++	
+ 2006-09-28 Gonzalo Paniagua Javier <gonzalo@ximian.com>
+ 
+ 	* console-io.c: ignore previous SIGINT handler.
+Index: mono/mono/metadata/class-internals.h
+===================================================================
+--- mono/mono/metadata/class-internals.h	(revision 66109)
++++ mono/mono/metadata/class-internals.h	(working copy)
+@@ -714,6 +714,7 @@
+ 	MonoClass *generic_nullable_class;
+ 	MonoClass *variant_class;
+ 	MonoClass *com_object_class;
++	MonoClass *com_interop_proxy_class;
+ } MonoDefaults;
+ 
+ extern MonoDefaults mono_defaults MONO_INTERNAL;
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 66109)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -266,6 +266,32 @@
+ }
+ 
+ /**
++ * cominterop_object_is_com_object:
++ * @obj: a pointer to the object
++ *
++ * Returns: a value indicating if the object is a
++ * Runtime Callable Wrapper (RCW) for a COM object
++ */
++static int
++cominterop_object_is_rcw (MonoObject *obj)
++{
++	MonoClass *klass = NULL;
++	MonoRealProxy* real_proxy = NULL;
++	if (!obj)
++		return FALSE;
++	klass = mono_object_class (obj);
++	if (klass != mono_defaults.transparent_proxy_class)
++		return FALSE;
++
++	real_proxy = ((MonoTransparentProxy*)obj)->rp;
++	if (!real_proxy)
++		return FALSE;
++
++	klass = mono_object_class (real_proxy);
++	return (klass && klass == mono_defaults.com_interop_proxy_class);
++}
++
++/**
+  * cominterop_get_com_slot_for_method:
+  * @method: a method
+  *
+@@ -419,6 +445,7 @@
+ 		register_icall (mono_gc_wbarrier_generic_store, "wb_generic", "void ptr object", FALSE);
+ 		register_icall (cominterop_get_method_interface, "cominterop_get_method_interface", "object ptr", FALSE);
+ 		register_icall (cominterop_get_function_pointer, "cominterop_get_function_pointer", "ptr ptr int32", FALSE);
++		register_icall (cominterop_object_is_rcw, "cominterop_object_is_rcw", "object int32", FALSE);
+ 	}
+ }
+ 
+@@ -1720,6 +1747,52 @@
+ 	case MONO_MARSHAL_CONV_ARRAY_LPARRAY:
+ 		g_error ("Structure field of type %s can't be marshalled as LPArray", mono_class_from_mono_type (type)->name);
+ 		break;
++	case MONO_MARSHAL_CONV_OBJECT_INTERFACE:
++	case MONO_MARSHAL_CONV_OBJECT_IUNKNOWN:
++	case MONO_MARSHAL_CONV_OBJECT_IDISPATCH: {
++		static MonoClass* com_interop_proxy_class = NULL;
++		static MonoMethod* com_interop_proxy_get_proxy = NULL;
++		static MonoMethod* get_transparent_proxy = NULL;
++		int real_proxy;
++		guint32 pos_failed = 0;
++		MonoClass *klass = mono_class_from_mono_type (type);
++
++		mono_mb_emit_ldloc (mb, 1);
++		mono_mb_emit_byte (mb, CEE_LDNULL);
++		mono_mb_emit_byte (mb, CEE_STIND_REF);
++
++		mono_mb_emit_ldloc (mb, 0);
++		mono_mb_emit_byte (mb, CEE_LDIND_I);
++		pos_failed = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++
++		if (!com_interop_proxy_class)
++			com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
++		if (!com_interop_proxy_get_proxy)
++			com_interop_proxy_get_proxy = mono_class_get_method_from_name_flags (com_interop_proxy_class, "GetProxy", 2, METHOD_ATTRIBUTE_PRIVATE);
++		if (!get_transparent_proxy)
++			get_transparent_proxy = mono_class_get_method_from_name (mono_defaults.real_proxy_class, "GetTransparentProxy", 0);
++
++		real_proxy = mono_mb_add_local (mb, &com_interop_proxy_class->byval_arg);
++
++		mono_mb_emit_ldloc (mb, 0);
++		mono_mb_emit_byte (mb, CEE_LDIND_I);
++		mono_mb_emit_ptr (mb, &mono_defaults.com_object_class->byval_arg);
++		mono_mb_emit_icall (mb, type_from_handle);
++		mono_mb_emit_managed_call (mb, com_interop_proxy_get_proxy, NULL);
++		mono_mb_emit_stloc (mb, real_proxy);
++
++		
++		mono_mb_emit_ldloc (mb, 1);
++		mono_mb_emit_ldloc (mb, real_proxy);
++		mono_mb_emit_managed_call (mb, get_transparent_proxy, NULL);
++		if (klass && klass != mono_defaults.object_class)
++			mono_mb_emit_op (mb, CEE_CASTCLASS, klass);
++		mono_mb_emit_byte (mb, CEE_STIND_REF);
++
++		// case if null
++		mono_mb_patch_short_branch (mb, pos_failed);
++		break;
++	}
+ 	case MONO_MARSHAL_CONV_STR_BSTR:
+ 	case MONO_MARSHAL_CONV_STR_ANSIBSTR:
+ 	case MONO_MARSHAL_CONV_STR_TBSTR:
+@@ -1982,6 +2055,78 @@
+ 		mono_mb_patch_short_branch (mb, pos);
+ 		break;
+ 	}
++	case MONO_MARSHAL_CONV_OBJECT_INTERFACE:
++	case MONO_MARSHAL_CONV_OBJECT_IDISPATCH:
++	case MONO_MARSHAL_CONV_OBJECT_IUNKNOWN: {
++		guint32 pos_failed = 0, pos_rcw = 0;
++		char * msg;
++
++		mono_mb_emit_ldloc (mb, 1);
++		//mono_mb_emit_ldloc (mb, 0);
++		mono_mb_emit_ptr (mb, 0);
++		//mono_mb_emit_byte (mb, CEE_LDIND_U1);
++		mono_mb_emit_byte (mb, CEE_STIND_I);
++
++		mono_mb_emit_ldloc (mb, 0);	
++		mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++		// if null just break, dst was already inited to 0
++		pos_failed = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++
++		mono_mb_emit_ldloc (mb, 0);	
++		mono_mb_emit_byte (mb, CEE_LDIND_REF);
++		mono_mb_emit_icall (mb, cominterop_object_is_rcw);
++		pos_rcw = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++
++		// load dst to store later
++		mono_mb_emit_ldloc (mb, 1);
++
++		// load src
++		mono_mb_emit_ldloc (mb, 0);	
++		mono_mb_emit_byte (mb, CEE_LDIND_REF);
++		mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++		mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++		/* load the RCW from the ComInteropProxy*/
++		mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoComInteropProxy, com_object));
++		mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++		if (conv == MONO_MARSHAL_CONV_OBJECT_INTERFACE) {
++			static MonoMethod* GetInterface = NULL;
++			
++			if (!GetInterface)
++				GetInterface = mono_class_get_method_from_name (mono_defaults.com_object_class, "GetInterface", 1);
++			mono_mb_emit_ptr (mb, type);
++			mono_mb_emit_icall (mb, type_from_handle);
++			mono_mb_emit_managed_call (mb, GetInterface, NULL);
++		}
++		else if (conv == MONO_MARSHAL_CONV_OBJECT_IUNKNOWN) {
++			static MonoProperty* iunknown = NULL;
++			
++			if (!iunknown)
++				iunknown = mono_class_get_property_from_name (mono_defaults.com_object_class, "IUnknown");
++			mono_mb_emit_managed_call (mb, iunknown->get, NULL);
++		}
++		else if (conv == MONO_MARSHAL_CONV_OBJECT_IDISPATCH) {
++			static MonoProperty* idispatch = NULL;
++			
++			if (!idispatch)
++				idispatch = mono_class_get_property_from_name (mono_defaults.com_object_class, "IDispatch");
++			mono_mb_emit_managed_call (mb, idispatch->get, NULL);
++		}
++		else {
++		}
++		mono_mb_emit_byte (mb, CEE_STIND_I);
++		
++		// if not rcw
++		mono_mb_patch_short_branch (mb, pos_rcw);
++		msg = g_strdup ("Marshalling of COM Callable Wrappers is not yet implemented.");
++		mono_mb_emit_exception_marshal_directive (mb, msg);
++
++		// case if null
++		mono_mb_patch_short_branch (mb, pos_failed);
++		break;
++	}
+ 	default: {
+ 		char *msg = g_strdup_printf ("marshalling conversion %d not implemented", conv);
+ 		MonoException *exc = mono_get_exception_not_implemented (msg);
+@@ -2115,7 +2260,35 @@
+ 				mono_mb_emit_stloc (mb, 1);
+ 				break;
+ 			}
++			case MONO_TYPE_OBJECT: {
++				if (to_object) {
++					static MonoMethod *variant_clear = NULL;
++					static MonoMethod *get_object_for_native_variant = NULL;
++					if (!variant_clear)
++						variant_clear = mono_class_get_method_from_name (mono_defaults.variant_class, "Clear", 0);
++					if (!get_object_for_native_variant)
++						get_object_for_native_variant = mono_class_get_method_from_name (mono_defaults.marshal_class, "GetObjectForNativeVariant", 1);
++					mono_mb_emit_ldloc (mb, 1);
++					mono_mb_emit_ldloc (mb, 0);
++					mono_mb_emit_managed_call (mb, get_object_for_native_variant, NULL);
++					mono_mb_emit_byte (mb, CEE_STIND_REF);
+ 
++					mono_mb_emit_ldloc (mb, 0);
++					mono_mb_emit_managed_call (mb, variant_clear, NULL);
++				}
++				else {
++					static MonoMethod *get_native_variant_for_object = NULL;
++					if (!get_native_variant_for_object)
++						get_native_variant_for_object = mono_class_get_method_from_name (mono_defaults.marshal_class, "GetNativeVariantForObject", 2);
++
++					mono_mb_emit_ldloc (mb, 0);
++					mono_mb_emit_byte(mb, CEE_LDIND_REF);
++					mono_mb_emit_ldloc (mb, 1);
++					mono_mb_emit_managed_call (mb, get_native_variant_for_object, NULL);
++					}
++				break;
++			}
++
+ 			default:
+ 				g_warning ("marshaling type %02x not implemented", ftype->type);
+ 				g_assert_not_reached ();
+@@ -5741,12 +5914,17 @@
+ 
+ 				}
+ 			} else {
+-				guint32 pos_failed = 0;
++				char *msg = NULL;
++				guint32 pos_failed = 0, pos_rcw = 0;
+ 				mono_mb_emit_ldarg (mb, argnum);	
+ 				// if null just break, conv arg was already inited to 0
+-				pos_failed = mono_mb_emit_branch (mb, CEE_BRFALSE);
++				pos_failed = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
+ 
+ 				mono_mb_emit_ldarg (mb, argnum);
++				mono_mb_emit_icall (mb, cominterop_object_is_rcw);
++				pos_rcw = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++
++				mono_mb_emit_ldarg (mb, argnum);
+ 				mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
+ 				mono_mb_emit_byte (mb, CEE_LDIND_REF);
+ 
+@@ -5781,8 +5959,13 @@
+ 				}
+ 				mono_mb_emit_stloc (mb, conv_arg);
+ 				
++				// if not rcw
++				mono_mb_patch_short_branch (mb, pos_rcw);
++				msg = g_strdup ("Marshalling of COM Callable Wrappers is not yet implemented.");
++				mono_mb_emit_exception_marshal_directive (mb, msg);
++
+ 				// case if null
+-				mono_mb_patch_addr (mb, pos_failed, mb->pos - (pos_failed + 4));
++				mono_mb_patch_short_branch (mb, pos_failed);
+ 			}
+ 		}
+ 		else if (klass->delegate) {
+@@ -5908,7 +6091,7 @@
+ 				mono_mb_emit_byte (mb, CEE_STIND_REF);
+ 
+ 				mono_mb_emit_ldloc (mb, conv_arg);
+-				pos_failed = mono_mb_emit_branch (mb, CEE_BRFALSE);
++				pos_failed = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
+ 
+ 				if (!com_interop_proxy_class)
+ 					com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
+@@ -5934,7 +6117,7 @@
+ 				mono_mb_emit_byte (mb, CEE_STIND_REF);
+ 
+ 				// case if null
+-				mono_mb_patch_addr (mb, pos_failed, mb->pos - (pos_failed + 4));
++				mono_mb_patch_short_branch (mb, pos_failed);
+ 			}
+ 				break;
+ 		}
+@@ -9587,6 +9770,11 @@
+ 		return sizeof (gpointer);
+ 	case MONO_NATIVE_STRUCT: 
+ 		klass = mono_class_from_mono_type (type);
++		if (klass == mono_defaults.object_class &&
++			(mspec && mspec->native == MONO_NATIVE_STRUCT)) {
++		*align = 16;
++		return 16;
++		}
+ 		return mono_class_native_size (klass, align);
+ 	case MONO_NATIVE_BYVALTSTR: {
+ 		int esize = unicode ? 2: 1;
+Index: mono/mono/tests/ChangeLog
+===================================================================
+--- mono/mono/tests/ChangeLog	(revision 66109)
++++ mono/mono/tests/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2006-09-30  Jonathan Chambers  <joncham@gmail.com>
++
++	* marshal7.cs: Added tests for size of structs containing
++	objects with MarshalAs.Interface,IUnknown,IDispatch, and Struct.
++	
+ 2006-09-20  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* libtest.c (mono_test_marshal_stringbuilder_default): Null terminate string to
+Index: mono/mono/tests/marshal7.cs
+===================================================================
+--- mono/mono/tests/marshal7.cs	(revision 66109)
++++ mono/mono/tests/marshal7.cs	(working copy)
+@@ -23,6 +23,34 @@
+ 		public int		c;
+ 	}
+ 
++	[StructLayout (LayoutKind.Sequential)]
++	public class TestStruct4
++	{
++		[MarshalAs (UnmanagedType.Interface)]
++		object itf;
++	}
++
++	[StructLayout (LayoutKind.Sequential)]
++	public class TestStruct5
++	{
++		[MarshalAs (UnmanagedType.IUnknown)]
++		object itf;
++	}
++
++	[StructLayout (LayoutKind.Sequential)]
++	public class TestStruct6
++	{
++		[MarshalAs (UnmanagedType.IDispatch)]
++		object itf;
++	}
++
++	[StructLayout (LayoutKind.Sequential)]
++	public class TestStruct7
++	{
++		[MarshalAs (UnmanagedType.Struct)]
++		object itf;
++	}
++
+ 	public unsafe static int Main () 
+ 	{
+ 		///
+@@ -99,6 +127,17 @@
+ 			return 9;
+ 		}
+ 
++		// test size of structs with objects
++		if (Marshal.SizeOf (typeof (TestStruct4)) != IntPtr.Size)
++			return 10;
++		if (Marshal.SizeOf (typeof (TestStruct5)) != IntPtr.Size)
++			return 11;
++		if (Marshal.SizeOf (typeof (TestStruct6)) != IntPtr.Size)
++			return 12;
++		// a VARIANT is 
++		if (Marshal.SizeOf (typeof (TestStruct7)) != 16)
++			return 13;
++
+ 		return 0;
+ 	}
+ }

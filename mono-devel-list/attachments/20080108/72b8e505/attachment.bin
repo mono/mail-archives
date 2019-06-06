@@ -1,0 +1,243 @@
+Index: metadata/loader.c
+===================================================================
+--- metadata/loader.c	(revision 92458)
++++ metadata/loader.c	(working copy)
+@@ -969,7 +969,7 @@
+ 	return found;
+ }
+ 
+-static int 
++int 
+ mono_dllmap_lookup (MonoImage *assembly, const char *dll, const char* func, const char **rdll, const char **rfunc)
+ {
+ 	int res;
+Index: metadata/loader.h
+===================================================================
+--- metadata/loader.h	(revision 92458)
++++ metadata/loader.h	(working copy)
+@@ -62,6 +62,9 @@
+ void
+ mono_dllmap_insert (MonoImage *assembly, const char *dll, const char *func, const char *tdll, const char *tfunc);
+ 
++int
++mono_dllmap_lookup (MonoImage *assembly, const char *dll, const char* func, const char **rdll, const char **rfunc);
++
+ gpointer
+ mono_lookup_pinvoke_call (MonoMethod *method, const char **exc_class, const char **exc_arg);
+ 
+Index: metadata/ChangeLog
+===================================================================
+--- metadata/ChangeLog	(revision 92479)
++++ metadata/ChangeLog	(working copy)
+@@ -1,3 +1,11 @@
++2008-01-08  Jonathan Chambers <joncham@gmail.com>
++	* loader.h: Expose mono_dllmap_lookup.
++	
++	* loader.c: Expose mono_dllmap_lookup.
++
++	* marshal.c: Allow BSTR support to be pluggable based on
++	COM provider. Add MONO_COM environment variable.
++
+ 2008-01-08  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* boehm-gc.c (mono_gc_deregister_root): Fix the size passed to libgc.
+Index: metadata/marshal.c
+===================================================================
+--- metadata/marshal.c	(revision 92458)
++++ metadata/marshal.c	(working copy)
+@@ -41,6 +41,13 @@
+ 	MONO_MARSHAL_SERIALIZE		/* Value needs to be serialized into the new domain */
+ } MonoXDomainMarshalType;
+ 
++typedef enum {
++	MONO_COM_DEFAULT,
++	MONO_COM_MS
++} MonoCOMProvider;
++
++static MonoCOMProvider com_provider = MONO_COM_DEFAULT;
++
+ enum {
+ #include "mono/cil/opcode.def"
+ 	LAST = 0xff
+@@ -538,6 +545,9 @@
+ 	static gboolean module_initialized = FALSE;
+ 
+ 	if (!module_initialized) {
++		char* com_provider_env = getenv ("MONO_COM");
++		if (com_provider_env && !strcmp(com_provider_env, "MS"))
++			com_provider = MONO_COM_MS;
+ 		module_initialized = TRUE;
+ 		InitializeCriticalSection (&marshal_mutex);
+ 		InitializeCriticalSection (&cominterop_mutex);
+@@ -1074,6 +1084,8 @@
+ 	return NULL;
+ }
+ 
++typedef gpointer (*SysAllocStringLenFunc)(gunichar* str, guint32 len);
++
+ gpointer
+ mono_string_to_bstr (MonoString *string_obj)
+ {
+@@ -1082,19 +1094,60 @@
+ 		return NULL;
+ 	return SysAllocStringLen (mono_string_chars (string_obj), mono_string_length (string_obj));
+ #else
+-	int slen = mono_string_length (string_obj);
+-	char *ret = g_malloc (slen * 2 + 4 + 2);
+-	if (ret == NULL)
+-		return NULL;
+-	memcpy (ret + 4, mono_string_chars (string_obj), slen * 2);
+-	* ((guint32 *) ret) = slen * 2;
+-	ret [4 + slen * 2] = 0;
+-	ret [5 + slen * 2] = 0;
++	if (com_provider == MONO_COM_DEFAULT) {
++		int slen = mono_string_length (string_obj);
++		char *ret = g_malloc (slen * 2 + 4 + 2);
++		if (ret == NULL)
++			return NULL;
++		memcpy (ret + 4, mono_string_chars (string_obj), slen * 2);
++		* ((guint32 *) ret) = slen;
++		ret [4 + slen * 2] = 0;
++		ret [5 + slen * 2] = 0;
+ 
+-	return ret + 4;
++		return ret + 4;
++	}
++	else if (com_provider == MONO_COM_MS) {
++		char *error_msg;
++		gpointer ret = NULL;
++		gunichar* str = NULL;
++		guint32 len;
++		MonoDl *module = NULL;
++		SysAllocStringLenFunc pSysAllocString = NULL;
++		const char* scope = "liboleaut32.so";
++		const char* import = "SysAllocStringLen";
++		const char* new_scope = NULL;
++		const char* new_import = NULL;
++		if (mono_dllmap_lookup (mono_defaults.corlib, scope, import, &new_scope, &new_import)) {
++			scope = new_scope;
++			import = new_import;
++		}
++		module = mono_dl_open(scope, MONO_DL_LAZY, &error_msg);
++		if (error_msg) {
++			g_warning ("Error loading COM support library '%s': %s", scope, error_msg);
++			g_assert_not_reached ();
++			return NULL;
++		}
++		error_msg = mono_dl_symbol (module, import, (gpointer*)&pSysAllocString);
++		if (error_msg) {
++			g_warning ("Error loading entry point '%s' in COM support library '%s': %s", import, scope, error_msg);
++			g_assert_not_reached ();
++			return NULL;
++		}
++		len = mono_string_length (string_obj);
++		str = g_utf16_to_ucs4 (mono_string_chars (string_obj), len,
++			NULL, NULL, NULL);
++		ret = pSysAllocString(str, len);
++		g_free(str);
++		return ret;
++	}
++	else {
++		g_assert_not_reached ();
++	}
+ #endif
+ }
+ 
++typedef guint32 (*SysStringLenFunc)(gpointer bstr);
++
+ MonoString *
+ mono_string_from_bstr (gpointer bstr)
+ {
+@@ -1103,17 +1156,90 @@
+ 		return NULL;
+ 	return mono_string_new_utf16 (mono_domain_get (), bstr, SysStringLen (bstr));
+ #else
+-	return mono_string_new_utf16 (mono_domain_get (), bstr, *(guint32 *)((char *)bstr - 4) / 2);
++	if (com_provider == MONO_COM_DEFAULT) {
++		return mono_string_new_utf16 (mono_domain_get (), bstr, *(guint32 *)((char *)bstr - 4));
++	}
++	else if (com_provider == MONO_COM_MS) {
++		MonoString* str = NULL;
++		glong written = 0;
++		gunichar2* utf16 = NULL;
++		char *error_msg;
++		MonoDl *module = NULL;
++		SysStringLenFunc pSysStringLen = NULL;
++		const char* scope = "liboleaut32.so";
++		const char* import = "SysStringLen";
++		const char* new_scope = NULL;
++		const char* new_import = NULL;
++		if (mono_dllmap_lookup (mono_defaults.corlib, scope, import, &new_scope, &new_import)) {
++			scope = new_scope;
++			import = new_import;
++		}
++		module = mono_dl_open (scope, MONO_DL_LAZY, &error_msg);
++		if (error_msg) {
++			g_warning ("Error loading COM support library '%s': %s", scope, error_msg);
++			g_assert_not_reached ();
++			return NULL;
++		}
++		error_msg = mono_dl_symbol (module, import, (gpointer*)&pSysStringLen);
++		if (error_msg) {
++			g_warning ("Error loading entry point '%s' in COM support library '%s': %s", import, scope, error_msg);
++			g_assert_not_reached ();
++			return NULL;
++		}
++
++		utf16 = g_ucs4_to_utf16 (bstr, pSysStringLen(bstr), NULL, &written, NULL);
++		str = mono_string_new_utf16 (mono_domain_get (), utf16, written);
++		g_free (utf16);
++		return str;
++	}
++	else {
++		g_assert_not_reached ();
++	}
++
+ #endif
+ }
+ 
++typedef void (*SysFreeStringFunc)(gunichar* str);
++
+ void
+ mono_free_bstr (gpointer bstr)
+ {
+ #ifdef PLATFORM_WIN32
+ 	SysFreeString ((BSTR)bstr);
+ #else
+-	g_free (((char *)bstr) - 4);
++	if (com_provider == MONO_COM_DEFAULT) {
++		g_free (((char *)bstr) - 4);
++	}
++	else if (com_provider == MONO_COM_MS) {
++		char *error_msg;
++		MonoDl *module = NULL;
++		SysFreeStringFunc pSysFreeString = NULL;
++		const char* scope = "liboleaut32.so";
++		const char* import = "SysFreeString";
++		const char* new_scope = NULL;
++		const char* new_import = NULL;
++		if (mono_dllmap_lookup (mono_defaults.corlib, scope, import, &new_scope, &new_import)) {
++			scope = new_scope;
++			import = new_import;
++		}
++		module = mono_dl_open(scope, MONO_DL_LAZY, &error_msg);
++		if (error_msg) {
++			g_warning ("Error loading COM support library '%s': %s", scope, error_msg);
++			g_assert_not_reached ();
++			return;
++		}
++		error_msg = mono_dl_symbol (module, import, (gpointer*)&pSysFreeString);
++		if (error_msg) {
++			g_warning ("Error loading entry point '%s' in COM support library '%s': %s", import, scope, error_msg);
++			g_assert_not_reached ();
++			return;
++		}
++		pSysFreeString (bstr);
++	}
++	else {
++		g_assert_not_reached ();
++	}
++
+ #endif
+ }
+ 

@@ -1,0 +1,337 @@
+Index: metadata/class.c
+===================================================================
+--- metadata/class.c	(revision 93177)
++++ metadata/class.c	(working copy)
+@@ -6234,10 +6234,91 @@
+ 	return NULL;
+ }
+ 
+-/* FIXME: check visibility of type, too */
+ static gboolean
+-can_access_member (MonoClass *access_klass, MonoClass *member_klass, int access_level)
++is_nesting_type (MonoClass *outer_klass, MonoClass *inner_klass)
++ {
++	do {
++		if (outer_klass == inner_klass)
++			return TRUE;
++		inner_klass = inner_klass->nested_in;
++	} while (inner_klass);
++	return FALSE;
++}
++
++/*
++ * Subtype can only access parent members with family protection if the site object
++ * is subclass of Subtype. For example:
++ * class A { protected int x; }
++ * class B : A {
++ * 	void valid_access () {
++ * 		B b;
++ * 		b.x = 0;
++ *  }
++ *  void invalid_access () {
++ *		A a;
++ * 		a.x = 0;
++ *  }
++ * }
++ * */
++static gboolean
++is_valid_family_access (MonoClass *access_klass, MonoClass *member_klass, MonoClass *context_klass)
+ {
++	if (!mono_class_has_parent (access_klass, member_klass))
++		return FALSE;
++
++	if (context_klass == NULL)
++		return TRUE;
++	/*if access_klass is not member_klass context_klass must be type compat*/
++	if (access_klass != member_klass && !mono_class_has_parent (context_klass, access_klass))
++		return FALSE;
++	return TRUE;
++}
++
++static gboolean
++can_access_type (MonoClass *access_klass, MonoClass *member_klass)
++{
++	int access_level = member_klass->flags & TYPE_ATTRIBUTE_VISIBILITY_MASK;
++
++	if (is_nesting_type (access_klass, member_klass) || (access_klass->nested_in && is_nesting_type (access_klass->nested_in, member_klass)))
++		return TRUE;
++
++	if (member_klass->nested_in && !can_access_type (access_klass, member_klass->nested_in))
++		return FALSE;
++
++	switch (access_level) {
++	case TYPE_ATTRIBUTE_NOT_PUBLIC:
++		return can_access_internals (access_klass->image->assembly, member_klass->image->assembly);
++
++	case TYPE_ATTRIBUTE_PUBLIC:
++		return TRUE;
++
++	case TYPE_ATTRIBUTE_NESTED_PUBLIC:
++		return TRUE;
++
++	case TYPE_ATTRIBUTE_NESTED_PRIVATE:
++		return is_nesting_type (member_klass, access_klass);
++
++	case TYPE_ATTRIBUTE_NESTED_FAMILY:
++		return mono_class_has_parent (access_klass, member_klass->nested_in); 
++
++	case TYPE_ATTRIBUTE_NESTED_ASSEMBLY:
++		return can_access_internals (access_klass->image->assembly, member_klass->image->assembly);
++
++	case TYPE_ATTRIBUTE_NESTED_FAM_AND_ASSEM:
++		return can_access_internals (access_klass->image->assembly, member_klass->nested_in->image->assembly) &&
++			mono_class_has_parent (access_klass, member_klass->nested_in);
++
++	case TYPE_ATTRIBUTE_NESTED_FAM_OR_ASSEM:
++		return can_access_internals (access_klass->image->assembly, member_klass->nested_in->image->assembly) ||
++			mono_class_has_parent (access_klass, member_klass->nested_in);
++	}
++	return FALSE;
++}
++
++
++static gboolean
++can_access_member (MonoClass *access_klass, MonoClass *member_klass, MonoClass *context_klass, int access_level)
++{
+ 	MonoClass *member_generic_def;
+ 	if (((access_klass->generic_class && access_klass->generic_class->container_class) ||
+ 					access_klass->generic_container) && 
+@@ -6249,10 +6330,13 @@
+ 		else
+ 			access_container = access_klass->generic_class->container_class;
+ 
+-		if (can_access_member (access_container, member_generic_def, access_level))
++		if (can_access_member (access_container, member_generic_def, context_klass, access_level))
+ 			return TRUE;
+ 	}
+ 
++	if (!can_access_type (access_klass, member_klass) && (!access_klass->nested_in || !can_access_type (access_klass->nested_in, member_klass)))
++		return FALSE;
++	
+ 	/* Partition I 8.5.3.2 */
+ 	/* the access level values are the same for fields and methods */
+ 	switch (access_level) {
+@@ -6262,35 +6346,41 @@
+ 	case FIELD_ATTRIBUTE_PRIVATE:
+ 		return access_klass == member_klass;
+ 	case FIELD_ATTRIBUTE_FAM_AND_ASSEM:
+-		if (mono_class_has_parent (access_klass, member_klass) &&
+-		    can_access_internals (access_klass->image->assembly, member_klass->image->assembly))
+-			return TRUE;
+-		return FALSE;
++		return can_access_internals (access_klass->image->assembly, member_klass->image->assembly) &&
++			is_valid_family_access (access_klass, member_klass, context_klass);
+ 	case FIELD_ATTRIBUTE_ASSEMBLY:
+ 		return can_access_internals (access_klass->image->assembly, member_klass->image->assembly);
+ 	case FIELD_ATTRIBUTE_FAMILY:
+-		if (mono_class_has_parent (access_klass, member_klass))
+-			return TRUE;
+-		return FALSE;
++		return is_valid_family_access (access_klass, member_klass, context_klass);
+ 	case FIELD_ATTRIBUTE_FAM_OR_ASSEM:
+-		if (mono_class_has_parent (access_klass, member_klass))
+-			return TRUE;
+-		return can_access_internals (access_klass->image->assembly, member_klass->image->assembly);
++		return can_access_internals (access_klass->image->assembly, member_klass->image->assembly) ||
++			is_valid_family_access (access_klass, member_klass, context_klass);
+ 	case FIELD_ATTRIBUTE_PUBLIC:
+ 		return TRUE;
+ 	}
+ 	return FALSE;
+ }
+ 
++/*
++ * mono_method_can_access_method_with_context:
++ * @method: The caller method 
++ * @field: The accessed field
++ * @context_klass: The static type on stack of the owner @field object used
++ * 
++ * This function must be used with instance fields, as they have more strict family accessibility.
++ * It can be used with static fields, but context_klass should be NULL.
++ * 
++ * Returns: TRUE if caller have proper visibility and acessibility to @field
++ */
+ gboolean
+-mono_method_can_access_field (MonoMethod *method, MonoClassField *field)
++mono_method_can_access_member_field (MonoMethod *method, MonoClassField *field, MonoClass *context_klass)
+ {
+ 	/* FIXME: check all overlapping fields */
+-	int can = can_access_member (method->klass, field->parent, field->type->attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK);
++	int can = can_access_member (method->klass, field->parent, context_klass, field->type->attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK);
+ 	if (!can) {
+ 		MonoClass *nested = method->klass->nested_in;
+ 		while (nested) {
+-			can = can_access_member (nested, field->parent, field->type->attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK);
++			can = can_access_member (nested, field->parent, context_klass, field->type->attrs & FIELD_ATTRIBUTE_FIELD_ACCESS_MASK);
+ 			if (can)
+ 				return TRUE;
+ 			nested = nested->nested_in;
+@@ -6299,14 +6389,41 @@
+ 	return can;
+ }
+ 
++/*
++ * mono_method_can_access_field:
++ * @method: The caller method 
++ * @field: The accessed field 
++ *
++ * This method should be used with static fields. 
++ * Use mono_method_can_access_field_with_context for instance fields.
++ *
++ * Returns: TRUE if caller have proper visibility and acessibility to @field
++ */
+ gboolean
+-mono_method_can_access_method (MonoMethod *method, MonoMethod *called)
++mono_method_can_access_field (MonoMethod *method, MonoClassField *field)
++ {
++	return mono_method_can_access_member_field (method, field, NULL);
++}
++
++/*
++ * mono_method_can_access_method_with_context:
++ * @method: The caller method 
++ * @called: The called method 
++ * @context_klass:TThe static type on stack of the owner @called object used
++ * 
++ * This function must be used with instance calls, as they have more strict family accessibility.
++ * It can be used with static mehthod, but context_klass should be NULL.
++ * 
++ * Returns: TRUE if caller have proper visibility and acessibility to @called
++ */
++gboolean
++mono_method_can_access_member_method (MonoMethod *method, MonoMethod *called, MonoClass *context_klass)
+ {
+-	int can = can_access_member (method->klass, called->klass, called->flags & METHOD_ATTRIBUTE_MEMBER_ACCESS_MASK);
++	int can = can_access_member (method->klass, called->klass, context_klass, called->flags & METHOD_ATTRIBUTE_MEMBER_ACCESS_MASK);
+ 	if (!can) {
+ 		MonoClass *nested = method->klass->nested_in;
+ 		while (nested) {
+-			can = can_access_member (nested, called->klass, called->flags & METHOD_ATTRIBUTE_MEMBER_ACCESS_MASK);
++			can = can_access_member (nested, called->klass, context_klass, called->flags & METHOD_ATTRIBUTE_MEMBER_ACCESS_MASK);
+ 			if (can)
+ 				return TRUE;
+ 			nested = nested->nested_in;
+@@ -6324,6 +6441,22 @@
+ 	return can;
+ }
+ 
++/*
++ * mono_method_can_access_method:
++ * @method: The caller method 
++ * @called: The called method 
++ *
++ * This method should be used with static methods. 
++ * Use mono_method_can_access_method_with_context for instance methods.
++ *
++ * Returns: TRUE if caller have proper visibility and acessibility to @called
++ */
++gboolean
++mono_method_can_access_method (MonoMethod *method, MonoMethod *called)
++{
++	return mono_method_can_access_member_method (method, called, NULL);
++}
++
+ /**
+  * mono_type_is_valid_enum_basetype:
+  * @type: The MonoType to check
+Index: metadata/class-internals.h
+===================================================================
+--- metadata/class-internals.h	(revision 93177)
++++ metadata/class-internals.h	(working copy)
+@@ -913,5 +913,11 @@
+ MonoRuntimeGenericContextTemplate*
+ mono_class_get_runtime_generic_context_template (MonoClass *class) MONO_INTERNAL;
+ 
++gboolean
++mono_method_can_access_member_method (MonoMethod *method, MonoMethod *called, MonoClass *context_klass) MONO_INTERNAL;
++
++gboolean
++mono_method_can_access_member_field (MonoMethod *method, MonoClassField *field, MonoClass *context_klass) MONO_INTERNAL;
++
+ #endif /* __MONO_METADATA_CLASS_INTERBALS_H__ */
+ 
+Index: metadata/verify.c
+===================================================================
+--- metadata/verify.c	(revision 93185)
++++ metadata/verify.c	(working copy)
+@@ -2533,8 +2533,9 @@
+ 			ADD_VERIFY_ERROR (ctx, g_strdup_printf ("Incompatible this argument on stack with method signature at 0x%04x", ctx->ip_offset));
+ 			return;
+ 		}
+-	}
+-	if (!mono_method_can_access_method (ctx->method, method))
++		if (!mono_method_can_access_member_method (ctx->method, method, value->type->data.klass))
++			CODE_NOT_VERIFIABLE (ctx, g_strdup_printf ("Method is not accessible at 0x%04x", ctx->ip_offset));
++	} else if (!mono_method_can_access_method (ctx->method, method))
+ 		CODE_NOT_VERIFIABLE (ctx, g_strdup_printf ("Method is not accessible at 0x%04x", ctx->ip_offset));
+ 
+ 	if (sig->ret->type != MONO_TYPE_VOID) {
+@@ -2649,11 +2650,10 @@
+ 		if (!stack_slot_is_null_literal (obj) && !verify_type_compatibility (ctx, &field->parent->byval_arg, mono_type_get_type_byval (obj->type)))
+ 			CODE_NOT_VERIFIABLE (ctx, g_strdup_printf ("Type at stack is not compatible to reference the field at 0x%04x", ctx->ip_offset));
+ 
+-		if (!mono_method_can_access_field (ctx->method, field))
++		if (!mono_method_can_access_member_field (ctx->method, field, obj->type->data.klass))
+ 			CODE_NOT_VERIFIABLE (ctx, g_strdup_printf ("Type at stack is not accessible at 0x%04x", ctx->ip_offset));
+-	}
+ 
+-	if (!mono_method_can_access_field (ctx->method, field))
++	} else if (!mono_method_can_access_field (ctx->method, field))
+ 		CODE_NOT_VERIFIABLE (ctx, g_strdup_printf ("Type at stack is not accessible at 0x%04x", ctx->ip_offset));
+ 
+ 	if (stack_slot_get_underlying_type (obj) == TYPE_NATIVE_INT)
+Index: mini/mini.c
+===================================================================
+--- mini/mini.c	(revision 93146)
++++ mini/mini.c	(working copy)
+@@ -4417,6 +4417,7 @@
+ 	dont_verify |= method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE; /* bug #77896 */
+ 	dont_verify |= method->wrapper_type == MONO_WRAPPER_COMINTEROP;
+ 	dont_verify |= method->wrapper_type == MONO_WRAPPER_COMINTEROP_INVOKE;
++	dont_verify |= method->wrapper_type == MONO_WRAPPER_DELEGATE_INVOKE;
+ 
+ 	/* turn off visibility checks for smcs */
+ 	dont_verify |= mono_security_get_mode () == MONO_SECURITY_MODE_SMCS_HACK;
+@@ -5136,8 +5137,6 @@
+ 
+ 				if (!cmethod)
+ 					goto load_error;
+-				if (!dont_verify && !cfg->skip_visibility && !mono_method_can_access_method (method, cil_method))
+-					METHOD_ACCESS_FAILURE;
+ 
+ 				if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
+ 					ensure_method_is_allowed_to_call_method (cfg, method, cil_method, bblock, ip);
+@@ -5159,7 +5158,24 @@
+ 				} else {
+ 					fsig = mono_method_get_signature_full (cmethod, image, token, generic_context);
+ 				}
++				
++				if (!dont_verify && !cfg->skip_visibility) {
++					gboolean is_verifiable;
++					MonoInst *this_arg = sp [-(fsig->param_count + 1)];
++					/*
++					 * If it's a non-static method, we need to do checks based on the static type of the this parameter on stack.
++					 * FIXME: while compiling 1.1 System.dll, inlining pushes the wrong this parameter for some mcs constructor methods.
++					 * It reports object instead of the actual type.  
++					 */
++					if (fsig->hasthis && cfg->method == method)
++						is_verifiable = mono_method_can_access_member_method (method, cil_method, this_arg->klass);
++					else
++						is_verifiable = mono_method_can_access_method (method, cil_method);
+ 
++					if (!is_verifiable)
++						METHOD_ACCESS_FAILURE;
++				}
++
+ 				mono_save_token_info (cfg, image, token, cmethod);
+ 
+ 				n = fsig->param_count + fsig->hasthis;
+@@ -6596,7 +6612,7 @@
+ 			if (!field)
+ 				goto load_error;
+ 			mono_class_init (klass);
+-			if (!dont_verify && !cfg->skip_visibility && !mono_method_can_access_field (method, field))
++			if (!dont_verify && !cfg->skip_visibility && !mono_method_can_access_member_field (method, field, sp [0]->klass))
+ 				FIELD_ACCESS_FAILURE;
+ 
+ 			foffset = klass->valuetype? field->offset - sizeof (MonoObject): field->offset;

@@ -1,0 +1,234 @@
+Index: mono/mono/metadata/ChangeLog
+===================================================================
+--- mono/mono/metadata/ChangeLog	(revision 61549)
++++ mono/mono/metadata/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2006-06-05  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
++	* object-internals.h marshal.c marshal.h icall.c: Implement method 
++	Marshal.GetComSlotForMethodInfo using internal call.
++
+ 2006-06-07  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* class-internals.h: Add a new kind of loader error LOADER_ERROR_ASSEMBLY plus
+Index: mono/mono/metadata/object-internals.h
+===================================================================
+--- mono/mono/metadata/object-internals.h	(revision 61549)
++++ mono/mono/metadata/object-internals.h	(working copy)
+@@ -393,6 +393,11 @@
+ 	gint32 lcid;
+ } MonoSortKey;
+ 
++typedef struct {
++	MonoObject object;
++	guint16 intType;
++} MonoInterfaceTypeAttribute;
++
+ /* used to free a dynamic method */
+ typedef void        (*MonoFreeMethodFunc)	 (MonoDomain *domain, MonoMethod *method);
+ 
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 61549)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -8247,6 +8247,33 @@
+ 	mono_free_bstr (ptr);
+ }
+ 
++guint32
++ves_icall_System_Runtime_InteropServices_Marshal_GetComSlotForMethodInfoInternal (MonoReflectionMethod *m)
++{
++	MONO_ARCH_SAVE_REGS;
++	static MonoClass *interface_type_attribute = NULL;
++	MonoInterfaceTypeAttribute* itf_attr = NULL; 
++	MonoCustomAttrInfo *cinfo = NULL;
++	guint32 offset = 7; 
++
++	if (!interface_type_attribute)
++		interface_type_attribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "InterfaceTypeAttribute");
++	cinfo = mono_custom_attrs_from_class (m->method->klass);
++	if (cinfo)
++	{
++		itf_attr = (MonoInterfaceTypeAttribute*)mono_custom_attrs_get_attr (cinfo, interface_type_attribute);
++		if (!cinfo->cached)
++			mono_custom_attrs_free (cinfo);
++	}
++
++	if (itf_attr && itf_attr->intType == 1)
++		offset = 3; /* 3 methods in IUnknown*/
++	else
++		offset = 7; /* 7 methods in IDispatch*/
++
++	return m->method->slot + offset;
++}
++
+ guint32 
+ ves_icall_System_Runtime_InteropServices_Marshal_GetLastWin32Error (void)
+ {
+Index: mono/mono/metadata/marshal.h
+===================================================================
+--- mono/mono/metadata/marshal.h	(revision 61549)
++++ mono/mono/metadata/marshal.h	(working copy)
+@@ -317,6 +317,9 @@
+ MonoString *
+ ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringBSTR (gpointer ptr);
+ 
++guint32
++ves_icall_System_Runtime_InteropServices_Marshal_GetComSlotForMethodInfoInternal (MonoReflectionMethod *m);
++
+ guint32 
+ ves_icall_System_Runtime_InteropServices_Marshal_GetLastWin32Error (void);
+ 
+Index: mono/mono/metadata/icall.c
+===================================================================
+--- mono/mono/metadata/icall.c	(revision 61549)
++++ mono/mono/metadata/icall.c	(working copy)
+@@ -6979,6 +6979,7 @@
+ 	{"FreeBSTR", ves_icall_System_Runtime_InteropServices_Marshal_FreeBSTR},
+ 	{"FreeCoTaskMem", ves_icall_System_Runtime_InteropServices_Marshal_FreeCoTaskMem},
+ 	{"FreeHGlobal", ves_icall_System_Runtime_InteropServices_Marshal_FreeHGlobal},
++	{"GetComSlotForMethodInfoInternal", ves_icall_System_Runtime_InteropServices_Marshal_GetComSlotForMethodInfoInternal},
+ 	{"GetDelegateForFunctionPointerInternal", ves_icall_System_Runtime_InteropServices_Marshal_GetDelegateForFunctionPointerInternal},
+ 	{"GetFunctionPointerForDelegateInternal", mono_delegate_to_ftnptr},
+ 	{"GetLastWin32Error", ves_icall_System_Runtime_InteropServices_Marshal_GetLastWin32Error},
+Index: mcs/class/corlib/System.Runtime.InteropServices/ChangeLog
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/ChangeLog	(revision 61549)
++++ mcs/class/corlib/System.Runtime.InteropServices/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-06-07  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
++	* Marshal.cs: Implement GetComSlotForMethodInfo
++
+ 2006-06-05  Jonathan Chambers  <jonathan.chambers@ansys.com>
+ 
+ 	* Marshal.cs: Implement VARIANT marshalling methods
+Index: mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(revision 61549)
++++ mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(working copy)
+@@ -237,9 +237,18 @@
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO]
+-		public static int GetComSlotForMethodInfo (MemberInfo m) {
+-			throw new NotImplementedException ();
++		[MethodImplAttribute(MethodImplOptions.InternalCall)]
++		private extern static int GetComSlotForMethodInfoInternal (MemberInfo m);
++
++		public static int GetComSlotForMethodInfo (MemberInfo m)
++		{
++			if (m == null)
++				throw new ArgumentNullException("m", "Value cannot be null.");
++			if (!(m is MethodInfo))
++				throw new ArgumentException("m", "The MemberInfo must be an interface method.");
++			if (!m.DeclaringType.IsInterface)
++				throw new ArgumentException("m", "The MemberInfo must be an interface method.");
++			return GetComSlotForMethodInfoInternal (m);
+ 		}
+ 
+ 		[MonoTODO]
+Index: mcs/class/corlib/Test/System.Runtime.InteropServices/ChangeLog
+===================================================================
+--- mcs/class/corlib/Test/System.Runtime.InteropServices/ChangeLog	(revision 61549)
++++ mcs/class/corlib/Test/System.Runtime.InteropServices/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-06-07  Jonathan Chambers  <jonathan.chambers@ansys.com>
++
++	* MarshalTest.cs: Added tests for GetComSlotForMethodInfo method.
++
+ 2005-10-28  Sebastien Pouliot  <sebastien@ximian.com>
+ 
+ 	* MarshalTest.cs: Added tests for 2.0 SecureTo* and ZeroFree* methods.
+Index: mcs/class/corlib/Test/System.Runtime.InteropServices/MarshalTest.cs
+===================================================================
+--- mcs/class/corlib/Test/System.Runtime.InteropServices/MarshalTest.cs	(revision 61549)
++++ mcs/class/corlib/Test/System.Runtime.InteropServices/MarshalTest.cs	(working copy)
+@@ -289,6 +289,86 @@
+ 			}
+ 		}
+ #endif
++
++		[Test]
++		public void TestGetComSlotForMethodInfo ()
++		{
++			Assert.AreEqual	(7, Marshal.GetComSlotForMethodInfo(typeof(ITestDefault).GetMethod("DoNothing")));
++			Assert.AreEqual	(7, Marshal.GetComSlotForMethodInfo(typeof(ITestDual).GetMethod("DoNothing")));
++			Assert.AreEqual (7, Marshal.GetComSlotForMethodInfo (typeof(ITestDefault).GetMethod ("DoNothing")));
++			Assert.AreEqual (3, Marshal.GetComSlotForMethodInfo (typeof(ITestUnknown).GetMethod ("DoNothing")));
++
++			for (int i = 0; i < 10; i++)
++				Assert.AreEqual (7+i, Marshal.GetComSlotForMethodInfo(typeof(ITestInterface).GetMethod ("Method"+i.ToString())));
++		}
++
++		[Test]
++		[ExpectedException(typeof(ArgumentNullException))]
++		public void TestGetComSlotForMethodInfoNullException()
++		{
++			Marshal.GetComSlotForMethodInfo (null);
++		}
++
++		[Test]
++		[ExpectedException(typeof(ArgumentException))]
++		public void TestGetComSlotForMethodInfoArgumentException2 ()
++		{
++			Marshal.GetComSlotForMethodInfo (typeof(TestCoClass).GetMethod ("DoNothing"));
++		}
+ 	}
++
++	[ComImport()]
++	[Guid("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")]
++	interface ITestDefault
++	{
++		void DoNothing ();
++	}
++
++	[ComImport()]
++	[Guid("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")]
++	[InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
++	interface ITestDispatch
++	{
++		void DoNothing ();
++	}
++
++	[ComImport()]
++	[Guid("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")]
++	[InterfaceType(ComInterfaceType.InterfaceIsDual)]
++	interface ITestDual
++	{
++		void DoNothing ();
++	}
++
++	[ComImport()]
++	[Guid("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")]
++	[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
++	interface ITestUnknown
++	{
++		void DoNothing ();
++	}
++
++	[ComImport()]
++	[Guid("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")]
++	interface ITestInterface
++	{
++		void Method0 ();
++		void Method1 ();
++		void Method2 ();
++		void Method3 ();
++		void Method4 ();
++		void Method5 ();
++		void Method6 ();
++		void Method7 ();
++		void Method8 ();
++		void Method9 ();
++	}
++
++	public class TestCoClass : ITestDispatch
++	{
++		public void DoNothing ()
++		{
++		}
++	}
+ }
+ 

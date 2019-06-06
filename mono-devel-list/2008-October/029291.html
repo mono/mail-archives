@@ -1,0 +1,179 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Patch: Fast virtual generic method calls
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%3A%20Fast%20virtual%20generic%20method%20calls&In-Reply-To=1222873498.10317.13.camel%40newton">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="029287.html">
+   <LINK REL="Next"  HREF="029300.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Patch: Fast virtual generic method calls</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Patch%3A%20Fast%20virtual%20generic%20method%20calls&In-Reply-To=1222873498.10317.13.camel%40newton"
+       TITLE="[Mono-dev] Patch: Fast virtual generic method calls">lupus at ximian.com
+       </A><BR>
+    <I>Wed Oct  1 14:12:04 EDT 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="029287.html">[Mono-dev] Patch: Fast virtual generic method calls
+</A></li>
+        <LI>Next message: <A HREF="029300.html">[Mono-dev] Patch: Fast virtual generic method calls
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29291">[ date ]</a>
+              <a href="thread.html#29291">[ thread ]</a>
+              <a href="subject.html#29291">[ subject ]</a>
+              <a href="author.html#29291">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 10/01/08 Mark Probst wrote:
+&gt;<i> Here's the patch again, updated with code to keep track of how many
+</I>&gt;<i> times a generic virtual method is invoked and to insert it in the thunk
+</I>&gt;<i> only if a threshold (currently 100) is reached.
+</I>
+100 seems high, especially since the lookup can be a O(n) list walk.
+Maybe 10 is more appropriate.
+
+&gt;<i> Index: metadata/object.c
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- metadata/object.c	(revision 114206)
+</I>&gt;<i> +++ metadata/object.c	(working copy)
+</I>&gt;<i> +static void
+</I>&gt;<i> +init_thunk_free_lists (MonoDomain *domain)
+</I>&gt;<i> +{
+</I>&gt;<i> +	if (domain-&gt;thunk_free_lists)
+</I>&gt;<i> +		return;
+</I>&gt;<i> +	domain-&gt;thunk_free_lists = mono_mempool_alloc0 (domain-&gt;mp, sizeof (gpointer) * NUM_FREE_LISTS);
+</I>
+mono_domain_alloc0 () should be used, so that all the domain allocations
+are properly tracked.
+
+&gt;<i> +/*
+</I>&gt;<i> + * LOCKING: The domain lock must be held.
+</I>&gt;<i> + */
+</I>&gt;<i> +static void
+</I>&gt;<i> +invalidate_generic_virtual_thunk (MonoDomain *domain, gpointer code)
+</I>&gt;<i> +{
+</I>&gt;<i> +	guint32 *p = code;
+</I>&gt;<i> +	MonoThunkFreeList *l = (MonoThunkFreeList*)(p - 1);
+</I>&gt;<i> +
+</I>&gt;<i> +	init_thunk_free_lists (domain);
+</I>&gt;<i> +
+</I>&gt;<i> +	while (domain-&gt;thunk_free_lists [0] &amp;&amp; domain-&gt;thunk_free_lists [0]-&gt;length &gt;= MAX_WAIT_LENGTH) {
+</I>&gt;<i> +		MonoThunkFreeList *item = domain-&gt;thunk_free_lists [0];
+</I>&gt;<i> +		int length = item-&gt;length;
+</I>&gt;<i> +		int i;
+</I>&gt;<i> +
+</I>&gt;<i> +		/* unlink the first item from the wait list */
+</I>&gt;<i> +		domain-&gt;thunk_free_lists [0] = item-&gt;next;
+</I>&gt;<i> +		domain-&gt;thunk_free_lists [0]-&gt;length = length - 1;
+</I>&gt;<i> +
+</I>&gt;<i> +		i = list_index_for_size (item-&gt;size);
+</I>&gt;<i> +
+</I>&gt;<i> +		g_print (&quot;putting thunk of size %d in list %d\n&quot;, item-&gt;size, i);
+</I>
+Leftover.
+
+&gt;<i> +/**
+</I>&gt;<i> + * mono_method_add_generic_virtual_case:
+</I>
+Maybe invocation is better than case? Any other suggestion?
+
+&gt;<i> +void
+</I>&gt;<i> +mono_method_add_generic_virtual_case (MonoDomain *domain, gpointer *vtable_slot,
+</I>&gt;<i> +	MonoGenericInst *method_inst, gpointer code)
+</I>&gt;<i> +{
+</I>&gt;<i> +	static gboolean inited = FALSE;
+</I>&gt;<i> +	static int num_added = 0;
+</I>&gt;<i> +
+</I>&gt;<i> +	GenericVirtualCase *gvc, *list;
+</I>&gt;<i> +	MonoImtBuilderEntry *entries;
+</I>&gt;<i> +	int i;
+</I>&gt;<i> +	GPtrArray *sorted;
+</I>&gt;<i> +
+</I>&gt;<i> +	mono_domain_lock (domain);
+</I>&gt;<i> +	if (!domain-&gt;generic_virtual_cases)
+</I>&gt;<i> +		domain-&gt;generic_virtual_cases = g_hash_table_new (mono_aligned_addr_hash, NULL);
+</I>&gt;<i> +
+</I>&gt;<i> +	/* Check whether the case was already added */
+</I>&gt;<i> +	gvc = g_hash_table_lookup (domain-&gt;generic_virtual_cases, vtable_slot);
+</I>&gt;<i> +	while (gvc) {
+</I>&gt;<i> +		if (gvc-&gt;inst == method_inst)
+</I>&gt;<i> +			break;
+</I>&gt;<i> +		gvc = gvc-&gt;next;
+</I>&gt;<i> +	}
+</I>
+This is the O(n) loop I mentioned. It shouldn't be a big deal, though.
+
+&gt;<i> +
+</I>&gt;<i> +	/* If not found, make a new one */
+</I>&gt;<i> +	if (!gvc) {
+</I>&gt;<i> +		gvc = mono_mempool_alloc (domain-&gt;mp, sizeof (GenericVirtualCase));
+</I>
+mono_domain_alloc () here.
+
+&gt;<i> Index: metadata/domain-internals.h
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- metadata/domain-internals.h	(revision 114206)
+</I>&gt;<i> +++ metadata/domain-internals.h	(working copy)
+</I>&gt;<i> @@ -141,6 +141,12 @@
+</I>&gt;<i>  	MONO_APPDOMAIN_UNLOADED
+</I>&gt;<i>  } MonoAppDomainState;
+</I>&gt;<i>  
+</I>&gt;<i> +typedef struct _MonoThunkFreeList {
+</I>&gt;<i> +	guint32 size;
+</I>&gt;<i> +	struct _MonoThunkFreeList *next;
+</I>&gt;<i> +	int length;		/* only valid for the wait list */
+</I>
+Put the pointer first, so sie and length fit inside the other 8 bytes on
+64 bit systems and the total size will be 16 instead of 24.
+
+&gt;<i> --- mini/tramp-x86.c	(revision 114206)
+</I>&gt;<i> +++ mini/tramp-x86.c	(working copy)
+</I>&gt;<i> @@ -94,7 +94,7 @@
+</I>&gt;<i>  	} else {
+</I>&gt;<i>  		printf (&quot;Invalid trampoline sequence: %x %x %x %x %x %x %x\n&quot;, code [0], code [1], code [2], code [3],
+</I>&gt;<i>  				code [4], code [5], code [6]);
+</I>&gt;<i> -		g_assert_not_reached ();
+</I>&gt;<i> +		//g_assert_not_reached ();
+</I>
+Leftover.
+
+The rest of the code looks fine to me.
+It would be nice to also see some speedup numbers from this change:)
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="029287.html">[Mono-dev] Patch: Fast virtual generic method calls
+</A></li>
+	<LI>Next message: <A HREF="029300.html">[Mono-dev] Patch: Fast virtual generic method calls
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#29291">[ date ]</a>
+              <a href="thread.html#29291">[ thread ]</a>
+              <a href="subject.html#29291">[ subject ]</a>
+              <a href="author.html#29291">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

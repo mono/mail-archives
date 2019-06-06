@@ -1,0 +1,534 @@
+Index: ChangeLog
+===================================================================
+RCS file: /mono/mcs/class/Mono.Data.SqliteClient/ChangeLog,v
+retrieving revision 1.10
+diff -u -b -r1.10 ChangeLog
+--- ChangeLog	29 Apr 2004 13:54:32 -0000	1.10
++++ ChangeLog	9 May 2004 23:19:42 -0000
+@@ -1,3 +1,22 @@
++2004-05-09  Chris Turchin  <chris@turchin.net>
++
++	* Mono.Data.SqliteClient/SqliteCommand.cs: 
++		- implemented named input parameters using ADO.NET Syntax: @-prefix (e.g. @param1, @myparam, etc)
++		- ProcessParameters() method extracts the named parameters in the ParametersCollection from the raw sql and
++		  replaces them with the respective parameter values before executing the query
++	* Mono.Data.SqliteClient/SqliteDataReader.cs:
++		- added note regarding datatypes
++	* Mono.Data.SqliteClient/SqliteParameterCollection.cs:
++		- implemented various NotYetImplemented interface implementations - IList, ICollection interface methods 
++		  and properties now return the corresponding results from the numeric_param_hash in the background.
++		- fixed bug in IndexOf (string parameterName) where parameterName is not present
++		- added range checks for this[index] and this[propertyName] properties with IndexOutOfRangeException()
++		- fixed bug in  Add (object value) related to the wrong key being stored in named_param_hash[]
++		- GenerateParameterName() like firebird provider for case SqlParameter.ParameterName.Length == 0
++		  generates name using format: @ + numeric_param_hash.Count + 1
++	* Test/SqliteTest.cs:
++		- added tests related to named parameters. restructured the code to be more modular. 
++		
+ 2004-04-29  Gonzalo Paniagua Javier <gonzalo@ximian.com>
+ 
+ 	* Mono.Data.SqliteClient/SqliteCommand.cs: implement LastInsertRowId.
+Index: Mono.Data.SqliteClient/SqliteCommand.cs
+===================================================================
+RCS file: /mono/mcs/class/Mono.Data.SqliteClient/Mono.Data.SqliteClient/SqliteCommand.cs,v
+retrieving revision 1.4
+diff -u -b -r1.4 SqliteCommand.cs
+--- Mono.Data.SqliteClient/SqliteCommand.cs	29 Apr 2004 13:54:32 -0000	1.4
++++ Mono.Data.SqliteClient/SqliteCommand.cs	9 May 2004 23:19:42 -0000
+@@ -3,12 +3,13 @@
+ //  SqliteCommand.cs
+ //
+ //  Author(s): Vladimir Vukicevic  <vladimir@pobox.com>
+-//
++//			Chris Turchin <chris@turchin.net>
+ //  Copyright (C) 2002  Vladimir Vukicevic
+ //
+ 
+ using System;
+ using System.Text;
++using System.Text.RegularExpressions;
+ using System.Runtime.InteropServices;
+ using System.Data;
+ 
+@@ -199,17 +200,26 @@
+ 				byte *msg_result;
+ 
+ 				try {
++					
++					string sqlData = sql;
++					
++					if (Parameters.Count > 0)
++					{
++						//in a future version of sqlite, named parameters will be supported
++						//then one could due a better  implementation (pinvoking add_parameter() or whatever)
++						sqlData = ProcessParameters();
++					}
++					
+ 	                                if (want_results) {
+ 	                                        reader = new SqliteDataReader (this);
+-						
+-						err = sqlite_exec (parent_conn.Handle,
+-								   sql,
++						err = sqlite_exec ( parent_conn.Handle,
++											sqlData,
+ 								   new SqliteCallbackFunction (reader.SqliteCallback),
+ 								   IntPtr.Zero, &msg_result);
+ 						reader.ReadingDone ();
+ 	                                } else {
+ 	                                        err = sqlite_exec (parent_conn.Handle,
+-	                                                           sql,
++											sqlData,
+ 	                                                           null,
+ 	                                                           IntPtr.Zero, &msg_result);
+ 	                                }
+@@ -235,6 +245,40 @@
+                         return reader;
+                 }
+ 
++				private string ProcessParameters()
++				{
++					string processedText = sql;
++					//Regex looks odd perhaps, but it works - same impl. as in the firebird db provider
++					//the named parameters are using the ADO.NET standard @-prefix but sqlite is considering ":" as a prefix for v.3...
++					//ref: http://www.mail-archive.com/sqlite-users@sqlite.org/msg01851.html
++					Regex r = new Regex(@"(('[^']*?\@[^']*')*[^'@]*?)*(?<param>@\w+)+([^'@]*?('[^']*?\@[^']*'))*",RegexOptions.ExplicitCapture);
++					MatchEvaluator me = new MatchEvaluator(ReplaceParams);
++                    processedText = r.Replace(sql, me);
++					return processedText;
++                }
++				
++                public string ReplaceParams(Match m)
++                {
++                        string input = m.Value;
++                                                                                                                            
++                        if (m.Groups["param"].Success)
++                        {
++							Group g = m.Groups["param"];
++							string find = g.Value;
++							//FIXME: sqlite works internally only with strings, so this assumtion is mostly legit, but what about date formatting, etc?
++							//Need to fix SqlLiteDataReader first to acurately describe the tables
++							SqliteParameter sqlp = Parameters[find];
++							string replace = Convert.ToString(sqlp.Value);
++							
++							if(sqlp.DbType == DbType.String)
++								replace =  "\"" + replace + "\"";
++							
++							input = Regex.Replace(input,find,replace);
++							return input;
++                        }
++                        else
++                            return m.Value;
++                }
+ 
+                 internal int NumChanges () {
+                         return sqlite_changes (parent_conn.Handle);
+Index: Mono.Data.SqliteClient/SqliteDataReader.cs
+===================================================================
+RCS file: /mono/mcs/class/Mono.Data.SqliteClient/Mono.Data.SqliteClient/SqliteDataReader.cs,v
+retrieving revision 1.5
+diff -u -b -r1.5 SqliteDataReader.cs
+--- Mono.Data.SqliteClient/SqliteDataReader.cs	29 Apr 2004 13:54:32 -0000	1.5
++++ Mono.Data.SqliteClient/SqliteDataReader.cs	9 May 2004 23:19:43 -0000
+@@ -64,6 +64,9 @@
+ 			// we -could- parse the table definition (since that's the only info
+ 			// that we can get out of sqlite about the table), but it's probably
+ 			// not worth it.
++			// http://sqlite.org/datatypes.html is an imporant read for anyone
++			// doing anything with sqlite datatypes. important is:
++			// One exception to the typelessness of SQLite is a column whose type is INTEGER PRIMARY KEY.(autoincrement)
+ 
+ 			DataTable dataTableSchema  = null;
+ 
+Index: Mono.Data.SqliteClient/SqliteParameterCollection.cs
+===================================================================
+RCS file: /mono/mcs/class/Mono.Data.SqliteClient/Mono.Data.SqliteClient/SqliteParameterCollection.cs,v
+retrieving revision 1.2
+diff -u -b -r1.2 SqliteParameterCollection.cs
+--- Mono.Data.SqliteClient/SqliteParameterCollection.cs	12 Nov 2003 01:19:19 -0000	1.2
++++ Mono.Data.SqliteClient/SqliteParameterCollection.cs	9 May 2004 23:19:44 -0000
+@@ -3,7 +3,7 @@
+ //  SqliteParameterCollection.cs
+ //
+ //  Author(s): Vladimir Vukicevic  <vladimir@pobox.com>
+-//
++//			Chris Turchin <chris@turchin.net>
+ //  Copyright (C) 2002  Vladimir Vukicevic
+ //
+ 
+@@ -21,7 +21,7 @@
+ 
+                 public IEnumerator GetEnumerator ()
+                 {
+-                        throw new NotImplementedException ();
++                        return this.numeric_param_list.GetEnumerator();
+                 }
+ 
+                 public void RemoveAt (string parameterName)
+@@ -52,7 +52,10 @@
+ 
+                 public int IndexOf (string parameterName)
+                 {
++					if (named_param_hash.Contains(parameterName))
+                         return (int) named_param_hash[parameterName];
++					else
++						return -1;
+                 }
+ 
+                 public int IndexOf (SqliteParameter param)
+@@ -97,37 +100,47 @@
+ 
+                 public SqliteParameter this[string parameterName] {
+                         get {
++							if (this.Contains(parameterName))
+                                 return this[(int) named_param_hash[parameterName]];
++							else
++								throw new IndexOutOfRangeException("The specified name does not exist: " + parameterName);
+                         }
+                         set {
+-                                if (this.Contains (parameterName))
++							if (this.Contains(parameterName))
+                                         numeric_param_list[(int) named_param_hash[parameterName]] = value;
+-                                else          // uhm, do we add it if it doesn't exist? what does ms do?
+-                                        Add (value);
++                            else          
++                                throw new IndexOutOfRangeException("The specified name does not exist: " + parameterName);
+                         }
+                 }
+ 
+                 public SqliteParameter this[int parameterIndex] {
+                         get {
++							if (this.Count >= parameterIndex+1)
+                                 return (SqliteParameter) numeric_param_list[parameterIndex];
++							else          
++								throw new IndexOutOfRangeException("The specified parameter index does not exist: " + parameterIndex.ToString());
+                         }
+                         set {
++							if (this.Count >= parameterIndex+1)
+                                 numeric_param_list[parameterIndex] = value;
++							else          
++								throw new IndexOutOfRangeException("The specified parameter index does not exist: " + parameterIndex.ToString());
+                         }
+                 }
+ 
+                 public int Add (object value)
+                 {
+                         CheckSqliteParam (value);
+-                        SqliteParameter sqlp = (SqliteParameter) value;
++						
++						SqliteParameter sqlp = value as SqliteParameter;
++					
+                         if (named_param_hash.Contains (sqlp.ParameterName))
+-                                throw new DuplicateNameException ("Parameter collection already contains given value.");
++                                throw new DuplicateNameException ("Parameter collection already contains the a SqliteParameter with the given ParameterName.");
+ 
+-                        named_param_hash[value] = numeric_param_list.Add (value);
++                        named_param_hash[sqlp.ParameterName] = numeric_param_list.Add(value);
+ 
+-                        return (int) named_param_hash[value];
++                        return (int) named_param_hash[sqlp.ParameterName];
+                 }
+-
+                 // IList
+ 
+                 public SqliteParameter Add (SqliteParameter param)
+@@ -146,16 +159,14 @@
+                         return Add (new SqliteParameter (name, type));
+                 }
+ 
+-                public bool IsFixedSize {
+-                        get {
+-                                return false;
+-                        }
++				bool IList.IsFixedSize
++				{
++					get { return this.numeric_param_list.IsFixedSize; }
+                 }
+ 
+-                public bool IsReadOnly {
+-                        get {
+-                                return false;
+-                        }
++				bool IList.IsReadOnly
++				{
++					get { return this.numeric_param_list.IsReadOnly; }
+                 }
+ 
+                 public void Clear ()
+@@ -184,33 +195,35 @@
+ 
+                 // ICollection
+ 
+-                public int Count {
+-                        get {
+-                                return numeric_param_list.Count;
+-                        }
++				public int Count 
++				{
++					get { return this.numeric_param_list.Count; }
+                 }
+ 
+-                public bool IsSynchronized {
+-                        get {
+-                                return false;
+-                        }
++				bool ICollection.IsSynchronized 
++				{
++					get { return this.numeric_param_list.IsSynchronized; }
+                 }
+ 
+-                public object SyncRoot {
+-                        get {
+-                                return null;
+-                        }
++				object ICollection.SyncRoot 
++				{
++					get { return this.numeric_param_list.SyncRoot; }
+                 }
+ 
+                 public void CopyTo (Array array, int index)
+                 {
+-                        throw new NotImplementedException ();
++                        this.numeric_param_list.CopyTo(array, index);
+                 }
+ 
+                 private void CheckSqliteParam (object value)
+                 {
+                         if (!(value is SqliteParameter))
+                                 throw new InvalidCastException ("Can only use SqliteParameter objects");
++					
++					SqliteParameter sqlp = value as SqliteParameter;
++					
++					if (sqlp.ParameterName == null || sqlp.ParameterName.Length == 0)
++						sqlp.ParameterName = this.GenerateParameterName();
+                 }
+ 
+                 private void RecreateNamedHash ()
+@@ -219,5 +232,25 @@
+                                 named_param_hash[((SqliteParameter) numeric_param_list[i]).ParameterName] = i;
+                         }
+                 }
++				
++				//FIXME: if the user is calling Insert at various locations with unnamed parameters, this is not going to work....
++				private string GenerateParameterName()
++				{
++					int		index	= this.Count + 1;
++					string	name	= String.Empty;
++		
++					while (index > 0)
++					{
++						name = "@" + index.ToString();
++
++						if (this.IndexOf(name) == -1)
++							index = -1;
++						else
++							index++;
++					}
++		
++					return name;
++				}
++
+         }
+ }
+Index: Test/SqliteTest.cs
+===================================================================
+RCS file: /mono/mcs/class/Mono.Data.SqliteClient/Test/SqliteTest.cs,v
+retrieving revision 1.1
+diff -u -b -r1.1 SqliteTest.cs
+--- Test/SqliteTest.cs	13 Oct 2002 10:53:43 -0000	1.1
++++ Test/SqliteTest.cs	9 May 2004 23:19:44 -0000
+@@ -11,11 +11,11 @@
+ // There are binaries for Windows and Linux.
+ //
+ // To compile:
+-//  mcs SqliteTest.cs -r System.Data.dll -r Mono.Data.SqliteClient.dll
++//        mcs -r:System.Data -r:Mono.Data.SqliteClient SqliteTest.cs
+ //
+ // Author:
+ //     Daniel Morgan <danmorg@sc.rr.com>
+-//
++//	Chris Turchin <chris@turchin.net>
+ 
+ using System;
+ using System.Data;
+@@ -25,12 +25,10 @@
+ {
+ 	class SqliteTest
+ 	{
++		//TODO: write unit tests for all of this using nunit
+ 		[STAThread]
+ 		static void Main(string[] args)
+ 		{
+-			Console.WriteLine("If this test works, you should get:");
+-			Console.WriteLine("Data 1: 5");
+-			Console.WriteLine("Data 2: Mono");
+ 
+ 			Console.WriteLine("create SqliteConnection...");
+ 			SqliteConnection dbcon = new SqliteConnection();
+@@ -40,51 +38,135 @@
+ 			// file is created.
+ 
+ 			// "URI=file:some/path"
+-			string connectionString =
+-				"URI=file:SqliteTest.db";
+-			Console.WriteLine("setting ConnectionString using: " + 
+-				connectionString);
++			string connectionString = "URI=file:SqliteTest.db";
++			Console.WriteLine("setting ConnectionString using: " + connectionString);
+ 			dbcon.ConnectionString = connectionString;
+ 				
+ 			Console.WriteLine("open the connection...");
+ 			dbcon.Open();
+ 
+-			Console.WriteLine("create SqliteCommand to CREATE TABLE MONO_TEST");
+ 			SqliteCommand dbcmd = new SqliteCommand();
+ 			dbcmd.Connection = dbcon;
+ 			
+-			dbcmd.CommandText = 
+-				"CREATE TABLE MONO_TEST ( " +
+-				"NID INT, " +
+-				"NDESC TEXT )";		
+-			Console.WriteLine("execute command...");
+-			dbcmd.ExecuteNonQuery();
+-
+-			Console.WriteLine("set and execute command to INSERT INTO MONO_TEST");
+-			dbcmd.CommandText =
+-				"INSERT INTO MONO_TEST  " +
+-				"(NID, NDESC )"+
+-				"VALUES(5,'Mono')";
+-			dbcmd.ExecuteNonQuery();
+-
+-			Console.WriteLine("set command to SELECT FROM MONO_TEST");
+-			dbcmd.CommandText =
+-				"SELECT * FROM MONO_TEST";
+-			SqliteDataReader reader;
+-			Console.WriteLine("execute reader...");
+-			reader = dbcmd.ExecuteReader();
++			SetupDB(dbcmd);
++			
++			Console.WriteLine("SELECTING DATA FROM MONO_TEST");
++			
++			TestWithoutParameters(dbcmd);
++			TestSingleParameter(dbcmd);
++			//TestUnnamedParameters(dbcmd);
++			TestMultipleParameters(dbcmd);
+ 
+-			Console.WriteLine("read and display data...");
+-			while(reader.Read()) {
+-				Console.WriteLine("Data 1: " + reader[0].ToString());
+-				Console.WriteLine("Data 2: " + reader[1].ToString());
+-			}
+-			Console.WriteLine("clean up...");
+-			reader.Close();
+ 			dbcmd.Dispose();
+ 			dbcon.Close();
+ 
+ 			Console.WriteLine("Done.");
++		}
++		
++		static void SetupDB(SqliteCommand dbcmd)
++		{
++			dbcmd.CommandText = "CREATE TABLE MONO_TEST ( NID INT, NDESC TEXT, EMAIL TEXT)";		
++			Console.WriteLine("execute SqliteCommand to CREATE TABLE MONO_TEST: " + dbcmd.CommandText );
++			dbcmd.ExecuteNonQuery();
++			
++			Console.WriteLine("inserting data into MONO_TEST...");
++			dbcmd.CommandText =	"INSERT INTO MONO_TEST  (NID, NDESC, EMAIL ) VALUES(1,'Mono 1','chris@turchin.net')";
++			dbcmd.ExecuteNonQuery();
++			
++			dbcmd.CommandText ="INSERT INTO MONO_TEST  (NID, NDESC, EMAIL ) VALUES(2,'Mono 2','test@test')";
++			dbcmd.ExecuteNonQuery();
++
++			dbcmd.CommandText = "INSERT INTO MONO_TEST  (NID, NDESC ) VALUES(3,'Mono 3')";
++			dbcmd.ExecuteNonQuery();
++
++			dbcmd.CommandText ="INSERT INTO MONO_TEST (NID, NDESC ) VALUES(4,'Mono 4')";
++			dbcmd.ExecuteNonQuery();
++
++			dbcmd.CommandText = "INSERT INTO MONO_TEST (NID, NDESC, EMAIL ) VALUES(5,'Mono 5','test@test')";
++			dbcmd.ExecuteNonQuery();
++		}
++		
++		static void TestWithoutParameters(SqliteCommand dbcmd)
++		{
++			dbcmd.CommandText =	"SELECT * FROM MONO_TEST where NID >  2";
++			Console.WriteLine("TestWithoutParameters: " + dbcmd.CommandText + "\n\nexecute reader...");			
++			ShowData( dbcmd.ExecuteReader());
++			
++			Console.WriteLine("next test...");
++		}
++		
++		static void TestSingleParameter( SqliteCommand dbcmd )
++		{
++			dbcmd.CommandText =	"SELECT * FROM MONO_TEST where NID >  @1";
++
++			SqliteParameter param = new SqliteParameter();
++			
++			param.ParameterName = "@1";
++			param.Value = 1;
++			param.DbType = DbType.Int32;
++			
++			dbcmd.Parameters.Add(param);
++			
++			Console.WriteLine("TestSingleParameter: " + dbcmd.CommandText + "\n\nexecute reader...");
++			
++			ShowData( dbcmd.ExecuteReader());
++			dbcmd.Parameters.Clear();
++			Console.WriteLine("next test...");
++			
++		}
++		
++		static void TestMultipleParameters( SqliteCommand dbcmd )
++		{
++		
++			dbcmd.CommandText =	"SELECT * FROM MONO_TEST where NID >=  @nid AND NDESC LIKE @ndesc and (EMAIL LIKE '%@test' or EMAIL = @email)";
++			
++			dbcmd.Parameters.Add(new SqliteParameter("@nid" , 1) );
++			dbcmd.Parameters.Add(new SqliteParameter("@ndesc", "_ono%") );
++			dbcmd.Parameters.Insert(1,new SqliteParameter("@email","chris@turchin.net"));
++			
++			Console.WriteLine("TestMultipleParameters: " + dbcmd.CommandText + "\n\nexecute reader...");
++			ShowData( dbcmd.ExecuteReader());
++			dbcmd.Parameters.Clear();
++			Console.WriteLine("next test...");
++		}
++		
++		static void TestUnnamedParameters( SqliteCommand dbcmd )
++		{
++			dbcmd.CommandText =	"SELECT * FROM MONO_TEST where NID >  @1 AND NDESC LIKE @2 and (EMAIL LIKE '%@test' or EMAIL = @3)";
++
++			SqliteParameter param = new SqliteParameter();
++			SqliteParameter param2 = new SqliteParameter();
++		
++			param.Value = 1;
++			param.DbType = DbType.Int32;
++			param2.Value = "_ono 5";
++			
++			dbcmd.Parameters.Add(param);
++			dbcmd.Parameters.Add(param2);
++			dbcmd.Parameters.Insert(1,new SqliteParameter("@3","chris@turchin.net"));
++			
++			Console.WriteLine("TestUnnamedParameters: " + dbcmd.CommandText + "\n\nexecute reader...");
++
++			ShowData( dbcmd.ExecuteReader());
++			dbcmd.Parameters.Clear();
++			Console.WriteLine("next test...");
++			
++		}
++		
++		static void ShowData(SqliteDataReader reader)
++		{
++			Console.WriteLine("read and display data...");
++			while(reader.Read()) {
++				Console.Write("datarow:\t" + reader[0].ToString());
++				Console.Write("|\t" + reader[1].ToString());
++				string email;
++				if (reader[2]==null)
++					email = "(null)";
++				else
++					email = reader[2].ToString();
++				Console.Write("|\t" + email + "\n");
++			}
++			reader.Close();
+ 		}
+ 	}
+ }

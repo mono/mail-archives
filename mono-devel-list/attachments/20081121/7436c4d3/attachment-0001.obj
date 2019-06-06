@@ -1,0 +1,1180 @@
+Index: mono/mini/mini-mips.c
+===================================================================
+--- mono/mini/mini-mips.c	(revision 119429)
++++ mono/mini/mini-mips.c	(working copy)
+@@ -20,13 +20,14 @@
+ 
+ #include "mini-mips.h"
+ #include "cpu-mips.h"
++#include "ir-emit.h"
+ #include "trace.h"
+ 
+-#error "The mips backend has not been ported to linear IR."
++#warning "The mips backend is still being ported to the linear IR."
+ 
+ #define SAVE_FP_REGS		0
+ #define SAVE_ALL_REGS		0
+-#define EXTRA_STACK_SPACE	0	/* suppresses some s-reg corruption issues */
++#define EXTRA_STACK_SPACE	1	/* suppresses some s-reg corruption issues */
+ #define LONG_BRANCH		1	/* needed for yyparse in mcs */
+ 
+ #define SAVE_LMF		1
+@@ -415,6 +416,15 @@
+ 	return frame_size;
+ }
+ 
++gpointer
++mono_arch_get_this_arg_from_call (MonoGenericSharingContext *gsctx, MonoMethodSignature *sig, gssize *regs, guint8 *code)
++{
++	/* FIXME: handle returning a struct */
++	if (MONO_TYPE_ISSTRUCT (sig->ret))
++		return (gpointer)regs [mips_a1];
++	return (gpointer)regs [mips_a0];
++}
++
+ /*
+  * Initialize the cpu to execute managed code.
+  */
+@@ -1181,13 +1191,26 @@
+  * etc.
+  * Issue: who does the spilling if needed, and when?
+  */
+-MonoCallInst*
+-mono_arch_call_opcode (MonoCompile *cfg, MonoBasicBlock* bb, MonoCallInst *call, int is_virtual) {
+-	MonoInst *arg, *in;
++static void
++emit_sig_cookie (MonoCompile *cfg, MonoCallInst *call, CallInfo *cinfo)
++{
++	int sig_reg = mono_alloc_ireg (cfg);
++
++	MONO_EMIT_NEW_ICONST (cfg, sig_reg, (guint32)call->signature);
++	MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STORE_MEMBASE_REG,
++			mips_sp, cinfo->sig_cookie.offset, sig_reg);
++}
++
++void
++mono_arch_emit_call (MonoCompile *cfg, MonoCallInst *call)
++{
++	MonoInst *in, *ins;
+ 	MonoMethodSignature *sig;
+ 	int i, n;
+ 	CallInfo *cinfo;
+-	ArgInfo *ainfo;
++#if 1
++	int is_virtual = 0;
++#endif
+ 
+ 	sig = call->signature;
+ 	n = sig->param_count + sig->hasthis;
+@@ -1197,7 +1220,19 @@
+ 		call->used_iregs |= 1 << cinfo->struct_ret;
+ 
+ 	for (i = 0; i < n; ++i) {
+-		ainfo = cinfo->args + i;
++		ArgInfo *ainfo = cinfo->args + i;
++		MonoType *t;
++
++		if (i >= sig->hasthis)
++			t = sig->params [i - sig->hasthis];
++		else
++			t = &mono_defaults.int_class->byval_arg;
++		t = mini_type_get_underlying_type (cfg->generic_sharing_context, t);
++
++#if 1
++		if (!sig->pinvoke && (sig->call_convention == MONO_CALL_VARARG) && (i == sig->sentinelpos))
++			emit_sig_cookie (cfg, call, cinfo);
++#else
+ 		if ((sig->call_convention == MONO_CALL_VARARG) && (i == sig->sentinelpos)) {
+ 			MonoInst *sig_arg;
+ 			cfg->disable_aot = TRUE;
+@@ -1213,71 +1248,184 @@
+ 			arg->next = call->out_args;
+ 			call->out_args = arg;
+ 		}
++#endif
+ 		if (is_virtual && i == 0) {
+ 			/* the argument will be attached to the call instrucion */
+ 			in = call->args [i];
+ 			call->used_iregs |= 1 << ainfo->reg;
+-		} else {
+-			MONO_INST_NEW (cfg, arg, OP_OUTARG);
+-			in = call->args [i];
+-			arg->cil_code = in->cil_code;
+-			arg->inst_left = in;
+-			arg->inst_call = call;
+-			arg->type = in->type;
+-			/* prepend, we'll need to reverse them later */
+-			arg->next = call->out_args;
+-			call->out_args = arg;
+-			if (ainfo->regtype == RegTypeGeneral) {
+-				arg->backend.reg3 = ainfo->reg;
+-				call->used_iregs |= 1 << ainfo->reg;
+-				if (arg->type == STACK_I8)
+-					call->used_iregs |= 1 << (ainfo->reg + 1);
+-			} else if (ainfo->regtype == RegTypeStructByAddr) {
+-				/* FIXME: where is the data allocated? */
+-				arg->backend.reg3 = ainfo->reg;
+-				call->used_iregs |= 1 << ainfo->reg;
+-			} else if (ainfo->regtype == RegTypeStructByVal) {
+-				int cur_reg;
+-				MonoMIPSArgInfo *ai = mono_mempool_alloc0 (cfg->mempool, sizeof (MonoMIPSArgInfo));
+-				/* mark the used regs */
+-				for (cur_reg = 0; cur_reg < ainfo->size; ++cur_reg) {
+-					call->used_iregs |= 1 << (ainfo->reg + cur_reg);
+-				}
+-				arg->opcode = OP_OUTARG_VT;
+-				ai->reg = ainfo->reg;
+-				ai->size = ainfo->size;
+-				ai->vtsize = ainfo->vtsize;
+-				ai->offset = ainfo->offset;
+-				arg->backend.data = ai;
++			continue;
++		}
+ #if 0
+-				g_printf ("OUTARG_VT reg=%d size=%d vtsize=%d offset=%d\n",
+-					  ai->reg, ai->size, ai->vtsize, ai->offset);
++		MONO_INST_NEW (cfg, arg, OP_OUTARG);
+ #endif
+-			} else if (ainfo->regtype == RegTypeBase) {
+-				MonoMIPSArgInfo *ai = mono_mempool_alloc0 (cfg->mempool, sizeof (MonoMIPSArgInfo));
+-				g_assert(ainfo->reg == mips_sp);
+-				arg->opcode = OP_OUTARG_MEMBASE;
+-				ai->reg = ainfo->reg;
+-				ai->size = ainfo->size;
+-				ai->offset = ainfo->offset;
+-				arg->backend.data = ai;
+-			} else if (ainfo->regtype == RegTypeFP) {
+-				arg->opcode = OP_OUTARG_R8;
+-				arg->backend.reg3 = ainfo->reg;
+-				call->used_fregs |= 1 << ainfo->reg;
++		in = call->args [i];
++#if 0
++		arg->cil_code = in->cil_code;
++		arg->inst_left = in;
++		arg->inst_call = call;
++		arg->type = in->type;
++		/* prepend, we'll need to reverse them later */
++		arg->next = call->out_args;
++		call->out_args = arg;
++#endif
++		if (ainfo->regtype == RegTypeGeneral) {
++#if 1
++			if (!t->byref && ((t->type == MONO_TYPE_I8) || (t->type == MONO_TYPE_U8))) {
++				MONO_INST_NEW (cfg, ins, OP_MOVE);
++				ins->dreg = mono_alloc_ireg (cfg);
++				ins->sreg1 = in->dreg + 1;
++				MONO_ADD_INS (cfg->cbb, ins);
++				mono_call_inst_add_outarg_reg (cfg, call, ins->dreg, ainfo->reg + 1, FALSE);
++
++				MONO_INST_NEW (cfg, ins, OP_MOVE);
++				ins->dreg = mono_alloc_ireg (cfg);
++				ins->sreg1 = in->dreg + 2;
++				MONO_ADD_INS (cfg->cbb, ins);
++				mono_call_inst_add_outarg_reg (cfg, call, ins->dreg, ainfo->reg, FALSE);
++			} else {
++				MONO_INST_NEW (cfg, ins, OP_MOVE);
++				ins->dreg = mono_alloc_ireg (cfg);
++				ins->sreg1 = in->dreg;
++				MONO_ADD_INS (cfg->cbb, ins);
++
++				mono_call_inst_add_outarg_reg (cfg, call, ins->dreg, ainfo->reg, FALSE);
++			}
++#else
++			arg->backend.reg3 = ainfo->reg;
++			call->used_iregs |= 1 << ainfo->reg;
++			if (arg->type == STACK_I8)
++				call->used_iregs |= 1 << (ainfo->reg + 1);
++#endif
++		} else if (ainfo->regtype == RegTypeStructByAddr) {
++#if 1
++			MONO_INST_NEW (cfg, ins, OP_OUTARG_VT);
++			ins->opcode = OP_OUTARG_VT;
++			ins->sreg1 = in->dreg;
++			ins->klass = in->klass;
++			ins->inst_p0 = call;
++			ins->inst_p1 = mono_mempool_alloc (cfg->mempool, sizeof (ArgInfo));
++			memcpy (ins->inst_p1, ainfo, sizeof (ArgInfo));
++			MONO_ADD_INS (cfg->cbb, ins);
++#else
++			/* FIXME: where is the data allocated? */
++			arg->backend.reg3 = ainfo->reg;
++			call->used_iregs |= 1 << ainfo->reg;
++#endif
++		} else if (ainfo->regtype == RegTypeStructByVal) {
++#if 1
++			/* this is further handled in mono_arch_emit_outarg_vt () */
++			MONO_INST_NEW (cfg, ins, OP_OUTARG_VT);
++			ins->opcode = OP_OUTARG_VT;
++			ins->sreg1 = in->dreg;
++			ins->klass = in->klass;
++			ins->inst_p0 = call;
++			ins->inst_p1 = mono_mempool_alloc (cfg->mempool, sizeof (ArgInfo));
++			memcpy (ins->inst_p1, ainfo, sizeof (ArgInfo));
++			MONO_ADD_INS (cfg->cbb, ins);
++#else
++			int cur_reg;
++			MonoMIPSArgInfo *ai = mono_mempool_alloc0 (cfg->mempool, sizeof (MonoMIPSArgInfo));
++			/* mark the used regs */
++			for (cur_reg = 0; cur_reg < ainfo->size; ++cur_reg) {
++				call->used_iregs |= 1 << (ainfo->reg + cur_reg);
++			}
++			arg->opcode = OP_OUTARG_VT;
++			ai->reg = ainfo->reg;
++			ai->size = ainfo->size;
++			ai->vtsize = ainfo->vtsize;
++			ai->offset = ainfo->offset;
++			arg->backend.data = ai;
++#if 0
++			g_printf ("OUTARG_VT reg=%d size=%d vtsize=%d offset=%d\n",
++				  ai->reg, ai->size, ai->vtsize, ai->offset);
++#endif
++#endif
++		} else if (ainfo->regtype == RegTypeBase) {
++#if 1
++			if (!t->byref && ((t->type == MONO_TYPE_I8) || (t->type == MONO_TYPE_U8))) {
++				MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STOREI8_MEMBASE_REG, mips_sp, ainfo->offset, in->dreg);
++			} else if (!t->byref && ((t->type == MONO_TYPE_R4) || (t->type == MONO_TYPE_R8))) {
++				if (t->type == MONO_TYPE_R8)
++					MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STORER8_MEMBASE_REG, mips_sp, ainfo->offset, in->dreg);
++				else
++					MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STORER4_MEMBASE_REG, mips_sp, ainfo->offset, in->dreg);
++			} else {
++				MONO_EMIT_NEW_STORE_MEMBASE (cfg, OP_STORE_MEMBASE_REG, mips_sp, ainfo->offset, in->dreg);
++			}
++#else
++			MonoMIPSArgInfo *ai = mono_mempool_alloc0 (cfg->mempool, sizeof (MonoMIPSArgInfo));
++			g_assert(ainfo->reg == mips_sp);
++			arg->opcode = OP_OUTARG_MEMBASE;
++			ai->reg = ainfo->reg;
++			ai->size = ainfo->size;
++			ai->offset = ainfo->offset;
++			arg->backend.data = ai;
++#endif
++		} else if (ainfo->regtype == RegTypeFP) {
++#if 1
++			if (t->type == MONO_TYPE_VALUETYPE) {
++				/* this is further handled in mono_arch_emit_outarg_vt () */
++				MONO_INST_NEW (cfg, ins, OP_OUTARG_VT);
++				ins->opcode = OP_OUTARG_VT;
++				ins->sreg1 = in->dreg;
++				ins->klass = in->klass;
++				ins->inst_p0 = call;
++				ins->inst_p1 = mono_mempool_alloc (cfg->mempool, sizeof (ArgInfo));
++				memcpy (ins->inst_p1, ainfo, sizeof (ArgInfo));
++				MONO_ADD_INS (cfg->cbb, ins);
++
++				cfg->flags |= MONO_CFG_HAS_FPOUT;
++			} else {
++				int dreg = mono_alloc_freg (cfg);
++
+ 				if (ainfo->size == 4) {
+-					arg->opcode = OP_OUTARG_R4;
+-					/* we reduce the precision */
+-					/*MonoInst *conv;
+-					MONO_INST_NEW (cfg, conv, OP_FCONV_TO_R4);
+-					conv->inst_left = arg->inst_left;
+-					arg->inst_left = conv;*/
++					MONO_EMIT_NEW_UNALU (cfg, OP_FCONV_TO_R4, dreg, in->dreg);
++				} else {
++					MONO_INST_NEW (cfg, ins, OP_FMOVE);
++					ins->dreg = dreg;
++					ins->sreg1 = in->dreg;
++					MONO_ADD_INS (cfg->cbb, ins);
+ 				}
+-			} else {
+-				g_assert_not_reached ();
++
++				mono_call_inst_add_outarg_reg (cfg, call, dreg, ainfo->reg, TRUE);
++				cfg->flags |= MONO_CFG_HAS_FPOUT;
+ 			}
++#else
++			arg->opcode = OP_OUTARG_R8;
++			arg->backend.reg3 = ainfo->reg;
++			call->used_fregs |= 1 << ainfo->reg;
++			if (ainfo->size == 4) {
++				arg->opcode = OP_OUTARG_R4;
++				/* we reduce the precision */
++				/*MonoInst *conv;
++				MONO_INST_NEW (cfg, conv, OP_FCONV_TO_R4);
++				conv->inst_left = arg->inst_left;
++				arg->inst_left = conv;*/
++			}
++#endif
++		} else {
++			g_assert_not_reached ();
+ 		}
+ 	}
++#if 1
++
++	/* Emit the signature cookie in the case that there is no
++	   additional argument */
++	if (!sig->pinvoke && (sig->call_convention == MONO_CALL_VARARG) && (n == sig->sentinelpos))
++		emit_sig_cookie (cfg, call, cinfo);
++
++	if (cinfo->struct_ret) {
++		MonoInst *vtarg;
++
++		MONO_INST_NEW (cfg, vtarg, OP_MOVE);
++		vtarg->sreg1 = call->vret_var->dreg;
++		vtarg->dreg = mono_alloc_preg (cfg);
++		MONO_ADD_INS (cfg->cbb, vtarg);
++
++		mono_call_inst_add_outarg_reg (cfg, call, vtarg->dreg, cinfo->struct_ret, FALSE);
++	}
++#endif
++#if 0
+ 	/*
+ 	 * Reverse the call->out_args list.
+ 	 */
+@@ -1291,6 +1439,7 @@
+ 		}
+ 		call->out_args = prev;
+ 	}
++#endif
+ 	call->stack_usage = cinfo->stack_usage;
+ 	cfg->param_area = MAX (cfg->param_area, cinfo->stack_usage);
+ 	cfg->param_area = MAX (cfg->param_area, 16); /* a0-a3 always present */
+@@ -1302,16 +1451,9 @@
+ 	 */
+ 
+ 	g_free (cinfo);
+-	return call;
+ }
+ 
+ void
+-mono_arch_emit_call (MonoCompile *cfg, MonoCallInst *call)
+-{
+-	NOT_IMPLEMENTED;
+-}
+-
+-void
+ mono_arch_emit_outarg_vt (MonoCompile *cfg, MonoInst *ins, MonoInst *src)
+ {
+ 	NOT_IMPLEMENTED;
+@@ -1320,7 +1462,25 @@
+ void
+ mono_arch_emit_setret (MonoCompile *cfg, MonoMethod *method, MonoInst *val)
+ {
+-	NOT_IMPLEMENTED;
++	MonoType *ret = mini_type_get_underlying_type (cfg->generic_sharing_context,
++			mono_method_signature (method)->ret);
++
++	if (!ret->byref) {
++		if (ret->type == MONO_TYPE_I8 || ret->type == MONO_TYPE_U8) {
++			MonoInst *ins;
++
++			MONO_INST_NEW (cfg, ins, OP_SETLRET);
++			ins->sreg1 = val->dreg + 1;
++			ins->sreg2 = val->dreg + 2;
++			MONO_ADD_INS (cfg->cbb, ins);
++			return;
++		}
++		if (ret->type == MONO_TYPE_R8 || ret->type == MONO_TYPE_R4) {
++			MONO_EMIT_NEW_UNALU (cfg, OP_FMOVE, cfg->ret->dreg, val->dreg);
++			return;
++		}
++	}
++	MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, cfg->ret->dreg, val->dreg);
+ }
+ 
+ void
+@@ -1499,6 +1659,35 @@
+ 	} while (0)
+ 
+ static int
++map_to_mips_branch_compare_op (int op)
++{
++	switch (op) {
++	case OP_IBEQ:
++		return OP_MIPS_BEQ;
++	case OP_IBGE:
++		return OP_MIPS_BGEZ;
++	case OP_IBGT:
++		return OP_MIPS_BGTZ;
++	case OP_IBLE:
++		return OP_MIPS_BLEZ;
++	case OP_IBLT:
++		return OP_MIPS_BLTZ;
++
++	case OP_IBNE_UN:
++		return OP_MIPS_BNE;
++
++	case OP_IBGE_UN:
++	case OP_IBGT_UN:
++	case OP_IBLE_UN:
++	case OP_IBLT_UN:
++
++	default:
++		g_warning ("unknown opcode %s in %s()\n", mono_inst_name (op), __FUNCTION__);
++		g_assert_not_reached ();
++	}
++}
++
++static int
+ map_to_reg_reg_op (int op)
+ {
+ 	switch (op) {
+@@ -1510,6 +1699,8 @@
+ 		return CEE_AND;
+ 	case OP_COMPARE_IMM:
+ 		return OP_COMPARE;
++	case OP_ICOMPARE_IMM:
++		return OP_ICOMPARE;
+ 	case OP_ADDCC_IMM:
+ 		return OP_ADDCC;
+ 	case OP_ADC_IMM:
+@@ -1575,10 +1766,8 @@
+ mono_arch_lowering_pass (MonoCompile *cfg, MonoBasicBlock *bb)
+ {
+ 	MonoInst *ins, *next, *temp, *last_ins = NULL;
+-	int imm;
+ 
+ 	MONO_BB_FOR_EACH_INS (bb, ins) {
+-loop_start:
+ 		switch (ins->opcode) {
+ 		case OP_ADD_IMM:
+ 		case OP_ADDCC_IMM:
+@@ -1590,7 +1779,75 @@
+ 				ins->opcode = map_to_reg_reg_op (ins->opcode);
+ 			}
+ 			break;
++
++		case OP_COMPARE:
++		case OP_COMPARE_IMM:
++		case OP_ICOMPARE:
++		case OP_ICOMPARE_IMM:
++			next = ins->next;
++			/* Branch opts can eliminate the branch */
++			if (!next || (!(MONO_IS_COND_BRANCH_OP (next) || MONO_IS_COND_EXC (next) || MONO_IS_SETCC (next)))) {
++				ins->opcode = OP_NOP;
++				break;
++			}
++			g_assert(next);
++			if ((ins->opcode == OP_COMPARE_IMM) || (ins->opcode == OP_ICOMPARE_IMM)) {
++				NEW_INS (cfg, temp, OP_ICONST);
++				temp->inst_c0 = ins->inst_imm;
++				temp->dreg = mono_alloc_ireg (cfg);
++				ins->sreg2 = temp->dreg;
++				ins->opcode = map_to_reg_reg_op (ins->opcode);
++			}
++			/* it's a register-register compare now */
++
++			/*
++			 * remap compare/branch and compare/set
++			 * to MIPS specific opcodes.
++			 */
++			if (MONO_IS_COND_BRANCH_OP (next)) {
++				ins->opcode = OP_NOP;
++				next->opcode = map_to_mips_branch_compare_op (next->opcode);
++				next->sreg1 = ins->sreg1;
++				next->sreg2 = ins->sreg2;
++			} else {
++				switch (next->opcode) {
+ #if 0
++MINI_OP(OP_ICEQ,   "int_ceq", IREG, NONE, NONE)
++MINI_OP(OP_ICGT,   "int_cgt", IREG, NONE, NONE)
++MINI_OP(OP_ICGT_UN,"int_cgt_un", IREG, NONE, NONE)
++MINI_OP(OP_ICLT,   "int_clt", IREG, NONE, NONE)
++MINI_OP(OP_ICLT_UN,"int_clt_un", IREG, NONE, NONE)
++#endif
++
++				case OP_ICGT_UN:
++					ins->opcode = OP_NOP;
++					next->opcode = OP_MIPS_SLT;
++					next->sreg1 = ins->sreg1;
++					next->sreg2 = ins->sreg2;
++					break;
++
++				case OP_COND_EXC_NE_UN:
++					ins->opcode = OP_NOP;
++					next->opcode = OP_MIPS_COND_EXC_NE_UN;
++					next->sreg1 = ins->sreg1;
++					next->sreg2 = ins->sreg2;
++					break;
++
++				case OP_COND_EXC_LE_UN:
++					ins->opcode = OP_NOP;
++					next->opcode = OP_MIPS_COND_EXC_LE_UN;
++					next->sreg1 = ins->sreg1;
++					next->sreg2 = ins->sreg2;
++					break;
++
++				default:
++					g_warning ("unknown opcode %s in %s()\n", mono_inst_name (next->opcode), __FUNCTION__);
++					g_assert_not_reached ();
++				}
++			}
++			break;
++
++#if 0
+ 		case OP_SUB_IMM:
+ 			if (!mips_is_imm16 (-ins->inst_imm)) {
+ 				NEW_INS (cfg, temp, OP_ICONST);
+@@ -1626,27 +1883,6 @@
+ 			break;
+ #endif
+ #if 0
+-		case OP_COMPARE_IMM:
+-			if (compare_opcode_is_unsigned (ins->next->opcode)) {
+-				if (!ppc_is_uimm16 (ins->inst_imm)) {
+-					NEW_INS (cfg, temp, OP_ICONST);
+-					temp->inst_c0 = ins->inst_imm;
+-					temp->dreg = mono_alloc_ireg (cfg);
+-					ins->sreg2 = temp->dreg;
+-					ins->opcode = map_to_reg_reg_op (ins->opcode);
+-				}
+-			} else {
+-				if (!ppc_is_imm16 (ins->inst_imm)) {
+-					NEW_INS (cfg, temp, OP_ICONST);
+-					temp->inst_c0 = ins->inst_imm;
+-					temp->dreg = mono_alloc_ireg (cfg);
+-					ins->sreg2 = temp->dreg;
+-					ins->opcode = map_to_reg_reg_op (ins->opcode);
+-				}
+-			}
+-			break;
+-#endif
+-#if 0
+ 		case OP_MUL_IMM:
+ 			if (ins->inst_imm == 1) {
+ 				ins->opcode = OP_MOVE;
+@@ -1847,6 +2083,50 @@
+ 	return code;
+ }
+ 
++static guint8*
++emit_reserve_param_area (MonoCompile *cfg, guint8 *code)
++{
++	int size = cfg->param_area;
++
++	size += MONO_ARCH_FRAME_ALIGNMENT - 1;
++	size &= -MONO_ARCH_FRAME_ALIGNMENT;
++
++	if (!size)
++		return code;
++#if 0
++	ppc_lwz (code, ppc_r0, 0, ppc_sp);
++	if (ppc_is_imm16 (-size)) {
++		ppc_stwu (code, ppc_r0, -size, ppc_sp);
++	} else {
++		ppc_load (code, ppc_r11, -size);
++		ppc_stwux (code, ppc_r0, ppc_sp, ppc_r11);
++	}
++#endif
++	return code;
++}
++
++static guint8*
++emit_unreserve_param_area (MonoCompile *cfg, guint8 *code)
++{
++	int size = cfg->param_area;
++
++	size += MONO_ARCH_FRAME_ALIGNMENT - 1;
++	size &= -MONO_ARCH_FRAME_ALIGNMENT;
++
++	if (!size)
++		return code;
++#if 0
++	ppc_lwz (code, ppc_r0, 0, ppc_sp);
++	if (ppc_is_imm16 (size)) {
++		ppc_stwu (code, ppc_r0, size, ppc_sp);
++	} else {
++		ppc_load (code, ppc_r11, size);
++		ppc_stwux (code, ppc_r0, ppc_sp, ppc_r11);
++	}
++#endif
++	return code;
++}
++
+ void
+ mono_arch_output_basic_block (MonoCompile *cfg, MonoBasicBlock *bb)
+ {
+@@ -1898,6 +2178,13 @@
+ 		}
+ 
+ 		switch (ins->opcode) {
++		case OP_RELAXED_NOP:
++		case OP_NOP:
++		case OP_DUMMY_USE:
++		case OP_DUMMY_STORE:
++		case OP_NOT_REACHED:
++		case OP_NOT_NULL:
++			break;
+ 		case OP_TLS_GET:
+ 			g_assert_not_reached();
+ #if 0
+@@ -1914,8 +2201,6 @@
+ 			mips_mflo (code, ins->dreg);
+ 			mips_mfhi (code, ins->dreg+1);
+ 			break;
+-		case OP_RELAXED_NOP:
+-			break;
+ 		case OP_MEMORY_BARRIER:
+ #if 0
+ 			ppc_sync (code);
+@@ -2070,6 +2355,9 @@
+ 		case OP_ADDCC:
+ 			g_assert_not_reached ();
+ 			break;
++		case OP_IADD:
++			mips_addu (code, ins->dreg, ins->sreg1, ins->sreg2);
++			break;
+ 		case CEE_ADD:
+ 			mips_addu (code, ins->dreg, ins->sreg1, ins->sreg2);
+ 			break;
+@@ -2080,6 +2368,7 @@
+ 			g_assert_not_reached ();
+ 			break;
+ 		case OP_ADD_IMM:
++		case OP_IADD_IMM:
+ 			if (mips_is_imm16 (ins->inst_imm)) {
+ 				mips_addiu (code, ins->dreg, ins->sreg1, ins->inst_imm);
+ 			} else {
+@@ -2430,16 +2719,19 @@
+ 		case OP_FCALL:
+ 		case OP_LCALL:
+ 		case OP_VCALL:
++		case OP_VCALL2:
+ 		case OP_VOIDCALL:
+ 		case OP_CALL:
+ 		case OP_FCALL_REG:
+ 		case OP_LCALL_REG:
+ 		case OP_VCALL_REG:
++		case OP_VCALL2_REG:
+ 		case OP_VOIDCALL_REG:
+ 		case OP_CALL_REG:
+ 		case OP_FCALL_MEMBASE:
+ 		case OP_LCALL_MEMBASE:
+ 		case OP_VCALL_MEMBASE:
++		case OP_VCALL2_MEMBASE:
+ 		case OP_VOIDCALL_MEMBASE:
+ 		case OP_CALL_MEMBASE:
+ 			call = (MonoCallInst*)ins;
+@@ -2447,6 +2739,7 @@
+ 			case OP_FCALL:
+ 			case OP_LCALL:
+ 			case OP_VCALL:
++			case OP_VCALL2:
+ 			case OP_VOIDCALL:
+ 			case OP_CALL:
+ 				if (ins->flags & MONO_INST_HAS_METHOD)
+@@ -2459,6 +2752,7 @@
+ 			case OP_FCALL_REG:
+ 			case OP_LCALL_REG:
+ 			case OP_VCALL_REG:
++			case OP_VCALL2_REG:
+ 			case OP_VOIDCALL_REG:
+ 			case OP_CALL_REG:
+ 				mips_move (code, mips_t9, ins->sreg1);
+@@ -2466,6 +2760,7 @@
+ 			case OP_FCALL_MEMBASE:
+ 			case OP_LCALL_MEMBASE:
+ 			case OP_VCALL_MEMBASE:
++			case OP_VCALL2_MEMBASE:
+ 			case OP_VOIDCALL_MEMBASE:
+ 			case OP_CALL_MEMBASE:
+ 				mips_lw (code, mips_t9, ins->sreg1, ins->inst_offset);
+@@ -2516,41 +2811,56 @@
+ 			mips_break (code, 0xfb);
+ 			break;
+ 		}
+-		case OP_START_HANDLER:
++		case OP_START_HANDLER: {
+ 			/*
+-			 * The START_HANDLER instruction marks the beginning of a handler 
+-			 * block. It is called using a call instruction, so mips_ra contains 
+-			 * the return address. Since the handler executes in the same stack
+-			 * frame as the method itself, we can't use save/restore to save 
+-			 * the return address. Instead, we save it into a dedicated 
+-			 * variable.
++			 * The START_HANDLER instruction marks the beginning of
++			 * a handler block. It is called using a call
++			 * instruction, so mips_ra contains the return address.
++			 * Since the handler executes in the same stack frame
++			 * as the method itself, we can't use save/restore to
++			 * save the return address. Instead, we save it into
++			 * a dedicated variable.
+ 			 */
+-			if (mips_is_imm16 (ins->inst_left->inst_offset)) {
+-				mips_sw (code, mips_ra, ins->inst_left->inst_basereg, ins->inst_left->inst_offset);
++			MonoInst *spvar = mono_find_spvar_for_region (cfg, bb->region);
++			g_assert (spvar->inst_basereg != mips_sp);
++			code = emit_reserve_param_area (cfg, code);
++
++			if (mips_is_imm16 (spvar->inst_offset)) {
++				mips_sw (code, mips_ra, spvar->inst_basereg, spvar->inst_offset);
+ 			} else {
+-				mips_load_const (code, mips_at, ins->inst_left->inst_offset);
+-				mips_add (code, mips_at, mips_at, ins->inst_left->inst_basereg);
++				mips_load_const (code, mips_at, spvar->inst_offset);
++				mips_addu (code, mips_at, mips_at, spvar->inst_basereg);
+ 				mips_sw (code, mips_ra, mips_at, 0);
+ 			}
+ 			break;
+-		case OP_ENDFILTER:
++		}
++		case OP_ENDFILTER: {
++			MonoInst *spvar = mono_find_spvar_for_region (cfg, bb->region);
++			g_assert (spvar->inst_basereg != mips_sp);
++			code = emit_unreserve_param_area (cfg, code);
++
+ 			if (ins->sreg1 != mips_v0)
+ 				mips_move (code, mips_v0, ins->sreg1);
+-			if (mips_is_imm16 (ins->inst_left->inst_offset)) {
+-				mips_lw (code, mips_ra, ins->inst_left->inst_basereg, ins->inst_left->inst_offset);
++			if (mips_is_imm16 (spvar->inst_offset)) {
++				mips_lw (code, mips_ra, spvar->inst_basereg, spvar->inst_offset);
+ 			} else {
+-				mips_load_const (code, mips_at, ins->inst_left->inst_offset);
+-				mips_addu (code, mips_at, mips_at, ins->inst_left->inst_basereg);
++				mips_load_const (code, mips_at, spvar->inst_offset);
++				mips_addu (code, mips_at, mips_at, spvar->inst_basereg);
+ 				mips_lw (code, mips_ra, mips_at, 0);
+ 			}
+ 			mips_jr (code, mips_ra);
+ 			mips_nop (code);
+ 			break;
+-		case OP_ENDFINALLY:
+-			mips_lw (code, mips_t9, ins->inst_left->inst_basereg, ins->inst_left->inst_offset);
++		}
++		case OP_ENDFINALLY: {
++			MonoInst *spvar = mono_find_spvar_for_region (cfg, bb->region);
++			g_assert (spvar->inst_basereg != mips_sp);
++			code = emit_unreserve_param_area (cfg, code);
++			mips_lw (code, mips_t9, spvar->inst_basereg, spvar->inst_offset);
+ 			mips_jalr (code, mips_t9, mips_ra);
+ 			mips_nop (code);
+ 			break;
++		}
+ 		case OP_CALL_HANDLER: 
+ 			mono_add_patch_info (cfg, offset, MONO_PATCH_INFO_BB, ins->inst_target_bb);
+ 			mips_lui (code, mips_t9, mips_zero, 0);
+@@ -2710,16 +3020,23 @@
+ 			   the tests. */
+ 
+ 			/* Remember, an unpatched branch to 0 branches to the delay slot */
+-			throw = (guint32 *)(void *)code;
+ 			switch (ins->opcode) {
+ 			case OP_MIPS_COND_EXC_EQ:
++				throw = (guint32 *)(void *)code;
+ 				mips_beq (code, ins->sreg1, ins->sreg2, 0);
+ 				mips_nop (code);
+ 				break;
+ 			case OP_MIPS_COND_EXC_NE_UN:
++				throw = (guint32 *)(void *)code;
+ 				mips_bne (code, ins->sreg1, ins->sreg2, 0);
+ 				mips_nop (code);
+ 				break;
++			case OP_MIPS_COND_EXC_LE_UN:
++				mips_subu (code, mips_at, ins->sreg1, ins->sreg2);
++				throw = (guint32 *)(void *)code;
++				mips_blez (code, mips_at, 0);
++				mips_nop (code);
++				break;
+ 			default:
+ 				/* Not yet implemented */
+ 				g_warning ("NYI conditional exception %s\n", mono_inst_name (ins->opcode));
+@@ -3416,7 +3733,9 @@
+ 			/* Argument ends up on the stack */
+ 			if (ainfo->regtype == RegTypeGeneral) {
+ 				/* Incoming parameters should be above this frame */
+-				g_assert (inst->inst_offset >= alloc_size);
++				if (cfg->verbose_level > 2)
++					g_print ("stack slot at %d of %d\n", inst->inst_offset, alloc_size);
++				/* g_assert (inst->inst_offset >= alloc_size); */
+ 				g_assert (mips_is_imm16 (inst->inst_offset));
+ 				switch (ainfo->size) {
+ 				case 1:
+@@ -4109,3 +4428,153 @@
+ 	/* FIXME: implement */
+ 	g_assert_not_reached ();
+ }
++
++#ifdef MONO_ARCH_HAVE_IMT
++
++#define CMP_SIZE 12
++#define BR_SIZE 4
++#define JUMP_IMM_SIZE 12
++#define JUMP_IMM32_SIZE 16
++#define ENABLE_WRONG_METHOD_CHECK 0
++
++/*
++ * LOCKING: called with the domain lock held
++ */
++gpointer
++mono_arch_build_imt_thunk (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count,
++	gpointer fail_tramp)
++{
++	NOT_IMPLEMENTED;
++#if 0
++	int i;
++	int size = 0;
++	guint8 *code, *start;
++
++	for (i = 0; i < count; ++i) {
++		MonoIMTCheckItem *item = imt_entries [i];
++		if (item->is_equals) {
++			if (item->check_target_idx) {
++				if (!item->compare_done)
++					item->chunk_size += CMP_SIZE;
++				if (fail_tramp)
++					item->chunk_size += BR_SIZE + JUMP_IMM32_SIZE;
++				else
++					item->chunk_size += BR_SIZE + JUMP_IMM_SIZE;
++			} else {
++				if (fail_tramp) {
++					item->chunk_size += CMP_SIZE + BR_SIZE + JUMP_IMM32_SIZE * 2;
++				} else {
++					item->chunk_size += JUMP_IMM_SIZE;
++#if ENABLE_WRONG_METHOD_CHECK
++					item->chunk_size += CMP_SIZE + BR_SIZE + 4;
++#endif
++				}
++			}
++		} else {
++			item->chunk_size += CMP_SIZE + BR_SIZE;
++			imt_entries [item->check_target_idx]->compare_done = TRUE;
++		}
++		size += item->chunk_size;
++	}
++	if (fail_tramp) {
++		code = mono_method_alloc_generic_virtual_thunk (domain, size);
++	} else {
++		/* the initial load of the vtable address */
++		size += 8;
++		code = mono_code_manager_reserve (domain->code_mp, size);
++	}
++	start = code;
++	if (!fail_tramp)
++		ppc_load (code, ppc_r11, (guint32)(& (vtable->vtable [0])));
++	for (i = 0; i < count; ++i) {
++		MonoIMTCheckItem *item = imt_entries [i];
++		item->code_target = code;
++		if (item->is_equals) {
++			if (item->check_target_idx) {
++				if (!item->compare_done) {
++					ppc_load (code, ppc_r0, (guint32)item->key);
++					ppc_cmpl (code, 0, 0, MONO_ARCH_IMT_REG, ppc_r0);
++				}
++				item->jmp_code = code;
++				ppc_bc (code, PPC_BR_FALSE, PPC_BR_EQ, 0);
++				if (fail_tramp)
++					ppc_load (code, ppc_r0, item->value.target_code);
++				else
++					ppc_lwz (code, ppc_r0, (sizeof (gpointer) * item->value.vtable_slot), ppc_r11);
++				ppc_mtctr (code, ppc_r0);
++				ppc_bcctr (code, PPC_BR_ALWAYS, 0);
++			} else {
++				if (fail_tramp) {
++					ppc_load (code, ppc_r0, (guint32)item->key);
++					ppc_cmpl (code, 0, 0, MONO_ARCH_IMT_REG, ppc_r0);
++					item->jmp_code = code;
++					ppc_bc (code, PPC_BR_FALSE, PPC_BR_EQ, 0);
++					ppc_load (code, ppc_r0, item->value.target_code);
++					ppc_mtctr (code, ppc_r0);
++					ppc_bcctr (code, PPC_BR_ALWAYS, 0);
++					ppc_patch (item->jmp_code, code);
++					ppc_load (code, ppc_r0, fail_tramp);
++					ppc_mtctr (code, ppc_r0);
++					ppc_bcctr (code, PPC_BR_ALWAYS, 0);
++					item->jmp_code = NULL;
++				} else {
++					/* enable the commented code to assert on wrong method */
++#if ENABLE_WRONG_METHOD_CHECK
++					ppc_load (code, ppc_r0, (guint32)item->key);
++					ppc_cmpl (code, 0, 0, MONO_ARCH_IMT_REG, ppc_r0);
++					item->jmp_code = code;
++					ppc_bc (code, PPC_BR_FALSE, PPC_BR_EQ, 0);
++#endif
++					ppc_lwz (code, ppc_r0, (sizeof (gpointer) * item->value.vtable_slot), ppc_r11);
++					ppc_mtctr (code, ppc_r0);
++					ppc_bcctr (code, PPC_BR_ALWAYS, 0);
++#if ENABLE_WRONG_METHOD_CHECK
++					ppc_patch (item->jmp_code, code);
++					ppc_break (code);
++					item->jmp_code = NULL;
++#endif
++				}
++			}
++		} else {
++			ppc_load (code, ppc_r0, (guint32)item->key);
++			ppc_cmpl (code, 0, 0, MONO_ARCH_IMT_REG, ppc_r0);
++			item->jmp_code = code;
++			ppc_bc (code, PPC_BR_FALSE, PPC_BR_LT, 0);
++		}
++	}
++	/* patch the branches to get to the target items */
++	for (i = 0; i < count; ++i) {
++		MonoIMTCheckItem *item = imt_entries [i];
++		if (item->jmp_code) {
++			if (item->check_target_idx) {
++				ppc_patch (item->jmp_code, imt_entries [item->check_target_idx]->code_target);
++			}
++		}
++	}
++
++	if (!fail_tramp)
++		mono_stats.imt_thunks_size += code - start;
++	g_assert (code - start <= size);
++	mono_arch_flush_icache (start, size);
++	return start;
++#endif
++}
++
++MonoMethod*
++mono_arch_find_imt_method (gpointer *regs, guint8 *code)
++{
++	return (MonoMethod*) regs [MONO_ARCH_IMT_REG];
++}
++
++MonoObject*
++mono_arch_find_this_argument (gpointer *regs, MonoMethod *method, MonoGenericSharingContext *gsctx)
++{
++	return mono_arch_get_this_arg_from_call (gsctx, mono_method_signature (method), (gssize*)regs, NULL);
++}
++#endif
++
++MonoVTable*
++mono_arch_find_static_call_vtable (gpointer *regs, guint8 *code)
++{
++	return (MonoVTable*) regs [MONO_ARCH_RGCTX_REG];
++}
+Index: mono/mini/mini-mips.h
+===================================================================
+--- mono/mini/mini-mips.h	(revision 119429)
++++ mono/mini/mini-mips.h	(working copy)
+@@ -162,8 +162,15 @@
+ #define MIPS_FIRST_FPARG_REG	mips_f12
+ #define MIPS_LAST_FPARG_REG	mips_f14
+ 
++#define MONO_ARCH_HAVE_IMT 1
++#define MONO_ARCH_IMT_REG mips_a0		/* XXX */
++#define MONO_ARCH_COMMON_VTABLE_TRAMPOLINE 1
+ 
++#define MONO_ARCH_VTABLE_REG	mips_a0		/* XXX */
++#define MONO_ARCH_RGCTX_REG	mips_a0		/* XXX */
+ 
++#define MONO_ARCH_HAVE_GENERALIZED_IMT_THUNK 1
++
+ /* XXX - a mystery, but it works */
+ #define MONO_GET_CONTEXT \
+ 	void *ctx = (void *)(((int)context)+24);
+Index: mono/mini/mini-codegen.c
+===================================================================
+--- mono/mini/mini-codegen.c	(revision 119429)
++++ mono/mini/mini-codegen.c	(working copy)
+@@ -250,9 +250,6 @@
+ 	MonoSpillInfo *info;
+ 	int size;
+ 
+-#if defined (__mips__)
+-	g_assert_not_reached();
+-#endif
+ 	if (G_UNLIKELY (spillvar >= (cfg->spill_info_len [bank]))) {
+ 		while (spillvar >= cfg->spill_info_len [bank])
+ 			resize_spill_info (cfg, bank);
+Index: mono/mini/cpu-mips.md
+===================================================================
+--- mono/mini/cpu-mips.md	(revision 119429)
++++ mono/mini/cpu-mips.md	(working copy)
+@@ -58,53 +58,13 @@
+ jmp: len:92
+ call: dest:v clob:c len:20
+ br: len:16
+-int_beq: len:8
+-int_bge: len:8
+-int_bgt: len:8
+-int_ble: len:8
+-int_blt: len:8
+-int_bne_un: len:8
+-int_bge_un: len:8
+-int_bgt_un: len:8
+-int_ble_un: len:8
+-int_blt_un: len:8
+ switch: src1:i len:40
+-int_add: dest:i src1:i src2:i len:4
+-int_sub: dest:i src1:i src2:i len:4
+-int_mul: dest:i src1:i src2:i len:20
+-int_div: dest:i src1:i src2:i len:76
+-int_div_un: dest:i src1:i src2:i len:76
+-int_rem: dest:i src1:i src2:i len:76
+-int_rem_un: dest:i src1:i src2:i len:76
+-int_and: dest:i src1:i src2:i len:4
+-int_or: dest:i src1:i src2:i len:4
+-int_xor: dest:i src1:i src2:i len:4
+-int_shl: dest:i src1:i src2:i len:4
+-int_shr: dest:i src1:i src2:i len:4
+-int_shr_un: dest:i src1:i src2:i len:4
+-int_neg: dest:i src1:i len:4
+-int_not: dest:i src1:i len:4
+-int_conv_to_i1: dest:i src1:i len:8
+-int_conv_to_i2: dest:i src1:i len:8
+-int_conv_to_i4: dest:i src1:i len:4
+-int_conv_to_r4: dest:f src1:i len:36
+-int_conv_to_r8: dest:f src1:i len:36
+-int_conv_to_u1: dest:i src1:i len:4
+-int_conv_to_u2: dest:i src1:i len:8
+-int_conv_to_u4: dest:i src1:i
+-int_conv_to_i: dest:i src1:i len:4
+-int_conv_to_u: dest:i src1:i len:4
++
+ callvirt: dest:v clob:c len:20
+ int_conv_to_r_un: dest:f src1:i len:32
+ throw: src1:i len:24
+ rethrow: src1:i len:24
+ ckfinite: dest:f src1:f len:24
+-int_add_ovf: dest:i src1:i src2:i len:64
+-int_add_ovf_un: dest:i src1:i src2:i len:64
+-int_mul_ovf: dest:i src1:i src2:i len:64
+-int_mul_ovf_un: dest:i src1:i src2:i len:64
+-int_sub_ovf: dest:i src1:i src2:i len:64
+-int_sub_ovf_un: dest:i src1:i src2:i len:64
+ start_handler: len:16
+ endfinally: len:12
+ ceq: dest:i len:16
+@@ -119,20 +79,30 @@
+ oparglist: src1:i len:12
+ setlret: src1:i src2:i len:12
+ checkthis: src1:b len:4
++
+ voidcall: len:20 clob:c
+ voidcall_reg: src1:i len:20 clob:c
+ voidcall_membase: src1:b len:20 clob:c
++
+ fcall: dest:g len:20 clob:c
+ fcall_reg: dest:g src1:i len:20 clob:c
+ fcall_membase: dest:g src1:b len:20 clob:c
++
+ lcall: dest:V len:28 clob:c
+ lcall_reg: dest:V src1:i len:28 clob:c
+ lcall_membase: dest:V src1:b len:28 clob:c
++
++call_reg: dest:v src1:i len:20 clob:c
++call_membase: dest:v src1:b len:20 clob:c
++
+ vcall: len:16 clob:c
+ vcall_reg: src1:i len:20 clob:c
+ vcall_membase: src1:b len:20 clob:c
+-call_reg: dest:v src1:i len:20 clob:c
+-call_membase: dest:v src1:b len:20 clob:c
++
++vcall2: len:16 clob:c
++vcall2_reg: src1:i len:20 clob:c
++vcall2_membase: src1:b len:20 clob:c
++
+ iconst: dest:i len:12
+ r4const: dest:f len:20
+ r8const: dest:f len:28
+@@ -178,6 +148,84 @@
+ shl_imm: dest:i src1:i len:8
+ shr_imm: dest:i src1:i len:8
+ shr_un_imm: dest:i src1:i len:8
++
++# Linear IR opcodes
++dummy_use: len:0
++dummy_store: len:0
++not_reached: len:0
++not_null: src1:i len:0
++
++# 32 bit opcodes
++int_add: dest:i src1:i src2:i len:4
++int_sub: dest:i src1:i src2:i len:4
++int_mul: dest:i src1:i src2:i len:4
++int_div: dest:i src1:i src2:i len:40
++int_div_un: dest:i src1:i src2:i len:16
++int_rem: dest:i src1:i src2:i len:48
++int_rem_un: dest:i src1:i src2:i len:24
++int_and: dest:i src1:i src2:i len:4
++int_or: dest:i src1:i src2:i len:4
++int_xor: dest:i src1:i src2:i len:4
++int_shl: dest:i src1:i src2:i len:4
++int_shr: dest:i src1:i src2:i len:4
++int_shr_un: dest:i src1:i src2:i len:4
++int_neg: dest:i src1:i len:4
++int_not: dest:i src1:i len:4
++int_conv_to_i1: dest:i src1:i len:8
++int_conv_to_i2: dest:i src1:i len:8
++int_conv_to_i4: dest:i src1:i len:4
++int_conv_to_r4: dest:f src1:i len:36
++int_conv_to_r8: dest:f src1:i len:36
++int_conv_to_u4: dest:i src1:i
++int_conv_to_u2: dest:i src1:i len:8
++int_conv_to_u1: dest:i src1:i len:4
++int_beq: len:8
++int_bge: len:8
++int_bgt: len:8
++int_ble: len:8
++int_blt: len:8
++int_bne_un: len:8
++int_bge_un: len:8
++int_bgt_un: len:8
++int_ble_un: len:8
++int_blt_un: len:8
++int_add_ovf: dest:i src1:i src2:i len:16
++int_add_ovf_un: dest:i src1:i src2:i len:16
++int_mul_ovf: dest:i src1:i src2:i len:16
++int_mul_ovf_un: dest:i src1:i src2:i len:16
++int_sub_ovf: dest:i src1:i src2:i len:16
++int_sub_ovf_un: dest:i src1:i src2:i len:16
++
++int_adc: dest:i src1:i src2:i len:4
++int_addcc: dest:i src1:i src2:i len:4
++int_subcc: dest:i src1:i src2:i len:4
++int_sbb: dest:i src1:i src2:i len:4
++int_adc_imm: dest:i src1:i len:12
++int_sbb_imm: dest:i src1:i len:12
++
++int_add_imm: dest:i src1:i len:12
++int_sub_imm: dest:i src1:i len:12
++int_mul_imm: dest:i src1:i len:12
++int_div_imm: dest:i src1:i len:20
++int_div_un_imm: dest:i src1:i len:12
++int_rem_imm: dest:i src1:i len:28
++int_rem_un_imm: dest:i src1:i len:16
++int_and_imm: dest:i src1:i len:12
++int_or_imm: dest:i src1:i len:12
++int_xor_imm: dest:i src1:i len:12
++int_shl_imm: dest:i src1:i len:8
++int_shr_imm: dest:i src1:i len:8
++int_shr_un_imm: dest:i src1:i len:8
++
++int_ceq: dest:i len:12
++int_cgt: dest:i len:12
++int_cgt_un: dest:i len:12
++int_clt: dest:i len:12
++int_clt_un: dest:i len:12
++
++cond_exc_ieq: len:8
++cond_exc_ine_un: len:8
++cond_exc_ilt: len:8
+ cond_exc_eq: len:32
+ cond_exc_ne_un: len:32
+ cond_exc_lt: len:32
+@@ -192,6 +240,10 @@
+ cond_exc_no: len:32
+ cond_exc_c: len:32
+ cond_exc_nc: len:32
++
++icompare: src1:i src2:i len:4
++icompare_imm: src1:i len:12
++
+ long_conv_to_i1: dest:i src1:l len:32
+ long_conv_to_i2: dest:i src1:l len:32
+ long_conv_to_i4: dest:i src1:l len:32
+@@ -203,6 +255,7 @@
+ long_conv_to_u1: dest:i src1:l len:32
+ long_conv_to_i:  dest:i src1:l len:32
+ long_conv_to_ovf_i: dest:i src1:i src2:i len:32
++
+ long_mul_ovf: 
+ long_conv_to_r_un: dest:f src1:i src2:i len:37 
+ float_beq:    src1:f src2:f len:16
+@@ -289,7 +342,7 @@
+ mips_cond_exc_ne_un: src1:i src2:i len:40
+ mips_cond_exc_ge_un: src1:i src2:i len:40
+ mips_cond_exc_gt_un: src1:i src2:i len:40
+-mips_cond_exc_le_un: src1:i src2:i len:40
++mips_cond_exc_le_un: src1:i src2:i len:44
+ mips_cond_exc_lt_un: src1:i src2:i len:40
+ mips_cond_exc_ov: src1:i src2:i len:40
+ mips_cond_exc_no: src1:i src2:i len:40

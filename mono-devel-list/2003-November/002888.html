@@ -1,0 +1,206 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Re: [Gtk-sharp-list] Disposing problem
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Re%3A%20%5BGtk-sharp-list%5D%20Disposing%20problem&In-Reply-To=1068404254.2348.30.camel%40localhost">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="002881.html">
+   <LINK REL="Next"  HREF="002891.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Re: [Gtk-sharp-list] Disposing problem</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Re%3A%20%5BGtk-sharp-list%5D%20Disposing%20problem&In-Reply-To=1068404254.2348.30.camel%40localhost"
+       TITLE="[Mono-devel-list] Re: [Gtk-sharp-list] Disposing problem">jonpryor at vt.edu
+       </A><BR>
+    <I>Sun Nov  9 18:31:05 EST 2003</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="002881.html">[Mono-devel-list] Re: [Gtk-sharp-list] Disposing problem
+</A></li>
+        <LI>Next message: <A HREF="002891.html">[Mono-devel-list] Re: [Gtk-sharp-list] Disposing problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2888">[ date ]</a>
+              <a href="thread.html#2888">[ thread ]</a>
+              <a href="subject.html#2888">[ subject ]</a>
+              <a href="author.html#2888">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>There's the .NET/CIL interpretation, and then there's what Mono does.
+
+For most of this, they actually agree. :-)
+
+Unlike Java, .NET/CIL/Mono (eventually) will make an effort to run
+object finalizers (Object.Finalize).  However, finalizers are run
+specially: when a &quot;dead&quot; (unreferenced) object is found, the finalizer
+isn't run immediately; instead, the object is placed on a finalization
+queue, and during the NEXT GC the objects on the finalization queue are
+executed.  Or, the objects in the finalization queue are run on a
+separate thread.  Whatever.  Also note that the finalization queue is
+per-generation, so if it's a Gen-2 object that was placed on the
+finalization queue, it may not be until app-exit that the finalizer is
+run.
+
+Problem #1 is that everything that derives from GLib.Object has a
+finalizer, and thus has the above deferred behavior with the GC system.
+
+This, however, isn't the major problem.
+
+The major problem is Problem #2 (as far as you're concerned), which is
+that the gtk-sharp library is keeping a reference to all GLib objects. 
+GLib.Object.PerformQueuedUnrefs is fully-managed code.
+
+So, your understanding is correct, it's just that another library
+(gtk-sharp) is keeping a reference to your objects (Pixbufs) without you
+realizing it.  This is handled by the GLib.Object constructor &amp; related
+methods, so *every* GLib.Object-derived class will exhibit this
+behavior.
+
+To get gtk-sharp to remove it's reference to your objects, you need to
+let it run GLib.Object.PerformQueuedUnrefs, which requires running the
+idle handler.
+
+Due to Problem #1, there will be a delay before the memory is generally
+usable.  First you need to perform the queued unrefs, then the GC will
+realize that the objects are unreachable, and (if GC.SuppressFinalize
+hasn't been called on the object), the objects will be placed on the
+finalization queue and collected on the NEXT GC (again, for that GC
+generation).
+
+Note that invoking Dispose() on the objects will call
+GC.SuppressFinalize, so calling Dispose will remove the need to wait for
+the 2nd GC to collect memory.
+
+Where mono differs from the above is that the Boehem GC is used, and
+things are still in flux, so it is less likely for finalizers to be
+invoked.  This will likely change (if it hasn't been fixed already), as
+we get a better GC infrastructure.
+
+ - Jon
+
+On Sun, 2003-11-09 at 13:57, Bruno Fernandez-Ruiz wrote:
+&gt;<i> I understand from your message that under Gtk# managed objects are
+</I>&gt;<i> prevented to be GC'ed, and queued to be dereferenced in the unmanaged
+</I>&gt;<i> code. Your code should work as it allows idle cycles to happen
+</I>&gt;<i> (yielding). I will try it out on my Gtk# application and let you know if
+</I>&gt;<i> it works.
+</I>&gt;<i> 
+</I>&gt;<i> Now, I still have a question beyond Gtk#, and more related to the Mono
+</I>&gt;<i> runtime. 
+</I>&gt;<i> 
+</I>&gt;<i> Please accept my apologies if I am getting it wrong, but I assimilate
+</I>&gt;<i> the mono VM to a JVM, where both GUI and non GUI managed applications
+</I>&gt;<i> run on a managed memory heap. Roughly speaking, on a JVM, if after a
+</I>&gt;<i> marking cycle from the GC thread, there is not enough marked objects to
+</I>&gt;<i> be reclaimed to leave enough free memory for a requested allocation, the
+</I>&gt;<i> actual heap is expanded up. If the max heap is reached, and there is
+</I>&gt;<i> still more memory requested, then the application crashes with an out of
+</I>&gt;<i> memory error. 
+</I>&gt;<i> 
+</I>&gt;<i> In my sample using mono, I would expect the VM GC mark policy, whichever
+</I>&gt;<i> policy is used, to limit the amount of memory used, as the test objects
+</I>&gt;<i> are not kept referenced, at least by the application code. So either,
+</I>&gt;<i> the GC mark and sweep is not happening, or something else is keeping a
+</I>&gt;<i> reference to the objects that prevents finalization. Instead, CPU sky
+</I>&gt;<i> rockets, and the system starts swapping memory until freeze.
+</I>&gt;<i> 
+</I>&gt;<i> Could somebody please give me some light? My experience from heavily
+</I>&gt;<i> loaded server-side applications, enterprise level, ist that optimized GC
+</I>&gt;<i> is critical for system performance.
+</I>&gt;<i> 
+</I>&gt;<i> Thanks!
+</I>&gt;<i> Bruno
+</I>&gt;<i> 
+</I>&gt;<i> public class Test
+</I>&gt;<i> {
+</I>&gt;<i>         ~Test ()
+</I>&gt;<i>         {
+</I>&gt;<i>                 Console.WriteLine (&quot;Finalized&quot;);
+</I>&gt;<i>         }
+</I>&gt;<i>                                                                                                                                                                                    
+</I>&gt;<i>         public static void Main ()
+</I>&gt;<i>         {
+</I>&gt;<i>                 for (long i = 10000000000; i &gt; 0; i--)
+</I>&gt;<i>                         new Test ();
+</I>&gt;<i>         }
+</I>&gt;<i> }
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> On Sun, 2003-11-09 at 18:32, Jonathan Pryor wrote:
+</I>&gt;<i> &gt; The problem is that you're not a GUI app. :-)
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt; PerformQueuedUnrefs is called from the Idle handler for the GUI.  The
+</I>&gt;<i> &gt; Idle handler is run whenever the GUI is not busy.
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt; (Recall that GUIs are event-driven, so if the user isn't doing anything,
+</I>&gt;<i> &gt; and the app isn't doing anything, then the app is idle, so you can do
+</I>&gt;<i> &gt; background work during idle processing.)
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt; Your sample app doesn't have a GUI, so there's never an &quot;idle time&quot;, so
+</I>&gt;<i> &gt; the idle handler is never run, so PerfrmQueuedUnrefs is never called.
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt; Some possible solutions:
+</I>&gt;<i> &gt;   - Insert the code:
+</I>&gt;<i> &gt; 	while(GLib.MainContext.Iteration()) {
+</I>&gt;<i> &gt; 		// do nothing
+</I>&gt;<i> &gt; 	}
+</I>&gt;<i> &gt;     This should explicitly run the idle handler.  This should be run
+</I>&gt;<i> &gt;     after the .Dispose() call.
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt;   - Make Object.Dispose virtual, then make Pixbuf.Dispose free memory 
+</I>&gt;<i> &gt;     immediately.
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt;     This probably isn't a good idea, as GTK+ requires that all objects
+</I>&gt;<i> &gt;     be disposed from the same thread, which is what PerformQueuedUnrefs
+</I>&gt;<i> &gt;     does (since the idle handler is only run on the GUI thread, so only
+</I>&gt;<i> &gt;     one thread will ever do the unrefs).
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt;     Pixbuf might not have this requirement, though.  I have no idea.
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt; The first option is the safest and simplest option, if it works.  Please
+</I>&gt;<i> &gt; try it and let us know.
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt;  - Jon
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt; On Sat, 2003-11-08 at 13:55, Bruno Fernandez-Ruiz wrote:
+</I>&gt;<i> &gt; &gt; On Sat, 2003-11-08 at 20:54, Gon&#231;al Carrero Puig wrote:
+</I>&gt;<i> &gt; &gt; &gt; Anyone knows why idle is never calling PerformedQueuedUnrefs?
+</I>&gt;<i> &gt; &gt; 
+</I>&gt;<i> &gt; &gt; I have seen similar problems in due to the GC thread never entering, and
+</I>&gt;<i> &gt; &gt; the heap expanding until memory exhaustion. Try to create many dummy
+</I>&gt;<i> &gt; &gt; objects that implement IDisposable, and see if they get reclaimed. When
+</I>&gt;<i> &gt; &gt; running the attached sample, I freeze the system and run out of memory.
+</I>&gt;<i> &gt; &gt; No collection ever happens. 
+</I>&gt;<i> &gt; &gt; 
+</I>&gt;<i> &gt; &gt; Is GC disabled by default in mono?
+</I>&gt;<i> &gt; &gt; 
+</I>&gt;<i> &gt; &gt; Bruno
+</I>
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="002881.html">[Mono-devel-list] Re: [Gtk-sharp-list] Disposing problem
+</A></li>
+	<LI>Next message: <A HREF="002891.html">[Mono-devel-list] Re: [Gtk-sharp-list] Disposing problem
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2888">[ date ]</a>
+              <a href="thread.html#2888">[ thread ]</a>
+              <a href="subject.html#2888">[ subject ]</a>
+              <a href="author.html#2888">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,245 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Control-C handler
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Control-C%20handler&In-Reply-To=1201207128.25514.91.camel%40lina.magi.jprl.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026721.html">
+   <LINK REL="Next"  HREF="026735.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Control-C handler</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Control-C%20handler&In-Reply-To=1201207128.25514.91.camel%40lina.magi.jprl.com"
+       TITLE="[Mono-dev] Control-C handler">lupus at ximian.com
+       </A><BR>
+    <I>Mon Jan 28 09:25:42 EST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026721.html">[Mono-dev] Bug in todays WebBrowser commit
+</A></li>
+        <LI>Next message: <A HREF="026735.html">[Mono-dev] Control-C handler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26732">[ date ]</a>
+              <a href="thread.html#26732">[ thread ]</a>
+              <a href="subject.html#26732">[ subject ]</a>
+              <a href="author.html#26732">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 01/24/08 Jonathan Pryor wrote:
+&gt;<i> After talking on IRC, the sane interface is to provide
+</I>&gt;<i> Stdlib.signal_default(), Stdlib.signal_error(), and
+</I>&gt;<i> Stdlib.signal_ignore() methods instead of using Stdlib.signal() with
+</I>
+Well, those methods shouldn't be in that namespace and the names
+are not really nice.
+Ignore maps well to a static Ignore (int signal) method but
+I can't come up with a nice name for the other two cases.
+An alternative is:
+	enum SignalAction {
+		Default,
+		Ignore,
+		Error
+	}
+
+and
+	static int SetSignalAction (int signum, SignalAction action);
+
+&gt;<i> Index: Mono.Unix/UnixSignal.cs
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- Mono.Unix/UnixSignal.cs	(revision 0)
+</I>&gt;<i> +++ Mono.Unix/UnixSignal.cs	(revision 0)
+</I>&gt;<i> +using System;
+</I>&gt;<i> +using System.Runtime.InteropServices;
+</I>&gt;<i> +using System.Threading;
+</I>&gt;<i> +
+</I>&gt;<i> +using Mono.Unix.Native;
+</I>&gt;<i> +
+</I>&gt;<i> +namespace Mono.Unix {
+</I>&gt;<i> +	public class UnixSignal : WaitHandle {
+</I>
+It should have a finalizer.
+
+&gt;<i> +		private Signum signum;
+</I>&gt;<i> +		private int _signum;
+</I>&gt;<i> +		private IntPtr signal_info;
+</I>&gt;<i> +
+</I>&gt;<i> +		public UnixSignal (Signum signum)
+</I>&gt;<i> +		{
+</I>&gt;<i> +			this.signum = signum;
+</I>&gt;<i> +			this._signum = NativeConvert.FromSignum (signum);
+</I>
+There is no need to store reduntant info.
+
+&gt;<i> +		private void AssertValid ()
+</I>&gt;<i> +		{
+</I>&gt;<i> +			if (signal_info == IntPtr.Zero)
+</I>&gt;<i> +				throw new ObjectDisposedException (GetType().FullName);
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		private unsafe SignalInfo* Info {
+</I>&gt;<i> +			get {return (SignalInfo*) signal_info;}
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		public bool IsSet {
+</I>&gt;<i> +			get {
+</I>&gt;<i> +				AssertValid ();
+</I>&gt;<i> +				return Count &gt; 0;
+</I>&gt;<i> +			}
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		public unsafe bool Reset ()
+</I>&gt;<i> +		{
+</I>&gt;<i> +			AssertValid ();
+</I>&gt;<i> +			int n = Info-&gt;count;
+</I>&gt;<i> +			Info-&gt;count = 0;
+</I>&gt;<i> +			return n != 0;
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		public unsafe int Count {
+</I>&gt;<i> +			get {return Info-&gt;count;}
+</I>&gt;<i> +			set {Info-&gt;count = value;}
+</I>
+Crashes when Info is NULL.
+
+&gt;<i> +		#region WaitHandle overrides
+</I>&gt;<i> +		protected unsafe override void Dispose (bool disposing)
+</I>&gt;<i> +		{
+</I>&gt;<i> +			if (signal_info == IntPtr.Zero)
+</I>&gt;<i> +				return;
+</I>&gt;<i> +			uninstall (_signum);
+</I>&gt;<i> +			signal_info = IntPtr.Zero;
+</I>&gt;<i> +		}
+</I>
+This doesn't implement the documented Dispose pattern.
+
+&gt;<i> Index: signal.c
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- signal.c	(revision 92060)
+</I>&gt;<i> +++ signal.c	(working copy)
+</I>&gt;<i> @@ -3,18 +3,29 @@
+</I>&gt;<i>   *
+</I>&gt;<i>   * Authors:
+</I>&gt;<i>   *   Jonathan Pryor (<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">jonpryor at vt.edu</A>)
+</I>&gt;<i> + *   Jonathan Pryor (<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">jpryor at novell.com</A>)
+</I>&gt;<i>   *
+</I>&gt;<i>   * Copyright (C) 2004-2005 Jonathan Pryor
+</I>&gt;<i> + * Copyright (C) 2008 Novell, Inc.
+</I>&gt;<i>   */
+</I>&gt;<i>  
+</I>&gt;<i>  #include &lt;signal.h&gt;
+</I>&gt;<i>  
+</I>&gt;<i> +#ifndef PLATFORM_WIN32
+</I>&gt;<i> +#include &lt;unistd.h&gt;
+</I>&gt;<i> +#include &lt;stdlib.h&gt;
+</I>&gt;<i> +#include &lt;string.h&gt;
+</I>&gt;<i> +#include &lt;poll.h&gt;
+</I>
+As reported already the last time, you can't unconditionally use poll.
+
+&gt;<i> @@ -49,6 +61,158 @@
+</I>&gt;<i>  	psignal (sig, s);
+</I>&gt;<i>  	return errno == 0 ? 0 : -1;
+</I>&gt;<i>  }
+</I>&gt;<i> +
+</I>&gt;<i> +static signal_info signals[64];
+</I>&gt;<i> +
+</I>&gt;<i> +static inline signal_info*
+</I>&gt;<i> +get_info (int signum)
+</I>&gt;<i> +{
+</I>&gt;<i> +	if (signum &lt; 0 || signum &gt;= sizeof(signals)/sizeof(signals [0]))
+</I>&gt;<i> +		return NULL;
+</I>&gt;<i> +	return &amp;signals [signum];
+</I>&gt;<i> +}
+</I>&gt;<i> +
+</I>&gt;<i> +static void
+</I>&gt;<i> +default_handler (int signum)
+</I>&gt;<i> +{
+</I>&gt;<i> +	signal_info* h = get_info (signum);
+</I>&gt;<i> +	int fd = 0;
+</I>&gt;<i> +	if (h) {
+</I>&gt;<i> +		++h-&gt;count;
+</I>&gt;<i> +		if (h-&gt;write_fd &gt; 0)
+</I>&gt;<i> +			fd = h-&gt;write_fd;
+</I>&gt;<i> +	}
+</I>&gt;<i> +	if (fd) {
+</I>&gt;<i> +		char c = signum;
+</I>&gt;<i> +		write (fd, &amp;c, 1);
+</I>&gt;<i> +	}
+</I>&gt;<i> +}
+</I>&gt;<i> +
+</I>&gt;<i> +static pthread_mutex_t signals_mutex = PTHREAD_MUTEX_INITIALIZER;
+</I>&gt;<i> +
+</I>&gt;<i> +void*
+</I>&gt;<i> +Mono_Unix_UnixSignal_install (int sig)
+</I>&gt;<i> +{
+</I>&gt;<i> +	int mr;
+</I>&gt;<i> +	signal_info* h; 
+</I>&gt;<i> +
+</I>&gt;<i> +	mr = pthread_mutex_lock (&amp;signals_mutex);
+</I>&gt;<i> +	if (mr != 0) {
+</I>&gt;<i> +		errno = mr;
+</I>&gt;<i> +		return NULL;
+</I>&gt;<i> +	}
+</I>&gt;<i> +
+</I>&gt;<i> +	h = get_info (sig);
+</I>&gt;<i> +	if (h == NULL)
+</I>&gt;<i> +		errno = EINVAL;
+</I>&gt;<i> +	else if (h-&gt;have_handler)
+</I>&gt;<i> +		errno = EADDRINUSE;
+</I>&gt;<i> +	else {
+</I>&gt;<i> +		h-&gt;count = 0;
+</I>&gt;<i> +		h-&gt;handler = signal (sig, default_handler);
+</I>&gt;<i> +		if (h-&gt;handler == SIG_ERR) {
+</I>&gt;<i> +			h-&gt;handler = NULL;
+</I>&gt;<i> +		}
+</I>&gt;<i> +		else
+</I>&gt;<i> +			h-&gt;have_handler = 1;
+</I>&gt;<i> +	}
+</I>&gt;<i> +
+</I>&gt;<i> +	pthread_mutex_unlock (&amp;signals_mutex);
+</I>&gt;<i> +
+</I>&gt;<i> +	return h;
+</I>&gt;<i> +}
+</I>&gt;<i> +
+</I>&gt;<i> +int
+</I>&gt;<i> +Mono_Unix_UnixSignal_uninstall (int sig)
+</I>
+It is important (as in my initialy API sketch) that this function take
+the signal_info and not the dignal number, as this implementation allows
+only just an handler per signal in the API.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026721.html">[Mono-dev] Bug in todays WebBrowser commit
+</A></li>
+	<LI>Next message: <A HREF="026735.html">[Mono-dev] Control-C handler
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26732">[ date ]</a>
+              <a href="thread.html#26732">[ thread ]</a>
+              <a href="subject.html#26732">[ subject ]</a>
+              <a href="author.html#26732">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

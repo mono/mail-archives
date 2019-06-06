@@ -1,0 +1,370 @@
+Index: gc.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/gc.c,v
+retrieving revision 1.55
+diff -u -r1.55 gc.c
+--- gc.c	11 Feb 2004 17:37:08 -0000	1.55
++++ gc.c	21 Feb 2004 05:30:16 -0000
+@@ -276,19 +276,48 @@
+ }
+ 
+ static CRITICAL_SECTION allocator_section;
+-static CRITICAL_SECTION handle_section;
+-static guint32 next_handle = 0;
+-static gpointer *gc_handles = NULL;
+-static guint8 *gc_handle_types = NULL;
+-static guint32 array_size = 0;
++
+ 
+ /*
+- * The handle type is encoded in the lower two bits of the handle value:
+- * 0 -> normal
+- * 1 -> pinned
+- * 2 -> weak
++ * HANDLE SUPPORT
++ * 
++ * Handles allow for two important interfaces to the GC:
++ * 
++ * 1) WeakRefs
++ * This is when an object is weakly held. You have a pointer to the object,
++ * but it does not "count" as a reference WRT the GC. In other words, the object
++ * can be collected even if the weakref is there. We implement this using
++ * GC_GENERAL_REGISTER_DISAPPEARING_LINK from the GC. Basically, you get an address
++ * in memory and if the the target is GCd a specified memory address is set to zero.
++ * 
++ * 2) Pinned/Normal handles
++ * This allows code to have a `handle' to an object. The main purpose is so that a
++ * reference to a managed object can be put into unmanaged code. We implement it
++ * by having a GC allocated array which just holds each address. This will prevent
++ * the GC from collecting. In a moving GC there is a concept of a pinned handle (one
++ * which cant move). However, for us it is the same as a normal handle.
++ *
++ * HANDLE REUSE SCHEME
++ * In order to conserve memory, we reuse handles once they are freed. MS does this, you can see
++ * it if you run:
++ * 	GCHandle h = GCHandle.Alloc (1); Console.WriteLine ((IntPtr) h); h.Free ();
++ * 	h = GCHandle.Alloc (1); Console.WriteLine ((IntPtr) h); h.Free ()
++ * It will print the same pointer.
++ * 
++ * Now, if we did caching by storing NULL in elements that were free, it would require
++ * and O(n) search on the array. This could become pretty expensive if the table is full.
++ * 
++ * Rather, what we do is something smarter. the next_free member of GCHandleTable has
++ * the offset of the first free entry. In any free entry, the offset to the next free
++ * entry is stored. When we free an entry, we swap next_free into its store and put its
++ * offset into next_free. When we need an entry, if next_free != NULL, we take the entry
++ * at that offset. We then take the next available free space (ie, the entry that was in
++ * the one we are taking) and put it into next_free. In this way, we are able to cache but taking
++ * up O(1) time and not having any memory overhead.
+  */
+ 
++static CRITICAL_SECTION handle_section;
++
+ typedef enum {
+ 	HANDLE_WEAK,
+ 	HANDLE_WEAK_TRACK,
+@@ -296,32 +325,57 @@
+ 	HANDLE_PINNED
+ } HandleType;
+ 
++typedef enum {
++	HANDLE_IMPL_WEAK,
++	HANDLE_IMPL_NORMAL
++} HandleImplType;
++
++
+ /*
+- * FIXME: make thread safe and reuse the array entries.
++ * We have one of these for WeakRefs, and one for Normal handles
++ * 
++ * The WeakRef one is allocated with g_new0, the normal one with GC_MALLOC
+  */
++typedef struct GCHandleTable {
++	/* the last handle that was allocated */
++	guint32 prev_handle;
++	
++	/* an offset of a free space */
++	guint32 next_free;
++	
++	/* size of the array below */
++	guint32 array_size;
++	
++	/* the handles -- Indexes start from 1 since 0 means the handle is not allocated */
++	gpointer *gc_address;
++} GCHandleTable;
++
++static GCHandleTable weak_handle_table = { 0, };
++static GCHandleTable normal_handle_table = { 0, };
++
++/* the bottom bit is 1 if the handle is weak */
++#define HANDLE_IS_WEAK(handle) (((handle) & 1) == HANDLE_IMPL_WEAK)
++#define HANDLE_IS_NORMAL(handle) (((handle) & 1) == HANDLE_IMPL_NORMAL)
++#define HANDLE_GET_OFFSET(handle) ((handle) >> 1)
++#define HANDLE_GET_TABLE(handle) (&(HANDLE_IS_WEAK(handle) ? weak_handle_table : normal_handle_table))
++#define HANDLE_MAKE(offset, tabletype) ((offset) << 1 | (tabletype))
++
+ MonoObject *
+ ves_icall_System_GCHandle_GetTarget (guint32 handle)
+ {
+ 	MonoObject *obj;
+-	gint32 type;
++	guint32 offset = HANDLE_GET_OFFSET (handle);
++	GCHandleTable *table = HANDLE_GET_TABLE (handle);
+ 
+ 	MONO_ARCH_SAVE_REGS;
+-
+-	if (gc_handles) {
+-		type = handle & 0x3;
+-		EnterCriticalSection (&handle_section);
+-		g_assert (type == gc_handle_types [handle >> 2]);
+-		obj = gc_handles [handle >> 2];
+-		LeaveCriticalSection (&handle_section);
+-		if (!obj)
+-			return NULL;
+-
+-		if ((type == HANDLE_WEAK) || (type == HANDLE_WEAK_TRACK))
+-			return REVEAL_POINTER (obj);
+-		else
+-			return obj;
+-	}
+-	return NULL;
++	
++	g_return_val_if_fail (table->gc_address, NULL);
++	
++	EnterCriticalSection (&handle_section);
++	obj = table->gc_address [offset];
++	LeaveCriticalSection (&handle_section);
++	
++	return obj;
+ }
+ 
+ guint32
+@@ -331,122 +385,137 @@
+ 	guint32 h, idx;
+ 
+ 	MONO_ARCH_SAVE_REGS;
+-
++#if !HAVE_BOEHM_GC
++	mono_raise_exception (mono_get_exception_execution_engine ("No GCHandle support built-in"));
++	return 0;
++#else
+ 	EnterCriticalSection (&handle_section);
+-	/* Indexes start from 1 since 0 means the handle is not allocated */
+-	idx = ++next_handle;
+-	if (idx >= array_size) {
+-#if HAVE_BOEHM_GC
++	/* remember, 0 is a reserved offset, so it is not used */
++	
++	if (type == HANDLE_WEAK || type == HANDLE_WEAK_TRACK) {
+ 		gpointer *new_array;
+-		guint8 *new_type_array;
+-		if (!array_size)
+-			array_size = 16;
+-		new_array = GC_MALLOC (sizeof (gpointer) * (array_size * 2));
+-		new_type_array = GC_MALLOC (sizeof (guint8) * (array_size * 2));
+-		if (gc_handles) {
+-			int i;
+-			memcpy (new_array, gc_handles, sizeof (gpointer) * array_size);
+-			memcpy (new_type_array, gc_handle_types, sizeof (guint8) * array_size);
+-			/* need to re-register links for weak refs. test if GC_realloc needs the same */
+-			for (i = 0; i < array_size; ++i) {
+-#if 0 /* This breaks the threaded finalizer, by causing segfaults deep
+-       * inside libgc.  I assume it will also break without the
+-       * threaded finalizer, just that the stress test (bug 31333)
+-       * deadlocks too early without it.  Reverting to the previous
+-       * version here stops the segfault.
+-       */
+-				if ((gc_handle_types[i] == HANDLE_WEAK) || (gc_handle_types[i] == HANDLE_WEAK_TRACK)) { /* all and only disguised pointers have it set */
+-#else
+-				if (((gulong)new_array [i]) & 0x1) {
+-#endif
+-					if (gc_handles [i] != (gpointer)-1)
+-						GC_unregister_disappearing_link (&(gc_handles [i]));
+-					if (new_array [i] != (gpointer)-1)
+-						GC_GENERAL_REGISTER_DISAPPEARING_LINK (&(new_array [i]), REVEAL_POINTER (new_array [i]));
+-				}
++		int i;
++		
++		GCHandleTable *table = &weak_handle_table;
++		if (table->next_free) {
++			/* there is a free space available */
++			idx = table->next_free;
++			table->next_free = (guint32) table->gc_address [idx];
++			goto found_weak_pos;
++		}
++		
++		idx = ++table->prev_handle;
++		if (idx < table->array_size)
++			goto found_weak_pos;
++		
++		if (! table->gc_address) {
++			table->array_size = 16;
++			table->gc_address = g_new0 (gpointer, 16);
++			goto found_weak_pos;
++		}
++		
++		new_array = g_new0 (gpointer, 2 * table->array_size);
++		memcpy (new_array, table->gc_address, sizeof (gpointer) * table->array_size);
++
++
++		/*
++		 * In this code, we already know that all the slots are either:
++		 *   a) in use and pointing to a valid object
++		 *   b) pointer to null (the target was freed).
++		 * 
++		 * In other words, we dont have to worry about the free chain pointers,
++		 * because by the time we get here, we know they are all used up.
++		 */
++		
++		for (i = table->array_size - 1; i > 0; i--) {
++			if (table->gc_address [i]) {
++				GC_unregister_disappearing_link (&(table->gc_address [i]));
++				GC_GENERAL_REGISTER_DISAPPEARING_LINK (&(new_array [i]), new_array [i]);
+ 			}
+ 		}
+-		array_size *= 2;
+-		gc_handles = new_array;
+-		gc_handle_types = new_type_array;
+-#else
+-		mono_raise_exception (mono_get_exception_execution_engine ("No GCHandle support built-in"));
+-#endif
+-	}
+-
+-	/* resuse the type from the old target */
+-	if (type == -1)
+-		type =  handle & 0x3;
+-	h = (idx << 2) | type;
+-	switch (type) {
+-	case HANDLE_WEAK:
+-	case HANDLE_WEAK_TRACK:
+-		val = (gpointer)HIDE_POINTER (val);
+-		gc_handles [idx] = val;
+-		gc_handle_types [idx] = type;
+-#if HAVE_BOEHM_GC
+-		if (gc_handles [idx] != (gpointer)-1)
+-			GC_GENERAL_REGISTER_DISAPPEARING_LINK (&(gc_handles [idx]), obj);
+-#else
+-		mono_raise_exception (mono_get_exception_execution_engine ("No weakref support"));
+-#endif
+-		break;
+-	default:
+-		gc_handles [idx] = val;
+-		gc_handle_types [idx] = type;
+-		break;
++		
++		table->array_size *= 2;
++		g_free (table->gc_address);
++		table->gc_address = new_array;
++		
++	found_weak_pos:
++		
++		table->gc_address [idx] = val;
++		GC_GENERAL_REGISTER_DISAPPEARING_LINK (&(table->gc_address [idx]), val);
++		h = HANDLE_MAKE (idx, HANDLE_IMPL_WEAK);
++	} else {
++		
++		GCHandleTable *table = &normal_handle_table;
++		if (table->next_free) {
++			/* there is a free space available */
++			idx = table->next_free;
++			table->next_free = (guint32) table->gc_address [idx];
++			goto found_normal_pos;
++		}
++		
++		idx = ++table->prev_handle;
++		if (idx < table->array_size)
++			goto found_normal_pos;
++		
++		if (! table->gc_address) {
++			table->array_size = 16;
++			table->gc_address = GC_MALLOC (sizeof (gpointer) * 16);
++			goto found_normal_pos;
++		}
++		
++		table->array_size *= 2;
++		table->gc_address = GC_REALLOC (table->gc_address, sizeof (gpointer) * table->array_size);
++		
++	found_normal_pos:
++		table->gc_address [idx] = val;
++		h = HANDLE_MAKE (idx, HANDLE_IMPL_NORMAL);
+ 	}
+ 	LeaveCriticalSection (&handle_section);
+ 	return h;
++#endif
+ }
+ 
+ void
+ ves_icall_System_GCHandle_FreeHandle (guint32 handle)
+ {
+-	int idx = handle >> 2;
+-	int type = handle & 0x3;
++	guint32 offset = HANDLE_GET_OFFSET (handle);
++	GCHandleTable *table = HANDLE_GET_TABLE (handle);
+ 
+ 	MONO_ARCH_SAVE_REGS;
+-
+-	EnterCriticalSection (&handle_section);
+-
+-#ifdef HAVE_BOEHM_GC
+-	g_assert (type == gc_handle_types [idx]);
+-	if ((type == HANDLE_WEAK) || (type == HANDLE_WEAK_TRACK)) {
+-		if (gc_handles [idx] != (gpointer)-1)
+-			GC_unregister_disappearing_link (&(gc_handles [idx]));
+-	}
++#ifndef HAVE_BOEHM_GC
++	mono_raise_exception (mono_get_exception_execution_engine ("No GCHandle support"));
+ #else
++	
++	g_return_if_fail (table->gc_address);
++	
++	EnterCriticalSection (&handle_section);
++	
++	if (HANDLE_IS_WEAK (handle))
++		GC_unregister_disappearing_link (&(table->gc_address [offset]));
++	
++	table->gc_address [offset] = (gpointer) table->next_free;
++	table->next_free = offset;
++	
+ 	LeaveCriticalSection (&handle_section);
+-	mono_raise_exception (mono_get_exception_execution_engine ("No GCHandle support"));
+ #endif
+-
+-	gc_handles [idx] = (gpointer)-1;
+-	gc_handle_types [idx] = (guint8)-1;
+-	LeaveCriticalSection (&handle_section);
+ }
+ 
+ gpointer
+ ves_icall_System_GCHandle_GetAddrOfPinnedObject (guint32 handle)
+ {
+-	MonoObject *obj;
+-	int type = handle & 0x3;
++	guint32 offset = HANDLE_GET_OFFSET (handle);
++	GCHandleTable *table = HANDLE_GET_TABLE (handle);
++	gpointer obj;
+ 
+ 	MONO_ARCH_SAVE_REGS;
+ 
+-	if (gc_handles) {
+-		EnterCriticalSection (&handle_section);
+-		obj = gc_handles [handle >> 2];
+-		g_assert (gc_handle_types [handle >> 2] == type);
+-		LeaveCriticalSection (&handle_section);
+-		if ((type == HANDLE_WEAK) || (type == HANDLE_WEAK_TRACK)) {
+-			obj = REVEAL_POINTER (obj);
+-			if (obj == (MonoObject *) -1)
+-				return NULL;
+-		}
+-		return obj;
+-	}
+-	return NULL;
++	g_return_val_if_fail (table->gc_address, NULL);
++	
++	EnterCriticalSection (&handle_section);
++	obj = table->gc_address [offset];
++	LeaveCriticalSection (&handle_section);
++	
++	return obj;
+ }
+ 
+ #if HAVE_BOEHM_GC

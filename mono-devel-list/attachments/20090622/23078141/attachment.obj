@@ -1,0 +1,147 @@
+Index: mono/mono/metadata/object-internals.h
+===================================================================
+--- mono/mono/metadata/object-internals.h	(revision 136598)
++++ mono/mono/metadata/object-internals.h	(working copy)
+@@ -354,7 +354,7 @@
+ 	 * These fields are used to avoid having to increment corlib versions
+ 	 * when a new field is added to the unmanaged MonoThread structure.
+ 	 */
+-	gpointer unused2;
++	gpointer interrupt_on_stop;
+ 	gpointer unused3;
+ 	gpointer unused4;
+ 	gpointer unused5;
+Index: mono/mono/metadata/threads.c
+===================================================================
+--- mono/mono/metadata/threads.c	(revision 136598)
++++ mono/mono/metadata/threads.c	(working copy)
+@@ -2625,7 +2625,7 @@
+ 	
+ 	THREAD_DEBUG (g_message("%s: %d threads to wait for in this batch", __func__, wait->num));
+ 
+-	ret=WaitForMultipleObjectsEx(wait->num, wait->handles, TRUE, timeout, FALSE);
++		ret=WaitForMultipleObjectsEx(wait->num, wait->handles, TRUE, timeout, FALSE);
+ 
+ 	if(ret==WAIT_FAILED) {
+ 		/* See the comment in build_wait_tids() */
+@@ -3774,6 +3774,13 @@
+ 	/* The thread may already be stopping */
+ 	if (thread == NULL) 
+ 		return NULL;
++
++#ifdef PLATFORM_WIN32
++	if (thread->interrupt_on_stop && 
++		thread->state & ThreadState_StopRequested && 
++		thread->state & ThreadState_Background)
++		ExitThread (1);
++#endif
+ 	
+ 	if (InterlockedCompareExchange (&thread->interruption_requested, 1, 0) == 1)
+ 		return NULL;
+Index: mono/mono/metadata/socket-io.c
+===================================================================
+--- mono/mono/metadata/socket-io.c	(revision 136598)
++++ mono/mono/metadata/socket-io.c	(working copy)
+@@ -844,45 +844,23 @@
+ 	MONO_ARCH_SAVE_REGS;
+ 
+ 	*error = 0;
+-
+ #ifdef PLATFORM_WIN32
+-	/* Several applications are getting stuck during shutdown on Windows 
+-	 * when an accept call is on a background thread.
+-	 * 
+-	 */
+-	if (blocking) {
++	{
+ 		MonoThread* curthread = mono_thread_current ();
+ 
+-		if (curthread) {
+-			for (;;) {
+-				int selectret;
+-				int optlen = sizeof (gint);
+-				TIMEVAL timeout; 
+-				fd_set readfds;
+-				FD_ZERO (&readfds);
+-				FD_SET(sock, &readfds);
+-				timeout.tv_sec = 0;
+-				timeout.tv_usec = 1000;
+-				selectret = select (0, &readfds, NULL, NULL, &timeout);
+-				if (selectret > 0)
+-					break;
+-				if (curthread->state & ThreadState_StopRequested)
+-					return NULL;
+-				/* A negative return from select means that an error has occurred.
+-				 * Let _wapi_accept handle that.*/
+-				if (selectret != 0)
+-					break;
+-				/* The socket's state may have changed.  If it is no longer listening, stop.*/
+-				if (!getsockopt (sock, SOL_SOCKET, SO_ACCEPTCONN, (char*)&selectret, &optlen)) {
+-					if (!selectret)
+-						break;
+-				}
+-			}
+-		}
++		EnterCriticalSection (curthread->synch_cs);
++		curthread->interrupt_on_stop = (gpointer)TRUE;
++		LeaveCriticalSection (curthread->synch_cs);
++
++		newsock = _wapi_accept (sock, NULL, 0);
++
++		EnterCriticalSection (curthread->synch_cs);
++		curthread->interrupt_on_stop = (gpointer)FALSE;
++		LeaveCriticalSection (curthread->synch_cs);
+ 	}
+-#endif
+-	
++#else
+ 	newsock = _wapi_accept (sock, NULL, 0);
++#endif
+ 	if(newsock==INVALID_SOCKET) {
+ 		*error = WSAGetLastError ();
+ 		return(NULL);
+@@ -1430,8 +1408,25 @@
+ 		*error = WSAEOPNOTSUPP;
+ 		return (0);
+ 	}
+-		
++
++#ifdef PLATFORM_WIN32
++	{
++		MonoThread* curthread = mono_thread_current ();
++
++		EnterCriticalSection (curthread->synch_cs);
++		curthread->interrupt_on_stop = (gpointer)TRUE;
++		LeaveCriticalSection (curthread->synch_cs);
++
++		ret = _wapi_recv (sock, buf, count, recvflags);
++
++		EnterCriticalSection (curthread->synch_cs);
++		curthread->interrupt_on_stop = (gpointer)FALSE;
++		LeaveCriticalSection (curthread->synch_cs);
++	}
++#else
+ 	ret = _wapi_recv (sock, buf, count, recvflags);
++#endif
++
+ 	if(ret==SOCKET_ERROR) {
+ 		*error = WSAGetLastError ();
+ 		return(0);
+Index: mcs/class/corlib/System.Threading/Thread.cs
+===================================================================
+--- mcs/class/corlib/System.Threading/Thread.cs	(revision 136598)
++++ mcs/class/corlib/System.Threading/Thread.cs	(working copy)
+@@ -107,11 +107,12 @@
+ 		   start_wrapper() in the runtime. */
+ 		private ExecutionContext ec_to_set;
+ 
++		private IntPtr interrupt_on_stop;
++
+ 		/* 
+ 		 * These fields are used to avoid having to increment corlib versions
+ 		 * when a new field is added to the unmanaged MonoThread structure.
+ 		 */
+-		private IntPtr unused2;
+ 		private IntPtr unused3;
+ 		private IntPtr unused4;
+ 		private IntPtr unused5;

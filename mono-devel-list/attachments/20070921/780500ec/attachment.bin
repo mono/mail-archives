@@ -1,0 +1,229 @@
+Index: metadata/class.c
+===================================================================
+--- metadata/class.c	(revision 86148)
++++ metadata/class.c	(working copy)
+@@ -2847,10 +2847,46 @@
+ 	return class_init_ok;
+ }
+ 
++
+ /*
+  * LOCKING: this assumes the loader lock is held
+  */
+ void
++mono_class_setup_generic_type_container (MonoClass *class, gboolean dynamic)
++{
++	MonoGenericContainer * container = class->generic_container;
++	MonoGenericInst * inst;
++	MonoGenericClass *gklass;
++
++	g_assert (container);
++	g_assert (!class->generic_class);
++
++	if (container->gtd_class)
++		return;
++
++
++	if (container->gtd_class) {
++		return;
++	}
++
++	inst = mono_get_shared_generic_inst (container);
++	gklass = mono_metadata_lookup_generic_class (class, inst, dynamic);
++
++	if (!gklass->cached_class)
++		gklass->cached_class = class;
++
++	g_assert (gklass->cached_class == class);
++
++	container->gtd_class = gklass;
++	
++	g_assert (class == mono_class_from_mono_type (&class->byval_arg));
++}
++
++
++/*
++ * LOCKING: this assumes the loader lock is held
++ */
++void
+ mono_class_setup_mono_type (MonoClass *class)
+ {
+ 	const char *name = class->name;
+@@ -2968,6 +3004,8 @@
+ 	if (MONO_CLASS_IS_INTERFACE (class))
+ 		class->interface_id = mono_get_unique_iid (class);
+ 
++	if (class->generic_container)
++		mono_class_setup_generic_type_container (class, class->wastypebuilder);
+ }
+ 
+ /*
+@@ -3271,7 +3309,6 @@
+ 	mono_loader_lock ();
+ 	if (gclass->cached_class) {
+ 		mono_loader_unlock ();
+-		g_assert (!gclass->cached_class->generic_container);
+ 		return gclass->cached_class;
+ 	}
+ 
+@@ -6009,3 +6046,17 @@
+ 
+ 	return TRUE;
+ }
++
++gboolean
++mono_generic_class_is_generic_type_definition (MonoGenericClass *gklass)
++{
++	return gklass == gklass->container_class->generic_container->gtd_class;
++}
++
++gboolean 
++mono_type_is_generic_type_definition (MonoType *type)
++{
++	if (type->type != MONO_TYPE_GENERICINST)
++		return FALSE;
++	return mono_generic_class_is_generic_type_definition (type->data.generic_class);
++}
+Index: metadata/metadata.c
+===================================================================
+--- metadata/metadata.c	(revision 86148)
++++ metadata/metadata.c	(working copy)
+@@ -1430,6 +1430,7 @@
+ 	guint hash = mono_metadata_type_hash (&gclass->container_class->byval_arg);
+ 
+ 	hash *= 13;
++	hash += gclass->is_tb_open;
+ 	hash += mono_metadata_generic_context_hash (&gclass->context);
+ 
+ 	return hash;
+@@ -2179,7 +2180,7 @@
+ 	int i;
+ 
+ 	/* FIXME: The dynamic case */
+-	if (gclass->cached_class && !gclass->cached_class->image->dynamic) {
++	if (gclass->cached_class && !gclass->cached_class->image->dynamic && !mono_generic_class_is_generic_type_definition (gclass)) {
+ 		MonoClass *class = gclass->cached_class;
+ 
+ 		/* Allocated in mono_class_init () */
+@@ -2305,6 +2306,28 @@
+ 	return ginst;
+ }
+ 
++static gboolean
++mono_metadata_is_type_builder_generic_type_definition (MonoClass *container_class, MonoGenericInst *inst, gboolean is_dynamic)
++{
++	int i;
++	MonoGenericContainer *container = container_class->generic_container; 
++
++	if (!is_dynamic || container_class->wastypebuilder || container->type_argc != inst->type_argc)
++		return FALSE;
++
++	for (i = 0; i < inst->type_argc; ++i) {
++		MonoType *type = inst->type_argv [i];
++		MonoGenericParam *param = &container->type_params [i];
++		MonoGenericParam *other_param = type->data.generic_param;
++		
++		if (type->type != MONO_TYPE_VAR)
++			return FALSE;
++
++		if (param->num != other_param->num || param->owner != other_param->owner)
++			return FALSE;
++	}
++	return TRUE;
++}
+ /*
+  * mono_metadata_lookup_generic_class:
+  *
+@@ -2315,12 +2338,14 @@
+ mono_metadata_lookup_generic_class (MonoClass *container_class, MonoGenericInst *inst, gboolean is_dynamic)
+ {
+ 	MonoGenericClass *gclass;
++	MonoGenericClass helper;
++	gboolean is_tb_open = mono_metadata_is_type_builder_generic_type_definition (container_class, inst, is_dynamic);
+ 
+-	MonoGenericClass helper;
+ 	helper.container_class = container_class;
+ 	helper.context.class_inst = inst;
+ 	helper.context.method_inst = NULL;
+ 	helper.is_dynamic = is_dynamic; /* We use this in a hash lookup, which does not attempt to downcast the pointer */
++	helper.is_tb_open = is_tb_open;
+ 	helper.cached_class = NULL;
+ 
+ 	mono_loader_lock ();
+@@ -2343,6 +2368,7 @@
+ 		gclass = g_new0 (MonoGenericClass, 1);
+ 	}
+ 
++	gclass->is_tb_open = is_tb_open;
+ 	gclass->container_class = container_class;
+ 	gclass->context.class_inst = inst;
+ 	gclass->context.method_inst = NULL;
+@@ -3752,7 +3778,7 @@
+ 		if (!do_mono_metadata_type_equal (i1->type_argv [i], i2->type_argv [i], signature_only))
+ 			return FALSE;
+ 	}
+-	return TRUE;
++	return g1->is_tb_open == g2->is_tb_open;
+ }
+ 
+ guint
+Index: metadata/class-internals.h
+===================================================================
+--- metadata/class-internals.h	(revision 86148)
++++ metadata/class-internals.h	(working copy)
+@@ -400,6 +400,7 @@
+ 	MonoClass *container_class;	/* the generic type definition */
+ 	MonoGenericContext context;	/* a context that contains the type instantiation doesn't contain any method instantiation */
+ 	guint is_dynamic  : 1;		/* We're a MonoDynamicGenericClass */
++	guint is_tb_open  : 1;		/* This is the open instantiation for a type_builder*/
+ 	MonoClass *cached_class;	/* if present, the MonoClass corresponding to the instantiation.  */
+ };
+ 
+@@ -443,6 +444,9 @@
+ 	int is_method    : 1;
+ 	/* Our type parameters. */
+ 	MonoGenericParam *type_params;
++
++	/* The generic class bound as the generic type definition. This applies only to class containers. */
++	MonoGenericClass *gtd_class;
+ };
+ 
+ /*
+@@ -847,5 +851,15 @@
+ MonoType *
+ mono_type_get_full        (MonoImage *image, guint32 type_token, MonoGenericContext *context) MONO_INTERNAL;
+ 
++
++gboolean 
++mono_type_is_generic_type_definition (MonoType *type) MONO_INTERNAL;
++
++gboolean
++mono_generic_class_is_generic_type_definition (MonoGenericClass *gklass) MONO_INTERNAL;
++
++void
++mono_class_setup_generic_type_container (MonoClass *class, gboolean dynamic) MONO_INTERNAL;
++
+ #endif /* __MONO_METADATA_CLASS_INTERBALS_H__ */
+ 
+Index: metadata/reflection.c
+===================================================================
+--- metadata/reflection.c	(revision 86148)
++++ metadata/reflection.c	(working copy)
+@@ -8909,6 +8909,7 @@
+ 	MONO_ARCH_SAVE_REGS;
+ 
+ 	klass = mono_class_from_mono_type (type->type.type);
++	g_assert (type->type.type->type == MONO_TYPE_GENERICINST);
+ 	gclass = type->type.type->data.generic_class;
+ 
+ 	g_assert (gclass->is_dynamic);
+@@ -9352,6 +9353,9 @@
+ 	typebuilder_setup_events (klass);
+ 	
+ 	klass->wastypebuilder = TRUE;
++	if (klass->generic_container)
++		mono_class_setup_generic_type_container (klass, TRUE);
++
+ 	mono_loader_unlock ();
+ 	mono_domain_unlock (domain);
+ 

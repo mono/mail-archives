@@ -1,0 +1,213 @@
+Index: reflection.c
+===================================================================
+--- reflection.c	(revision 54370)
++++ reflection.c	(working copy)
+@@ -820,6 +820,24 @@
+ 	return num_clauses;
+ }
+ 
++static gboolean
++method_use_fat_seh (MonoReflectionILGen *ilgen)
++{
++	guint32 i;
++	gboolean fat_header = FALSE;
++	MonoILExceptionInfo *ex_info;
++
++	for (i = 0; i < mono_array_length (ilgen->ex_handlers); i++) {
++		ex_info = (MonoILExceptionInfo *) mono_array_addr (ilgen->ex_handlers, MonoILExceptionInfo, i);
++		if (ex_info->len > 255) {
++			fat_header = TRUE;
++			break;
++		}
++	}
++
++	return fat_header;
++}
++
+ static MonoExceptionClause*
+ method_encode_clauses (MonoDynamicImage *assembly, MonoReflectionILGen *ilgen, guint32 num_clauses)
+ {
+@@ -876,7 +894,6 @@
+ 	gint32 max_stack, i;
+ 	gint32 num_locals = 0;
+ 	gint32 num_exception = 0;
+-	gint maybe_small;
+ 	guint32 fat_flags;
+ 	char fat_header [12];
+ 	guint32 int_value;
+@@ -914,32 +931,20 @@
+ 	}
+ 
+ 	stream_data_align (&assembly->code);
++	/* check if we can emit a small method header */
++	if ((!num_locals) && (!num_exception) && (max_stack <= 8) && (code_size < 64)) {
++		flags = (code_size << 2) | METHOD_HEADER_TINY_FORMAT;
+ 
+-	/* check for exceptions, maxstack, locals */
+-	maybe_small = (max_stack <= 8) && (!num_locals) && (!num_exception);
+-	if (maybe_small) {
+-		if (code_size < 64 && !(code_size & 1)) {
+-			flags = (code_size << 2) | 0x2;
+-		} else if (code_size < 32 && (code_size & 1)) {
+-			flags = (code_size << 2) | 0x6; /* LAMESPEC: see metadata.c */
+-		} else {
+-			goto fat_header;
+-		}
+ 		idx = mono_image_add_stream_data (&assembly->code, &flags, 1);
+ 		/* add to the fixup todo list */
+ 		if (mb->ilgen && mb->ilgen->num_token_fixups)
+ 			mono_g_hash_table_insert (assembly->token_fixups, mb->ilgen, GUINT_TO_POINTER (idx + 1));
+ 		mono_image_add_stream_data (&assembly->code, mono_array_addr (code, char, 0), code_size);
+ 		return assembly->text_rva + idx;
+-	} 
+-fat_header:
++	}
+ 	if (num_locals)
+ 		local_sig = MONO_TOKEN_SIGNATURE | encode_locals (assembly, mb->ilgen);
+-	/* 
+-	 * FIXME: need to set also the header size in fat_flags.
+-	 * (and more sects and init locals flags)
+-	 */
+-	fat_flags =  0x03;
++	fat_flags = METHOD_HEADER_FAT_FORMAT;
+ 	if (num_exception)
+ 		fat_flags |= METHOD_HEADER_MORE_SECTS;
+ 	if (mb->init_locals)
+@@ -956,67 +961,91 @@
+ 	/* add to the fixup todo list */
+ 	if (mb->ilgen && mb->ilgen->num_token_fixups)
+ 		mono_g_hash_table_insert (assembly->token_fixups, mb->ilgen, GUINT_TO_POINTER (idx + 12));
+-	
++
+ 	mono_image_add_stream_data (&assembly->code, mono_array_addr (code, char, 0), code_size);
+ 	if (num_exception) {
+ 		unsigned char sheader [4];
+ 		MonoILExceptionInfo * ex_info;
+ 		MonoILExceptionBlock * ex_block;
++		gboolean fat_header;
+ 		int j;
+ 
+ 		stream_data_align (&assembly->code);
+-		/* always use fat format for now */
+-		sheader [0] = METHOD_HEADER_SECTION_FAT_FORMAT | METHOD_HEADER_SECTION_EHTABLE;
+-		num_exception *= 6 * sizeof (guint32);
+-		num_exception += 4; /* include the size of the header */
+-		sheader [1] = num_exception & 0xff;
+-		sheader [2] = (num_exception >> 8) & 0xff;
+-		sheader [3] = (num_exception >> 16) & 0xff;
+-		mono_image_add_stream_data (&assembly->code, sheader, 4);
+-		/* fat header, so we are already aligned */
++		fat_header = method_use_fat_seh (mb->ilgen);
++		if (fat_header) {
++			sheader [0] = METHOD_HEADER_SECTION_FAT_FORMAT | METHOD_HEADER_SECTION_EHTABLE;
++			num_exception *= 6 * sizeof (guint32);
++			num_exception += 4; /* include the size of the header */
++			sheader [1] = num_exception & 0xff;
++			sheader [2] = (num_exception >> 8) & 0xff;
++			sheader [3] = (num_exception >> 16) & 0xff;
++		} else {
++			sheader [0] = METHOD_HEADER_SECTION_EHTABLE;
++			num_exception *= 12;
++			num_exception += 4;
++			sheader [1] = num_exception;
++			sheader [2] = sheader [3] = 0;
++		}
++		mono_image_add_stream_data (&assembly->code, (char *) sheader, 4);
+ 		/* reverse order */
+ 		for (i = mono_array_length (mb->ilgen->ex_handlers) - 1; i >= 0; --i) {
+-			ex_info = (MonoILExceptionInfo *)mono_array_addr (mb->ilgen->ex_handlers, MonoILExceptionInfo, i);
+-			if (ex_info->handlers) {
+-				int finally_start = ex_info->start + ex_info->len;
+-				for (j = 0; j < mono_array_length (ex_info->handlers); ++j) {
+-					guint32 val;
+-					ex_block = (MonoILExceptionBlock*)mono_array_addr (ex_info->handlers, MonoILExceptionBlock, j);
++			ex_info = (MonoILExceptionInfo *) mono_array_addr (mb->ilgen->ex_handlers, MonoILExceptionInfo, i);
++			if (!ex_info->handlers)
++				g_error ("No clauses for ex info block %d", i);
++
++    		for (j = 0; j < mono_array_length (ex_info->handlers); ++j) {
++    			guint32 val32;
++    			ex_block = (MonoILExceptionBlock *) mono_array_addr (ex_info->handlers, MonoILExceptionBlock, j);
++
++				if (fat_header) {
+ 					/* the flags */
+-					val = GUINT32_TO_LE (ex_block->type);
+-					mono_image_add_stream_data (&assembly->code, (char*)&val, sizeof (guint32));
++					val32 = GUINT32_TO_LE (ex_block->type);
++    				mono_image_add_stream_data (&assembly->code, (char *) &val32, sizeof (guint32));
+ 					/* try offset */
+-					val = GUINT32_TO_LE (ex_info->start);
+-					mono_image_add_stream_data (&assembly->code, (char*)&val, sizeof (guint32));
+-					/* need fault, too, probably */
+-					if (ex_block->type == MONO_EXCEPTION_CLAUSE_FINALLY)
+-						val = GUINT32_TO_LE (finally_start - ex_info->start);
+-					else
+-						val = GUINT32_TO_LE (ex_info->len);
+-					mono_image_add_stream_data (&assembly->code, (char*)&val, sizeof (guint32));
++					val32 = GUINT32_TO_LE (ex_info->start);
++					mono_image_add_stream_data (&assembly->code, (char *) &val32, sizeof (guint32));
++					/* try len */
++					val32 = GUINT32_TO_LE (ex_info->len);
++					mono_image_add_stream_data (&assembly->code, (char *) &val32, sizeof (guint32));
+ 					/* handler offset */
+-					val = GUINT32_TO_LE (ex_block->start);
+-					mono_image_add_stream_data (&assembly->code, (char*)&val, sizeof (guint32));
++					val32 = GUINT32_TO_LE (ex_block->start);
++					mono_image_add_stream_data (&assembly->code, (char *) &val32, sizeof (guint32));
+ 					/* handler len */
+-					val = GUINT32_TO_LE (ex_block->len);
+-					mono_image_add_stream_data (&assembly->code, (char*)&val, sizeof (guint32));
+-					finally_start = ex_block->start + ex_block->len;
+-					if (ex_block->extype) {
+-						val = mono_metadata_token_from_dor (mono_image_typedef_or_ref (assembly, ex_block->extype->type));
+-					} else {
+-						if (ex_block->type == MONO_EXCEPTION_CLAUSE_FILTER)
+-							val = ex_block->filter_offset;
+-						else
+-							val = 0;
+-					}
+-					val = GUINT32_TO_LE (val);
+-					mono_image_add_stream_data (&assembly->code, (char*)&val, sizeof (guint32));
+-					/*g_print ("out clause %d: from %d len=%d, handler at %d, %d, finally_start=%d, ex_info->start=%d, ex_info->len=%d, ex_block->type=%d, j=%d, i=%d\n", 
+-							clause.flags, clause.try_offset, clause.try_len, clause.handler_offset, clause.handler_len, finally_start, ex_info->start, ex_info->len, ex_block->type, j, i);*/
++					val32 = GUINT32_TO_LE (ex_block->len);
++					mono_image_add_stream_data (&assembly->code, (char *) &val32, sizeof (guint32));
++				} else {
++					gint8 val8;
++					guint16 val16;
++					/* the flags */
++					val16 = GUINT16_TO_LE ((guint16) ex_block->type);
++    				mono_image_add_stream_data (&assembly->code, (char *) &val16, sizeof (guint16));
++					/* try offset */
++					val16 = GUINT16_TO_LE ((guint16) ex_info->start);
++					mono_image_add_stream_data (&assembly->code, (char *) &val16, sizeof (guint16));
++					/* try len */
++					val8 = (gint) ex_info->len;
++					mono_image_add_stream_data (&assembly->code, (char *) &val8, sizeof (gint8));
++					/* handler offset */
++					val16 = GUINT16_TO_LE ((guint16) ex_block->start);
++					mono_image_add_stream_data (&assembly->code, (char *) &val16, sizeof (guint16));
++					/* handler len */
++					val8 = (gint) ex_block->len;
++					mono_image_add_stream_data (&assembly->code, (char *) &val8, sizeof (gint8));
++    			}
++
++    			if (ex_block->extype) {
++					val32 = mono_metadata_token_from_dor (mono_image_typedef_or_ref (assembly, ex_block->extype->type));
++				} else {
++					if (ex_block->type == MONO_EXCEPTION_CLAUSE_FILTER)
++						val32 = ex_block->filter_offset;
++					else
++						val32 = 0;
+ 				}
+-			} else {
+-				g_error ("No clauses for ex info block %d", i);
+-			}
++				val32 = GUINT32_TO_LE (val32);
++				mono_image_add_stream_data (&assembly->code, (char *) &val32, sizeof (guint32));
++    			/*g_print ("out clause %d: from %d len=%d, handler at %d, %d, finally_start=%d, ex_info->start=%d, ex_info->len=%d, ex_block->type=%d, j=%d, i=%d\n", 
++    					clause.flags, clause.try_offset, clause.try_len, clause.handler_offset, clause.handler_len, finally_start, ex_info->start, ex_info->len, ex_block->type, j, i);*/
++    		}
+ 		}
+ 	}
+ 	return assembly->text_rva + idx;

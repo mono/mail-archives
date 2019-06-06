@@ -1,0 +1,144 @@
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data.Odbc/ChangeLog,v
+retrieving revision 1.33
+diff -u -r1.33 ChangeLog
+--- ChangeLog	7 Jul 2004 09:15:52 -0000	1.33
++++ ChangeLog	23 Jul 2004 08:36:44 -0000
+@@ -1,3 +1,8 @@
++2004-07-23  Sureshkumar T (tsureshkumar@novell.com)
++        * OdbcCommand.cs: Closed statement handle to fix memory leak
++        * OdbcDataReader.cs: Closed statement handle to fix memory leak
++			     Removed SQLState login in GetBytes coz OdbcError provides the same.
++				    
+ 2004-07-07 Umadevi S (sumadevi@novell.com)
+         * OdbcConnection.cs - Allowed Close to be called multiple times
+                             - Implementation of Dispose method
+Index: OdbcCommand.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data.Odbc/OdbcCommand.cs,v
+retrieving revision 1.10
+diff -u -r1.10 OdbcCommand.cs
+--- OdbcCommand.cs	7 Jul 2004 08:39:49 -0000	1.10
++++ OdbcCommand.cs	23 Jul 2004 08:36:45 -0000
+@@ -292,6 +292,10 @@
+ 
+ 		public int ExecuteNonQuery ()
+ 		{
++			return ExecuteNonQuery (true);
++		}
++
++		private int ExecuteNonQuery (bool freeHandle) {
+ 			if (connection == null)
+ 				throw new InvalidOperationException ();
+ 			if (connection.State == ConnectionState.Closed)
+@@ -300,10 +304,13 @@
+ 
+ 			ExecSQL(CommandText);
+ 
+-//			if (!prepared)
+-//				libodbc.SQLFreeHandle( (ushort) OdbcHandleType.Stmt, hstmt);
++			if (freeHandle && !prepared) {
++				OdbcReturn ret = libodbc.SQLFreeHandle( (ushort) OdbcHandleType.Stmt, hstmt);
++				if ((ret!=OdbcReturn.Success) && (ret!=OdbcReturn.SuccessWithInfo)) 
++					throw new OdbcException(new OdbcError("SQLFreeHandle",OdbcHandleType.Stmt,hstmt));
++			}
+ 			return 0;
+-		}
++		}
+ 
+ 		public void Prepare()
+ 		{
+@@ -337,7 +344,7 @@
+ 
+ 		public OdbcDataReader ExecuteReader (CommandBehavior behavior)
+ 		{
+-			ExecuteNonQuery();
++			ExecuteNonQuery(false);
+ 			dataReader=new OdbcDataReader(this,behavior);
+ 			return dataReader;
+ 		}
+Index: OdbcDataReader.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data.Odbc/OdbcDataReader.cs,v
+retrieving revision 1.16
+diff -u -r1.16 OdbcDataReader.cs
+--- OdbcDataReader.cs	16 Jun 2004 13:41:13 -0000	1.16
++++ OdbcDataReader.cs	23 Jul 2004 08:36:45 -0000
+@@ -167,25 +167,8 @@
+ 			return cols[ordinal];
+ 		}
+ 
+-                private string GetSQLState (IntPtr hstmt, ushort recNo) 
+-                {
+-                        OdbcReturn ret = OdbcReturn.Error;
+-                        short bufLength=256, txtLength=0;
+-                        int nativeError = 1;
+-                        string sqlState = "", sqlMsg = "";
+-                        byte [] msgtxtBuffer = new byte [bufLength];
+-                        byte [] sqlStateBuffer = new byte [bufLength];
+-                        ret = libodbc.SQLGetDiagRec (OdbcHandleType.Stmt, hstmt, recNo,
+-                                            sqlStateBuffer, ref nativeError, msgtxtBuffer, 
+-                                            bufLength, ref txtLength);
+-                        sqlState = Encoding.Default.GetString (sqlStateBuffer).Replace (
+-                                                        (char) 0, ' ').Trim ();
+-                        return sqlState;
+-                }
+-	
+ 		public void Close ()
+ 		{
+-			// libodbc.SQLFreeHandle((ushort) OdbcHandleType.Stmt, hstmt);
+ 		
+ 			OdbcReturn ret=libodbc.SQLCloseCursor(hstmt);
+ 			if ((ret!=OdbcReturn.Success) && (ret!=OdbcReturn.SuccessWithInfo)) 
+@@ -196,6 +179,9 @@
+ 
+ 			if ((behavior & CommandBehavior.CloseConnection)==CommandBehavior.CloseConnection)
+ 				this.command.Connection.Close();
++			ret = libodbc.SQLFreeHandle( (ushort) OdbcHandleType.Stmt, hstmt);
++			if ((ret!=OdbcReturn.Success) && (ret!=OdbcReturn.SuccessWithInfo)) 
++				throw new OdbcException(new OdbcError("SQLFreeHandle",OdbcHandleType.Stmt,hstmt));
+ 		}
+ 
+ 		~OdbcDataReader ()
+@@ -231,6 +217,10 @@
+                         if ( (ret != OdbcReturn.Success) && (ret != OdbcReturn.SuccessWithInfo)) 
+                                 throw new OdbcException (new OdbcError ("SQLGetData", OdbcHandleType.Stmt, hstmt));
+ 
++			OdbcError odbcErr = null;
++			if ( (ret == OdbcReturn.SuccessWithInfo))
++				odbcErr = new OdbcError ("SQLGetData", OdbcHandleType.Stmt, hstmt);
++
+                         if (buffer == null)
+                                 return outsize; //if buffer is null,return length of the field
+                         
+@@ -241,11 +231,10 @@
+                                         copyBuffer = false;
+                                         returnVal = -1;
+                                 } else {
+-                                        string sqlstate = GetSQLState (hstmt, 1);
++                                        string sqlstate = odbcErr.SQLState;
+                                         //SQLState: String Data, Right truncated
+                                         if (sqlstate != libodbc.SQLSTATE_RIGHT_TRUNC) 
+-                                                throw new OdbcException (new OdbcError ("SQLGetData",
+-                                                                OdbcHandleType.Stmt, hstmt));
++                                                throw new OdbcException ( odbcErr);
+                                         copyBuffer = true;
+                                 }
+                         } else {
+@@ -400,7 +389,6 @@
+ 				for (int i = 0; i < cols.Length; i += 1 ) 
+ 				{
+ 					OdbcColumn col=GetColumn(i);
+-					//Console.WriteLine("{0}:{1}:{2}",col.ColumnName,col.DataType,col.OdbcType);
+ 
+ 					schemaRow = dataTableSchema.NewRow ();
+ 					dataTableSchema.Rows.Add (schemaRow);
+@@ -539,7 +527,6 @@
+                                                 DataValue = buffer;
+                                                 break;
+ 					default:
+-						//Console.WriteLine("Fetching unsupported data type as string: "+col.OdbcType.ToString());
+ 						bufsize=255;
+ 						buffer=new byte[bufsize];
+ 						ret=libodbc.SQLGetData(hstmt, ColIndex, OdbcType.Char, buffer, bufsize, ref outsize);

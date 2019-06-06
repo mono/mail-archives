@@ -1,0 +1,133 @@
+diff --git a/mono/metadata/ChangeLog b/mono/metadata/ChangeLog
+index 015b91f..0a64469 100644
+--- a/mono/metadata/ChangeLog
++++ b/mono/metadata/ChangeLog
+@@ -1,5 +1,16 @@
+ 2010-05-24 Rodrigo Kumpera  <rkumpera@novell.com>
+ 
++	* sgen-major-copying.c (alloc_major_section): Register with block map.
++
++	* sgen-major-copying.c (major_copy_or_mark_object): Use block map to figure out
++	where the object lives.
++
++	* sgen-gc.c: Add some notes regarding major-copying and block map.
++
++	Gives a 2% reduction in execution time on modified binary-tree (no structs).
++
++2010-05-24 Rodrigo Kumpera  <rkumpera@novell.com>
++
+ 	* sgen-gc.c: New block map API. Maps addresses to Block structs. Use a two
+ 	level sparse array similar to boehm's block map.
+ 
+diff --git a/mono/metadata/sgen-gc.c b/mono/metadata/sgen-gc.c
+index 15ed6cd..ceab703 100644
+--- a/mono/metadata/sgen-gc.c
++++ b/mono/metadata/sgen-gc.c
+@@ -364,6 +364,10 @@ mono_gc_flush_info (void)
+ 
+ #define GC_BITS_PER_WORD (sizeof (mword) * 8)
+ 
++/*
++ * When adding or changing this enum, take care of major_copy_or_mark_object, it depends on
++ * a specific ordering.
++ */
+ enum {
+ 	MEMORY_ROLE_GEN0,
+ 	MEMORY_ROLE_GEN1,
+@@ -396,7 +400,7 @@ struct _GCMemSection {
+ 	int pin_queue_start;
+ 	int pin_queue_end;
+ 	unsigned short num_scan_start;
+-	gboolean is_to_space;
++	gboolean is_to_space; /*XXX move me next to block to reduce cache misses since major-copying uses me in major_copy_or_mark_object*/
+ };
+ 
+ #define SIZEOF_GC_MEM_SECTION	((sizeof (GCMemSection) + 7) & ~7)
+diff --git a/mono/metadata/sgen-major-copying.c b/mono/metadata/sgen-major-copying.c
+index 4a6b623..617937b 100644
+--- a/mono/metadata/sgen-major-copying.c
++++ b/mono/metadata/sgen-major-copying.c
+@@ -116,6 +116,8 @@ alloc_major_section (void)
+ 	section->block.role = MEMORY_ROLE_GEN1;
+ 	section->is_to_space = TRUE;
+ 
++	block_map_register_block (&section->block, (mword)section->data, (mword)section->end_data);
++
+ 	/* add to the section list */
+ 	section->block.next = section_list;
+ 	section_list = section;
+@@ -129,6 +131,7 @@ static void
+ free_major_section (GCMemSection *section)
+ {
+ 	DEBUG (3, fprintf (gc_debug_file, "Freed major section %p (%p-%p)\n", section, section->data, section->end_data));
++	block_map_deregister_block ((mword)section->data, (mword)section->end_data);
+ 	free_internal_mem (section->scan_starts, INTERNAL_MEM_SCAN_STARTS);
+ 	free_os_memory (section, MAJOR_SECTION_SIZE);
+ 	total_alloc -= MAJOR_SECTION_SIZE - SIZEOF_GC_MEM_SECTION;
+@@ -283,9 +286,11 @@ alloc_degraded (MonoVTable *vtable, size_t size)
+ static void
+ major_copy_or_mark_object (void **obj_slot)
+ {
++	unsigned char role;
+ 	char *forwarded;
+ 	char *obj = *obj_slot;
+ 	mword objsize;
++	Block *block;
+ 
+ 	DEBUG (9, g_assert (current_collection_generation == GENERATION_OLD));
+ 
+@@ -332,32 +337,21 @@ major_copy_or_mark_object (void **obj_slot)
+ 		return;
+ 	}
+ 
+-	if (ptr_in_nursery (obj))
+-		goto copy;
+ 
+ 	/*
+-	 * At this point we know obj is not pinned, not forwarded and
+-	 * belongs to 2, 3, 4, or 5.
++	 * At this point we know obj is not pinned and not forwarded.
+ 	 *
+-	 * LOS object (2) are simple, at least until we always follow
+-	 * the rule: if objsize > MAX_SMALL_OBJ_SIZE, pin the object
+-	 * and return it.  At the end of major collections, we walk
+-	 * the los list and if the object is pinned, it is marked,
+-	 * otherwise it can be freed.
++	 * If the object belong to pinned or LOS spaces, just pin it and forget.
+ 	 *
+-	 * Pinned chunks (3) and major heap sections (4, 5) both
+-	 * reside in blocks, which are always aligned, so once we've
+-	 * eliminated LOS objects, we can just access the block and
+-	 * see whether it's a pinned chunk or a major heap section.
++	 * If the object belongs to gen1 and in on to_space, ignore it.
+ 	 */
+ 
+-	objsize = safe_object_get_size ((MonoObject*)obj);
+-	objsize += ALLOC_ALIGN - 1;
+-	objsize &= ~(ALLOC_ALIGN - 1);
++	block = block_map_find_block ((mword)obj);
++	role = block->role;
++
++	if (role >= MEMORY_ROLE_PINNED) {
++		DEBUG (9, g_assert (!object_is_pinned (obj)));/*It can't be pinned since this was checked before*/
+ 
+-	if (G_UNLIKELY (objsize > MAX_SMALL_OBJ_SIZE || obj_is_from_pinned_alloc (obj))) {
+-		if (object_is_pinned (obj))
+-			return;
+ 		DEBUG (9, fprintf (gc_debug_file, " (marked LOS/Pinned %p (%s), size: %zd)\n", obj, safe_name (obj), objsize));
+ 		binary_protocol_pin (obj, (gpointer)LOAD_VTABLE (obj), safe_object_get_size ((MonoObject*)obj));
+ 		pin_object (obj);
+@@ -366,12 +360,7 @@ major_copy_or_mark_object (void **obj_slot)
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Now we know the object is in a major heap section.  All we
+-	 * need to do is check whether it's already in to-space (5) or
+-	 * not (4).
+-	 */
+-	if (MAJOR_OBJ_IS_IN_TO_SPACE (obj)) {
++	if (((GCMemSection*)block)->is_to_space) {
+ 		DEBUG (9, g_assert (objsize <= MAX_SMALL_OBJ_SIZE));
+ 		DEBUG (9, fprintf (gc_debug_file, " (already copied)\n"));
+ 		HEAVY_STAT (++stat_major_copy_object_failed_to_space);

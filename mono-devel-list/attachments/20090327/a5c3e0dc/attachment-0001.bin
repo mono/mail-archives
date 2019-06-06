@@ -1,0 +1,310 @@
+Index: metadata/security-core-clr.c
+===================================================================
+--- metadata/security-core-clr.c	(revision 130414)
++++ metadata/security-core-clr.c	(working copy)
+@@ -46,6 +46,66 @@
+ }
+ 
+ /*
++ * mono_security_core_clr_check_inheritance:
++ *
++ *	Determine if the specified class can inherit from its parent using 
++ * 	the CoreCLR inheritance rules.
++ *
++ *	Base Type	Allow Derived Type
++ *	------------	------------------
++ *	Transparent	Transparent, SafeCritical, Critical
++ *	SafeCritical	SafeCritical, Critical
++ *	Critical	Critical
++ *
++ *	Reference: http://msdn.microsoft.com/en-us/magazine/cc765416.aspx#id0190030
++ */
++void
++mono_security_core_clr_check_inheritance (MonoClass *class)
++{
++	MonoSecurityCoreCLRLevel class_level, parent_level;
++	MonoClass *parent = class->parent;
++
++	if (!parent)
++		return;
++
++	class_level = mono_security_core_clr_class_level (class);
++	parent_level = mono_security_core_clr_class_level (parent);
++
++	if (class_level < parent_level)
++		mono_class_set_failure (class, MONO_EXCEPTION_TYPE_LOAD, NULL);
++}
++
++/*
++ * mono_security_core_clr_check_override:
++ *
++ *	Determine if the specified override can "legally" override the 
++ *	specified base method using the CoreCLR inheritance rules.
++ *
++ *	Base (virtual/interface)	Allowed override
++ *	------------------------	-------------------------
++ *	Transparent			Transparent, SafeCritical
++ *	SafeCritical			Transparent, SafeCritical
++ *	Critical			Critical
++ *
++ *	Reference: http://msdn.microsoft.com/en-us/magazine/cc765416.aspx#id0190030
++ */
++void
++mono_security_core_clr_check_override (MonoClass *class, MonoMethod *override, MonoMethod *base)
++{
++	MonoSecurityCoreCLRLevel base_level = mono_security_core_clr_method_level (base, FALSE);
++	MonoSecurityCoreCLRLevel override_level = mono_security_core_clr_method_level (override, FALSE);
++	/* if the base method is decorated with [SecurityCritical] then the overrided method MUST be too */
++	if (base_level == MONO_SECURITY_CORE_CLR_CRITICAL) {
++		if (override_level != MONO_SECURITY_CORE_CLR_CRITICAL)
++			mono_class_set_failure (class, MONO_EXCEPTION_TYPE_LOAD, NULL);
++	} else {
++		/* base is [SecuritySafeCritical] or [SecurityTransparent], override MUST NOT be [SecurityCritical] */
++		if (override_level == MONO_SECURITY_CORE_CLR_CRITICAL)
++			mono_class_set_failure (class, MONO_EXCEPTION_TYPE_LOAD, NULL);
++	}
++}
++
++/*
+  * get_caller_no_reflection_related:
+  *
+  *	Find the first managed caller that is either:
+Index: metadata/security-core-clr.h
+===================================================================
+--- metadata/security-core-clr.h	(revision 130414)
++++ metadata/security-core-clr.h	(working copy)
+@@ -22,6 +22,9 @@
+ 
+ extern gboolean mono_security_core_clr_test;
+ 
++extern void mono_security_core_clr_check_inheritance (MonoClass *class) MONO_INTERNAL;
++extern void mono_security_core_clr_check_override (MonoClass *class, MonoMethod *override, MonoMethod *base) MONO_INTERNAL;
++
+ extern void mono_security_core_clr_ensure_reflection_access_field (MonoClassField *field) MONO_INTERNAL;
+ extern void mono_security_core_clr_ensure_reflection_access_method (MonoMethod *method) MONO_INTERNAL;
+ extern gboolean mono_security_core_clr_ensure_delegate_creation (MonoMethod *method, gboolean throwOnBindFailure) MONO_INTERNAL;
+Index: metadata/ChangeLog
+===================================================================
+--- metadata/ChangeLog	(revision 130414)
++++ metadata/ChangeLog	(working copy)
+@@ -1,3 +1,10 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* class.c: move coreclr inheritance/override checks to 
++	security-core.clr.c
++	* security-core.clr.c|h: add code from class.c with additional
++	documentation. Fix override check when the method is not critical.
++
+ 2009-03-27  Sebastien Pouliot  <sebastien@ximian.com> 
+ 
+ 	* appdomain.h: Export a new callback type and a new function to
+Index: metadata/class.c
+===================================================================
+--- metadata/class.c	(revision 130414)
++++ metadata/class.c	(working copy)
+@@ -2727,19 +2727,6 @@
+ 	return;
+ }
+ 
+-static void
+-check_core_clr_override_method (MonoClass *class, MonoMethod *override, MonoMethod *base)
+-{
+-	MonoSecurityCoreCLRLevel base_level = mono_security_core_clr_method_level (base, FALSE);
+-	/* if the base method is decorated with [SecurityCritical] then the overrided method MUST be too */
+-	if (base_level == MONO_SECURITY_CORE_CLR_CRITICAL) {
+-		MonoSecurityCoreCLRLevel override_level = mono_security_core_clr_method_level (override, FALSE);
+-		if (override_level != MONO_SECURITY_CORE_CLR_CRITICAL)
+-			mono_class_set_failure (class, MONO_EXCEPTION_TYPE_LOAD, NULL);
+-	}
+-}
+-
+-
+ #define DEBUG_INTERFACE_VTABLE_CODE 0
+ #define TRACE_INTERFACE_VTABLE_CODE 0
+ #define VERIFY_INTERFACE_VTABLE_CODE 0
+@@ -2838,7 +2825,7 @@
+ 		}
+ 
+ 		if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
+-			check_core_clr_override_method (class, cm, im);
++			mono_security_core_clr_check_override (class, cm, im);
+ 		TRACE_INTERFACE_VTABLE (printf ("[NAME CHECK OK]"));
+ 		return TRUE;
+ 	} else {
+@@ -2907,7 +2894,7 @@
+ 		}
+ 
+ 		if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
+-			check_core_clr_override_method (class, cm, im);
++			mono_security_core_clr_check_override (class, cm, im);
+ 		
+ 		TRACE_INTERFACE_VTABLE (printf ("[INJECTED INTERFACE CHECK OK]"));
+ 		return TRUE;
+@@ -3167,7 +3154,7 @@
+ 			g_hash_table_insert (override_map, overrides [i * 2], overrides [i * 2 + 1]);
+ 
+ 			if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
+-				check_core_clr_override_method (class, vtable [dslot], decl);
++				mono_security_core_clr_check_override (class, vtable [dslot], decl);
+ 		}
+ 	}
+ 	TRACE_INTERFACE_VTABLE (print_overrides (override_map, "AFTER OVERRIDING INTERFACE METHODS"));
+@@ -3323,7 +3310,7 @@
+ 						}
+ 
+ 						if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
+-							check_core_clr_override_method (class, cm, m1);
++							mono_security_core_clr_check_override (class, cm, m1);
+ 
+ 						slot = mono_method_get_vtable_slot (m1);
+ 						g_assert (cm->slot < max_vtsize);
+@@ -3359,7 +3346,7 @@
+ 			g_hash_table_insert (override_map, decl, overrides [i * 2 + 1]);
+ 
+ 			if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
+-				check_core_clr_override_method (class, vtable [decl->slot], decl);
++				mono_security_core_clr_check_override (class, vtable [decl->slot], decl);
+ 		}
+ 	}
+ 
+@@ -3658,22 +3645,6 @@
+ 	mono_class_set_failure (class, error->exception_type, exception_data);
+ }
+ 
+-static void
+-check_core_clr_inheritance (MonoClass *class)
+-{
+-	MonoSecurityCoreCLRLevel class_level, parent_level;
+-	MonoClass *parent = class->parent;
+-
+-	if (!parent)
+-		return;
+-
+-	class_level = mono_security_core_clr_class_level (class);
+-	parent_level = mono_security_core_clr_class_level (parent);
+-
+-	if (class_level < parent_level)
+-		mono_class_set_failure (class, MONO_EXCEPTION_TYPE_LOAD, NULL);
+-}
+-
+ /**
+  * mono_class_init:
+  * @class: the class to initialize
+@@ -3724,7 +3695,7 @@
+ 	}
+ 
+ 	if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
+-		check_core_clr_inheritance (class);
++		mono_security_core_clr_check_inheritance (class);
+ 
+ 	mono_stats.initialized_class_count++;
+ 
+Index: tests/coreclr-security.cs
+===================================================================
+--- tests/coreclr-security.cs	(revision 130387)
++++ tests/coreclr-security.cs	(working copy)
+@@ -106,6 +106,45 @@
+         }
+ }
+ 
++public class TransparentBaseClass {
++	public virtual void TransparentMethod ()
++	{
++	}
++
++	[SecuritySafeCritical]
++	public virtual void SafeCriticalMethod ()
++	{
++	}
++
++	[SecurityCritical]
++	public virtual void CriticalMethod ()
++	{
++	}
++}
++
++public class BadTransparentOverrideClass : TransparentBaseClass {
++	[SecurityCritical]
++	public override void TransparentMethod ()
++	{
++		Test.error ("this method is critical and cannot override its base (transparent)");
++	}
++}
++
++public class BadSafeCriticalOverrideClass : TransparentBaseClass {
++	[SecurityCritical]
++	public override void SafeCriticalMethod ()
++	{
++		Test.error ("this method is critical and cannot override its base (safe critical)");
++	}
++}
++
++public class BadCriticalOverrideClass : TransparentBaseClass {
++	public override void CriticalMethod ()
++	{
++		Test.error ("this method is NOT critical and cannot override its base (critical)");
++	}
++}
++
+ public delegate void MethodDelegate ();
+ 
+ public delegate Object InvokeDelegate (Object obj, Object[] parms);
+@@ -163,6 +202,21 @@
+ 	}
+ 	*/
+ 
++	static void doBadTransparentOverrideClass ()
++	{
++		new BadTransparentOverrideClass ();
++	}
++
++	static void doBadSafeCriticalOverrideClass ()
++	{
++		new BadSafeCriticalOverrideClass ();
++	}
++
++	static void doBadCriticalOverrideClass ()
++	{
++		new BadCriticalOverrideClass ();
++	}
++
+ 	public static void TransparentReflectionCMethod ()
+ 	{
+ 	}
+@@ -301,6 +355,24 @@
+ 			error ("string test failed");
+ 		}
+ 
++		try {
++			doBadTransparentOverrideClass ();
++			error ("BadTransparentOverrideClass error");
++		} catch (TypeLoadException) {
++		}
++
++		try {
++			doBadSafeCriticalOverrideClass ();
++			error ("BadSafeCriticalOverrideClass error");
++		} catch (TypeLoadException) {
++		}
++
++		try {
++			doBadCriticalOverrideClass ();
++			error ("BadCriticalOverrideClass error");
++		} catch (TypeLoadException) {
++		}
++
+ 		//Console.WriteLine ("ok");
+ 
+ 		if (haveError)
+Index: tests/ChangeLog
+===================================================================
+--- tests/ChangeLog	(revision 130387)
++++ tests/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* coreclr-security.cs: Add more override test cases.
++
+ 2009-03-26  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* pinvoke2.cs: Add a test for #488670.

@@ -1,0 +1,331 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Collections;
+
+public sealed class StateObject
+{
+    internal Socket workSocket = null;
+    internal const int BufferSize = 1024;
+    internal byte[] buffer = new byte[BufferSize];
+    internal StringBuilder sb = new StringBuilder();
+	internal long ticksUpdate;
+	internal string ip;
+	internal Object disconnectLock = new Object();
+	internal bool connected = true;
+
+    public StateObject(string ip)
+    {
+        this.ip = ip;
+        Hit();
+    }
+
+    public override string ToString()
+    {
+    	return ip;
+    }
+
+	public void Hit()
+	{
+		ticksUpdate = DateTime.UtcNow.Ticks;
+	}
+}
+
+public sealed class Server
+{
+    private ManualResetEvent allDone = new ManualResetEvent(false);
+    private ArrayList states = new ArrayList();
+    private Timer cleanupTimer;
+    private string ip;
+    private int port;
+
+    public Server()
+    {
+    	ip = "0.0.0.0";
+    	port = 4444;
+	}
+
+    public Server(string ip, int port)
+    {
+    	this.ip = ip;
+    	this.port = port;
+    }
+
+    public void Cleanup(object stateInfo)
+    {
+    	long now = DateTime.UtcNow.Ticks;
+    	StateObject obj = null;
+    	try
+    	{
+            Stack probes = new Stack();
+			lock (states.SyncRoot)
+			{
+				foreach (object state1 in states)
+				{
+					obj = (StateObject) state1;
+					if (now - obj.ticksUpdate > 30000)
+						probes.Push(obj);
+				}
+			}
+    		if (probes.Count > 0)
+    		{
+    			Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Before probes send " + probes.Count);
+	            while (probes.Count > 0)
+	            {
+	            	obj = (StateObject)probes.Pop();
+					lock (obj.disconnectLock)
+					{
+						if (obj.connected == true && obj.workSocket.Connected == false)
+						{
+							// does not work anyway
+							Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Cleanup: " + obj);
+							Disconnect(obj, true);
+						}
+	            	}
+	                Send(obj, "\0");  // probe socket
+	            }
+    			Console.WriteLine(Thread.CurrentThread.GetHashCode() + " After probes send.");
+        	}
+    	}
+    	catch (Exception e)
+    	{
+    		if (obj != null)
+    			Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Error in Cleanup for " + obj.ip + e);
+    		else
+    			Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Error in Cleanup" + e);
+    	}
+    }
+
+    public void StartListening()
+    {
+        cleanupTimer = new Timer(new TimerCallback(Cleanup), null, 10000, 10000);
+        // Dns.GetHostName()
+        //IPHostEntry ipHostInfo = Dns.Resolve(dns);//Dns.GetHostEntry("localhost");
+        IPAddress ipAddress = IPAddress.Parse(ip);//ipHostInfo.AddressList[0];
+        Console.WriteLine(Thread.CurrentThread.GetHashCode() + string.Format(" Listening on address: {0}", ipAddress));
+        IPEndPoint localEndPoint = new IPEndPoint(ipAddress, port);
+        Socket listener = new Socket(AddressFamily.InterNetwork,
+            SocketType.Stream, ProtocolType.Tcp);
+        try
+        {
+            listener.Bind(localEndPoint);
+            listener.Listen(100);
+
+            while (true)
+            {
+                // Set the event to nonsignaled state.
+                allDone.Reset();
+
+                // Start an asynchronous socket to listen for connections.
+                listener.BeginAccept(
+                    new AsyncCallback(AcceptCallback),
+                    listener);
+
+                // Wait until a connection is made before continuing.
+                allDone.WaitOne();
+            }
+        }
+        catch (Exception e)
+        {
+        	try
+        	{
+        		listener.Shutdown(SocketShutdown.Both);
+        	}
+        	catch
+        	{
+        	}
+        	try
+        	{
+        		listener.Close();
+        	} catch { }
+        }
+    }
+
+    public void AcceptCallback(IAsyncResult ar)
+    {
+        allDone.Set();
+
+		try
+		{
+            Socket listener = (Socket)ar.AsyncState;
+            Socket handler = listener.EndAccept(ar);
+            StateObject state = new StateObject(handler.RemoteEndPoint.ToString());
+            state.workSocket = handler;
+			lock (states.SyncRoot)
+			{
+				states.Add(state);
+	            Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Accepted from: " + handler.RemoteEndPoint.ToString() + " -> " + states.Count);
+			}
+            handler.BeginReceive(state.buffer, 0, StateObject.BufferSize, 0,
+                new AsyncCallback(ReadCallback), state);
+        }
+        catch (Exception e)
+        {
+        	Console.WriteLine(e);
+        }
+    }
+
+    public void ReadCallback(IAsyncResult ar)
+    {
+        String content = String.Empty;
+
+        StateObject state = (StateObject)ar.AsyncState;
+        Socket handler = state.workSocket;
+		state.Hit();
+
+        int bytesRead = 0;
+        try
+        {
+        	bytesRead = handler.EndReceive(ar);
+    	}
+    	catch (Exception e)
+    	{
+    		Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Error1 in ReadCallback for " + handler + " " + e);
+			Disconnect(state, true);
+			return;
+    	}
+
+        if (bytesRead > 0)
+        {
+            state.sb.Append(Encoding.UTF8.GetString(
+                state.buffer, 0, bytesRead));
+
+            content = state.sb.ToString();
+            if (content.IndexOf("\0") > -1)
+            {
+                int count = 0;
+                int pos = -1;
+                int oldpos = 0;
+                do
+                {
+                	pos = content.IndexOf('\0', pos+1);
+                	if (pos != -1)
+                	{
+                		string message = content.Substring(oldpos, pos-oldpos);
+	                    if (HandleMessage(state, message) == false)
+	                    {
+	                    	Disconnect(state, false);
+	                    	return;
+	                    }
+                		oldpos = pos+1;
+                	}
+                	count++;
+                } while (pos != -1);
+                state.sb = new StringBuilder(content.Substring(oldpos, content.Length-oldpos));
+            }
+
+            // Not all data received. Get more.
+            try
+            {
+                handler.BeginReceive(state.buffer, 0, StateObject.BufferSize, 0,
+	                new AsyncCallback(ReadCallback), state);
+            }
+            catch (Exception e)
+            {
+        		Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Error2 in ReadCallback for " + handler + " " + e);
+				Disconnect(state, true);
+            }	
+        }
+    }
+
+    public void Send(StateObject handler, String data)
+    {
+		handler.Hit();
+        byte[] byteData = Encoding.UTF8.GetBytes(data);
+
+        try
+        {
+            handler.workSocket.BeginSend(byteData, 0, byteData.Length, 0,
+                new AsyncCallback(SendCallback), handler);
+        }
+        catch (Exception e)
+        {
+			Disconnect(handler, true);
+        }
+    }
+
+    private void SendCallback(IAsyncResult ar)
+    {
+    	StateObject handler = null;
+        try
+        {
+            handler = (StateObject)ar.AsyncState;
+
+            handler.workSocket.EndSend(ar);
+
+        }
+        catch (Exception e)
+        {
+			Disconnect(handler, true);
+        }
+    }
+
+	internal void Disconnect(StateObject handler, bool removeStates)
+	{
+		lock (handler.disconnectLock)
+		{
+			if (handler.connected == false)
+			{
+	            Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Already disconnected. " + handler);
+				return;
+			}
+			handler.connected = false;
+	        int count = -1;
+        	if (removeStates == true)
+        	{
+				lock (states.SyncRoot)
+				{
+		            states.Remove(handler);
+		            count = states.Count;
+		        }
+		    }
+           	if (handler.workSocket.Connected == true)
+           	{
+	            try
+	            {
+			        handler.workSocket.Shutdown(SocketShutdown.Both);
+	        	}
+	        	catch (Exception e2)
+	        	{
+	        		Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Error2 in Disconnect " + e2);
+	        	}
+	            try
+	            {
+	                handler.workSocket.Close();
+	        	}
+	        	catch (Exception e3)
+	        	{
+	        		Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Error3 in Disconnect " + e3);
+	        	}
+        	}
+            Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Disconnect -> " + count + " " + handler);
+		}
+	}
+
+    public bool HandleMessage(StateObject state, string message)
+    {
+    	Console.WriteLine(Thread.CurrentThread.GetHashCode() + " Handling: " + message);
+    	return true;
+    }
+    
+    public static int Main(String[] args)
+    {
+		try
+		{
+	    	Server server = new Server();
+		    Thread thread = new Thread(new System.Threading.ThreadStart(server.StartListening));
+		    thread.IsBackground = true;
+		    thread.Start();
+	        
+	        Console.WriteLine(Thread.CurrentThread.GetHashCode() + " ==== Hit Return to stop the server. ========");
+	        Console.ReadLine();
+		}
+		catch (Exception e)
+		{
+			Console.WriteLine(Thread.CurrentThread.GetHashCode() + " " + e);
+		}
+    	return 0;
+	}
+}

@@ -1,0 +1,605 @@
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/tools/corcompare/ChangeLog,v
+retrieving revision 1.17
+diff -u -r1.17 ChangeLog
+--- ChangeLog	11 Jun 2004 12:37:23 -0000	1.17
++++ ChangeLog	12 Jun 2004 19:19:32 -0000
+@@ -1,3 +1,19 @@
++2004-06-12  Gert Driesen <drieseng@users.sourceforge.net>
++
++	* mono-api-diff.cs: 
++	  - check method/ctor parameters
++	  - use target attribute for attributes in key for attributes 
++	    (if available). This allows us to differentiate between method 
++	    and return type attributes for methods
++	  - check field values (for literal fields)
++	  - LoadExtraData was not always called, causing certain signature
++	    mismatches not to be reported
++
++	* mono-api-info.cs: 
++	  - check field values of literal fields
++	  - document parameters of method/ctors
++	  - also output attribute applied to return type of methods
++
+ 2004-06-11  Gert Driesen <drieseng@users.sourceforge.net>
+ 
+ 	* mono-api-info.cs: ignore non-public attributes
+Index: mono-api-diff.cs
+===================================================================
+RCS file: /cvs/public/mcs/tools/corcompare/mono-api-diff.cs,v
+retrieving revision 1.10
+diff -u -r1.10 mono-api-diff.cs
+--- mono-api-diff.cs	4 Jun 2004 01:17:07 -0000	1.10
++++ mono-api-diff.cs	12 Jun 2004 19:19:34 -0000
+@@ -293,8 +293,7 @@
+ 				if (CheckIfAdd (name, n)) {
+ 					string key = GetNodeKey (name, n);
+ 					keys.Add (key, name);
+-					if (n.HasChildNodes)
+-						LoadExtraData (key, n.FirstChild);
++					LoadExtraData (key, n);
+ 				}
+ 			}
+ 		}
+@@ -863,6 +862,67 @@
+ 		}
+ 	}
+ 
++	class XMLParameter : XMLData
++	{
++		string name;
++		string type;
++		string attrib;
++		string direction;
++		bool isUnsafe;
++		bool isOptional;
++		string defaultValue;
++
++		public override void LoadData (XmlNode node)
++		{
++			if (node == null)
++				throw new ArgumentNullException ("node");
++
++			if (node.Name != "parameter")
++				throw new ArgumentException ("Expecting <parameter>");
++
++			name = node.Attributes["name"].Value;
++			type = node.Attributes["type"].Value;
++			attrib = node.Attributes["attrib"].Value;
++			if (node.Attributes ["direction"] != null)
++				direction = node.Attributes["direction"].Value;
++			if (node.Attributes["unsafe"] != null)
++				isUnsafe = bool.Parse (node.Attributes["unsafe"].Value);
++			if (node.Attributes["optional"] != null)
++				isOptional = bool.Parse (node.Attributes["optional"].Value);
++			if (node.Attributes["defaultValue"] != null)
++				defaultValue = node.Attributes["defaultValue"].Value;
++		}
++
++		public override void CompareTo (XmlDocument doc, XmlNode parent, object other)
++		{
++			this.document = doc;
++
++			XMLParameter oparm = (XMLParameter) other;
++
++			if (type != oparm.type)
++				AddWarning (parent, "Parameter type is wrong: {0} != {1}", type, oparm.type);
++			
++			if (attrib != oparm.attrib)
++				AddWarning (parent, "Parameter attributes wrong: {0} != {1}", attrib, oparm.attrib);
++
++			if (direction != oparm.direction)
++				AddWarning (parent, "Parameter direction wrong: {0} != {1}", direction, oparm.direction);
++
++			if (isUnsafe != oparm.isUnsafe)
++				AddWarning (parent, "Parameter unsafe wrong: {0} != {1}", isUnsafe, oparm.isUnsafe);
++
++			if (isOptional != oparm.isOptional)
++				AddWarning (parent, "Parameter optional wrong: {0} != {1}", isOptional, oparm.isOptional);
++
++			if (defaultValue != oparm.defaultValue)
++				AddWarning (parent, "Parameter default value wrong: {0} != {1}", defaultValue, oparm.defaultValue);
++		}
++
++		public string Name {
++			get { return name; }
++		}
++	}
++
+ 	class XMLAttributes : XMLNameGroup
+ 	{
+ 		bool isTodo;
+@@ -884,9 +944,12 @@
+ 
+ 		public override string GetNodeKey (string name, XmlNode node)
+ 		{
++			string target = string.Empty;
++			if (node.Attributes["target"] != null)
++				target = node.Attributes["target"].Value;
+ 			int i = 0;
+ 			while (keys.ContainsKey (name)) {
+-				name = String.Format ("{0}:{1}", name, i++);
++				name = String.Format ("{0} [{1}]:{1}", name, target, i++);
+ 			}
+ 
+ 			return name;
+@@ -932,6 +995,8 @@
+ 				access [name] = xatt.Value;
+ 			
+ 			XmlNode orig = node;
++
++			node = node.FirstChild;
+ 			while (node != null) {
+ 				if (node != null && node.Name == "attributes") {
+ 					XMLAttributes a = new XMLAttributes ();
+@@ -975,7 +1040,7 @@
+ 				}
+ 			}
+ 
+-			if (access == null)
++			if (!CheckAttributes)
+ 				return;
+ 
+ 			XMLMember member = (XMLMember) other;
+@@ -992,18 +1057,26 @@
+ 			if (oacc != null)
+ 				oaccName = ConvertToString (Int32.Parse (oacc));
+ 
+-			AddWarning (parent, "Incorrect attributes: '{0}' != '{1}'", accName, oaccName);
++			if (accName != oaccName)
++				AddWarning (parent, "Incorrect attributes: '{0}' != '{1}'", accName, oaccName);
+ 		}
+ 
+ 		protected virtual string ConvertToString (int att)
+ 		{
+ 			return null;
+ 		}
++
++		protected virtual bool CheckAttributes {
++			get {
++				return true;
++			}
++		}
+ 	}
+ 	
+ 	class XMLFields : XMLMember
+ 	{
+ 		Hashtable fieldTypes;
++		Hashtable fieldValues;
+ 
+ 		protected override void LoadExtraData (string name, XmlNode node)
+ 		{
+@@ -1015,22 +1088,39 @@
+ 				fieldTypes [name] = xatt.Value;
+ 			}
+ 
++			xatt = node.Attributes ["value"];
++			if (xatt != null) {
++				if (fieldValues == null)
++					fieldValues = new Hashtable ();
++
++				fieldValues[name] = xatt.Value;
++			}
++
+ 			base.LoadExtraData (name, node);
+ 		}
+ 
+ 		protected override void CompareToInner (string name, XmlNode parent, XMLNameGroup other)
+ 		{
+ 			base.CompareToInner (name, parent, other);
+-			if (fieldTypes == null)
+-				return;
+-
+ 			XMLFields fields = (XMLFields) other;
+-			string ftype = fieldTypes [name] as string;
+-			string oftype = null;
+-			if (fields.fieldTypes != null)
+-				oftype = fields.fieldTypes [name] as string;
++			if (fieldTypes != null) {
++				string ftype = fieldTypes [name] as string;
++				string oftype = null;
++				if (fields.fieldTypes != null)
++					oftype = fields.fieldTypes [name] as string;
++
++				if (ftype != oftype)
++					AddWarning (parent, "Field type is {0} and should be {1}", oftype, ftype);
++			}
++			if (fieldValues != null) {
++				string fvalue = fieldValues [name] as string;
++				string ofvalue = null;
++				if (fields.fieldValues != null)
++					ofvalue = fields.fieldValues [name] as string;
+ 
+-			AddWarning (parent, "Field type is {0} and should be {1}", oftype, ftype);
++				if (fvalue != ofvalue)
++					AddWarning (parent, "Field value is {0} and should be {1}", ofvalue, fvalue);
++			}
+ 		}
+ 
+ 		protected override string ConvertToString (int att)
+@@ -1039,6 +1129,14 @@
+ 			return fa.ToString ();
+ 		}
+ 
++		protected override bool CheckAttributes {
++			get {
++				// FIXME: set this to true once bugs #60086 and 
++				// #60090 are fixed
++				return false;
++			}
++		}
++
+ 		public override string GroupName {
+ 			get { return "fields"; }
+ 		}
+@@ -1048,6 +1146,92 @@
+ 		}
+ 	}
+ 
++	class XMLParameters : XMLNameGroup
++	{
++		public override void LoadData (XmlNode node)
++		{
++			if (node == null)
++				throw new ArgumentNullException ("node");
++
++			if (node.Name != GroupName)
++				throw new FormatException (String.Format ("Expecting <{0}>", GroupName));
++
++			keys = new Hashtable ();
++			foreach (XmlNode n in node.ChildNodes) {
++				string name = n.Attributes["name"].Value;
++				string key = GetNodeKey (name, n);
++				XMLParameter parm = new XMLParameter ();
++				parm.LoadData (n);
++				keys.Add (key, parm);
++				LoadExtraData (key, n);
++			}
++		}
++
++		public override string GroupName {
++			get {
++				return "parameters";
++			}
++		}
++
++		public override string Name {
++			get {
++				return "parameter";
++			}
++		}
++
++		public override string GetNodeKey (string name, XmlNode node)
++		{
++			return node.Attributes["position"].Value;
++		}
++
++		public override void CompareTo (XmlDocument doc, XmlNode parent, object other)
++		{
++			this.document = doc;
++			if (group == null)
++				group = doc.CreateElement (GroupName, null);
++
++			Hashtable okeys = null;
++			if (other != null && ((XMLParameters) other).keys != null) {
++				okeys = ((XMLParameters) other).keys;
++			}
++
++			XmlNode node = null;
++			bool onull = (okeys == null);
++			if (keys != null) {
++				foreach (DictionaryEntry entry in keys) {
++					node = doc.CreateElement (Name, null);
++					group.AppendChild (node);
++					string key = (string) entry.Key;
++					XMLParameter parm = (XMLParameter) entry.Value;
++					AddAttribute (node, "name", parm.Name);
++
++					if (!onull && HasKey (key, okeys)) {
++						parm.CompareTo (document, node, okeys[key]);
++						counters.AddPartialToPartial (parm.Counters);
++						okeys.Remove (key);
++						counters.Present++;
++					} else {
++						AddAttribute (node, "presence", "missing");
++						counters.Missing++;
++					}
++				}
++			}
++
++			if (!onull && okeys.Count != 0) {
++				foreach (XMLParameter value in okeys.Values) {
++					node = doc.CreateElement (Name, null);
++					AddAttribute (node, "name", value.Name);
++					AddAttribute (node, "presence", "extra");
++					group.AppendChild (node);
++					counters.Extra++;
++				}
++			}
++
++			if (group.HasChildNodes)
++				parent.AppendChild (group);
++		}
++	}
++
+ 	class XMLProperties : XMLMember
+ 	{
+ 		Hashtable nameToMethod = new Hashtable ();
+@@ -1080,6 +1264,7 @@
+ 		protected override void LoadExtraData (string name, XmlNode node)
+ 		{
+ 			XmlNode orig = node;
++			node = node.FirstChild;
+ 			while (node != null) {
+ 				if (node != null && node.Name == "methods") {
+ 					XMLMethods m = new XMLMethods ();
+@@ -1146,7 +1331,8 @@
+ 				if (evt.eventTypes != null)
+ 					oetype = evt.eventTypes [name] as string;
+ 
+-				AddWarning (parent, "Event type is {0} and should be {1}", oetype, etype);
++				if (etype != oetype)
++					AddWarning (parent, "Event type is {0} and should be {1}", oetype, etype);
+ 			} finally {
+ 				AddCountersAttributes (parent);
+ 				copy.AddPartialToPartial (counters);
+@@ -1172,6 +1358,7 @@
+ 	class XMLMethods : XMLMember
+ 	{
+ 		Hashtable returnTypes;
++		Hashtable parameters;
+ 
+ 		protected override void LoadExtraData (string name, XmlNode node)
+ 		{
+@@ -1183,6 +1370,17 @@
+ 				returnTypes [name] = xatt.Value;
+ 			}
+ 
++			XmlNode parametersNode = node.SelectSingleNode ("parameters");
++			if (parametersNode != null) {
++				if (parameters == null)
++					parameters = new Hashtable ();
++
++				XMLParameters parms = new XMLParameters ();
++				parms.LoadData (parametersNode);
++
++				parameters[name] = parms;
++			}
++
+ 			base.LoadExtraData (name, node);
+ 		}
+ 
+@@ -1195,16 +1393,22 @@
+ 
+ 			try {
+ 				base.CompareToInner(name, parent, other);
+-				if (returnTypes == null)
+-					return;
++				XMLMethods methods = (XMLMethods) other;
++				if (returnTypes != null) {
++					string rtype = returnTypes[name] as string;
++					string ortype = null;
++					if (methods.returnTypes != null)
++						ortype = methods.returnTypes[name] as string;
+ 
+-				XMLMethods methods = (XMLMethods)other;
+-				string rtype = returnTypes[name] as string;
+-				string ortype = null;
+-				if (methods.returnTypes != null)
+-					ortype = methods.returnTypes[name] as string;
++					if (rtype != ortype)
++						AddWarning (parent, "Return type is {0} and should be {1}", ortype, rtype);
++				}
+ 
+-				AddWarning(parent, "Event type is {0} and should be {1}", ortype, rtype);
++				if (parameters != null) {
++					XMLParameters parms = parameters[name] as XMLParameters;
++					parms.CompareTo (document, parent, methods.parameters[name]);
++					counters.AddPartialToPartial (parms.Counters);
++				}
+ 			} finally {
+ 				// output counter attributes in result document
+ 				AddCountersAttributes(parent);
+@@ -1219,7 +1423,27 @@
+ 		protected override string ConvertToString (int att)
+ 		{
+ 			MethodAttributes ma = (MethodAttributes) att;
++			// ignore the HasSecurity attribute for now
++			if ((ma & MethodAttributes.HasSecurity) != 0)
++				ma = (MethodAttributes) (att - (int) MethodAttributes.HasSecurity);
++
++			// ignore the RequireSecObject attribute for now
++			if ((ma & MethodAttributes.RequireSecObject) != 0)
++				ma = (MethodAttributes) (att - (int) MethodAttributes.RequireSecObject);
++
++			// we don't care if the implementation is forwarded through PInvoke 
++			if ((ma & MethodAttributes.PinvokeImpl) != 0)
++				ma = (MethodAttributes) (att - (int) MethodAttributes.PinvokeImpl);
++
+ 			return ma.ToString ();
++		}
++
++		protected override  bool CheckAttributes {
++			get {
++				// FIXME: set this to true once bugs #60086 and 
++				// #60090 are fixed
++				return false;
++			}
+ 		}
+ 
+ 		public override string GroupName {
+Index: mono-api-info.cs
+===================================================================
+RCS file: /cvs/public/mcs/tools/corcompare/mono-api-info.cs,v
+retrieving revision 1.12
+diff -u -r1.12 mono-api-info.cs
+--- mono-api-info.cs	11 Jun 2004 12:37:23 -0000	1.12
++++ mono-api-info.cs	12 Jun 2004 19:19:35 -0000
+@@ -9,6 +9,7 @@
+ 
+ using System;
+ using System.Collections;
++using System.Globalization;
+ using System.Reflection;
+ using System.Text;
+ using System.Xml;
+@@ -497,6 +498,26 @@
+ 			base.AddExtraData (p, member);
+ 			FieldInfo field = (FieldInfo) member;
+ 			AddAttribute (p, "fieldtype", field.FieldType.FullName);
++
++			if (field.IsLiteral) {
++				object value = field.GetValue (null);
++				string stringValue = null;
++				if (value is double) {
++					// FIXME: when Mono bug #60111 has been 
++					// fixed, we should convert a double 
++					// to a culture neutral string
++				} else if (value is Enum) {
++					// FIXME: when Mono bug #60090 has been
++					// fixed, we should just be able to use
++					// Convert.ToString
++					stringValue = ((Enum) value).ToString ("D", CultureInfo.InvariantCulture);
++				} else {
++					stringValue = Convert.ToString (value, CultureInfo.InvariantCulture);
++				}
++
++				if (stringValue != null)
++					AddAttribute (p, "value", stringValue);
++			}
+ 		}
+ 
+ 		public override string ParentTag {
+@@ -627,11 +648,19 @@
+ 		protected override void AddExtraData (XmlNode p, MemberInfo member)
+ 		{
+ 			base.AddExtraData (p, member);
++
++			ParameterData parms = new ParameterData (document, p, 
++				((MethodBase) member).GetParameters ());
++			parms.DoOutput ();
++
+ 			if (!(member is MethodInfo))
+ 				return;
+-				
++
+ 			MethodInfo method = (MethodInfo) member;
+ 			AddAttribute (p, "returntype", method.ReturnType.FullName);
++
++			AttributeData.OutputAttributes (document, p,
++				method.ReturnTypeCustomAttributes.GetCustomAttributes (false));
+ 		}
+ 
+ 		public override bool NoMemberAttributes {
+@@ -664,14 +693,66 @@
+ 		}
+ 	}
+ 
++	class ParameterData : BaseData
++	{
++		private ParameterInfo[] parameters;
++
++		public ParameterData (XmlDocument document, XmlNode parent, ParameterInfo[] parameters)
++			: base (document, parent)
++		{
++			this.parameters = parameters;
++		}
++
++		public override void DoOutput ()
++		{
++			XmlNode parametersNode = document.CreateElement ("parameters", null);
++			parent.AppendChild (parametersNode);
++
++			foreach (ParameterInfo parameter in parameters) {
++				XmlNode paramNode = document.CreateElement ("parameter", null);
++				parametersNode.AppendChild (paramNode);
++				AddAttribute (paramNode, "name", parameter.Name);
++				AddAttribute (paramNode, "position", parameter.Position.ToString());
++				AddAttribute (paramNode, "attrib", parameter.Attributes.ToString());
++
++				string direction = "in";
++
++				if (parameter.ParameterType.IsByRef) {
++					direction = parameter.IsOut ? "out" : "ref";
++				}
++
++				Type t = parameter.ParameterType;
++				AddAttribute (paramNode, "type", t.FullName);
++
++				if (parameter.IsOptional) {
++					AddAttribute (paramNode, "optional", "true");
++					if (parameter.DefaultValue != null)
++						AddAttribute (paramNode, "defaultValue", parameter.DefaultValue.ToString ());
++				}
++
++				if (direction != "in")
++					AddAttribute (paramNode, "direction", direction);
++
++				AttributeData.OutputAttributes (document, paramNode, parameter.GetCustomAttributes (false));
++			}
++		}
++	}
++
+ 	class AttributeData : BaseData
+ 	{
+ 		object [] atts;
++		string target;
+ 
+-		AttributeData (XmlDocument doc, XmlNode parent, object [] attributes)
++		AttributeData (XmlDocument doc, XmlNode parent, object[] attributes, string target)
+ 			: base (doc, parent)
+ 		{
+-			this.atts = attributes;
++			atts = attributes;
++			this.target = target;
++		}
++
++		AttributeData (XmlDocument doc, XmlNode parent, object [] attributes)
++			: this (doc, parent, attributes, null)
++		{
+ 		}
+ 
+ 		public override void DoOutput ()
+@@ -682,8 +763,11 @@
+ 			if (atts == null || atts.Length == 0)
+ 				return;
+ 
+-			XmlNode natts = document.CreateElement ("attributes", null);
+-			parent.AppendChild (natts);
++			XmlNode natts = parent.SelectSingleNode("attributes");
++			if (natts == null) {
++				natts = document.CreateElement ("attributes", null);
++				parent.AppendChild (natts);
++			}
+ 
+ 			ArrayList typeList = new ArrayList (atts.Length);
+ 			string comment = null;
+@@ -704,6 +788,9 @@
+ 			foreach (Type t in types) {
+ 				XmlNode node = document.CreateElement ("attribute");
+ 				AddAttribute (node, "name", t.FullName);
++				if (target != null) {
++					AddAttribute (node, "target", target);
++				}
+ 				if (comment != null && t.Name.EndsWith ("TODOAttribute"))
+ 					AddAttribute (node, "comment", comment);
+ 
+@@ -711,9 +798,15 @@
+ 			}
+ 		}
+ 
+-		public static void OutputAttributes (XmlDocument doc, XmlNode parent, object [] attributes)
++		public static void OutputAttributes (XmlDocument doc, XmlNode parent, object[] attributes)
++		{
++			AttributeData ad = new AttributeData (doc, parent, attributes, null);
++			ad.DoOutput ();
++		}
++
++		public static void OutputAttributes (XmlDocument doc, XmlNode parent, object [] attributes, string target)
+ 		{
+-			AttributeData ad = new AttributeData (doc, parent, attributes);
++			AttributeData ad = new AttributeData (doc, parent, attributes, target);
+ 			ad.DoOutput ();
+ 		}
+ 

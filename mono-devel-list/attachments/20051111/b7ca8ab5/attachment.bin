@@ -1,0 +1,313 @@
+Index: System.Web.UI/ControlBuilder.cs
+===================================================================
+--- System.Web.UI/ControlBuilder.cs	(revision 52911)
++++ System.Web.UI/ControlBuilder.cs	(working copy)
+@@ -497,6 +497,19 @@
+ 		{
+ 			return CreateInstance ();
+ 		}
++
++		internal void ResetState()
++		{
++			haveParserVariable = false;
++
++			if (Children != null) {
++				foreach (object child in Children) {
++					ControlBuilder cb = child as ControlBuilder;
++					if (cb != null)
++						cb.ResetState ();
++				}
++			}
++		}
+ #endif
+ 	}
+ }
+Index: System.Web.UI/TemplateParser.cs
+===================================================================
+--- System.Web.UI/TemplateParser.cs	(revision 52911)
++++ System.Web.UI/TemplateParser.cs	(working copy)
+@@ -67,6 +67,10 @@
+ 		string oc_header, oc_custom, oc_param, oc_controls;
+ 		bool oc_shared;
+ 		OutputCacheLocation oc_location;
++#if NET_2_0
++		string src;
++		string partialClassName;
++#endif
+ 		Assembly srcAssembly;
+ 		int appAssemblyIndex = -1;
+                 
+@@ -421,21 +425,48 @@
+ 			language = GetString (atts, "Language", CompilationConfig.DefaultLanguage);
+ 			strictOn = GetBool (atts, "Strict", CompilationConfig.Strict);
+ 			explicitOn = GetBool (atts, "Explicit", CompilationConfig.Explicit);
++
++			string inherits = GetString (atts, "Inherits", null);
+ #if NET_2_0
+-			string src = GetString (atts, "CodeFile", null);
++			// In ASP 2, the source file is actually integrated with
++			// the generated file via the use of partial classes. This
++			// means that the code file has to be confirmed, but not
++			// used at this point.
++			src = GetString (atts, "CodeFile", null);
++
++			if (src != null && inherits != null) {
++				// Make sure the source exists
++				src = UrlUtils.Combine (BaseVirtualDir, src);
++				string realPath = MapPath (src, false);
++				if (!File.Exists (realPath))
++					ThrowParseException ("File " + src + " not found");
++
++				// Verify that the inherits is a valid identify not a
++				// fully-qualified name.
++				if (!CodeGenerator.IsValidLanguageIndependentIdentifier (inherits))
++					ThrowParseException (String.Format ("'{0}' is not valid for 'inherits'", inherits));
++
++				// We are going to create a partial class that shares
++				// the same name as the inherits tag, so reset the
++				// name. The base type is changed because it is the
++				// code file's responsibilty to extend the classes
++				// needed.
++				partialClassName = inherits;
++
++				// Add the code file as an option to the
++				// compiler. This lets both files be compiled at once.
++				compilerOptions += " " + realPath;
++			} else if (inherits != null) {
++				// We just set the inherits directly because this is a
++				// Single-Page model.
++				SetBaseType (inherits);
++			}
+ #else
+ 			string src = GetString (atts, "Src", null);
+-#endif
++
+ 			if (src != null)
+ 				srcAssembly = GetAssemblyFromSource (src);
+ 
+-			string inherits = GetString (atts, "Inherits", null);
+-#if NET_2_0
+-			if (srcAssembly == null)
+-				className = inherits;
+-			else
+-				SetBaseType (inherits);
+-#else
+ 			if (inherits != null)
+ 				SetBaseType (inherits);
+ 
+@@ -498,6 +529,18 @@
+ 			set { inputFile = value; }
+ 		}
+ 
++#if NET_2_0
++		internal bool IsPartial
++		{
++			get { return src != null; }
++		}
++
++		internal string PartialClassName
++		{
++			get { return partialClassName; }
++		}
++#endif
++
+ 		internal string Text
+ 		{
+ 			get { return text; }
+Index: System.Web.Compilation/CachingCompiler.cs
+===================================================================
+--- System.Web.Compilation/CachingCompiler.cs	(revision 52915)
++++ System.Web.Compilation/CachingCompiler.cs	(working copy)
+@@ -70,11 +70,18 @@
+ 			Cache cache = HttpRuntime.Cache;
+ 			string key = cachePrefix + compiler.Parser.InputFile;
+ 			CompilerResults results = (CompilerResults) cache [key];
++
++#if NET_2_0
++			if (!compiler.IsRebuildingPartial)
++#endif
+ 			if (results != null)
+ 				return results;
+ 
+ 			lock (compilationLock) {
+ 				results = (CompilerResults) cache [key];
++#if NET_2_0
++				if (!compiler.IsRebuildingPartial)
++#endif
+ 				if (results != null)
+ 					return results;
+ 
+Index: System.Web.Compilation/BaseCompiler.cs
+===================================================================
+--- System.Web.Compilation/BaseCompiler.cs	(revision 52915)
++++ System.Web.Compilation/BaseCompiler.cs	(working copy)
+@@ -42,12 +42,21 @@
+ {
+ 	abstract class BaseCompiler
+ 	{
++#if NET_2_0
++		static BindingFlags replaceableFlags = BindingFlags.Public | BindingFlags.NonPublic |
++						  BindingFlags.Instance;
++#endif
++
+ 		TemplateParser parser;
+ 		CodeDomProvider provider;
+ 		ICodeCompiler compiler;
+ 		CodeCompileUnit unit;
+ 		CodeNamespace mainNS;
+ 		CompilerParameters compilerParameters;
++#if NET_2_0
++		bool isRebuilding = false;
++		protected Hashtable partialNameOverride = new Hashtable();
++#endif
+ 		protected CodeTypeDeclaration mainClass;
+ 		protected CodeTypeReferenceExpression mainClassExpr;
+ 		protected static CodeThisReferenceExpression thisRef = new CodeThisReferenceExpression ();
+@@ -61,13 +70,25 @@
+ 		void Init ()
+ 		{
+ 			unit = new CodeCompileUnit ();
++#if NET_2_0
++			if (parser.IsPartial) {
++				mainNS = new CodeNamespace ();
++				mainClass = new CodeTypeDeclaration (parser.PartialClassName);
++				mainClass.IsPartial = true;	
++				mainClassExpr = new CodeTypeReferenceExpression (parser.PartialClassName);
++			} else {
++#endif
+ 			mainNS = new CodeNamespace ("ASP");
++			mainClass = new CodeTypeDeclaration (parser.ClassName);
++			mainClass.BaseTypes.Add (new CodeTypeReference (parser.BaseType.FullName));
++			mainClassExpr = new CodeTypeReferenceExpression ("ASP." + parser.ClassName);
++#if NET_2_0
++			}
++#endif
+ 			unit.Namespaces.Add (mainNS);
+-			mainClass = new CodeTypeDeclaration (parser.ClassName);
+ 			mainClass.TypeAttributes = TypeAttributes.Public;
+ 			mainNS.Types.Add (mainClass);
+-			mainClass.BaseTypes.Add (new CodeTypeReference (parser.BaseType.FullName));
+-			mainClassExpr = new CodeTypeReferenceExpression ("ASP." + parser.ClassName);
++
+ 			foreach (object o in parser.Imports) {
+ 				if (o is string)
+ 					mainNS.Imports.Add (new CodeNamespaceImport ((string) o));
+@@ -111,6 +132,11 @@
+ 				ctor.Statements.AddRange (localVars);
+ 
+ 			CodeTypeReferenceExpression r;
++#if NET_2_0
++			if (parser.IsPartial)
++				r = new CodeTypeReferenceExpression (mainClass.Name);
++			else
++#endif
+ 			r = new CodeTypeReferenceExpression (mainNS.Name + "." + mainClass.Name);
+ 			CodeFieldReferenceExpression intialized;
+ 			intialized = new CodeFieldReferenceExpression (r, "__intialized");
+@@ -337,9 +363,90 @@
+ 			}
+ 
+ 			results.TempFiles.Delete ();
+-			return assembly.GetType (mainClassExpr.Type.BaseType, true);
++			Type mainClassType = assembly.GetType (mainClassExpr.Type.BaseType, true);
++
++#if NET_2_0
++			if (parser.IsPartial) {
++				// With the partial classes, we need to make sure we
++				// don't have any methods that should have not been
++				// created (because they are accessible from the base
++				// types). We cannot do this normally because the
++				// codebehind file is actually a partial class and we
++				// have no way of identifying the partial class' base
++				// type until now.
++				if (!isRebuilding && CheckPartialBaseType (mainClassType)) {
++					isRebuilding = true;
++					parser.RootBuilder.ResetState ();
++					return GetCompiledType ();
++				}
++			}
++#endif
++
++			return mainClassType;
+ 		}
+ 
++#if NET_2_0
++		internal bool IsRebuildingPartial
++		{
++			get { return isRebuilding; }
++		}
++
++		internal bool CheckPartialBaseType (Type type)
++		{
++			// Get the base type. If we don't have any (bad thing), we
++			// don't need to replace ourselves. Also check for the
++			// core file, since that won't have any either.
++			Type baseType = type.BaseType;
++			if (baseType == null || baseType == typeof(System.Web.UI.Page))
++				return false;
++
++			bool rebuild = false;
++
++			if (CheckPartialBaseFields (type, baseType))
++				rebuild = true;
++
++			if (CheckPartialBaseProperties (type, baseType))
++				rebuild = true;
++
++			return rebuild;
++		}
++
++		internal bool CheckPartialBaseFields (Type type, Type baseType)
++		{
++			bool rebuild = false;
++
++			foreach (FieldInfo baseInfo in baseType.GetFields (replaceableFlags)) {
++				if (baseInfo.IsPrivate)
++					continue;
++
++				FieldInfo typeInfo = type.GetField (baseInfo.Name, replaceableFlags);
++
++				if (typeInfo != null && typeInfo.DeclaringType == type) {
++					partialNameOverride [typeInfo.Name] = true;
++					rebuild = true;
++				}
++			}
++
++			return rebuild;
++		}
++
++		internal bool CheckPartialBaseProperties (Type type, Type baseType)
++		{
++			bool rebuild = false;
++
++			foreach (PropertyInfo baseInfo in baseType.GetProperties ()) {
++				PropertyInfo typeInfo = type.GetProperty (baseInfo.Name);
++
++				if (typeInfo != null && typeInfo.DeclaringType == type) {
++					partialNameOverride [typeInfo.Name] = true;
++					rebuild = true;
++				}
++			}
++
++			return rebuild;
++		}
++#endif
++
+ 		internal CompilerParameters CompilerParameters {
+ 			get { return compilerParameters; }
+ 		}
+Index: System.Web.Compilation/TemplateControlCompiler.cs
+===================================================================
+--- System.Web.Compilation/TemplateControlCompiler.cs	(revision 52915)
++++ System.Web.Compilation/TemplateControlCompiler.cs	(working copy)
+@@ -77,6 +77,10 @@
+ 
+ 		void CreateField (ControlBuilder builder, bool check)
+ 		{
++#if NET_2_0
++			if (partialNameOverride [builder.ID] != null)
++				return;
++#endif
+ 			currentLocation = builder.location;
+ 			if (check && CheckBaseFieldOrProperty (builder.ID, builder.ControlType))
+ 				return; // The field or property already exists in a base class and is accesible.

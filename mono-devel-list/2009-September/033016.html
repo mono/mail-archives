@@ -1,0 +1,214 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH] Fix serialization of typed datasets
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Fix%20serialization%20of%20typed%20datasets&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="033027.html">
+   <LINK REL="Next"  HREF="033017.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH] Fix serialization of typed datasets</H1>
+    <B>John Lenz</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Fix%20serialization%20of%20typed%20datasets&In-Reply-To="
+       TITLE="[Mono-dev] [PATCH] Fix serialization of typed datasets">jlenz2 at math.uiuc.edu
+       </A><BR>
+    <I>Mon Sep 14 15:48:02 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="033027.html">[Mono-dev] mkbundle + app.config
+</A></li>
+        <LI>Next message: <A HREF="033017.html">[Mono-dev] [PATCH] Fix serialization of typed datasets
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33016">[ date ]</a>
+              <a href="thread.html#33016">[ thread ]</a>
+              <a href="subject.html#33016">[ subject ]</a>
+              <a href="author.html#33016">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>This patch allows typed datasets produced by Microsoft's xsd.exe to work
+correctly in mono.  With this patch, I can serialize or deserialize the
+classes in the mono runtime and even communicate over
+the network where for example the client is running on mono and the
+server is running on MS.NET.
+
+I have only tested the XML serialization, I have not tested the binary
+serialization.  Thus my patch makes no changes to the code paths
+for binary serialization, but I suspect it actually fixes bug #427769
+because of the added call to InitializeDerivedDataSet in the constructor.
+
+Since these functions are undocumented, here is how I found out how they
+should work:  I looked at the code produced by xsd.exe and mono's
+implementation of the DataSet class.  Several things did not make sense
+until I made the changes below.  All are really obvious if you see what
+the xsd.exe produced code is expecting.
+
+I also ran a test server on the MS.NET runtime and a test client in
+monodevelop on the mono runtime.  I stuck some breakpoints into the
+client using monodevelop to see what the serialization format looked like.
+
+Here are the changes:
+
+1) The GetSerializationData() function should only load the data, not
+the schema.  This function is called by the derived dataset constructor
+after it has loaded the schema.  So I moved the schema loading code out
+of GetSerializationData and into the constructor.
+
+2) We need to know the incoming serialization mode (Included or Excluded).
+This is serialized in the &quot;SchemaSerializationMode.DataSet&quot;, which I found
+using monodevelop to debug the client constructor.  Fix the
+DetermineSchemaSerializationMode function and add the parameter to the
+serialization code.
+
+3) Implement the DataSet(SerializationInfo, StreamingContext, bool)
+constructor.  Basically, if the schema is excluded we call
+InitializeDerivedDataSet to create it.  This is really weird and
+I have no idea why the derived class does not call it directly.
+But the xsd.exe generated code expects it is called from the
+constructor.  The InitializeDerivedDataSet
+function in the base class should do nothing, it is overridden in each
+typed dataset.
+
+Index: class/System.Data/System.Data/DataSet.cs
+===================================================================
+--- class/System.Data/System.Data/DataSet.cs	(revision 141910)
++++ class/System.Data/System.Data/DataSet.cs	(working copy)
+@@ -95,6 +95,17 @@
+  		protected DataSet (SerializationInfo info, StreamingContext context)
+  			: this ()
+  		{
++#if NET_2_0
++			if (IsBinarySerialized (info, context)) {
++				BinaryDeserialize (info);
++				return;
++			}
++#endif
++			string s = info.GetValue (&quot;XmlSchema&quot;, typeof (String)) as String;
++			XmlTextReader reader = new XmlTextReader (new StringReader (s));
++			ReadXmlSchema (reader);
++			reader.Close ();
++
+  			GetSerializationData (info, context);
+  		}
+
+@@ -1132,6 +1143,9 @@
+  		{
+  #if NET_2_0
+  			if (RemotingFormat == SerializationFormat.Xml) {
++
++				info.AddValue (&quot;SchemaSerializationMode.DataSet&quot;, this.SchemaSerializationMode);
++
+  #endif
+  				StringWriter sw = new StringWriter ();
+  				XmlTextWriter writer = new XmlTextWriter (sw);
+@@ -1155,19 +1169,8 @@
+  		#region Protected Methods
+  		protected void GetSerializationData (SerializationInfo info, StreamingContext context)
+  		{
+-#if NET_2_0
+-			if (IsBinarySerialized (info, context)) {
+-				BinaryDeserialize (info);
+-				return;
+-			}
+-#endif
+-			string s = info.GetValue (&quot;XmlSchema&quot;, typeof (String)) as String;
++			string s = info.GetValue (&quot;XmlDiffGram&quot;, typeof (String)) as String;
+  			XmlTextReader reader = new XmlTextReader (new StringReader (s));
+-			ReadXmlSchema (reader);
+-			reader.Close ();
+-
+-			s = info.GetValue (&quot;XmlDiffGram&quot;, typeof (String)) as String;
+-			reader = new XmlTextReader (new StringReader (s));
+  			ReadXml (reader, XmlReadMode.DiffGram);
+  			reader.Close ();
+  		}
+@@ -1547,10 +1550,26 @@
+  		private bool dataSetInitialized = true;
+  		public event EventHandler Initialized;
+
+-		[MonoTODO]
+  		protected DataSet (SerializationInfo info, StreamingContext context, bool constructSchema)
+-			: this (info, context)
++			: this ()
+  		{
++			if (DetermineSchemaSerializationMode (info, context) == SchemaSerializationMode.ExcludeSchema) {
++				InitializeDerivedDataSet ();
++			}
++
++			if (IsBinarySerialized (info, context)) {
++				BinaryDeserialize (info);
++				return;
++			}
++
++			if (constructSchema) {
++				string s = info.GetValue (&quot;XmlSchema&quot;, typeof (String)) as String;
++				XmlTextReader reader = new XmlTextReader (new StringReader (s));
++				ReadXmlSchema (reader);
++				reader.Close ();
++
++				GetSerializationData (info, context);
++			}
+  		}
+
+  		SerializationFormat remotingFormat = SerializationFormat.Xml;
+@@ -1751,10 +1770,8 @@
+  			OnDataSetInitialized (e);
+  		}
+
+-		[MonoTODO]
+  		protected virtual void InitializeDerivedDataSet ()
+  		{
+-			throw new NotImplementedException ();
+  		}
+
+  		protected SchemaSerializationMode DetermineSchemaSerializationMode (XmlReader reader)
+@@ -1764,6 +1781,13 @@
+
+  		protected SchemaSerializationMode DetermineSchemaSerializationMode (SerializationInfo info, StreamingContext context)
+  		{
++			SerializationInfoEnumerator e = info.GetEnumerator ();
++			while (e.MoveNext ()) {
++				if (e.Name == &quot;SchemaSerializationMode.DataSet&quot;) {
++					return (SchemaSerializationMode) e.Value;
++				}
++			}
++
+  			return SchemaSerializationMode.IncludeSchema;
+  		}
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="033027.html">[Mono-dev] mkbundle + app.config
+</A></li>
+	<LI>Next message: <A HREF="033017.html">[Mono-dev] [PATCH] Fix serialization of typed datasets
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#33016">[ date ]</a>
+              <a href="thread.html#33016">[ thread ]</a>
+              <a href="subject.html#33016">[ subject ]</a>
+              <a href="author.html#33016">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,245 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Again on alias analysis
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Again%20on%20alias%20analysis&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010588.html">
+   <LINK REL="Next"  HREF="010542.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Again on alias analysis</H1>
+    <B>Massimiliano Mantione</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Again%20on%20alias%20analysis&In-Reply-To="
+       TITLE="[Mono-devel-list] Again on alias analysis">massi at ximian.com
+       </A><BR>
+    <I>Fri Feb 18 11:30:06 EST 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010588.html">[Mono-devel-list] Re: [Mono-list] Re: Compiling debugger
+</A></li>
+        <LI>Next message: <A HREF="010542.html">[Mono-devel-list] Again on alias analysis
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10541">[ date ]</a>
+              <a href="thread.html#10541">[ thread ]</a>
+              <a href="subject.html#10541">[ subject ]</a>
+              <a href="author.html#10541">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+Hello,
+in my work on alias analysis, and I'm trying to make so that the
+alias gatherer can understand where aliases are stored.
+Since I have some doubt, here I describe what I'm doing, I'd
+then like JIT hackers to read this and point out anything wrong I
+say...
+
+For now I consider &quot;alias creation&quot; each instruction that
+takes the address of a local variable (method arguments are
+also local variables in this discussion).
+It's really easy to discover all those instructions in a method
+(they are explicitly flagged when they are created).
+On the other hand, I have some doubt in my understanding of
+*where* those addresses are stored or used, and what the alias
+propagator should do in each case.
+
+Therefore, I instrumented the alias gatherer with logging, and
+made it run with mono --compile-all mscorlib.dll.
+This discovers 2889 instructions that produce aliases.
+I then categorized them in the following ways (hey, not by hand,
+grep, wc and pipes have been my friends here!):
+
+[1] In 1151 cases, the address is passed to an outarg* (so
+    it is a parameter of a method call). This means that at
+    the next call instruction, the local can be used (read
+    and/or written).
+[2] In 458 cases, the address is under a MonoInst that is a
+    vcall. It should be the this argument of the method call.
+[3] Similarly, in 25 cases it is under a voidcallvirt[.ctor].
+[4] Likewise, in 22 cases the address is under a callvirt node
+    (which of course is then used in another instruction).
+[5] In 368 cases, the address is the inst_left of a memcpy.
+[6] In 248 cases, the address is the inst_left of a memset.
+[7] In 128 cases, the address is stored in a local variable.
+[8] In 406 cases, the address is used as an argument of an add,
+    where the other argument is a constant.
+    This usually means that the JIT is coding the access to a
+    field of the local variable whose address has been taken.
+[9] In 37 and 45 cases respectively, the address is used as the
+    inst_left of a stind.i4 or a stind.i, like this:
+    (stind.i4 (ldaddr local[4]) iconst[0])
+    (stind.i (ldaddr local[1]) iconst[157217352])
+    These instructions have the effect of storing to the local
+    whose address has been taken (the ldaddr looks redundant).
+[10] In one case, the address is used in a load instruction
+    (which in turn is used in a setret, but this doesn't matter):
+    (setret (ldind.i4 (ldaddr local[1])))
+    This has the effect of returning the value of the local, so
+    also in this case the ldaddr looks redundant.
+
+Now, how should alias analysis behave in all those cases?
+
+Cases [1] to [4] look fairly easy, because the alias seems short
+lived, it is &quot;consumed&quot; by the following call instruction.
+So it is easy to consider that call as an use/redefinition of
+the local variable, and be OK with that.
+The problem is that this is true only if the alias is *really*
+short lived.
+What I mean is that in principle the called method could store
+the pointer in a location that outlives the call.
+Since we do not perform any interprocedural analysis, we don't
+know if the called method does this or not.
+The problem is that if this happens, then any subsequent call to
+any method could use/redefine our local variable (to be picky,
+any use of any pointer of which we don't know exactly the value
+could do it).
+If I understand the standard correctly, this can happen only if
+the parameter of the called method were a pointer (int*), and it
+cannot happen if it is an argument passed by reference (ref int).
+So it is important being able to relate each method argument to
+its declaration in the called method's signature, to know if it
+is a pointer passed by value (int*, like in C, which is unsafe
+and we cannot really control), or a local passed by reference
+(ref int or int&amp;, which we know will be used only in the called
+method).
+To verify this, I have written a small test program (attached).
+In that program, it is evident that &quot;(outarg (ldaddr local[0]))&quot;
+is used both for &quot;int*&quot; and &quot;int&amp;&quot; parameters, so it is obvious
+that to distinguish them we must look at the call signature.
+By the way, all of this actually matters only for case [1].
+In cases [2] to [4], the &quot;parameter&quot; is the &quot;this&quot; of a method
+call, so we can simply assume that the value is used/written.
+
+I still have to look at how cases [5] and [6] work exactly, but
+my impression is that they do not generate any alias, they just
+change the local value overwriting its memory area.
+
+Case [7] is simple in principle, but problematic in practice
+(because without proper data flow analysis we cannot really know
+where the alias will be used).
+Since it is relatively rare (with respect to other cases), and
+since this seems the *only* case where the alias propagator
+should perform data flow analysis, in the beginning I'd propose
+to handle in conservatively, and just assume that the pointer is
+potentially everywhere, so any &quot;suspicious&quot; operation can affect
+that local variable.
+However, this should change in the future.
+Particularly, when we'll have the linear IR, I guess that many
+cases will become of this kind: we will not have instruction
+trees, so all the tree nodes will be virtual registers.
+Now, on the other hand, traversing a MonoInst tree is like
+performing a simple local data flow analysis, but this will be
+lost with the linear IR.
+To ease this problem, perhaps we could handle in a special way
+those virtual registers that happen to be defined and used only
+once (maybe recording explicitly those unique use and definition
+points in the virtual register data structure).
+Zoltan, as you are looking at this linear IR thing, do you have
+any comment?
+
+On case [8] I have a few doubts.
+First of all I'd like to know if the assumption that those cases
+correspond to field accesses is true.
+I have verified a few of them, and it seems so...
+Moreover mono_method_to_ir in fact translates field accesses that
+way (as displacements from the base value address, getting the
+offset from the metadata).
+If it were all like this, we could safely assume that those cases
+do not really generate aliasing (not until we want to take care of
+the value of struct fields individually).
+The point is that up to now we do not (yet) have the framework to
+track each field's value individually. In fact each field use seems
+just an operation to/from a calculated memory address.
+We can optimize the *calculation* of those addresses (SSAPRE
+already does it), but we still cannot assume anything on the
+values contained there.
+In any case, to analyze what happens when pointer arithmetic is
+related to field accesses, we should see where the result of the
+add is stored/used. We would then reconduct this analysis to the
+same categories we are examining now.
+The reason why I have doubts is that (like for method arguments)
+we do not really know if this pointer arithmetic is done to
+access a field, or instead because the code is playing with unsafe
+pointers.
+At least, we do not know it if we just look at the &quot;add&quot; instruction
+that applies the displacement. We could look at the MonoType of the
+local, and see if that displacement is &quot;compatible&quot; with the type
+declaration (it refers to a specific field). But this seems a bit
+tricky, and I wouldn't try it in the first development of the alias
+analyzer.
+In this first attempt, I would just consider struct types like if
+they were unstructured &quot;blobs&quot;, with no attempt to optimize the
+access to their contents. So, if pointer arithmetic is applied to
+the address of a struct type, I'd just ignore it. If, on the other
+hand, the address in the add operation pointed to a local with a
+primitive type (int, float...), I would consider it aliased like if
+there were an unsafe pointer, and handle the case conservatively.
+
+Last, in cases [9] and [10], I would just ignore the operation.
+Even if the address of a local is taken, it is used in such a way
+that no real aliasing can happen, so I think this should be safe.
+
+So, to sum it up, an alias can be used in the following ways:
+- Method argument (cases [1] to [6]). Here we should look at the
+  method signature, and relate the argument to its declaration in
+  the signature. There are two sub-cases:
+  - The argument is by reference, or is the &quot;this&quot;: the call then
+    is a use/redefinition of the argument, and we are set.
+  - The argument is a proper pointer: the local is then &quot;badly&quot;
+    aliased, and since we do not perform interprocedural analysis
+    we must be totally conservative.
+- Stored in a local (case [7]). Initially I would handle this
+  conservatively, and in the future do some data flow analysis to
+  propagate the alias to its uses.
+- Used in pointer arithmetic (case [8]). Again, two sub-cases:
+  - The local is a struct: initially do nothing, in the future
+    set up the infrastructure to track (and optimize) each field
+    access (and register allocation) individually.
+  - The local has a primitive type: consider it &quot;badly&quot; aliased
+    and be conservative.
+- Used in a way that does not matter (cases [9] and [10]): just
+  ignore them.
+- Used in yet another way, not described here: consider the local
+  &quot;badly&quot; aliased and be conservative (put some debugging log, and
+  think of how this could be handled in the future).
+
+As usual, congratulation of you made it this far, and comments
+are welcome!
+
+Ciao,
+  Massi
+
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: test-references.cs
+Type: text/x-csharp
+Size: 1057 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20050218/f4ec82d4/attachment.bin">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20050218/f4ec82d4/attachment.bin</A> 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010588.html">[Mono-devel-list] Re: [Mono-list] Re: Compiling debugger
+</A></li>
+	<LI>Next message: <A HREF="010542.html">[Mono-devel-list] Again on alias analysis
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10541">[ date ]</a>
+              <a href="thread.html#10541">[ thread ]</a>
+              <a href="subject.html#10541">[ subject ]</a>
+              <a href="author.html#10541">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

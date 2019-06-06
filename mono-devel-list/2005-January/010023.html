@@ -1,0 +1,166 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Performance issues with security permissions
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Performance%20issues%20with%20security%20permissions&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010020.html">
+   <LINK REL="Next"  HREF="010025.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Performance issues with security permissions</H1>
+    <B>Sebastien Pouliot</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Performance%20issues%20with%20security%20permissions&In-Reply-To="
+       TITLE="[Mono-devel-list] Performance issues with security permissions">sebastien at ximian.com
+       </A><BR>
+    <I>Tue Jan 25 14:16:39 EST 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010020.html">[Mono-devel-list] Large file upload, could use suggestions
+</A></li>
+        <LI>Next message: <A HREF="010025.html">[Mono-devel-list] Performance issues with security permissions
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10023">[ date ]</a>
+              <a href="thread.html#10023">[ thread ]</a>
+              <a href="subject.html#10023">[ subject ]</a>
+              <a href="author.html#10023">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+My updates to System.Environment are now in SVN. 
+You can see the changes at:
+<A HREF="http://svn.myrealbox.com/viewcvs/trunk/mcs/class/corlib/System/Environment.cs?rev=39498&amp;r1=37976&amp;r2=39498">http://svn.myrealbox.com/viewcvs/trunk/mcs/class/corlib/System/Environment.cs?rev=39498&amp;r1=37976&amp;r2=39498</A>
+
+Included here are some of the performance consideration used. Other
+considerations will follow in another email.
+
+Comments welcome!
+
+
+* Declarative security is not gonna hurt performance (at least if you're
+not using mono --security). So, as much as possible, declarative
+security has been used. E.g.
+
+	[EnvironmentPermission (SecurityAction.Demand,
+		Unrestricted=true)]
+	public static string[] GetLogicalDrives ()
+	{
+		return GetLogicalDrivesInternal ();
+	}
+
+* Sadly declarative security cannot be used everywhere. When security
+decisions requires information only available at runtime then imperative
+security must be used. E.g.
+
+	public static string GetEnvironmentVariable (string name)
+	{
+		new EnvironmentPermission
+		    (EnvironmentPermissionAccess.Read, name).Demand ();
+
+		return internalGetEnvironmentVariable (name);
+	}
+
+* However this results in creating a lot of permission objects with a
+very short lifetime (as Demand wont do anything useful without
+--security). From CodeAccessPermission.cs
+
+        public void Demand ()
+        {
+        	// note: here we're sure it's a CAS demand
+        	if (!SecurityManager.SecurityEnabled)
+        		return;
+        	...
+        }
+        
+* So the only thing creating the permission object does (without
+--security) is more memory allocations, additional garbage collection...
+All bad for Mono's performance. So the pattern was changed to something
+like:
+
+	public static string GetEnvironmentVariable (string name)
+	{
+		if (SecurityManager.SecurityEnabled) {
+			new EnvironmentPermission 
+			    (EnvironmentPermissionAccess.Read,
+			    name).Demand ();
+		}
+		return internalGetEnvironmentVariable (name);
+	}
+
+This avoid the creation of the permission objects and, if someone
+forgets to add the check, wouldn't affect security.
+
+
+* Now the property value for SecurityManager.SecurityEnabled reside in
+unmanaged code (so it can be used over there and so we can't reflect on
+the field to change its value). This means an internal call each time.
+
+To avoid this the JIT _could_ produce code to replace SystemManager.
+SecurityEnabled by false when --security isn't enabled. In this case the
+permission creation/demand would be treated as dead code (and possibly
+totally removed by optimizations).
+
+	??? is it worth it ???
+
+We could also replace SystemManager.SecurityEnabled by false when it's
+false. I.e. true can become false, but false can't become true.
+
+This is a little more &quot;funky&quot; but it's a behavior of the MS runtime (at
+least for 1.0 and 1.1, didn't try with 2.0) that I didn't understand
+before today (not that I really tried to ;-).
+
+        Short story: the MS runtime defaults SystemManager.
+        SecurityEnabled to TRUE and you can switch it off anytime (if
+        you have the rights to do so). However the results are
+        &quot;undefined&quot; if you turn it back to TRUE.
+        
+
+* Another important thing to watch for is avoiding multiple demands (in
+sequence).
+
+        * A good example is not looping a call that does a security
+        check (e.g. GetEnvironmentVariables). However it's easy to
+        &quot;forget&quot; this (e.g. ExpandEnvironmentVariables) and may require
+        much more code refactoring.
+
+        * Another example is demanding a permission that is already
+        demanded by something else down the execution stack. This is why
+        Environment.CurrentDirectory doesn't check for PathDiscovery
+        permissions because System.IO.Directory already does the job.
+        
+        Note: IMHO we'll need some (hopefully automated) tools to
+        detects those kind of conditions.
+
+-- 
+Sebastien Pouliot  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">sebastien at ximian.com</A>&gt;
+blog: <A HREF="http://pages.infinit.net/ctech/poupou.html">http://pages.infinit.net/ctech/poupou.html</A>
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010020.html">[Mono-devel-list] Large file upload, could use suggestions
+</A></li>
+	<LI>Next message: <A HREF="010025.html">[Mono-devel-list] Performance issues with security permissions
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10023">[ date ]</a>
+              <a href="thread.html#10023">[ thread ]</a>
+              <a href="subject.html#10023">[ subject ]</a>
+              <a href="author.html#10023">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,356 @@
+from  Raja R Harinath  <rharinath@novell.com>
+
+	* expression.cs (BetterConversion): Don't allow either conversion 
+	to be null.  Remove redundant implicit conversion test when 'q == null'
+	-- when this function is invoked, we already know that the implicit 
+	conversion exists.
+	(BetterFunction): Assume that 'best' is non-null.  Remove redundant 
+	reimplementation of IsApplicable when 'best' is null.
+	(IsAncestralType): Extract from OverloadResolve.
+	(OverloadResolve): Make robust to the MethodGroupExpr being unsorted.
+	Clean up logic somewhat.  Don't pass null methods to BetterFunction.
+	
+
+Index: expression.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/expression.cs,v
+retrieving revision 1.596
+diff -u -u -r1.596 expression.cs
+--- expression.cs	29 Aug 2004 18:07:14 -0000	1.596
++++ expression.cs	1 Sep 2004 12:26:54 -0000
+@@ -4143,6 +4143,9 @@
+ 				throw new Exception ("Expression of type " + a.Expr +
+                                                      " does not resolve its type");
+ 
++			if (p == null || q == null)
++				throw new InternalErrorException ("BetterConversion Got a null conversion");
++
+ 			//
+ 			// This is a special case since csc behaves this way.
+ 			//
+@@ -4163,16 +4166,15 @@
+                         // I can't find this anywhere in the spec but we can interpret this
+                         // to mean that null can be of any type you wish in such a context
+                         //
+-                        if (p != null && q != null) {
+-                                if (argument_expr is NullLiteral &&
+-                                    !p.IsValueType &&
+-                                    q == TypeManager.object_type)
+-                                        return 1;
+-                                else if (argument_expr is NullLiteral &&
+-                                         !q.IsValueType &&
+-                                         p == TypeManager.object_type)
+-                                        return 0;
+-                        }
++			if (argument_expr is NullLiteral &&
++			    !p.IsValueType &&
++			    q == TypeManager.object_type)
++				return 1;
++			else if (argument_expr is NullLiteral &&
++				 !q.IsValueType &&
++				 p == TypeManager.object_type)
++				return 0;
++
+                                 
+ 			if (p == q)
+ 				return 0;
+@@ -4183,15 +4185,6 @@
+ 			if (argument_type == q)
+ 				return 0;
+ 
+-			if (q == null) {
+-				Expression tmp = Convert.ImplicitConversion (ec, argument_expr, p, loc);
+-				
+-				if (tmp != null)
+-					return 1;
+-				else
+-					return 0;
+-			}
+-
+ 			Expression p_tmp = new EmptyExpression (p);
+ 			Expression q_tmp = new EmptyExpression (q);
+ 			
+@@ -4235,12 +4228,10 @@
+ 					   Location loc)
+ 		{
+ 			ParameterData candidate_pd = GetParameterData (candidate);
+-			ParameterData best_pd;
+-			int argument_count;
++			ParameterData best_pd = GetParameterData (best);
++			int argument_count = 0;
+ 		
+-			if (args == null)
+-				argument_count = 0;
+-			else
++			if (args != null)
+ 				argument_count = args.Count;
+ 
+ 			int cand_count = candidate_pd.Count;
+@@ -4267,42 +4258,13 @@
+ 			// Trim (); is better than Trim (params char[] chars);
+                         //
+ 			if (cand_count == 0 && argument_count == 0)
+-				return best == null || best_params ? 1 : 0;
++				return best_params ? 1 : 0;
+ 
+ 			if ((candidate_pd.ParameterModifier (cand_count - 1) != Parameter.Modifier.PARAMS) &&
+ 			    (candidate_pd.ParameterModifier (cand_count - 1) != Parameter.Modifier.ARGLIST))
+ 				if (cand_count != argument_count)
+ 					return 0;
+ 
+-			if (best == null) {
+-				int x = 0;
+-
+-				if (argument_count == 0 && cand_count == 1 &&
+-				    candidate_pd.ParameterModifier (cand_count - 1) == Parameter.Modifier.PARAMS)
+-					return 1;
+-				
+-				for (int j = 0; j < argument_count; ++j) {
+-
+-					Argument a = (Argument) args [j];
+-					Type t = candidate_pd.ParameterType (j);
+-
+-					if (candidate_pd.ParameterModifier (j) == Parameter.Modifier.PARAMS)
+-						if (candidate_params)
+-							t = TypeManager.GetElementType (t);
+-
+-					x = BetterConversion (ec, a, t, null, loc);
+-					
+-					if (x <= 0)
+-						break;
+-				}
+-
+-				if (x > 0)
+-					return 1;
+-				else
+-					return 0;
+-			}
+-
+-			best_pd = GetParameterData (best);
+ 
+ 			int rating1 = 0, rating2 = 0;
+ 			
+@@ -4573,6 +4535,14 @@
+ 
+ 			return true;
+ 		}
++
++		static private bool IsAncestralType (Type candidate_type, Type applicable_type)
++		{
++			return applicable_type != candidate_type &&
++				(applicable_type.IsSubclassOf (candidate_type) ||
++				 TypeManager.ImplementsInterface (applicable_type, candidate_type));
++
++		}
+ 		
+ 		/// <summary>
+ 		///   Find the Applicable Function Members (7.4.2.1)
+@@ -4594,6 +4564,7 @@
+ 							  ArrayList Arguments, Location loc)
+ 		{
+ 			MethodBase method = null;
++			bool method_params = false;
+ 			Type applicable_type = null;
+ 			int argument_count;
+ 			ArrayList candidates = new ArrayList ();
+@@ -4608,21 +4579,15 @@
+                         Hashtable candidate_to_form = null;
+ 
+ 
+-                        //
+-                        // First we construct the set of applicable methods
+-                        //
+-                        // We start at the top of the type hierarchy and
+-                        // go down to find applicable methods
+-                        //
+-                        applicable_type = me.DeclaringType;
+-                        
+-                        if (me.Name == "Invoke" && TypeManager.IsDelegateType (applicable_type)) {
++                        if (me.Name == "Invoke" && TypeManager.IsDelegateType (me.DeclaringType)) {
+                                 Error_InvokeOnDelegate (loc);
+                                 return null;
+                         }
+ 
+-                        bool found_applicable = false;
+-
++                        //
++                        // First we construct the set of applicable methods
++                        //
++			bool is_sorted = true;
+ 			foreach (MethodBase candidate in me.Methods){
+                                 Type decl_type = candidate.DeclaringType;
+ 
+@@ -4630,64 +4595,93 @@
+                                 // If we have already found an applicable method
+                                 // we eliminate all base types (Section 14.5.5.1)
+                                 //
+-                                if (decl_type != applicable_type &&
+-                                    (applicable_type.IsSubclassOf (decl_type) ||
+-                                     TypeManager.ImplementsInterface (applicable_type, decl_type)) &&
+-                                    found_applicable)
+-                                                continue;
+-
++                                if (applicable_type != null && IsAncestralType (decl_type, applicable_type))
++					continue;
+ 
++				//
+ 				// Check if candidate is applicable (section 14.4.2.1)
+-				if (IsApplicable (ec, Arguments, candidate)) {
+-                                        // Candidate is applicable in normal form
+-                                        candidates.Add (candidate);
+-                                        applicable_type = candidate.DeclaringType;
+-                                        found_applicable = true;
+-                                } else if (IsParamsMethodApplicable (ec, Arguments, candidate, false)) {
++				//   Is candidate applicable in normal form?
++				//
++				bool is_applicable = IsApplicable (ec, Arguments, candidate);
++
++				if (!is_applicable &&
++				    (IsParamsMethodApplicable (ec, Arguments, candidate, false) ||
++				     IsParamsMethodApplicable (ec, Arguments, candidate, true))) {
+ 					if (candidate_to_form == null)
+ 						candidate_to_form = new PtrHashtable ();
+-					
+-					// Candidate is applicable in expanded form
+-					candidates.Add (candidate);
+-					applicable_type = candidate.DeclaringType;
+-					found_applicable = true; 
+ 					candidate_to_form [candidate] = candidate;
+-                                } else if (IsParamsMethodApplicable (ec, Arguments, candidate, true)) {
+-					if (candidate_to_form == null)
+-						candidate_to_form = new PtrHashtable ();
+-					
+ 					// Candidate is applicable in expanded form
+-					candidates.Add (candidate);
+-					applicable_type = candidate.DeclaringType;
+-					found_applicable = true; 
+-					candidate_to_form [candidate] = candidate;
++					is_applicable = true;
++				}
++
++				if (!is_applicable)
++					continue;
++
++				candidates.Add (candidate);
++				is_sorted = is_sorted && (applicable_type == null || applicable_type == decl_type);
++				applicable_type = decl_type;
++			}
++
++			int candidate_top = candidates.Count;
++			if (applicable_type != null && !is_sorted) {
++				//
++				// At this point, applicable_type is _one_ of the most derived types
++				// in the set of types containing the methods in this MethodGroup.
++
++				// We'll try to complete Section 14.5.5.1 for 'applicable_type' by
++				// eliminating all it's base types
++				//
++
++				int j = 0;
++				bool non_ancestors_found = false;
++				for (int i = 0; i < candidate_top; ++i) {
++					Type decl_type = ((MethodBase) candidates[i]).DeclaringType;
++					if (IsAncestralType (decl_type, applicable_type))
++                                                continue;
++					non_ancestors_found = non_ancestors_found || (decl_type != applicable_type);
++					candidates[j++] = candidates[i];
++				}
++				candidate_top = j;
++
++				if (non_ancestors_found) {
++					//
++					// Uh oh... there are other type hierarchies.
++					// FIXME: Do something about this :-) For now, ignore the issue.
++					//
++					Report.Warning (-28, loc, "Unsupported case: MethodGroupExpr '{0}' has candidates from types other than {1}",
++							me.Name, applicable_type);
++					for (int i = 0; i < candidate_top; ++i) {
++						MethodBase m = (MethodBase) candidates[i];
++						Type decl_type = m.DeclaringType;
++						if (applicable_type != decl_type)
++							Report.Warning (-28, "  from {0}: {1}", decl_type, m);
++					}
+ 				}
+ 			}
+-                        
+ 
+                         //
+                         // Now we actually find the best method
+                         //
+-			int candidate_top = candidates.Count;
+-			for (int ix = 0; ix < candidate_top; ix++){
+-				MethodBase candidate = (MethodBase) candidates [ix];
+ 
+-                                bool cand_params = candidate_to_form != null && candidate_to_form.Contains (candidate);
+-                                bool method_params = false;
+-
+-                                if (method != null)
+-                                        method_params = candidate_to_form != null && candidate_to_form.Contains (method);
+-                                
+-                                int x = BetterFunction (ec, Arguments,
+-                                                        candidate, cand_params,
+-                                                        method, method_params,
+-                                                        loc);
++			if (candidate_top != 0) {
++				method = (MethodBase) candidates[0];
++				method_params = candidate_to_form != null && candidate_to_form.Contains (method);
++				for (int ix = 1; ix < candidate_top; ix++){
++					MethodBase candidate = (MethodBase) candidates [ix];
++					bool cand_params = candidate_to_form != null && candidate_to_form.Contains (candidate);
+                                 
+-                                if (x == 0)
+-                                        continue;
+-                                
+-                                method = candidate;
+-                        }
++					int x = BetterFunction (ec, Arguments,
++								candidate, cand_params,
++								method, method_params,
++								loc);
++					
++					if (x == 0)
++						continue;
++					
++					method = candidate;
++					method_params = cand_params;
++				}
++			}
+ 
+ 			if (Arguments == null)
+ 				argument_count = 0;
+@@ -4728,8 +4722,6 @@
+ 			// Now check that there are no ambiguities i.e the selected method
+ 			// should be better than all the others
+ 			//
+-                        bool best_params = candidate_to_form != null && candidate_to_form.Contains (method);
+-
+ 			for (int ix = 0; ix < candidate_top; ix++){
+ 				MethodBase candidate = (MethodBase) candidates [ix];
+ 
+@@ -4750,14 +4742,15 @@
+                                 
+                                 bool cand_params = candidate_to_form != null && candidate_to_form.Contains (candidate);
+ 				int x = BetterFunction (ec, Arguments,
+-                                                        method, best_params,
++                                                        method, method_params,
+                                                         candidate, cand_params,
+ 							loc);
+ 
+ 				if (x != 1) {
+  					Report.Error (
+  						121, loc,
+- 						"Ambiguous call when selecting function due to implicit casts");
++ 						"Ambiguous call when selecting function due to implicit casts:\n\t{0}::{1}\n\t{2}::{3}", 
++						method.DeclaringType, method, candidate.DeclaringType, candidate);
+ 					return null;
+  				}
+ 			}
+@@ -4769,7 +4762,7 @@
+ 			// all right
+ 			//
+                         if (!VerifyArgumentsCompat (ec, Arguments, argument_count, method,
+-                                                    best_params, null, loc))
++                                                    method_params, null, loc))
+ 				return null;
+ 
+ 			return method;

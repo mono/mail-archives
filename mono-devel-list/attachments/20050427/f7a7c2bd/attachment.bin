@@ -1,0 +1,114 @@
+Index: mini-exceptions.c
+===================================================================
+--- mini-exceptions.c	(revision 43647)
++++ mini-exceptions.c	(working copy)
+@@ -403,7 +403,7 @@
+ 		return FALSE;
+ 	}
+ 
+-	si->frame = mono_declsec_create_frame (domain, ji);
++	si->frame = mono_declsec_create_frame (domain, ji, TRUE);
+ 
+ 	/* Stop - we only want the first frame (e.g. LinkDemand and InheritanceDemand) */
+ 	return TRUE;
+@@ -469,7 +469,7 @@
+ 		return FALSE;
+ 	}
+ 
+-	ss->stack = g_list_prepend (ss->stack, mono_declsec_create_frame (domain, ji));
++	ss->stack = g_list_prepend (ss->stack, mono_declsec_create_frame (domain, ji, FALSE));
+ 
+ 	/* continue down the stack */
+ 	return FALSE;
+@@ -510,7 +510,7 @@
+ 	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+ 	MonoSecurityStack ss;
+ 	MonoContext ctx;
+-	MonoArray *stack;
++	MonoArray *stack = NULL;
+ 
+ #ifdef _MSC_VER
+ 	/* seems that MSC doesn't like having __asm in macros */
+@@ -527,9 +527,29 @@
+ 	ss.stack = NULL;
+ 	mono_walk_stack (domain, jit_tls, &ctx, callback_get_stack_frames_security_info, (gpointer)&ss);
+ 
+-	stack = glist_to_array (ss.stack, mono_defaults.runtimesecurityframe_class);
+-	if (ss.stack)
++	if (ss.stack) {
++		MonoDomain *domain = mono_domain_get ();
++		int len = g_list_length (ss.stack);
++		int i;
++
++		stack = mono_array_new (domain, mono_defaults.runtimesecurityframe_class, len);
++		for (i = 0; ss.stack; ss.stack = ss.stack->next, i++) {
++			MonoSecurityFrame *unmanaged = (MonoSecurityFrame*) ss.stack->data;
++			MonoSecurityFrame *managed = (MonoSecurityFrame*) mono_object_new (domain, mono_defaults.runtimesecurityframe_class);
++			mono_array_set (stack, gpointer, i, managed);
++
++			/* copy the unmanaged informations to the managed side */
++			managed->domain = unmanaged->domain;
++			managed->method = unmanaged->method;
++			memcpy (&managed->assert, &unmanaged->assert, sizeof (MonoDeclSecurityEntry));
++			memcpy (&managed->deny, &unmanaged->deny, sizeof (MonoDeclSecurityEntry));
++			memcpy (&managed->permitonly, &unmanaged->permitonly, sizeof (MonoDeclSecurityEntry));
++
++			g_free (unmanaged);
++		}
++
+ 		g_list_free (ss.stack);
++	}
+ 
+ 	return stack;
+ }
+Index: declsec.c
+===================================================================
+--- declsec.c	(revision 43647)
++++ declsec.c	(working copy)
+@@ -58,10 +58,15 @@
+ 
+ 
+ MonoSecurityFrame*
+-mono_declsec_create_frame (MonoDomain *domain, MonoJitInfo *jinfo)
++mono_declsec_create_frame (MonoDomain *domain, MonoJitInfo *jinfo, gboolean managed)
+ {
+-	MonoSecurityFrame *frame = (MonoSecurityFrame*) mono_object_new (domain, mono_defaults.runtimesecurityframe_class);
++	MonoSecurityFrame *frame = NULL;
+ 
++	if (managed)
++		frame = (MonoSecurityFrame*) mono_object_new (domain, mono_defaults.runtimesecurityframe_class);
++	else
++		frame = (MonoSecurityFrame*) g_new0 (MonoSecurityFrame, 1);
++
+ 	if (!jinfo->cas_inited) {
+ 		if (mono_method_has_declsec (jinfo->method)) {
+ 			/* Cache the stack modifiers into the MonoJitInfo structure to speed up future stack walks */
+@@ -71,6 +76,7 @@
+ 	}
+ 
+ 	frame->method = mono_method_get_object (domain, jinfo->method, NULL);
++	frame->domain = domain->domain;
+ 
+ 	/* stack modifiers on methods have priority on (i.e. replaces) modifiers on class */
+ 
+Index: declsec.h
+===================================================================
+--- declsec.h	(revision 43647)
++++ declsec.h	(working copy)
+@@ -31,6 +31,7 @@
+ /* keep in synch with RuntimeSecurityFrame in /mcs/class/corlib/System.Security/SecurityFrame.cs */
+ typedef struct {
+ 	MonoObject obj;
++	MonoAppDomain *domain;
+ 	MonoReflectionMethod *method;
+ 	MonoDeclSecurityEntry assert;
+ 	MonoDeclSecurityEntry deny;
+@@ -56,7 +57,7 @@
+ /* Prototypes */
+ MonoBoolean mono_method_has_declsec (MonoMethod *method);
+ void mono_declsec_cache_stack_modifiers (MonoJitInfo *jinfo);
+-MonoSecurityFrame* mono_declsec_create_frame (MonoDomain *domain, MonoJitInfo *jinfo);
++MonoSecurityFrame* mono_declsec_create_frame (MonoDomain *domain, MonoJitInfo *jinfo, gboolean managed);
+ 
+ guint32 mono_declsec_linkdemand (MonoDomain *domain, MonoMethod *caller, MonoMethod *callee);
+ 

@@ -1,0 +1,347 @@
+Index: System/ChangeLog
+===================================================================
+--- System/ChangeLog	(revision 65765)
++++ System/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2006-09-22  Jonathan Chambers  <joncham@gmail.com>
++
++	* __ComObject.cs: Respect ExtensibleClassFactory.RegisterObjectCreationCallback
++	and cleanup the file.
++	
+ 2006-09-19 Gonzalo Paniagua Javier <gonzalo@ximian.com>
+ 
+ 	* ConsoleDriver.cs:
+Index: System/__ComObject.cs
+===================================================================
+--- System/__ComObject.cs	(revision 65765)
++++ System/__ComObject.cs	(working copy)
+@@ -52,6 +52,7 @@
+ 
+ 	internal class __ComObject : MarshalByRefObject
+ 	{
++		#region Fields
+ 		#region Sync with object-internals.h
+ 		IntPtr hash_table;
+ 		#endregion
+@@ -59,80 +60,48 @@
+ 		// this is used internally and for the the methods
+ 		// Marshal.GetComObjectData and Marshal.SetComObjectData
+ 		Hashtable hashtable;
++		static readonly int E_FAIL = -2147467259;
+ 
+ 		[ThreadStatic]
+ 		static bool coinitialized;
+ 
+-		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+-		internal extern void Finalizer ();
++		#endregion Fields
+ 
+-		~__ComObject ()
++		#region Constructors
++
++		internal __ComObject ()
+ 		{
+-			ComInteropProxy.ReleaseComObject (this);
+-			Finalizer ();
++			Init (GetType (), IntPtr.Zero);
+ 		}
+ 
+-		public __ComObject ()
++		internal __ComObject (Type t)
+ 		{
+-			// call CoInitialize once per thread
+-			if (!coinitialized) {
+-				CoInitialize (IntPtr.Zero);
+-				coinitialized = true;
+-			}
+-
+-			hashtable = new Hashtable ();
+-
+-			IntPtr ppv;
+-			Type t = GetType ();
+-			int hr = CoCreateInstance (GetCLSID (t), IntPtr.Zero, 0x1 | 0x4 | 0x10, IID_IUnknown, out ppv);
+-			Marshal.ThrowExceptionForHR (hr);
+-
+-			SetIUnknown (ppv);
++			Init (t, IntPtr.Zero);
+ 		}
+ 
+-		internal __ComObject (Type t)
++		internal __ComObject (IntPtr pItf)
+ 		{
+-			// call CoInitialize once per thread
+-			if (!coinitialized) {
+-				CoInitialize (IntPtr.Zero);
+-				coinitialized = true;
+-			}
++			Init (GetType (), pItf);
++		}
+ 
+-			hashtable = new Hashtable ();
++		#endregion Constructors
+ 
+-			IntPtr ppv;
+-			int hr = CoCreateInstance (GetCLSID (t), IntPtr.Zero, 0x1 | 0x4 | 0x10, IID_IUnknown, out ppv);
+-			Marshal.ThrowExceptionForHR (hr);
++		#region Finalizer
+ 
+-			SetIUnknown (ppv);
++		~__ComObject ()
++		{
++			ComInteropProxy.ReleaseComObject (this);
++			Finalizer ();
+ 		}
+ 
+-		private Guid GetCLSID (Type t)
+-		{
+-			if (t.IsImport)
+-				return t.GUID;
++		[MethodImplAttribute (MethodImplOptions.InternalCall)]
++		internal extern void Finalizer ();
+ 
+-			// look at supertypes
+-			Type super = t.BaseType;
+-			while (super != typeof (object)) {
+-				if (super.IsImport)
+-					return super.GUID;
+-				super = super.BaseType;
+-			}
+-			throw new COMException ("Could not find base COM type for type " + t.ToString());
+-		}
++		#endregion Finalizer
+ 
+-		internal __ComObject (IntPtr pItf)
+-		{
+-			hashtable = new Hashtable ();
+-			IntPtr ppv;
+-			Guid iid = IID_IUnknown;
+-			int hr = Marshal.QueryInterface (pItf, ref iid, out ppv);
+-			Marshal.ThrowExceptionForHR (hr);
+-			SetIUnknown (ppv);
+-        }
++		#region Internal Methods and Properties
+ 
+-		public Hashtable Hashtable
++		internal Hashtable Hashtable
+ 		{
+ 			get
+ 			{
+@@ -140,22 +109,7 @@
+ 			}
+ 		}
+ 
+-		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+-		internal static extern __ComObject CreateRCW (Type t);
+-
+-		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+-		extern void SetIUnknown (IntPtr t);
+-
+-		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+-		extern IntPtr GetIUnknown ();
+-
+-		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+-		extern IntPtr FindInterface (Type t);
+-
+-		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+-		extern void CacheInterface (Type t, IntPtr pItf);
+-
+-		internal IntPtr GetInterface(Type t)
++		internal IntPtr GetInterface (Type t)
+ 		{
+ 			// this is needed later and checks to see if we are
+ 			// a valid RCW
+@@ -177,7 +131,7 @@
+ 		{
+ 			get
+ 			{
+-				IntPtr pUnk = GetIUnknown();
++				IntPtr pUnk = GetIUnknown ();
+ 				if (pUnk == IntPtr.Zero)
+ 					throw new InvalidComObjectException ("COM object that has been separated from its underlying RCW cannot be used.");
+ 				return pUnk;
+@@ -199,7 +153,7 @@
+ 		{
+ 			get
+ 			{
+-				return new Guid("00000000-0000-0000-C000-000000000046");
++				return new Guid ("00000000-0000-0000-C000-000000000046");
+ 			}
+ 		}
+ 
+@@ -211,11 +165,76 @@
+ 			}
+ 		}
+ 
+-		[Guid ("00020400-0000-0000-C000-000000000046")]
+-		internal interface IDispatchMono
++		#endregion Internal Methods and Properties
++
++		#region Private Helpers
++
++		private void Init (Type t, IntPtr pUnk)
+ 		{
++			// call CoInitialize once per thread
++			if (!coinitialized) {
++				CoInitialize (IntPtr.Zero);
++				coinitialized = true;
++			}
++
++			hashtable = new Hashtable ();
++
++			if (pUnk == IntPtr.Zero) {
++				ObjectCreationDelegate creation_del = ExtensibleClassFactory.GetObjectCreationCallback (t);
++				if (creation_del != null) {
++					// should pass interface pointer to 'this' rather than IntPtr.Zero
++					ppv = creation_del (IntPtr.Zero);
++					if (ppv == IntPtr.Zero)
++						Marshal.ThrowExceptionForHR (E_FAIL);
++				}
++				else {
++					int hr = CoCreateInstance (GetCLSID (t), IntPtr.Zero, 0x1 | 0x4 | 0x10, IID_IUnknown, out ppv);
++					Marshal.ThrowExceptionForHR (hr);
++				}
++			}
++			else {
++				Guid iid = IID_IUnknown;
++				int hr = Marshal.QueryInterface (pUnk, ref iid, out ppv);
++				Marshal.ThrowExceptionForHR (hr);
++			}
++
++			SetIUnknown (ppv);
+ 		}
+ 
++		private Guid GetCLSID (Type t)
++		{
++			if (t.IsImport)
++				return t.GUID;
++
++			// look at supertypes
++			Type super = t.BaseType;
++			while (super != typeof (object)) {
++				if (super.IsImport)
++					return super.GUID;
++				super = super.BaseType;
++			}
++			throw new COMException ("Could not find base COM type for type " + t.ToString ());
++		}
++
++		[MethodImplAttribute (MethodImplOptions.InternalCall)]
++		internal static extern __ComObject CreateRCW (Type t);
++
++		[MethodImplAttribute (MethodImplOptions.InternalCall)]
++		extern void SetIUnknown (IntPtr t);
++
++		[MethodImplAttribute (MethodImplOptions.InternalCall)]
++		extern IntPtr GetIUnknown ();
++
++		[MethodImplAttribute (MethodImplOptions.InternalCall)]
++		extern IntPtr FindInterface (Type t);
++
++		[MethodImplAttribute (MethodImplOptions.InternalCall)]
++		extern void CacheInterface (Type t, IntPtr pItf);
++
++		#endregion Private Helpers
++
++		#region Object Overrides
++
+ 		public override bool Equals (object obj)
+ 		{
+ 			if (obj == null)
+@@ -234,7 +253,11 @@
+ 			// but IUnknown is identity in COM
+ 			return IUnknown.ToInt32 ();
+ 		}
++		
++		#endregion Object Overrides
+ 
++		#region Platform Invokes
++
+ 		[DllImport ("ole32.dll", CallingConvention = CallingConvention.StdCall)]
+ 		static extern int CoInitialize (IntPtr pvReserved);
+ 
+@@ -244,6 +267,17 @@
+ 		   IntPtr pUnkOuter,
+ 		   uint dwClsContext,
+ 		  [In, MarshalAs (UnmanagedType.LPStruct)] Guid riid,
+-			out IntPtr pUnk);
++		   out IntPtr pUnk);
++
++		#endregion Platform Invokes
++
++		#region Internal Interfaces
++
++		[Guid ("00020400-0000-0000-C000-000000000046")]
++		internal interface IDispatchMono
++		{
++		}
++
++		#endregion Internal Interfaces
+ 	}
+ }
+Index: System.Runtime.InteropServices/ExtensibleClassFactory.cs
+===================================================================
+--- System.Runtime.InteropServices/ExtensibleClassFactory.cs	(revision 65765)
++++ System.Runtime.InteropServices/ExtensibleClassFactory.cs	(working copy)
+@@ -3,10 +3,12 @@
+ //
+ // Author:
+ //   Andreas Nahr (ClassDevelopment@A-SoftTech.com)
++//   Jonathan Chambers (joncham@gmail.com)
+ //
+ 
+ //
+ // Copyright (C) 2004 Novell, Inc (http://www.novell.com)
++// Copyright (C) 2006 Jonathan Chambers
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining
+ // a copy of this software and associated documentation files (the
+@@ -28,18 +30,35 @@
+ // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ //
+ 
++using System.Diagnostics;
++using System.Threading;
++using System.Collections;
++
+ namespace System.Runtime.InteropServices
+ {
+ 	public sealed class ExtensibleClassFactory
+ 	{
++		static Hashtable hashtable;
++
++		static ExtensibleClassFactory ()
++		{
++			hashtable = new Hashtable ();
++		}
++
+ 		private ExtensibleClassFactory ()
+ 		{
+ 		}
+ 
+-		[MonoTODO ("implement")]
++		internal static ObjectCreationDelegate GetObjectCreationCallback (Type t)
++		{
++			return hashtable[t] as ObjectCreationDelegate;
++		}
++
+ 		public static void RegisterObjectCreationCallback (ObjectCreationDelegate callback)
+ 		{
+-			throw new NotImplementedException ();
++			StackTrace trace = new StackTrace (Thread.CurrentThread, false);
++			StackFrame frame = trace.GetFrame (0);
++			hashtable.Add (frame.GetMethod ().DeclaringType, callback);
+ 		}
+ 	}
+ }
+Index: System.Runtime.InteropServices/ChangeLog
+===================================================================
+--- System.Runtime.InteropServices/ChangeLog	(revision 65765)
++++ System.Runtime.InteropServices/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-09-22  Jonathan Chambers  <joncham@gmail.com>
++
++	* ExtensibleClassFactory.cs: Implement RegisterObjectCreationCallback.
++	
+ 2006-08-31 Robert Jordan  <robertj@gmx.net>
+ 
+ 	* Marshal.cs: Replaced the *Auto internal calls with managed

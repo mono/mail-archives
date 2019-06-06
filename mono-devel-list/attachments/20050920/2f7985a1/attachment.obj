@@ -1,0 +1,227 @@
+Index: System.Data.Common/Key.cs
+===================================================================
+--- System.Data.Common/Key.cs	(revision 50281)
++++ System.Data.Common/Key.cs	(working copy)
+@@ -114,6 +114,11 @@
+ 			}
+ 		}
+ 
++		internal bool HasFilter
++		{
++			get { return _filter != null; }
++		}
++
+ 		#endregion // Properties
+ 
+ 		#region Methods
+@@ -146,8 +151,16 @@
+ 			if (index < 0)
+ 				return index;
+ 
++			return CanContain (index) ? index : -1;
++		}
++
++		internal bool CanContain (int index)
++		{
++			if (_filter == null)
++				return true;
++
+ 			_tmpRow._current = index;
+-			return _filter.EvalBoolean(_tmpRow) ? index : -1;
++			return _filter.EvalBoolean(_tmpRow);
+ 		}
+ 
+ 		internal static int GetRecord(DataRow row, DataViewRowState rowStateFilter)
+@@ -193,8 +206,12 @@
+ 				return false;
+ 			}
+ 
+-			if (_filter != filter)
+-				return false;
++			if (_filter != null) {
++				if (!_filter.Equals (filter))
++					return false;
++			}
++			else if (filter != null)
++					return false;
+ 
+ 			if (Columns.Length != columns.Length) {
+ 				return false;
+@@ -221,6 +238,14 @@
+ 			return true;
+ 		}
+ 
++		internal bool DependsOn (DataColumn column)
++		{
++			if (_filter == null)
++				return false;
++
++			return _filter.DependsOn (column);
++		}
++
+ 		#endregion // Methods
+ 	}
+ }
+Index: System.Data.Common/ChangeLog
+===================================================================
+--- System.Data.Common/ChangeLog	(revision 50281)
++++ System.Data.Common/ChangeLog	(working copy)
+@@ -1,3 +1,11 @@
++2005-09-20 Boris Kirzner <borisk@mainsoft.com>
++	* Index.cs: 
++		- Rebuild index immediately after construction.
++		- Do not add records if they do not padd key filtration.
++	* Key.cs:
++		- Added HasFilter property, CanContain and DependsOn methods.
++		- Equals() uses filter expression comparison.		
++
+ 2005-09-07 Boris Kirzner <borisk@mainsoft.com>
+ 	* DataContainer.cs: Do not convert value if container type 
+ 	is System.Object.
+Index: System.Data.Common/Index.cs
+===================================================================
+--- System.Data.Common/Index.cs	(revision 50281)
++++ System.Data.Common/Index.cs	(working copy)
+@@ -57,6 +57,7 @@
+ 		{
+ 			_key = key;
+ 			Reset();
++			RebuildIndex ();
+ 		}
+ 
+ 		#endregion // Constructors
+@@ -476,6 +477,10 @@
+ 		private void Add(DataRow row,int newRecord)
+ 		{
+ 			int newIdx;
++
++			if (!Key.CanContain (newRecord))
++				return;
++
+ 			if (Size == 0) {
+ 				newIdx = 0;
+ 			}
+Index: System.Data/ChangeLog
+===================================================================
+--- System.Data/ChangeLog	(revision 50281)
++++ System.Data/ChangeLog	(working copy)
+@@ -1,3 +1,12 @@
++2005-09-20 Boris Kirzner <borisk@mainsoft.com>
++	* DataRow.cs: Fixes for index updating.
++	* DataTable.cs: 
++		- Reset case-sensitive indexes also if their filter contains columns 
++		of type string.
++		- Use GetIndex instead of FindIndex, so the indexes created in Select()
++		are reused. 
++	* RelatedDataView.cs: implement IExpression.Equals() and GetHashCode().
++
+ 2005-09-01 Boris Kirzner <borisk@mainsoft.com>
+ 	* System.Data/DataRowCollection.cs: indexes should be updated even if 
+ 	EnforceConstraints is false. Check for EnforceConstraints in
+Index: System.Data/DataRow.cs
+===================================================================
+--- System.Data/DataRow.cs	(revision 50281)
++++ System.Data/DataRow.cs	(working copy)
+@@ -640,6 +640,10 @@
+ 			if (HasVersion (DataRowVersion.Proposed)) {
+ 				Table.RecordCache.DisposeRecord(Proposed);
+ 				Proposed = -1;
++
++				int newVersion = (HasVersion (DataRowVersion.Current)) ? Current : Original;					
++				foreach(Index index in Table.Indexes)
++					index.Update(this,newVersion);					
+ 			}
+ 		}
+ 
+@@ -1299,7 +1303,13 @@
+ 				}
+ 				CheckChildRows(DataRowAction.Rollback);
+ 
+-				Current = Original;
++				if (Current != Original) {
++					foreach(Index index in Table.Indexes) {
++						index.Delete (this);
++						index.Update(this,Original);
++					}
++					Current = Original;
++				}
+ 			       
+ 				_table.ChangedDataRow (this, DataRowAction.Rollback);
+ 				CancelEdit ();
+Index: System.Data/DataTable.cs
+===================================================================
+--- System.Data/DataTable.cs	(revision 50281)
++++ System.Data/DataTable.cs	(working copy)
+@@ -1487,9 +1487,7 @@
+ 				filter = parser.Compile (filterExpression);
+ 			}
+ 
+-			Index index = FindIndex(columns, sorts, recordStates, filter);
+-			if (index == null)
+-				index = new Index(new Key(this,columns,sorts,recordStates,filter));
++			Index index = GetIndex(columns, sorts, recordStates, filter, false);
+ 
+ 			int[] records = index.GetAll();
+ 			DataRow[] dataRows = NewRowArray(index.Size);
+@@ -1570,6 +1568,13 @@
+ 					}
+ 				}
+ 
++				if (!containsStringcolumns && index.Key.HasFilter)
++					foreach (DataColumn column in Columns)
++						if ((column.DataType == DbTypes.TypeOfString) && (index.Key.DependsOn (column))) {
++						containsStringcolumns = true;
++						break;
++					}
++
+ 				if (containsStringcolumns) {
+ 					index.Reset();
+ 				}
+Index: System.Data/RelatedDataView.cs
+===================================================================
+--- System.Data/RelatedDataView.cs	(revision 50281)
++++ System.Data/RelatedDataView.cs	(working copy)
+@@ -48,6 +48,43 @@
+ 
+ 		#endregion // Methods
+ 
++		public override bool Equals(object obj)
++		{
++			if (!(obj is RelatedDataView)) {
++				if (base.FilterExpression == null)
++					return false;
++				return base.FilterExpression.Equals (obj);
++			}
++
++			RelatedDataView other = (RelatedDataView) obj;
++			if (_columns.Length != other._columns.Length)
++				return false;
++            
++			for (int i = 0; i < _columns.Length; i++)
++				if (!_columns[i].Equals(other._columns [i]) ||
++                    !_keyValues[i].Equals(other._keyValues [i]))
++					return false;
++			
++			if (!other.FilterExpression.Equals (base.FilterExpression))
++				return false;
++
++			return true;
++		}
++
++		public override int GetHashCode()
++		{
++			int hashCode = 0;
++			for (int i = 0; i < _columns.Length; i++) {
++				hashCode ^= _columns [i].GetHashCode ();
++				hashCode ^= _keyValues [i].GetHashCode ();
++			}
++
++			if (base.FilterExpression != null)
++				hashCode ^= base.FilterExpression.GetHashCode ();
++
++			return hashCode;
++		}
++
+ 		#region IExpression Members
+ 
+ 		public object Eval(DataRow row) {

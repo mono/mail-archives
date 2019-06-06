@@ -1,0 +1,225 @@
+Index: mini/ChangeLog
+===================================================================
+--- mini/ChangeLog	(revision 116185)
++++ mini/ChangeLog	(working copy)
+@@ -1,5 +1,11 @@
+ 2008-10-17  Mark Probst  <mark.probst@gmail.com>
+ 
++	* mini-x86.h, mini-x86.c, exceptions-x86.c: Align stack on all
++	platforms, with definable stack alignment value.  Set to 16 now
++	for all platforms.
++
++2008-10-17  Mark Probst  <mark.probst@gmail.com>
++
+ 	* method-to-ir.c (mono_method_to_ir2): "refanytype" produces a
+ 	RuntimeTypeHandle, not a TypedReference.
+ 
+Index: mini/mini-x86.c
+===================================================================
+--- mini/mini-x86.c	(revision 116184)
++++ mini/mini-x86.c	(working copy)
+@@ -464,12 +464,11 @@
+ 		add_general (&gr, &stack_size, &cinfo->sig_cookie);
+ 	}
+ 
+-#if defined(__APPLE__)
+-	if ((stack_size % 16) != 0) { 
++	if ((stack_size % MONO_ARCH_FRAME_ALIGNMENT) != 0) { 
+ 		cinfo->need_stack_align = TRUE;
+-		stack_size += cinfo->stack_align_amount = 16-(stack_size % 16);
++		cinfo->stack_align_amount = MONO_ARCH_FRAME_ALIGNMENT - (stack_size % MONO_ARCH_FRAME_ALIGNMENT);
++		stack_size += cinfo->stack_align_amount;
+ 	}
+-#endif
+ 
+ 	cinfo->stack_usage = stack_size;
+ 	cinfo->reg_usage = gr;
+@@ -529,7 +528,7 @@
+ 		offset += size;
+ 	}
+ 
+-	align = 4;
++	align = MONO_ARCH_FRAME_ALIGNMENT;
+ 	args_size += pad = (align - (args_size & (align - 1))) & (align - 1);
+ 	arg_info [k].pad = pad;
+ 
+@@ -1182,14 +1181,12 @@
+ 
+ 	call->stack_usage = cinfo->stack_usage;
+ 
+-#if defined(__APPLE__)
+ 	if (cinfo->need_stack_align) {
+ 		MONO_INST_NEW (cfg, arg, OP_X86_OUTARG_ALIGN_STACK);
+ 		arg->inst_c0 = cinfo->stack_align_amount;
+ 		arg->next = call->out_args;
+ 		call->out_args = arg;
+         }
+-#endif 
+ 
+ 	return call;
+ }
+@@ -1233,7 +1230,16 @@
+ 	if (!sig->pinvoke && (sig->call_convention == MONO_CALL_VARARG))
+ 		sentinelpos = sig->sentinelpos + (sig->hasthis ? 1 : 0);
+ 
+-#if defined(__APPLE__)
++	if (cfg->method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED ||
++			cfg->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE) {
++		int tmp = mono_alloc_ireg (cfg);
++
++		MONO_EMIT_NEW_UNALU (cfg, OP_MOVE, tmp, X86_ESP);
++		MONO_EMIT_NEW_BIALU_IMM (cfg, OP_AND_IMM, X86_ESP, X86_ESP, -MONO_ARCH_FRAME_ALIGNMENT);
++		MONO_EMIT_NEW_BIALU_IMM (cfg, OP_SUB_IMM, X86_ESP, X86_ESP, MONO_ARCH_FRAME_ALIGNMENT - 4);
++		MONO_EMIT_NEW_UNALU (cfg, OP_X86_PUSH, -1, tmp);
++	}
++
+ 	if (cinfo->need_stack_align) {
+ 		MONO_INST_NEW (cfg, arg, OP_SUB_IMM);
+ 		arg->dreg = X86_ESP;
+@@ -1241,7 +1247,6 @@
+ 		arg->inst_imm = cinfo->stack_align_amount;
+ 		MONO_ADD_INS (cfg->cbb, arg);
+ 	}
+-#endif 
+ 
+ 	if (sig->ret && MONO_TYPE_ISSTRUCT (sig->ret)) {
+ 		MonoInst *vtarg;
+@@ -1433,9 +1438,8 @@
+ {
+ 	guchar *code = p;
+ 
+-#if __APPLE__
+-	x86_alu_reg_imm (code, X86_SUB, X86_ESP, 8);
+-#endif
++	g_assert (MONO_ARCH_FRAME_ALIGNMENT >= 8);
++	x86_alu_reg_imm (code, X86_SUB, X86_ESP, MONO_ARCH_FRAME_ALIGNMENT - 8);
+ 
+ 	/* if some args are passed in registers, we need to save them here */
+ 	x86_push_reg (code, X86_EBP);
+@@ -1450,11 +1454,7 @@
+ 		mono_add_patch_info (cfg, code-cfg->native_code, MONO_PATCH_INFO_ABS, func);
+ 		x86_call_code (code, 0);
+ 	}
+-#if __APPLE__
+-	x86_alu_reg_imm (code, X86_ADD, X86_ESP, 16);
+-#else
+-	x86_alu_reg_imm (code, X86_ADD, X86_ESP, 8);
+-#endif
++	x86_alu_reg_imm (code, X86_ADD, X86_ESP, MONO_ARCH_FRAME_ALIGNMENT);
+ 
+ 	return code;
+ }
+@@ -2845,6 +2845,10 @@
+ 					x86_alu_reg_imm (code, X86_ADD, X86_ESP, call->stack_usage);
+ 				}
+ 			}
++			if (cfg->method->wrapper_type == MONO_WRAPPER_NATIVE_TO_MANAGED ||
++					cfg->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE) {
++				x86_pop_reg (code, X86_ESP);
++			}
+ 			code = emit_move_return_value (cfg, ins, code);
+ 			break;
+ 		case OP_FCALL_REG:
+@@ -2953,14 +2957,10 @@
+ 			break;
+ 		}
+ 		case OP_CALL_HANDLER:
+-#if __APPLE__
+-			x86_alu_reg_imm (code, X86_SUB, X86_ESP, 12);
+-#endif
++			x86_alu_reg_imm (code, X86_SUB, X86_ESP, MONO_ARCH_FRAME_ALIGNMENT - 4);
+ 			mono_add_patch_info (cfg, code - cfg->native_code, MONO_PATCH_INFO_BB, ins->inst_target_bb);
+ 			x86_call_imm (code, 0);
+-#ifdef __APPLE__
+-			x86_alu_reg_imm (code, X86_ADD, X86_ESP, 12);
+-#endif
++			x86_alu_reg_imm (code, X86_ADD, X86_ESP, MONO_ARCH_FRAME_ALIGNMENT - 4);
+ 			break;
+ 		case OP_START_HANDLER: {
+ 			MonoInst *spvar = mono_find_spvar_for_region (cfg, bb->region);
+@@ -4328,19 +4328,12 @@
+ 
+ 	alloc_size -= pos;
+ 
+-#if __APPLE__
+ 	/* the original alloc_size is already aligned: there is %ebp and retip pushed, so realign */
+ 	{
+ 		int tot = alloc_size + pos + 4 + 4; /* ret ip + ebp */
+-		if (tot & 4) {
+-			tot += 4;
+-			alloc_size += 4;
+-		}
+-		if (tot & 8) {
+-			alloc_size += 8;
+-		}
++		tot &= MONO_ARCH_FRAME_ALIGNMENT - 1;
++		alloc_size += MONO_ARCH_FRAME_ALIGNMENT - tot;
+ 	}
+-#endif
+ 
+ 	if (alloc_size) {
+ 		/* See mono_emit_stack_alloc */
+@@ -4358,13 +4351,15 @@
+ #endif
+ 	}
+ 
+-#if __APPLE__ && DEBUG_APPLE_ALIGNMENT
++#if DEBUG_STACK_ALIGNMENT
+ 	/* check the stack is aligned */
+-	x86_mov_reg_reg (code, X86_EDX, X86_ESP, 4);
+-	x86_alu_reg_imm (code, X86_AND, X86_EDX, 15);
+-	x86_alu_reg_imm (code, X86_CMP, X86_EDX, 0);
+-	x86_branch_disp (code, X86_CC_EQ, 3, FALSE);
+-	x86_breakpoint (code);
++	if (method->wrapper_type == MONO_WRAPPER_NONE) {
++		x86_mov_reg_reg (code, X86_ECX, X86_ESP, 4);
++		x86_alu_reg_imm (code, X86_AND, X86_ECX, MONO_ARCH_FRAME_ALIGNMENT - 1);
++		x86_alu_reg_imm (code, X86_CMP, X86_ECX, 0);
++		x86_branch_disp (code, X86_CC_EQ, 3, FALSE);
++		x86_breakpoint (code);
++	}
+ #endif
+ 
+         /* compute max_offset in order to use short forward jumps */
+Index: mini/mini-x86.h
+===================================================================
+--- mini/mini-x86.h	(revision 116184)
++++ mini/mini-x86.h	(working copy)
+@@ -111,12 +111,8 @@
+ #define MONO_ARCH_INST_IS_REGPAIR(desc) (desc == 'l' || desc == 'L')
+ #define MONO_ARCH_INST_REGPAIR_REG2(desc,hreg1) (desc == 'l' ? X86_EDX : -1)
+ 
+-#if __APPLE__
++/* must be at a power of 2 and >= 8 */
+ #define MONO_ARCH_FRAME_ALIGNMENT 16
+-#else
+-/* For storing doubles on the stack */
+-#define MONO_ARCH_FRAME_ALIGNMENT 8
+-#endif
+ 
+ /* fixme: align to 16byte instead of 32byte (we align to 32byte to get 
+  * reproduceable results for benchmarks */
+Index: mini/exceptions-x86.c
+===================================================================
+--- mini/exceptions-x86.c	(revision 116184)
++++ mini/exceptions-x86.c	(working copy)
+@@ -334,9 +334,19 @@
+ 	x86_mov_reg_membase (code, X86_ESI, X86_EAX,  G_STRUCT_OFFSET (MonoContext, esi), 4);
+ 	x86_mov_reg_membase (code, X86_EDI, X86_EAX,  G_STRUCT_OFFSET (MonoContext, edi), 4);
+ 
++	/* align stack and save ESP */
++	x86_mov_reg_reg (code, X86_EDX, X86_ESP, 4);
++	x86_alu_reg_imm (code, X86_AND, X86_ESP, -MONO_ARCH_FRAME_ALIGNMENT);
++	g_assert (MONO_ARCH_FRAME_ALIGNMENT >= 8);
++	x86_alu_reg_imm (code, X86_SUB, X86_ESP, MONO_ARCH_FRAME_ALIGNMENT - 8);
++	x86_push_reg (code, X86_EDX);
++
+ 	/* call the handler */
+ 	x86_call_reg (code, X86_ECX);
+ 
++	/* restore ESP */
++	x86_pop_reg (code, X86_ESP);
++
+ 	/* restore EBP */
+ 	x86_pop_reg (code, X86_EBP);
+ 

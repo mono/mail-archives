@@ -1,0 +1,349 @@
+Index: mono/mini/ChangeLog
+===================================================================
+--- mono/mini/ChangeLog	(revision 108427)
++++ mono/mini/ChangeLog	(working copy)
+@@ -1,3 +1,18 @@
++2008-07-22  Bill Holmes  <billholmes54@gmail.com>
++
++	* inssel-amd64.brg :  Adding rules for OP_VTARG_ADDR that are used for
++	  Winx64 struct arguments.
++
++	* mini-amd64.c (mono_arch_allocate_vars) : Implementing the ArgValuetypeAddrInIReg
++	  argument case.  Setting the argument op to OP_VTARG_ADDR (OP_REGOFFSET)).
++
++	* mini-amd64.c (mono_arch_emit_prolog, emit_load_volatile_arguments) :
++ 	  Implementing the ArgValuetypeAddrInIReg argument case.  When the address
++ 	  of a struct is passed in a register it must be saved with the other
++ 	  volatile argument on the stack.
++
++	Contributed under MIT/X11 license.
++
+ 2008-07-21  Bill Holmes  <billholmes54@gmail.com>
+ 
+ 	* mini-amd64.c (get_call_info): Winx64 fix for passing floats.
+Index: mono/mini/inssel-amd64.brg
+===================================================================
+--- mono/mini/inssel-amd64.brg	(revision 108427)
++++ mono/mini/inssel-amd64.brg	(working copy)
+@@ -619,6 +619,21 @@
+ 	MONO_EMIT_BIALU_MEMBASE (cfg, tree, OP_X86_MUL_REG_MEMBASE, state->reg1, state->left->reg1, base->inst_basereg, base->inst_offset);
+ } 
+ 
++reg: OP_VTARG_ADDR (base) {
++	MONO_EMIT_NEW_LOAD_MEMBASE (s, state->reg1, state->left->tree->inst_basereg, 
++					state->left->tree->inst_offset);
++}
++
++reg: OP_LDADDR (OP_VTARG_ADDR (base)) {
++	MONO_EMIT_NEW_LOAD_MEMBASE (s, state->reg1, state->left->left->tree->inst_basereg, 
++					state->left->left->tree->inst_offset);
++}
++
++reg: CEE_LDOBJ (OP_VTARG_ADDR (base)) {
++	MONO_EMIT_NEW_LOAD_MEMBASE (s, state->reg1, state->left->left->tree->inst_basereg, 
++					state->left->left->tree->inst_offset);
++}
++
+ reg: OP_LSHL (reg, reg),
+ reg: OP_LSHR (reg, reg),
+ reg: OP_LSHR_UN (reg, reg),
+Index: mono/mini/mini-amd64.c
+===================================================================
+--- mono/mini/mini-amd64.c	(revision 108427)
++++ mono/mini/mini-amd64.c	(working copy)
+@@ -1200,13 +1200,33 @@
+ 				break;
+ 			case ArgValuetypeInReg:
+ 				break;
+-			case ArgValuetypeAddrInIReg:
+-				break;  /*FIXME: Not sure what to do for this case yet on Winx64*/
++			case ArgValuetypeAddrInIReg: {
++				MonoInst *indir;
++				g_assert (!cfg->arch.omit_fp);
++				
++				MONO_INST_NEW (cfg, indir, 0);
++				indir->opcode = OP_REGOFFSET;
++				if (ainfo->pair_storage [0] == ArgInIReg) {
++					indir->inst_basereg = cfg->frame_reg;
++					offset = ALIGN_TO (offset, sizeof (gpointer));
++					offset += (sizeof (gpointer));
++					indir->inst_offset = - offset;
++				}
++				else {
++					indir->inst_basereg = cfg->frame_reg;
++					indir->inst_offset = ainfo->offset + ARGS_OFFSET;
++				}
++				
++				inst->opcode = OP_VTARG_ADDR;
++				inst->inst_left = indir;
++				
++				break;
++			}
+ 			default:
+ 				NOT_IMPLEMENTED;
+ 			}
+ 
+-			if (!inreg && (ainfo->storage != ArgOnStack)) {
++			if (!inreg && (ainfo->storage != ArgOnStack) && (ainfo->storage != ArgValuetypeAddrInIReg)) {
+ 				inst->opcode = OP_REGOFFSET;
+ 				inst->inst_basereg = cfg->frame_reg;
+ 				/* These arguments are saved to the stack in the prolog */
+@@ -2268,6 +2288,10 @@
+ 					}
+ 				}
+ 				break;
++			case ArgValuetypeAddrInIReg:
++				if (ainfo->pair_storage [0] == ArgInIReg)
++					amd64_mov_reg_membase (code, ainfo->pair_regs [0], ins->inst_left->inst_basereg, ins->inst_left->inst_offset,  sizeof (gpointer));
++				break;
+ 			default:
+ 				break;
+ 			}
+@@ -4258,6 +4282,10 @@
+ 					}
+ 				}
+ 				break;
++			case ArgValuetypeAddrInIReg:
++				if (ainfo->pair_storage [0] == ArgInIReg)
++					amd64_mov_membase_reg (code, ins->inst_left->inst_basereg, ins->inst_left->inst_offset, ainfo->pair_regs [0],  sizeof (gpointer));
++				break;
+ 			default:
+ 				break;
+ 			}
+Index: mono/tests/ChangeLog
+===================================================================
+--- mono/tests/ChangeLog	(revision 108427)
++++ mono/tests/ChangeLog	(working copy)
+@@ -1,3 +1,10 @@
++2008-07-22  Bill Holmes  <billholmes54@gmail.com>
++	* libtest.c, winx64structs.cs :
++	  Adding tests to exercise calling managed code from native with struct
++	  arguments on Winx64.
++
++	Contributed under MIT/X11 license.
++
+ 2008-07-21  Mark Probst  <mark.probst@gmail.com>
+ 
+ 	* generic-getgenericarguments.2.cs: Test case catching static
+Index: mono/tests/libtest.c
+===================================================================
+--- mono/tests/libtest.c	(revision 108427)
++++ mono/tests/libtest.c	(working copy)
+@@ -2033,7 +2033,7 @@
+ 	return 0;
+ }
+ 
+-typedef char** (*ReturnStringArrayDelegate) (int i);
++typedef char** (STDCALL *ReturnStringArrayDelegate) (int i);
+ 
+ LIBTEST_API int STDCALL 
+ mono_test_marshal_return_string_array_delegate (ReturnStringArrayDelegate d)
+@@ -3630,5 +3630,69 @@
+ 	return func (val);
+ }
+ 
++typedef int (STDCALL *managed_struct5_delegate) (winx64_struct5 a);
+ 
++LIBTEST_API int STDCALL 
++mono_test_managed_Winx64_struct5_in(managed_struct5_delegate func)
++{
++	winx64_struct5 val;
++	val.a = 5;
++	val.b = 0x10;
++	val.c = 0x99;
++	return func (val);
++}
+ 
++typedef int (STDCALL *managed_struct1_struct5_delegate) (winx64_struct1 a, winx64_struct5 b,
++							 winx64_struct1 c, winx64_struct5 d,
++							 winx64_struct1 e, winx64_struct5 f);
++
++LIBTEST_API int STDCALL 
++mono_test_managed_Winx64_struct1_struct5_in(managed_struct1_struct5_delegate func)
++{
++	winx64_struct1 a, c, e;
++	winx64_struct5 b, d, f;
++	a.a = 1;
++	b.a = 2; b.b = 3; b.c = 4;
++	c.a = 5;
++	d.a = 6; d.b = 7; d.c = 8;
++	e.a = 9;
++	f.a = 10; f.b = 11; f.c = 12;
++
++	return func (a, b, c, d, e, f);
++}
++
++typedef winx64_struct1 (STDCALL *managed_struct1_ret_delegate) ();
++
++LIBTEST_API int STDCALL 
++mono_test_Winx64_struct1_ret_managed (managed_struct1_ret_delegate func)
++{
++	winx64_struct1 ret;
++
++	ret = func ();
++
++	if (ret.a != 0x45)
++		return 1;
++	
++	return 0;
++}
++
++typedef winx64_struct5 (STDCALL *managed_struct5_ret_delegate) ();
++
++LIBTEST_API int STDCALL 
++mono_test_Winx64_struct5_ret_managed (managed_struct5_ret_delegate func)
++{
++	winx64_struct5 ret;
++
++	ret = func ();
++
++	if (ret.a != 0x12)
++		return 1;
++	if (ret.b != 0x34)
++		return 2;
++	if (ret.c != 0x56)
++		return 3;
++	
++	return 0;
++}
++
++
+Index: mono/tests/winx64structs.cs
+===================================================================
+--- mono/tests/winx64structs.cs	(revision 108427)
++++ mono/tests/winx64structs.cs	(working copy)
+@@ -190,6 +190,31 @@
+ 	[DllImport ("libtest")]
+ 	static extern int mono_test_managed_Winx64_struct1_in (managed_struct1_delegate func);
+ 
++	public delegate int managed_struct5_delegate ([MarshalAs (UnmanagedType.Struct)] winx64_struct5 var);
++
++	[DllImport ("libtest")]
++	static extern int mono_test_managed_Winx64_struct5_in (managed_struct5_delegate func);
++
++	public delegate int managed_struct1_struct5_delegate (winx64_struct1 var1, winx64_struct5 var2,
++							      winx64_struct1 var3, winx64_struct5 var4,
++							      winx64_struct1 var5, winx64_struct5 var6);
++
++	[DllImport ("libtest")]
++	static extern int mono_test_managed_Winx64_struct1_struct5_in (managed_struct1_struct5_delegate func);
++
++	[return:MarshalAs (UnmanagedType.Struct)]
++	public delegate winx64_struct1 mono_test_Winx64_struct1_ret_delegate ();
++
++	[DllImport ("libtest")]
++	static extern int mono_test_Winx64_struct1_ret_managed (mono_test_Winx64_struct1_ret_delegate func);
++
++	[return: MarshalAs (UnmanagedType.Struct)]
++	public delegate winx64_struct5 mono_test_Winx64_struct5_ret_delegate ();
++
++	[DllImport ("libtest")]
++	static extern int mono_test_Winx64_struct5_ret_managed (mono_test_Winx64_struct5_ret_delegate func);
++	
++
+ 	private static bool enableBroken = false;
+ 	
+ 	static int Main (string[] args)
+@@ -374,6 +399,57 @@
+ 		return 0;
+ 	}
+ 
++	public static int test_0_In_Args_Value_On_Stack_ADDR_In_RCX_Managed ()
++	{
++		int retCode;
++
++		managed_struct5_delegate s1Del = new managed_struct5_delegate (managed_struct5_test);
++
++		if ((retCode = mono_test_managed_Winx64_struct5_in (s1Del)) != 0)
++			return 100 + retCode;
++
++		return 0;
++	}
++
++	public static int test_0_In_Args_Values_In_Registers_with_Stack_and_On_Stack_Managed ()
++	{
++		int retCode;
++
++		managed_struct1_struct5_delegate s1Del = 
++			new managed_struct1_struct5_delegate (managed_struct1_struct5_test);
++
++		if ((retCode = mono_test_managed_Winx64_struct1_struct5_in (s1Del)) != 0)
++			return 100 + retCode;
++
++		return 0;
++	}
++
++	public static int test_0_Ret_In_RAX_managed ()
++	{
++		int retCode;
++
++		mono_test_Winx64_struct1_ret_delegate s1Del =
++			new mono_test_Winx64_struct1_ret_delegate (mono_test_Winx64_struct1_ret_test);
++
++		if ((retCode = mono_test_Winx64_struct1_ret_managed (s1Del)) != 0)
++			return 100 + retCode;
++
++		return 0;
++	}
++
++	public static int test_0_Ret_In_Address_managed ()
++	{
++		int retCode;
++
++		mono_test_Winx64_struct5_ret_delegate s1Del =
++			new mono_test_Winx64_struct5_ret_delegate (mono_test_Winx64_struct5_ret_test);
++
++		if ((retCode = mono_test_Winx64_struct5_ret_managed (s1Del)) != 0)
++			return 100 + retCode;
++
++		return 0;
++	}
++
+ 	public static int managed_struct1_test (winx64_struct1 var)
+ 	{
+ 		if (var.a != 5)
+@@ -381,4 +457,44 @@
+ 
+ 		return 0;
+ 	}
++
++	public static int managed_struct5_test (winx64_struct5 var)
++	{
++		if (var.a != 5)
++			return 1;
++		if (var.b != 0x10)
++			return 2;
++		if (var.c != 0x99)
++			return 3;
++
++		return 0;
++	}
++
++	public static int managed_struct1_struct5_test (winx64_struct1 var1, winx64_struct5 var2,
++							winx64_struct1 var3, winx64_struct5 var4,
++							winx64_struct1 var5, winx64_struct5 var6)
++	{
++		if (var1.a != 1 || var3.a != 5)
++			return 1;
++		if (var2.a != 2 || var2.b != 3 || var2.c != 4 ||
++		    var4.a != 6 || var4.b != 7 || var4.c != 8)
++			return 2;
++		if (var5.a != 9)
++			return 3;
++		if (var6.a != 10 || var6.b != 11 || var6.c != 12)
++			return 4;
++
++		return 0;
++	}
++
++	public static winx64_struct1 mono_test_Winx64_struct1_ret_test ()
++	{
++		return new winx64_struct1 (0x45);
++	}
++
++	public static winx64_struct5 mono_test_Winx64_struct5_ret_test ()
++	{
++		return new winx64_struct5 (0x12, 0x34, 0x56);
++	}
++	
+ }

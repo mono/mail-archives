@@ -1,0 +1,191 @@
+Index: metadata/appdomain.c
+===================================================================
+--- metadata/appdomain.c	(revision 126598)
++++ metadata/appdomain.c	(working copy)
+@@ -302,6 +302,10 @@
+ 	/* This ends up calling any pending pending (for at most 2 seconds) */
+ 	mono_gc_cleanup ();
+ 
++	mono_profiler_shutdown ();
++
++	mono_thread_wait_critical_threads ();
++
+ 	mono_thread_cleanup ();
+ 
+ #ifndef DISABLE_SOCKETS
+Index: metadata/threads.c
+===================================================================
+--- metadata/threads.c	(revision 126598)
++++ metadata/threads.c	(working copy)
+@@ -93,6 +93,10 @@
+ 	MonoHazardousFreeFunc free_func;
+ } DelayedFreeItem;
+ 
++enum {
++	MONO_THREAD_CRITICAL = 0x1
++};
++
+ /* Number of cached culture objects in the MonoThread->cached_culture_info array
+  * (per-type): we use the first NUM entries for CultureInfo and the last for
+  * UICultureInfo. So the size of the array is really NUM_CACHED_CULTURES * 2.
+@@ -167,6 +171,7 @@
+ static gboolean mono_thread_resume (MonoThread* thread);
+ static void mono_thread_start (MonoThread *thread);
+ static void signal_thread_state_change (MonoThread *thread);
++static gboolean mono_thread_is_critical (MonoThread *thread);
+ 
+ /* Spin lock for InterlockedXXX 64 bit functions */
+ #define mono_interlocked_lock() EnterCriticalSection (&interlocked_mutex)
+@@ -2534,6 +2539,11 @@
+ 			return;
+ 		}
+ 
++		if (mono_thread_is_critical (thread)) {
++			THREAD_DEBUG (g_message ("%s: ignoring critical thread %"G_GSIZE_FORMAT, __func__, (gsize)thread->tid));
++			return;
++		}
++
+ 		handle = OpenThread (THREAD_ALL_ACCESS, TRUE, thread->tid);
+ 		if (handle == NULL) {
+ 			THREAD_DEBUG (g_message ("%s: ignoring unopenable thread %"G_GSIZE_FORMAT, __func__, (gsize)thread->tid));
+@@ -2571,7 +2581,7 @@
+ 		return FALSE;
+ 
+ 	/* The finalizer thread is not a background thread */
+-	if (thread->tid != self && (thread->state & ThreadState_Background) != 0) {
++	if (thread->tid != self && (thread->state & ThreadState_Background) != 0 && !mono_thread_is_critical (thread)) {
+ 	
+ 		handle = OpenThread (THREAD_ALL_ACCESS, TRUE, thread->tid);
+ 		if (handle == NULL)
+@@ -2768,6 +2778,9 @@
+ 		(thread->state & ThreadState_Stopped) != 0)
+ 		return;
+ 
++	if (mono_thread_is_critical (thread))
++		return;
++
+ 	if (wait->num<MAXIMUM_WAIT_OBJECTS) {
+ 		handle = OpenThread (THREAD_ALL_ACCESS, TRUE, thread->tid);
+ 		if (handle == NULL)
+@@ -3777,3 +3790,64 @@
+ 	
+ 	return ret;
+ }
++
++/*
++ * Define a thread as critical.
++ * The runtime doesn't try to stop a critical thread during any part of the shutdown sequence.
++ * Critical threads are allowed to run until after the GC finalization after that the runtime
++ * will wait them to finalize.
++ *
++ * Users of this function must make sure that the thread finishes, otherwise the runtime will deadlock
++ * at shutdown.
++*/
++void
++mono_thread_set_critical (MonoThread *thread)
++{
++	thread->flags |= MONO_THREAD_CRITICAL;
++}
++
++static gboolean
++mono_thread_is_critical (MonoThread *thread)
++{
++	return (thread->flags & MONO_THREAD_CRITICAL) != 0;
++}
++
++static void
++build_critical_wait_list (gpointer key, gpointer value, gpointer user)
++{
++	struct wait_data *wait = (struct wait_data *)user;
++	gsize self = GetCurrentThreadId ();
++	MonoThread *thread = (MonoThread *) value;
++	HANDLE handle;
++
++	if (wait->num >= MAXIMUM_WAIT_OBJECTS)
++		return;
++
++	if (!mono_thread_is_critical (thread) || (thread->state & (ThreadState_Stopped | ThreadState_Suspended)) || thread->tid == self)
++		return;
++	handle = OpenThread (THREAD_ALL_ACCESS, TRUE, thread->tid);
++	if (handle == NULL)
++		return FALSE;
++
++	wait->handles[wait->num]=thread->handle;
++	wait->threads[wait->num]=thread;
++	wait->num++;
++}
++
++void
++mono_thread_wait_critical_threads (void)
++{
++	struct wait_data *wait = g_new0 (struct wait_data, 1);
++
++	do {
++		mono_threads_lock ();
++		wait->num = 0;
++		mono_g_hash_table_foreach (threads, build_critical_wait_list, wait);
++
++		mono_threads_unlock ();
++
++		if(wait->num > 0)
++			wait_for_tids (wait, INFINITE);
++	} while(wait->num > 0);
++	g_free (wait);
++}
+Index: metadata/threads.h
+===================================================================
+--- metadata/threads.h	(revision 126598)
++++ metadata/threads.h	(working copy)
+@@ -68,6 +68,8 @@
+ extern void mono_thread_force_interruption_checkpoint (void);
+ extern gint32* mono_thread_interruption_request_flag (void);
+ 
++void mono_thread_set_critical (MonoThread *thread);
++
+ G_END_DECLS
+ 
+ #endif /* _MONO_METADATA_THREADS_H_ */
+Index: metadata/object-internals.h
+===================================================================
+--- metadata/object-internals.h	(revision 126598)
++++ metadata/object-internals.h	(working copy)
+@@ -300,11 +300,12 @@
+ 	guint32 small_id; /* A small, unique id, used for the hazard pointer table. */
+ 	MonoThreadManageCallback manage_callback;
+ 	MonoException *pending_exception;
++
++	gssize flags; /*FIXME Change this to a guint32 on the next corlib version increase and sync with Thread.cs*/
+ 	/* 
+ 	 * These fields are used to avoid having to increment corlib versions
+ 	 * when a new field is added to the unmanaged MonoThread structure.
+ 	 */
+-	gpointer unused2;
+ 	gpointer unused3;
+ 	gpointer unused4;
+ 	gpointer unused5;
+Index: metadata/threads-types.h
+===================================================================
+--- metadata/threads-types.h	(revision 126598)
++++ metadata/threads-types.h	(working copy)
+@@ -163,6 +163,8 @@
+ 
+ void mono_threads_install_notify_pending_exc (MonoThreadNotifyPendingExcFunc func) MONO_INTERNAL;
+ 
++void mono_thread_wait_critical_threads (void) MONO_INTERNAL;
++
+ #define mono_hazard_pointer_set(hp,i,v)	\
+ 	do { g_assert ((i) == 0 || (i) == 1); \
+ 		(hp)->hazard_pointers [(i)] = (v); \
+Index: mini/mini.c
+===================================================================
+--- mini/mini.c	(revision 126331)
++++ mini/mini.c	(working copy)
+@@ -4947,8 +4947,6 @@
+ 
+ 	mono_runtime_cleanup (domain);
+ 
+-	mono_profiler_shutdown ();
+-
+ 	mono_icall_cleanup ();
+ 
+ 	mono_runtime_cleanup_handlers ();

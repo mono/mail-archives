@@ -1,0 +1,177 @@
+diff --git a/class/System.Data/Mono.Data.SqlExpressions/Functions.cs b/class/System.Data/Mono.Data.SqlExpressions/Functions.cs
+index a457ff6..86f6f3f 100644
+--- a/class/System.Data/Mono.Data.SqlExpressions/Functions.cs
++++ b/class/System.Data/Mono.Data.SqlExpressions/Functions.cs
+@@ -74,7 +74,7 @@ namespace Mono.Data.SqlExpressions {
+ 			object o = expr.Eval (row);
+ 			if (o == DBNull.Value)
+ 				return o;
+-			bool val = (bool)o;
++			bool val = Convert.ToBoolean(o);
+ 			return (val ? trueExpr.Eval (row) : falseExpr.Eval (row));
+ 		}
+ 	}
+diff --git a/class/System.Data/Mono.Data.SqlExpressions/Parser.jay b/class/System.Data/Mono.Data.SqlExpressions/Parser.jay
+index 5682514..684b4bd 100644
+--- a/class/System.Data/Mono.Data.SqlExpressions/Parser.jay
++++ b/class/System.Data/Mono.Data.SqlExpressions/Parser.jay
+@@ -250,6 +250,7 @@ RelationName
+ Function
+ 	: CalcFunction
+ 	| AggFunction
++ 	| StringFunction
+ 	;
+ 
+ AggFunction
+@@ -269,16 +270,27 @@ AggFunctionName
+ 	| VAR		{ $$ = AggregationFunction.Var; }
+ 	;
+ 
+-CalcFunction
+-	: IIF PAROPEN BoolExpr COMMA Expr COMMA Expr PARCLOSE
++StringExpr
++ 	: SingleColumnValue
++ 	| StringLiteral
++ 	| StringFunction
++ 	;
++
++StringFunction
++  : TRIM PAROPEN StringExpr PARCLOSE
+ 	{
+-		$$ = new IifFunction ((IExpression)$3, (IExpression)$5, (IExpression)$7);
++		$$ = new TrimFunction ((IExpression)$3);
++	}
++	| SUBSTRING PAROPEN StringExpr COMMA ArithExpr COMMA ArithExpr PARCLOSE
++	{
++		$$ = new SubstringFunction ((IExpression)$3, (IExpression)$5, (IExpression)$7);
+ 	}
+-	| SUBSTRING PAROPEN Expr COMMA NumberLiteral COMMA NumberLiteral PARCLOSE
++  ;
++
++CalcFunction
++	: IIF PAROPEN Expr COMMA Expr COMMA Expr PARCLOSE
+ 	{
+-		long arg1 = (long) $5;
+-		long arg2 = (long) $7;
+-		$$ = new SubstringFunction ((IExpression)$3, Convert.ToInt32(arg1), Convert.ToInt32(arg2));
++		$$ = new IifFunction ((IExpression)$3, (IExpression)$5, (IExpression)$7);
+ 	}
+ 	| ISNULL PAROPEN Expr COMMA Expr PARCLOSE
+ 	{
+@@ -288,10 +300,6 @@ CalcFunction
+ 	{
+ 		$$ = new LenFunction ((IExpression)$3);
+ 	}
+-	| TRIM PAROPEN Expr PARCLOSE
+-	{
+-		$$ = new TrimFunction ((IExpression)$3);
+-	}
+ 	| CONVERT PAROPEN Expr COMMA TypeSpecifier PARCLOSE
+ 	{
+ 		$$ = new ConvertFunction ((IExpression)$3, (string)$5);
+@@ -321,7 +329,7 @@ LikePredicate
+ 	}
+ 	| ArithExpr NOT LIKE StringLiteral
+ 	{
+-		$$ = new Negation (new Like ((IExpression)$1, (string)$3));
++		$$ = new Negation (new Like ((IExpression)$1, (string)$4));
+ 	}
+ 	;
+ 
+diff --git a/class/System.Data/Mono.Data.SqlExpressions/StringFunctions.cs b/class/System.Data/Mono.Data.SqlExpressions/StringFunctions.cs
+index 99d4d28..db1aa51 100644
+--- a/class/System.Data/Mono.Data.SqlExpressions/StringFunctions.cs
++++ b/class/System.Data/Mono.Data.SqlExpressions/StringFunctions.cs
+@@ -56,8 +56,9 @@ namespace Mono.Data.SqlExpressions {
+ 	}
+ 	
+ 	internal class SubstringFunction : StringFunction {
+-		int start, len;
+-		public SubstringFunction (IExpression e, int start, int len) : base (e)
++		IExpression start;
++		IExpression len;
++		public SubstringFunction (IExpression e, IExpression start, IExpression len) : base (e)
+ 		{
+ 			this.start = start;
+ 			this.len = len;
+@@ -92,13 +93,17 @@ namespace Mono.Data.SqlExpressions {
+ 		override public object Eval (DataRow row)
+ 		{
+ 			string str = (string)base.Eval (row);
++			object x = start.Eval (row);
++			int istart = Convert.ToInt32 (start.Eval (row));
++			int ilen = Convert.ToInt32 (len.Eval (row));
++			
+ 			if(str == null)
+ 				return null;
+ 				
+-			if (start > str.Length)
++			if (istart > str.Length)
+ 				return String.Empty;
+ 			
+-			return str.Substring (start - 1, System.Math.Min (len, str.Length - (start - 1)));
++			return str.Substring (istart - 1, System.Math.Min (ilen, str.Length - (istart - 1)));
+ 		}
+ 	}
+ 	
+diff --git a/class/System.Data/Test/Mono.Data.SqlExpressions/DataColumnExpressionTest.cs b/class/System.Data/Test/Mono.Data.SqlExpressions/DataColumnExpressionTest.cs
+index a344217..affad93 100644
+--- a/class/System.Data/Test/Mono.Data.SqlExpressions/DataColumnExpressionTest.cs
++++ b/class/System.Data/Test/Mono.Data.SqlExpressions/DataColumnExpressionTest.cs
+@@ -8,6 +8,36 @@ namespace Monotests_Mono.Data.SqlExpressions
+ 	public class DataColumnExprTest
+ 	{
+ 		[Test]
++		public void TestDataColumnExpr0SingleColumnValue ()
++		{
++			DataTable table = new DataTable ();
++			table.Columns.Add ("Col_0.Value", Type.GetType ("System.Int32"));
++			table.Columns.Add ("Col_1", Type.GetType ("System.Int32"));
++			table.Columns.Add ("Result", Type.GetType ("System.Int32"), "IIF(Col_0.Value, Col_1 + 5, 0)");
++
++			DataRow row = table.NewRow ();
++			row ["Col_0.Value"] = 0;
++			row ["Col_1"] = 10;
++
++			table.Rows.Add (row);
++			Assert.AreEqual (0, (int)table.Rows[0][2], "#1");
++		}
++		[Test]
++		public void TestDataColumnExpr0Literal ()
++		{
++			DataTable table = new DataTable ();
++			table.Columns.Add ("Col_0.Value", Type.GetType ("System.Int32"));
++			table.Columns.Add ("Col_1", Type.GetType ("System.Int32"));
++			table.Columns.Add ("Result", Type.GetType ("System.Int32"), "IIF(false, Col_1 + 5, 0)");
++
++			DataRow row = table.NewRow ();
++			row ["Col_0.Value"] = 0;
++			row ["Col_1"] = 10;
++
++			table.Rows.Add (row);
++			Assert.AreEqual (0, (int)table.Rows[0][2], "#1");
++		}
++		[Test]
+ 		public void TestDataColumnExpr1 ()
+ 		{
+ 			DataTable table = new DataTable ();
+@@ -37,6 +67,19 @@ namespace Monotests_Mono.Data.SqlExpressions
+ 			table.Rows.Add (row);
+ 			Assert.AreEqual (0, (int)table.Rows[0][2], "#1");
+ 		}
++		[Test]
++		public void TestDataColumnSubstring ()
++		{
++			DataTable table = new DataTable ();
++			table.Columns.Add ("Col_0", Type.GetType ("System.String"));
++			table.Columns.Add ("Result", Type.GetType ("System.String"), "SUBSTRING(Col_0, 2+2, 2)");
++
++			DataRow row = table.NewRow ();
++			row ["Col_0"] = "Is OK?";
++
++			table.Rows.Add (row);
++			Assert.AreEqual ("OK", (string)table.Rows[0][1], "#1");
++		}
+ 	}
+ 	[TestFixture]
+ 	public class DataColumnCharTest

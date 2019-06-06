@@ -1,0 +1,268 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] use sysctl for get_boot_time() on *BSD systems and Mac OS X
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20use%20sysctl%20for%20get_boot_time%28%29%20on%20%2ABSD%20systems%20and%0A%20Mac%20OS%20X&In-Reply-To=20100408152859.GA30040%40bsd.hu">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034717.html">
+   <LINK REL="Next"  HREF="034728.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] use sysctl for get_boot_time() on *BSD systems and Mac OS X</H1>
+    <B>Robert Nagy</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20use%20sysctl%20for%20get_boot_time%28%29%20on%20%2ABSD%20systems%20and%0A%20Mac%20OS%20X&In-Reply-To=20100408152859.GA30040%40bsd.hu"
+       TITLE="[Mono-dev] use sysctl for get_boot_time() on *BSD systems and Mac OS X">robert at openbsd.org
+       </A><BR>
+    <I>Thu Apr  8 15:48:56 EDT 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034717.html">[Mono-dev] use sysctl for get_boot_time() on *BSD systems and Mac	OS X
+</A></li>
+        <LI>Next message: <A HREF="034728.html">[Mono-dev] use sysctl for get_boot_time() on *BSD systems and	Mac OS X
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34722">[ date ]</a>
+              <a href="thread.html#34722">[ thread ]</a>
+              <a href="subject.html#34722">[ subject ]</a>
+              <a href="author.html#34722">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>My previous diffs for the 2.6 branch:
+
+Index: mono/io-layer/processes.c
+===================================================================
+--- mono/io-layer/processes.c	(revision 155084)
++++ mono/io-layer/processes.c	(working copy)
+@@ -1533,7 +1533,7 @@
+ 	name[2] = KERN_PROC_ALL;
+ 	name[3] = 0;
+ 	name[4] = sizeof(struct kinfo_proc2);
+-	name[5] = 400; /* XXX */
++	name[5] = 0;
+ #else
+ 	struct kinfo_proc *result;
+ 	static const int name[] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+@@ -1543,7 +1543,7 @@
+ 	
+ 	result = NULL;
+ 	done = FALSE;
+-	
++
+ 	do {
+ 		proclength = 0;
+ #if defined(__OpenBSD__)
+@@ -1558,7 +1558,11 @@
+ 
+ 			if (result == NULL)
+ 				return FALSE;
+-			
++
++#if defined(__OpenBSD__)	
++			name[5] = (int)(proclength / sizeof(struct kinfo_proc2));
++#endif
++
+ 			err = sysctl ((int *) name, size, result, &amp;proclength, NULL, 0);
+ 
+ 			if (err == 0) 
+@@ -2224,10 +2228,12 @@
+ 
+ static gchar *get_process_name_from_proc (pid_t pid)
+ {
++#if !defined(__OpenBSD__)
++	FILE *fp;
+ 	gchar *filename = NULL;
++	gchar buf[256];
++#endif
+ 	gchar *ret = NULL;
+-	gchar buf[256];
+-	FILE *fp;
+ 
+ #if defined(PLATFORM_SOLARIS)
+ 	filename = g_strdup_printf (&quot;/proc/%d/psinfo&quot;, pid);
+@@ -2250,6 +2256,40 @@
+ #  endif
+ 	if (strlen (buf) &gt; 0)
+ 		ret = g_strdup (buf);
++#elif defined(__OpenBSD__)
++	int mib [6];
++	size_t size;
++	struct kinfo_proc2 *pi;
++
++	mib [0] = CTL_KERN;
++	mib [1] = KERN_PROC2;
++	mib [2] = KERN_PROC_PID;
++	mib [3] = pid;
++	mib [4] = sizeof(struct kinfo_proc2);
++	mib [5] = 0;
++
++retry:
++	if (sysctl(mib, 6, NULL, &amp;size, NULL, 0) &lt; 0)
++		return(ret);
++
++	if ((pi = malloc(size)) == NULL)
++		return(ret);
++
++	mib[5] = (int)(size / sizeof(struct kinfo_proc2));
++
++	if ((sysctl (mib, 6, pi, &amp;size, NULL, 0) &lt; 0) ||
++	    (size != sizeof (struct kinfo_proc2))) {
++		if (errno == ENOMEM) {
++			free(pi);
++			goto retry;
++		}
++		return(ret);
++	}
++
++	if (strlen (pi-&gt;p_comm) &gt; 0)
++		ret = g_strdup (pi-&gt;p_comm);
++
++	free(pi);
+ #else
+ 	memset (buf, '\0', sizeof(buf));
+ 	filename = g_strdup_printf (&quot;/proc/%d/exe&quot;, pid);
+Index: mono/utils/mono-time.c
+===================================================================
+--- mono/utils/mono-time.c	(revision 155084)
++++ mono/utils/mono-time.c	(working copy)
+@@ -57,12 +57,32 @@
+ #include &lt;sys/time.h&gt;
+ #endif
+ 
++#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
++#include &lt;sys/param.h&gt;
++#include &lt;sys/sysctl.h&gt;
++#endif
++
+ #include &lt;time.h&gt;
+ 
+ static gint64
+ get_boot_time (void)
+ {
+-	/* FIXME: use sysctl (kern.boottime) on OSX */
++#if defined(PLATFORM_MACOSX) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
++	int mib [2];
++	size_t size;
++	time_t now;
++	struct timeval boottime;
++
++	(void)time(&amp;now);
++
++	mib [0] = CTL_KERN;
++	mib [1] = KERN_BOOTTIME;
++
++	size = sizeof(boottime);
++
++	if (sysctl(mib, 2, &amp;boottime, &amp;size, NULL, 0) != -1)
++		return (gint64)((now - boottime.tv_sec) * MTICKS_PER_SEC);
++#else
+ 	FILE *uptime = fopen (&quot;/proc/uptime&quot;, &quot;r&quot;);
+ 	if (uptime) {
+ 		double upt;
+@@ -73,6 +93,7 @@
+ 		}
+ 		fclose (uptime);
+ 	}
++#endif
+ 	/* a made up uptime of 300 seconds */
+ 	return (gint64)300 * MTICKS_PER_SEC;
+ }
+Index: mono/utils/mono-proclib.c
+===================================================================
+--- mono/utils/mono-proclib.c	(revision 155084)
++++ mono/utils/mono-proclib.c	(working copy)
+@@ -22,8 +22,13 @@
+ #include &lt;sys/user.h&gt;
+ #endif
+ #ifdef HAVE_STRUCT_KINFO_PROC_KP_PROC
+-#define kinfo_pid_member kp_proc.p_pid
+-#define kinfo_name_member kp_proc.p_comm
++#  ifdef KERN_PROC2
++#    define kinfo_pid_member p_pid
++#    define kinfo_name_member p_comm
++#  else
++#    define kinfo_pid_member kp_proc.p_pid
++#    define kinfo_name_member kp_proc.p_comm
++#  endif
+ #else
+ #define kinfo_pid_member ki_pid
+ #define kinfo_name_member ki_comm
+@@ -46,11 +51,12 @@
+ #ifdef KERN_PROC2
+ 	int mib [6];
+ 	size_t data_len = sizeof (struct kinfo_proc2) * 400;
++	struct kinfo_proc2 *processes = malloc (data_len);
+ #else
+ 	int mib [4];
+ 	size_t data_len = sizeof (struct kinfo_proc) * 400;
++	struct kinfo_proc *processes = malloc (data_len);
+ #endif /* KERN_PROC2 */
+-	struct kinfo_proc *processes = malloc (data_len);
+ 	void **buf = NULL;
+ 
+ 	if (size)
+@@ -181,11 +187,12 @@
+ #ifdef KERN_PROC2
+ 	int mib [6];
+ 	size_t data_len = sizeof (struct kinfo_proc2);
++	struct kinfo_proc2 processi;
+ #else
+ 	int mib [4];
+ 	size_t data_len = sizeof (struct kinfo_proc);
++	struct kinfo_proc processi;
+ #endif /* KERN_PROC2 */
+-	struct kinfo_proc processi;
+ 
+ 	memset (buf, 0, len);
+ 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034717.html">[Mono-dev] use sysctl for get_boot_time() on *BSD systems and Mac	OS X
+</A></li>
+	<LI>Next message: <A HREF="034728.html">[Mono-dev] use sysctl for get_boot_time() on *BSD systems and	Mac OS X
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34722">[ date ]</a>
+              <a href="thread.html#34722">[ thread ]</a>
+              <a href="subject.html#34722">[ subject ]</a>
+              <a href="author.html#34722">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

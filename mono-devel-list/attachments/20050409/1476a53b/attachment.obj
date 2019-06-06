@@ -1,0 +1,182 @@
+Index: server.cs
+===================================================================
+--- server.cs	(revision 42748)
++++ server.cs	(working copy)
+@@ -34,11 +34,15 @@
+ using System.Net;
+ using System.Reflection;
+ using System.Web.Hosting;
++using System.Security.Cryptography;
++using System.Security.Cryptography.X509Certificates;
+ 
+ namespace Mono.ASPNET
+ {
+ 	public class Server
+ 	{
++		static Mono.Security.Authenticode.PrivateKey key;
++		
+ 		static void ShowVersion ()
+ 		{
+ 			Assembly assembly = Assembly.GetExecutingAssembly ();
+@@ -88,6 +92,24 @@
+ #endif
+ 			Console.WriteLine ("                    AppSettings key name: MonoServerAddress");
+ 			Console.WriteLine ();
++			Console.WriteLine ("    --https:        enable SSL for the server");
++			Console.WriteLine ("                    Default value: false.");
++			Console.WriteLine ("                    AppSettings key name: ");
++			Console.WriteLine ();
++			Console.WriteLine ("    --cert FILENAME: path to X.509 certificate file");
++			Console.WriteLine ("                    AppSettings key name: ");
++			Console.WriteLine ();
++			Console.WriteLine ("    --pkfile FILENAME: path to private key file");
++			Console.WriteLine ("                    AppSettings key name: ");
++			Console.WriteLine ();
++			Console.WriteLine ("    --pkpwd PASSWORD: password for private key file");
++			Console.WriteLine ("                    AppSettings key name: ");
++			Console.WriteLine ();
++			Console.WriteLine ("    --protocol:     specify which protocols are available for SSL");
++			Console.WriteLine ("                    Possible values: Default, Tls, Ssl2, Ssl3");
++			Console.WriteLine ("                    Default value: Default (all)");
++			Console.WriteLine ("                    AppSettings key name: ");
++			Console.WriteLine ();
+ 			Console.WriteLine ("    --root rootdir: the server changes to this directory before");
+ 			Console.WriteLine ("                    anything else.");
+ 			Console.WriteLine ("                    Default value: current directory.");
+@@ -152,6 +174,7 @@
+ 			Address = 1 << 7,
+ 			Port = 1 << 8,
+ 			Terminate = 1 << 9,
++			Https = 1 << 10,
+ 		}
+ 
+ 		static void CheckAndSetOptions (string name, Options value, ref Options options)
+@@ -172,9 +195,18 @@
+ 				Environment.Exit (1);
+ 			}
+ 		}
+-		
++
++		private static AsymmetricAlgorithm GetPrivateKey (X509Certificate certificate, string targetHost) 
++		{ 
++			return key.RSA; 
++		} 
++
+ 		public static int Main (string [] args)
+ 		{
++			bool secure = false;
++			string certFilename = null, keyFilename = null, keyPassword = null, securityProtocolTypeParam = null;
++			Mono.Security.Protocol.Tls.SecurityProtocolType securityProtocolType = Mono.Security.Protocol.Tls.SecurityProtocolType.Default;
++			X509Certificate cert = null;
+ 			bool nonstop = false;
+ 			bool verbose = false;
+ 			Trace.Listeners.Add (new TextWriterTraceListener (Console.Out));
+@@ -218,6 +250,22 @@
+ 					CheckAndSetOptions (a, Options.Address, ref options);
+ 					ip = args [++i];
+ 					break;
++				case "--https":
++					CheckAndSetOptions (a, Options.Https, ref options);
++					secure=true;
++					break;
++				case "--cert":
++					certFilename = args [++i];
++					break;
++				case "--pkfile":
++					keyFilename = args [++i];
++					break;
++				case "--pkpwd":
++					keyPassword = args [++i];
++					break;
++				case "--protocols":
++					securityProtocolTypeParam = args [++i];
++					break;
+ 				case "--root":
+ 					CheckAndSetOptions (a, Options.Root, ref options);
+ 					rootDir = args [++i];
+@@ -292,8 +340,56 @@
+ 				return 1;
+ 			}
+ 
+-			if (rootDir != null && rootDir != "") {
++			if (secure)
++			{
++				if (certFilename==null)
++				{
++					Console.WriteLine ("A server X.509 certificate must be specified for a https server");
++					return 1;
++				}
+ 				try {
++					cert=X509Certificate.CreateFromCertFile(certFilename);
++				} catch (Exception) {
++					Console.WriteLine ("Unable to load X.509 certicate: "+certFilename);
++					return 1;
++				}
++				if (keyFilename==null)
++				{
++					Console.WriteLine ("A private key file must be specified for a https server");
++					return 1;
++				}
++				try 
++				{
++					if (keyPassword==null)
++						key = Mono.Security.Authenticode.PrivateKey.CreateFromFile(keyFilename);
++					else
++						key = Mono.Security.Authenticode.PrivateKey.CreateFromFile(keyFilename,keyPassword);
++				} 
++				catch (CryptographicException) 
++				{
++					Console.WriteLine ("Invalid private key password or private key file is corrupt");
++					return 1;
++				}				
++				catch (Exception ex) 
++				{
++					Console.WriteLine ("Unable to load private key: "+keyFilename);
++					return 1;
++				}
++				if (securityProtocolTypeParam!=null)
++				{
++					try {
++						securityProtocolType = (Mono.Security.Protocol.Tls.SecurityProtocolType) 
++							Enum.Parse(typeof(Mono.Security.Protocol.Tls.SecurityProtocolType),securityProtocolTypeParam);
++					} catch (Exception) {
++						Console.WriteLine ("The value given for security protcol is invalid: " + securityProtocolTypeParam);
++						return 1;
++					}
++				}
++			}
++
++			if (rootDir != null && rootDir != "") 
++			{
++				try {
+ 					Environment.CurrentDirectory = rootDir;
+ 				} catch (Exception e) {
+ 					Console.WriteLine ("Error: {0}", e.Message);
+@@ -324,8 +420,13 @@
+ 
+ 			ApplicationServer server = new ApplicationServer (webSource);
+ #else
+-			webSource = new XSPWebSource (ipaddr, port);
+-			ApplicationServer server = new ApplicationServer (webSource);
++			if (!secure)
++				webSource = new XSPWebSource (ipaddr, port);
++			else
++				webSource = new XSPWebSource(ipaddr, port, securityProtocolType, cert, 
++					new Mono.Security.Protocol.Tls.PrivateKeySelectionCallback(GetPrivateKey), false);
++
++			XSPApplicationServer server = new XSPApplicationServer (webSource);
+ #endif
+ 			server.Verbose = verbose;
+ 
+@@ -347,7 +448,10 @@
+ 			} else
+ #endif
+ 			{
+-				Console.WriteLine ("Listening on port: {0}", port);
++				if (secure)
++					Console.WriteLine ("Listening on port: {0} (SSL)", port);
++				else
++					Console.WriteLine ("Listening on port: {0}", port);
+ 				Console.WriteLine ("Listening on address: {0}", ip);
+ 			}
+ 			

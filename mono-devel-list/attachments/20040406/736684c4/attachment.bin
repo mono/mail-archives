@@ -1,0 +1,250 @@
+? .hidden
+? t
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/ChangeLog,v
+retrieving revision 1.438
+diff -u -r1.438 ChangeLog
+--- ChangeLog	5 Apr 2004 21:27:50 -0000	1.438
++++ ChangeLog	6 Apr 2004 21:57:20 -0000
+@@ -1,3 +1,19 @@
++2004-04-06 Ben Maurer  <bmaurer@users.sourceforge.net>
++
++	* inssel.brg: Remove STRLEN,GETTYPE,LDLEN and ARRAY_RANK
++	* mini.c (NEW_LOAD_MEMBASE): A macro to do `->'.
++	(decompose_foreach): chanage sig to have a MonoInst**,
++	Decompose the above opcodes here.
++	(dec_foreach): Change sig to use MonoInst**.
++	(decompose_pass): ditto.
++
++	By decomposing the opcodes earlier in the process, the burg
++	file is able to apply smarter rules than it would otherwise. For
++	example, if you have CMP (STRLEN, 0), it can use cmp_membase_reg,
++	which is shorter than mov/cmp.
++
++	The changes to MonoInst** avoid a memcpy.
++
+ 2004-04-05 Ben Maurer  <bmaurer@users.sourceforge.net>
+ 
+ 	* inssel.brg (MONO_EMIT_BOUNDS_CHECK): a new macro to emit bounds
+Index: inssel.brg
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/inssel.brg,v
+retrieving revision 1.37
+diff -u -r1.37 inssel.brg
+--- inssel.brg	5 Apr 2004 21:27:50 -0000	1.37
++++ inssel.brg	6 Apr 2004 21:57:21 -0000
+@@ -1723,33 +1723,22 @@
+ }
+ 
+ reg: OP_STRLEN (reg) {	
+-	MONO_EMIT_LOAD_MEMBASE_OP (s, tree, OP_LOADI4_MEMBASE, state->reg1, 
+-				   state->left->reg1, G_STRUCT_OFFSET (MonoString, length));
++	g_assert_not_reached ();
+ }
+ 
+ reg: OP_GETTYPE (reg) {	
+-	int vt_reg = mono_regstate_next_int (s->rs);
+-	MONO_EMIT_NEW_LOAD_MEMBASE (s, vt_reg, state->left->reg1, G_STRUCT_OFFSET (MonoObject, vtable));
+-	MONO_EMIT_LOAD_MEMBASE_OP (s, tree, OP_LOAD_MEMBASE, state->reg1, vt_reg, G_STRUCT_OFFSET (MonoVTable, type));
++	g_assert_not_reached ();
+ }
+ 
+ #
+ # array support
+ #
+ reg: CEE_LDLEN (reg) {	
+-	MONO_EMIT_LOAD_MEMBASE_OP (s, tree, OP_LOADI4_MEMBASE, state->reg1, 
+-				   state->left->reg1, G_STRUCT_OFFSET (MonoArray, max_length));
++	g_assert_not_reached ();
+ }
+ 
+ reg: OP_ARRAY_RANK (reg) {	
+-	int vtable_reg = mono_regstate_next_int (s->rs);
+-	int class_reg = mono_regstate_next_int (s->rs);
+-	MONO_EMIT_NEW_LOAD_MEMBASE_OP (s, OP_LOAD_MEMBASE, vtable_reg, 
+-				       state->left->reg1, G_STRUCT_OFFSET (MonoObject, vtable));
+-	MONO_EMIT_NEW_LOAD_MEMBASE_OP (s, OP_LOAD_MEMBASE, class_reg, 
+-				       vtable_reg, G_STRUCT_OFFSET (MonoVTable, klass));
+-	MONO_EMIT_NEW_LOAD_MEMBASE_OP (s, OP_LOADI4_MEMBASE, state->reg1, 
+-				       class_reg, G_STRUCT_OFFSET (MonoClass, rank));
++	g_assert_not_reached ();
+ }
+ 
+ reg: OP_CHECK_ARRAY_TYPE (reg) {
+Index: mini.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/mini.c,v
+retrieving revision 1.213
+diff -u -r1.213 mini.c
+--- mini.c	2 Apr 2004 15:51:53 -0000	1.213
++++ mini.c	6 Apr 2004 21:57:22 -0000
+@@ -61,7 +61,7 @@
+ static void handle_stobj (MonoCompile *cfg, MonoBasicBlock *bblock, MonoInst *dest, MonoInst *src, 
+ 			  const unsigned char *ip, MonoClass *klass, gboolean to_end, gboolean native);
+ 
+-static void dec_foreach (MonoInst *tree, MonoCompile *cfg);
++static void dec_foreach (MonoInst **tree, MonoCompile *cfg);
+ 
+ static int mono_method_to_ir (MonoCompile *cfg, MonoMethod *method, MonoBasicBlock *start_bblock, MonoBasicBlock *end_bblock, 
+ 		   int locals_offset, MonoInst *return_var, GList *dont_inline, MonoInst **inline_args, 
+@@ -618,6 +618,33 @@
+ 		(dest)->inst_right = (el2);	\
+ 	} while (0)
+ 
++#define NEW_LOAD_MEMBASE(cfg,dest,_source,offset,op) do { \
++		MonoInst* load_source; \
++		MonoInst* source = _source; \
++		if (offset != 0) { \
++			MonoInst* offset_inst; \
++			NEW_ICONST (cfg, offset_inst, offset); \
++			MONO_INST_NEW (cfg, load_source, CEE_ADD); \
++			load_source->cil_code = source->cil_code; \
++			load_source->inst_left = source; \
++			load_source->inst_right = offset_inst; \
++			if (source->type == STACK_MP || source->type == STACK_OBJ) \
++				load_source->type = STACK_MP; \
++			else if (source->type == STACK_PTR) \
++				load_source->type = STACK_PTR; \
++			else \
++				g_assert_not_reached (); \
++		} else { \
++			load_source = source; \
++		} \
++		MONO_INST_NEW (cfg, dest, op); \
++		(dest)->type = ldind_type [(op) - CEE_LDIND_I1]; \
++		(dest)->cil_code = source->cil_code; \
++		(dest)->inst_left = load_source; \
++		(dest)->flags |= source->flags; \
++	} while (0)
++
++
+ #if 0
+ static gint
+ compare_bblock (gconstpointer a, gconstpointer b)
+@@ -6314,16 +6341,16 @@
+ }
+ 
+ static void
+-decompose_foreach (MonoInst *tree, gpointer data) 
++decompose_foreach (MonoInst **ptree, MonoCompile *cfg) 
+ {
+ 	static MonoJitICallInfo *newarr_info = NULL;
+ 	static MonoJitICallInfo *newarr_specific_info = NULL;
+ 	MonoJitICallInfo *info;
+ 	int i;
+ 
+-	switch (tree->opcode) {
++	switch ((*ptree)->opcode) {
+ 	case CEE_NEWARR: {
+-		MonoCompile *cfg = data;
++		MonoInst *tree = *ptree;
+ 		MonoInst *iargs [3];
+ 
+ 		if (!newarr_info) {
+@@ -6353,13 +6380,38 @@
+ 
+ 		/* Need to decompose arguments after the the opcode is decomposed */
+ 		for (i = 0; i < info->sig->param_count; ++i)
+-			dec_foreach (iargs [i], cfg);
++			dec_foreach (& iargs [i], cfg);
+ 		break;
+ 	}
+-
+-	default:
++	
++	case OP_GETTYPE: {
++		MonoInst* load_vtable;
++		
++		NEW_LOAD_MEMBASE (cfg, load_vtable, (*ptree)->inst_left, G_STRUCT_OFFSET (MonoObject, vtable), CEE_LDIND_I);
++		NEW_LOAD_MEMBASE (cfg, *ptree, load_vtable, G_STRUCT_OFFSET (MonoVTable, type), CEE_LDIND_REF);	
+ 		break;
+ 	}
++	
++	case OP_STRLEN: {
++		NEW_LOAD_MEMBASE (cfg, *ptree, (*ptree)->inst_left, G_STRUCT_OFFSET (MonoString, length), CEE_LDIND_I4);
++		break;
++	}
++	
++	case CEE_LDLEN: {
++		NEW_LOAD_MEMBASE (cfg, *ptree, (*ptree)->inst_left, G_STRUCT_OFFSET (MonoArray, max_length), CEE_LDIND_I4);
++		break;
++	}
++	
++	case OP_ARRAY_RANK: {
++		MonoInst* load_vtable;
++		MonoInst* load_klass;
++		
++		NEW_LOAD_MEMBASE (cfg, load_vtable, (*ptree)->inst_left, G_STRUCT_OFFSET (MonoObject, vtable), CEE_LDIND_I);
++		NEW_LOAD_MEMBASE (cfg, load_klass, load_vtable, G_STRUCT_OFFSET (MonoVTable, klass), CEE_LDIND_I);
++		NEW_LOAD_MEMBASE (cfg, *ptree, load_klass, G_STRUCT_OFFSET (MonoClass, rank), CEE_LDIND_I4);
++		break;
++	}
++	}
+ }
+ 
+ void
+@@ -6744,15 +6796,17 @@
+ }
+ 
+ static void
+-dec_foreach (MonoInst *tree, MonoCompile *cfg) {
++dec_foreach (MonoInst **ptree, MonoCompile *cfg) {
+ 	MonoJitICallInfo *info;
++	MonoInst *tree;
+ 
+-	decompose_foreach (tree, cfg);
++	decompose_foreach (ptree, cfg);
++	tree = *ptree;
+ 
+ 	switch (mono_burg_arity [tree->opcode]) {
+ 	case 0: break;
+ 	case 1: 
+-		dec_foreach (tree->inst_left, cfg);
++		dec_foreach (& tree->inst_left, cfg);
+ 
+ 		if ((info = mono_find_jit_opcode_emulation (tree->opcode))) {
+ 			MonoInst *iargs [2];
+@@ -6777,7 +6831,7 @@
+ 			tree->opcode = (tree->inst_left->opcode == CEE_CONV_I8 ? OP_BIGMUL: OP_BIGMUL_UN);
+ 			tree->inst_left = tree->inst_left->inst_left;
+ 			tree->inst_right = tree->inst_right->inst_left;
+-			dec_foreach (tree, cfg);
++			dec_foreach (ptree, cfg);
+ 		} else 
+ #endif
+ 			if ((info = mono_find_jit_opcode_emulation (tree->opcode))) {
+@@ -6788,12 +6842,12 @@
+ 		
+ 			mono_emulate_opcode (cfg, tree, iargs, info);
+ 
+-			dec_foreach (iargs [0], cfg);
+-			dec_foreach (iargs [1], cfg);
++			dec_foreach (& iargs [0], cfg);
++			dec_foreach (& iargs [1], cfg);
+ 			return;
+ 		} else {
+-			dec_foreach (tree->inst_left, cfg);
+-			dec_foreach (tree->inst_right, cfg);
++			dec_foreach (& tree->inst_left, cfg);
++			dec_foreach (& tree->inst_right, cfg);
+ 		}
+ 		break;
+ 	default:
+@@ -6806,12 +6860,12 @@
+ 	MonoBasicBlock *bb;
+ 
+ 	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+-		MonoInst *tree;
++		MonoInst **ptree;
+ 		cfg->cbb = bb;
+ 		cfg->prev_ins = NULL;
+-		for (tree = cfg->cbb->code; tree; tree = tree->next) {
+-			dec_foreach (tree, cfg);
+-			cfg->prev_ins = tree;
++		for (ptree = &cfg->cbb->code; *ptree; ptree = & (*ptree)->next) {
++			dec_foreach (ptree, cfg);
++			cfg->prev_ins = *ptree;
+ 		}
+ 	}
+ }

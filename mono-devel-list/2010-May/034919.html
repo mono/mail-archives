@@ -1,0 +1,253 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH]Add ephemeron support for sgen
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5DAdd%20ephemeron%20support%20for%20sgen&In-Reply-To=v2y8cca42d81005041703m76211fcm841ca008c1235d68%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034917.html">
+   <LINK REL="Next"  HREF="034924.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH]Add ephemeron support for sgen</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5DAdd%20ephemeron%20support%20for%20sgen&In-Reply-To=v2y8cca42d81005041703m76211fcm841ca008c1235d68%40mail.gmail.com"
+       TITLE="[Mono-dev] [PATCH]Add ephemeron support for sgen">lupus at ximian.com
+       </A><BR>
+    <I>Wed May  5 11:04:34 EDT 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034917.html">[Mono-dev] [PATCH]Add ephemeron support for sgen
+</A></li>
+        <LI>Next message: <A HREF="034924.html">[Mono-dev] [PATCH]Add ephemeron support for sgen
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34919">[ date ]</a>
+              <a href="thread.html#34919">[ thread ]</a>
+              <a href="subject.html#34919">[ subject ]</a>
+              <a href="author.html#34919">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 05/04/10 Rodrigo Kumpera wrote:
+&gt;<i> Once this patch is accepted I'll move into finishing the managed side of it.
+</I>&gt;<i> Right now CWT is implemented doing linear search, but the idea is to switch
+</I>&gt;<i> to
+</I>&gt;<i> open addressing. To do that, the only change required to sgen is to store a
+</I>&gt;<i> tombstone instead of NULL when clearing unreachable keys.
+</I>
+The tombstone object needs to be known to both the managed and unmanaged
+code: it may be a good idea to register it with the GC in the same icall
+that registers the array (it would be per-domain, but storing it as an
+additional field in EphemeronLinkNode should be fine).
+
+&gt;<i> --- a/mono/metadata/sgen-gc.c
+</I>&gt;<i> +++ b/mono/metadata/sgen-gc.c
+</I>&gt;<i> +/* LOCKING: requires that the GC lock is held */
+</I>&gt;<i> +static void
+</I>&gt;<i> +clear_unreachable_ephemerons (CopyOrMarkObjectFunc copy_func, char *start, char *end)
+</I>&gt;<i> +{
+</I>&gt;<i> +	int was_in_nursery, was_promoted;
+</I>&gt;<i> +	EphemeronLinkNode *current = ephemeron_list, *prev = NULL;
+</I>&gt;<i> +	MonoArray *array;
+</I>&gt;<i> +	mword **ptr;
+</I>&gt;<i> +	uintptr_t i, length;
+</I>&gt;<i> +
+</I>&gt;<i> +	while (current) {
+</I>&gt;<i> +		char *object = current-&gt;array;
+</I>&gt;<i> +
+</I>&gt;<i> +		if (!object_is_reachable (object, start, end)) {
+</I>&gt;<i> +			EphemeronLinkNode *tmp = current;
+</I>&gt;<i> +
+</I>&gt;<i> +			DEBUG (5, fprintf (gc_debug_file, &quot;Dead Ephemeron array at %p\n&quot;, object));
+</I>&gt;<i> +
+</I>&gt;<i> +			if (prev)
+</I>&gt;<i> +				prev-&gt;next = current-&gt;next;
+</I>&gt;<i> +			else
+</I>&gt;<i> +				ephemeron_list = current-&gt;next;
+</I>&gt;<i> +
+</I>&gt;<i> +			current = current-&gt;next;
+</I>&gt;<i> +			free_internal_mem (tmp, INTERNAL_MEM_EPHEMERON_LINK);
+</I>&gt;<i> +
+</I>&gt;<i> +			continue;
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		was_in_nursery = ptr_in_nursery (object);
+</I>&gt;<i> +		copy_func ((void**)&amp;object);
+</I>&gt;<i> +		current-&gt;array = object;
+</I>&gt;<i> +
+</I>&gt;<i> +		/*The array was promoted. Promote all elements of the array and add global remsets from the ones left behind in the nursery.
+</I>&gt;<i> +		 */
+</I>&gt;<i> +		was_promoted = was_in_nursery &amp;&amp; !ptr_in_nursery (object);
+</I>&gt;<i> +
+</I>&gt;<i> +		DEBUG (5, fprintf (gc_debug_file, &quot;Clearing unreachable entries for ephemeron array at %p\n&quot;, object));
+</I>&gt;<i> +
+</I>&gt;<i> +		array = (MonoArray*)object;
+</I>&gt;<i> +		ptr = (mword**)mono_array_addr_with_size (array, sizeof (mword) * 2, 0);
+</I>&gt;<i> +		length = mono_array_length (array);
+</I>&gt;<i> +
+</I>&gt;<i> +		for (i = 0; i &lt; length; ++i) {
+</I>&gt;<i> +			char *key = (char*)ptr [0];
+</I>&gt;<i> +			char *value = (char*)ptr [1];
+</I>
+Using a:
+typedef struct {
+	void *key;
+	void *value;
+} Ephemeron;
+
+instead of using ptr[0]/ptr[1] should make the code nicer here.
+
+&gt;<i> +
+</I>&gt;<i> +			if (key)
+</I>&gt;<i> +				DEBUG (5, fprintf (gc_debug_file, &quot;[%d] key %p (%s) value %p (%s)\n&quot;, i,
+</I>&gt;<i> +					key, key &amp;&amp; object_is_reachable (key, start, end) ? &quot;reachable&quot; : &quot;unreachable&quot;,
+</I>&gt;<i> +					value, value &amp;&amp; object_is_reachable (value, start, end) ? &quot;reachable&quot; : &quot;unreachable&quot;));
+</I>&gt;<i> +
+</I>&gt;<i> +			if (key &amp;&amp; !object_is_reachable (key, start, end)) {
+</I>&gt;<i> +				DEBUG (5, fprintf (gc_debug_file, &quot;\tclearing index %d\n&quot;, i));
+</I>&gt;<i> +				ptr [0] = NULL;
+</I>&gt;<i> +				ptr [1] = NULL;
+</I>&gt;<i> +				key = NULL;
+</I>&gt;<i> +			}
+</I>&gt;<i> +
+</I>&gt;<i> +			if (key &amp;&amp; was_promoted) {
+</I>&gt;<i> +				if (ptr_in_nursery (key)) {/*key was not promoted*/
+</I>&gt;<i> +					DEBUG (5, fprintf (gc_debug_file, &quot;\tAdded remset to key %p\n&quot;, key));
+</I>&gt;<i> +					add_to_global_remset (ptr, FALSE);
+</I>&gt;<i> +				}
+</I>&gt;<i> +				if (ptr_in_nursery (value)) {/*value was not promoted*/
+</I>&gt;<i> +					DEBUG (5, fprintf (gc_debug_file, &quot;\tAdded remset to value %p\n&quot;, value));
+</I>&gt;<i> +					add_to_global_remset (ptr + 1, FALSE);
+</I>&gt;<i> +				}
+</I>&gt;<i> +			}
+</I>&gt;<i> +			ptr += 2;
+</I>&gt;<i> +	   }
+</I>
+I would move the ptr += 2 together with the ++i (or use a single loop
+indexer) and use the appropriate continue statements instead of the
+multiple checks for a NULL key (it will also simplify the code when
+tombstone support will be added).
+
+&gt;<i> +/* LOCKING: requires that the GC lock is held */
+</I>&gt;<i> +static int
+</I>&gt;<i> +mark_ephemerons_in_range (CopyOrMarkObjectFunc copy_func, char *start, char *end)
+</I>&gt;<i> +{
+</I>&gt;<i> +	int nothing_marked = 1;
+</I>&gt;<i> +	EphemeronLinkNode *current = ephemeron_list;
+</I>&gt;<i> +	MonoArray *array;
+</I>&gt;<i> +	mword **ptr;
+</I>&gt;<i> +	uintptr_t i, length;
+</I>&gt;<i> +
+</I>&gt;<i> +	while (current) {
+</I>
+A for loop here is likely more appropriate, instead of the multiple
+current = current-&gt;next statements.
+
+&gt;<i> +		char *object = current-&gt;array, *old;
+</I>&gt;<i> +		DEBUG (5, fprintf (gc_debug_file, &quot;Ephemeron array at %p\n&quot;, object));
+</I>&gt;<i> +		/*We ignore arrays in old gend during minor collections since all objects are promoted by the remset machinery.*/
+</I>&gt;<i> +
+</I>&gt;<i> +		if (object &lt; start || object &gt;= end) {
+</I>&gt;<i> +			current = current-&gt;next;
+</I>&gt;<i> +			continue;
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		/*it has to be alive*/
+</I>&gt;<i> +		if (!object_is_reachable (object, start, end)) {
+</I>&gt;<i> +			DEBUG (5, fprintf (gc_debug_file, &quot;Ephemeron array at %p is not reachable\n&quot;, object));
+</I>&gt;<i> +			current = current-&gt;next;
+</I>&gt;<i> +			continue;
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		old = object;
+</I>&gt;<i> +		copy_func ((void**)&amp;object);
+</I>&gt;<i> +
+</I>&gt;<i> +		array = (MonoArray*)object;
+</I>&gt;<i> +		ptr = (mword**)mono_array_addr_with_size (array, sizeof (mword) * 2, 0);
+</I>&gt;<i> +		length = mono_array_length (array);
+</I>&gt;<i> +
+</I>&gt;<i> +		DEBUG (5, fprintf (gc_debug_file, &quot;Processing Ephemeron array at %p - %p\n&quot;, object, old));
+</I>&gt;<i> +		for (i = 0; i &lt; mono_array_length (array); ++i) {
+</I>&gt;<i> +			char *key = (char*)ptr [0];
+</I>&gt;<i> +			char *value = (char*)ptr [1];
+</I>
+The Ephemeron struct would make the code nicer here, too.
+
+&gt;<i> +/* LOCKING: assumes the GC lock is held */
+</I>&gt;<i> +static void
+</I>&gt;<i> +mono_gc_register_ephemeron_array (MonoObject *obj)
+</I>&gt;<i> +{
+</I>[...]
+&gt;<i> +void
+</I>&gt;<i> +mono_gc_ephemeron_array_add (MonoObject *obj)
+</I>&gt;<i> +{
+</I>&gt;<i> +	LOCK_GC;
+</I>&gt;<i> +	mono_gc_register_ephemeron_array (obj);
+</I>&gt;<i> +	UNLOCK_GC;
+</I>&gt;<i> +}
+</I>
+Why two separate functions here? mono_gc_register_ephemeron_array has no
+other callers.
+Also, make the icall return the array or otherwise another value that
+can be used to deal with an out of memory condition in the linked list
+node allocation, for example (the exception would get thrown in managed
+code).
+If Mark doesn't have objections, with the above changes the code can go in.
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034917.html">[Mono-dev] [PATCH]Add ephemeron support for sgen
+</A></li>
+	<LI>Next message: <A HREF="034924.html">[Mono-dev] [PATCH]Add ephemeron support for sgen
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34919">[ date ]</a>
+              <a href="thread.html#34919">[ thread ]</a>
+              <a href="subject.html#34919">[ subject ]</a>
+              <a href="author.html#34919">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

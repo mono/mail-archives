@@ -1,0 +1,384 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH] Tree mover, again
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Tree%20mover%2C%20again&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="017266.html">
+   <LINK REL="Next"  HREF="017273.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH] Tree mover, again</H1>
+    <B>Massimiliano Mantione</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Tree%20mover%2C%20again&In-Reply-To="
+       TITLE="[Mono-dev] [PATCH] Tree mover, again">massi at ximian.com
+       </A><BR>
+    <I>Tue Feb 21 05:39:45 EST 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="017266.html">[Mono-dev] Invalid IL code in gtksharp_gnome_program_init
+</A></li>
+        <LI>Next message: <A HREF="017273.html">[Mono-dev] [PATCH] Tree mover, again
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17265">[ date ]</a>
+              <a href="thread.html#17265">[ thread ]</a>
+              <a href="subject.html#17265">[ subject ]</a>
+              <a href="author.html#17265">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+What looked like a simple fix ended up being almost a rewrite :-(
+
+I noticed that very often the tree mover did its job, but it was
+useless... the typical pattern was a tree that goes into a local
+which in turn is moved (copied) into another local.
+Then copyprop will propagate the copy, and as a result the 1st
+local (which the tree mover wanted to eliminate) was used *twice*
+(once in the definition of the 2nd local, and then &quot;properly&quot;, in
+the &quot;propagated&quot; site).
+This &quot;double use&quot; then killed the tree move :-(
+The point is that the 1st use is in a dead definition (dead because
+of copyprop, of course!).
+To make a long story short, changing the tree mover logic a bit
+solved the issue; the updated logic is in the attached text file.
+
+In a couple of days I'll also post a &quot;tuning&quot; patch for inline and
+SSAPRE, but the tree mover itself is independent from it.
+
+This time the patch should be considered definitive, so please
+review it and tell me if I can commit it.
+
+Well, actually there are *formal* issues in how I should commit it...
+
+For some reason, svn during a merge made my mini.c very different
+from the trunk one, but just in white space.
+This means that a plain &quot;svn diff mini.c&quot; in my tree results in an
+unreadable file, with countless differences in white space.
+What's &quot;bad&quot; is that my local version is much &quot;better&quot;, because it
+has no trailing spaces at all, while the svn one is really cluttered
+with lots of trailing spaces here and there.
+The attached patch is produced ignoring whitespace chars, but I'd
+really like to be allowed to commit &quot;my&quot; mini.c to clean things up.
+
+Then, most of my patch is in mini.c inside the &quot;local propagation&quot;
+logic.
+Since mini.c is already very large, I'd like to take this section
+out and put it in a different file (as an example, see the attached
+&quot;local-propagation.c&quot;, I actually never tried to compile but it
+contains all the relevant code).
+This file will export just one symbol: &quot;mono_local_cprop&quot;, and the
+rest of the code in mini.c is unaffected.
+
+So, I'm posting the patch in diff form against mini.c but if it were
+for me I'd do the following:
+- move the code in a different file. and
+- commit a &quot;whitespace cleanup&quot; to mini.c while moving the code.
+
+Finally, the txt file will go into the mono/docs/ directory.
+
+Ciao,
+  Massi
+
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: local-propagation.c
+Type: text/x-csrc
+Size: 35266 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20060221/8cd63b87/attachment.bin">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20060221/8cd63b87/attachment.bin</A> 
+-------------- next part --------------
+
+Purpose
+
+Especially when inlining is active, it can happen that temporary
+variables add pressure to the register allocator, producing bad
+code.
+
+The idea is that some of these temporaries can be totally eliminated
+my moving the MonoInst tree that defines them directly to the use
+point in the code (so the name &quot;tree mover&quot;).
+
+Please note that this is *not* an optimization: it is mostly a
+workaround to issues we have in the regalloc.
+Actually, with the new linear IR this will not be possible at all
+(there will be no more trees in the code!).
+Anyway, this workaround turns out to be useful in the current state
+of things...
+
+-----------------------------------------------------------------------
+
+Base logic
+
+If a local is defined by a value which is a proper expression (a tree
+of MonoInst, not just another local or a constant), and this definition
+is used only once, the tree can be moved directly to the use location,
+and the definition eliminated.
+Of course, none of the variables used in the tree must be defined in
+the code path between the definition and the use, and the tree must be
+free of side effects.
+We do not handle the cases when the tree is just a local or a constant
+because they are handled by copyprop and consprop, respectively.
+
+To make things simpler, we restrict the tree move to the case when:
+- the definition and the use are in the same BB, and
+- the use is followed by another definition in the same BB (it is not
+  possible that the 1st value is used again), or alternatively there
+  is no BB in the whole CFG that contains a use of this local before a
+  definition (so, again, there is no code path that can lead to a
+  subsequent use).
+
+To handle this, we maintain an ACT array (Available Copy Tree, similar
+to the ACP), where we store the &quot;state&quot; of every local.
+Ideally, every local can be in the following state:
+[E] Undefined (by a tree, it could be in the ACP but we don't care).
+[D] Defined (by a tree), and waiting for a use.
+[U] Used, with a tree definition available in the same BB, but still
+    without a definition following the use (always in the same BB).
+Of course state [E] (empty) is the initial one.
+
+Besides, there are two sort of &quot;meta states&quot;, or flags:
+[W] Still waiting for a use or definition in this BB (we have seen no
+    occurrence of the local yet).
+[X] Used without being previously defined in the same BB (note that if
+    there is a definition that precedes the use in the same BB, even if
+    the definition is not a tree or is not available because of side
+    effects or because the tree value has changed the local is not in
+    state [X]).
+Also note that state [X] is a sort of &quot;global&quot; condition, which if set
+in one BB will stay valid for the whole CFG, even if the local will
+otherwise change state. The idea of flagging a local as [X] is that if
+there is a definition/use pair that reaches the end of a BB, it could
+be that there is a CFG path that then leads to the BB flagging it as
+[X] (which contains a use), so the tree cannot be moved.
+So state [X] will always be set, and never examined in all the state
+transitions we will describe.
+In practice, we use flag [W] to set state [X]: if, when traversing a
+BB, we find a use for a local in state [W], then that local is flagged
+[X].
+
+
+For each BB, we initialize all states to [E] and [W], and then we
+traverse the code one inst at a time, and update the variable states
+in the ACT in the following ways:
+
+[Definition]
+  - Flag [W] is cleared.
+  - All &quot;affected trees&quot; are killed (go from state [D] to [E]).
+    The &quot;affected trees&quot; are the trees which contain (use) the defined
+    local, and the rationale is that the tree value changed, so the
+    tree is no longer available.
+  - If the local was in state [U], *that* tree move is marked &quot;safe&quot;
+    (because *this* definition makes us sure that the previous tree
+    cannot be used again in any way).
+    The idea is that &quot;safe&quot; moves can happen even if the local is
+    flagged [X], because the second definition &quot;covers&quot; the use.
+    The tree move is then saved in the &quot;todo&quot; list (and the affecting
+    nodes are cleared).
+  - If the local was defined by a tree, it goes to state [D], the tree
+    is recorded, and all the locals used in it are marked as &quot;affecting
+    this tree&quot; (of course these markers are lists, because each local
+    could affect more than one tree).
+
+[IndirectDefinition]
+  - All potentially affected trees (in state [D]) are killed.
+
+[Use]
+  - If the local is still [W], it is flagged [X] (the [W] goes away).
+  - If the local is in state [D], it goes to state [U].
+    The tree move must not yet be recorded in the &quot;todo&quot; list, it still
+    stays in the ACT slot belonging to this local.
+    Anyway, the &quot;affecting&quot; nodes are updated, because now a definition
+    of a local used in this tree will affect only &quot;indirect&quot; (or also
+    &quot;propagated&quot;) moves, but not *this* move (see below).
+  - If the local is in state [U], then the tree cannot be moved (it is
+    used two times): the move is canceled, and the state goes [E].
+  - If the local is in state [E], the use is ignored.
+
+[IndirectUse]
+  - All potentially affected trees (in state [D] or [U]) are killed.
+
+[SideEffect]
+  - Tree is marked as &quot;unmovable&quot;.
+
+Then, at the end of the BB, for each ACT slot:
+  - If state is [U], the tree move is recorded in the &quot;todo&quot; list, but
+    flagged &quot;unsafe&quot;.
+  - Anyway, state goes to [E], the [W] flag is set, and all &quot;affecting&quot;
+    lists are cleared (we get ready to traverse the next BB).
+Finally, when all BBs has been scanned, we traverse the &quot;todo&quot; list,
+moving all &quot;safe&quot; entries, and moving &quot;unsafe&quot; ones only if their ACT
+slot is not flagged [X].
+
+So far, so good.
+But there are two issues that make things harder :-(
+
+The first is the concept of &quot;indirect tree move&quot;.
+It can happen that a tree is scheduled for moving, and its destination
+is a use that is located in a second tree, which could also be moved.
+The main issue is that a definition of a variable of the 1st tree on
+the path between the definition and the use of the 2nd one must prevent
+the move.
+But which move? The 1st or the 2nd?
+Well, any of the two!
+The point is, the 2nd move must be prevented *only* if the 1st one
+happens: if it is aborted (for an [X] flag or any other reason), the
+2nd move is OK, and vice versa...
+We must handle this in the following way:
+- The ACT must still remember if a slot is scheduled for moving in
+  this BB, and if it is, all the locals used in the tree.
+  We say that the slot is in state [M].
+  Note that [M] is (like [X] and [W]) a sort of &quot;meta state&quot;: a local
+  is flagged [M] when it goes to state [U], and the flag is cleared
+  when the tree move is cancelled
+- A tree that uses a local whose slot is in state [M] is also using all
+  the locals used by the tree in state [M], but the use is &quot;indirect&quot;.
+  These use nodes are also included in the &quot;affecting&quot; lists.
+- The definition of a variable used in an &quot;indirect&quot; way has the
+  effect of &quot;linking&quot; the two involved tree moves, saying that only one
+  of the two can happen in practice, but not both.
+- When the 2nd tree is scheduled for moving, the 1st one is *still* in
+  state [M], because a third move could &quot;carry it forward&quot;, and all the
+  *three* moves should be mutually exclusive (to be safe!).
+
+The second tricky complication is the &quot;tree forwarding&quot; that can happen
+when copyprop is involved.
+It is conceptually similar to the &quot;indirect tree move&quot;.
+Only, the 2nd tree is not really a tree, it is just the local defined
+in the 1st tree move.
+It can happen that copyprop will propagate the definition.
+We cannot make treeprop do the same job of copyprop, because copyprop
+has less constraints, and is therefore more powerful in its scope.
+The main issue is that treeprop cannot propagate a tree to *two* uses,
+while copyprop is perfectly capable of propagating one definition to
+two (or more) different places.
+So we must let copyprop do its job otherwise we'll miss optimizations,
+but we must also make it play safe with treeprop.
+Let's clarify with an example:
+  a = v1 + v2; //a is defined by a tree, state [D], uses v2 and v2
+  b = a; //a is used, state [U] with move scheduled, and
+         //b is defined by a, ACP[b] is a, and b is in state [DC]
+  c = b + v3; // b is used, goes to state [U]
+The real trouble is that copyprop happens *immediately*, while treeprop
+is deferred to the end of the CFG traversal.
+So, in the 3rd statement, the &quot;b&quot; is immediately turned into an &quot;a&quot; by
+copyprop, regardless of what treeprop will do.
+Anyway, if we are careful, this is not so bad.
+First of all, we must &quot;accept&quot; the fact that in the 3rd statement the
+&quot;b&quot; is in fact an &quot;a&quot;, as treeprop must happen *after* copyprop.
+The real problem is that &quot;a&quot; is used twice: in the 2nd and 3rd lines.
+In our usual setup, the 2nd line would set it to [U], and the 3rd line
+would kill the move (and set &quot;a&quot; to [E]).
+I have tried to play tricks, and reason as of copyprop didn't happen,
+but everything becomes really messy.
+Instead, we should note that the 2nd line is very likely to be dead.
+At least in this BB, copyprop will turn all &quot;b&quot;s into &quot;a&quot;s as long as
+it can, and when it cannot, it will be because either &quot;a&quot; or &quot;b&quot; have
+been redefined, which would be after the tree move anyway.
+So, the reasoning gets different: let's pretend that &quot;b&quot; will be dead.
+This will make the &quot;a&quot; use in the 2nd statement useless, so there we
+can &quot;reset&quot; &quot;a&quot; to [D], but also take note that if &quot;b&quot; will end up
+not being dead, the tree move associated to this [D] must be aborted.
+We can detect this in the following way:
+- Either &quot;b&quot; is used before being defined in this BB, or
+- It will be flagged &quot;unsafe&quot;.
+Both things are very easy to check.
+The only quirk is that the &quot;affecting&quot; lists must not be cleared when
+a slot goes to state [U], because a &quot;propagation&quot; could put it back
+to state [D] (where those lists are needed, because it can be killed
+by a definition to a used slot).
+
+-----------------------------------------------------------------------
+
+Implementation notes
+
+All the implementation runs inside the existing mono_local_cprop
+function, and a separate memory pool is used to hold the temporary
+data.
+
+A struct, MonoTreeMover, contains the pointers to the pool, the ACT,
+the list of scheduled moves and auxiliary things.
+This struct is allocated if the tree move pass is requested, and is
+then passed along to all the involved functions, which are therefore
+aware of the tree mover state.
+
+The ACT is an array of slots, obviously one per local.
+Each slot is of type MonoTreeMoverActSlot, and contains the used and
+affected locals, a pointer to the pending tree move and the &quot;waiting&quot;
+and &quot;unsafe&quot; flags.
+
+The &quot;affecting&quot; lists a built from &quot;dependency nodes&quot;, of type
+MonoTreeMoverDependencyNode.
+Each of the nodes contains the used and affected local, and is in
+two lists: the locals used by a slot, and the locals affected by a
+slot (obviously a different one).
+So, each node means: &quot;variable x is used in tree t, so a definition
+of x affects tree t&quot;.
+The &quot;affecting&quot; lists are doubly linked, to allow for O(1) deletion.
+The &quot;used&quot; lists are simply linked, but when they are mantained there
+is always a pointer to the last element to allow for O(1) list moving.
+When a used list is dismissed (which happens often, any time a node is
+killed), its nodes are unlinked from their respective affecting lists
+and are then put in a &quot;free&quot; list in the MonoTreeMover to be reused.
+
+Each tree move is represented by a struct (MonoTreeMoverTreeMove),
+which contains:
+- the definition and use points,
+- the &quot;affected&quot; moves (recall the concept of &quot;indirect tree move&quot;),
+- the &quot;must be dead&quot; slots (recall &quot;tree forwarding&quot;). and
+- a few utility flags.
+The tree moves stays in the relevant ACT slot until it is ready to be
+scheduled for moving, at which point it is put in a list in the
+MonoTreeMover.
+The tree moves structs are reused when they are killed, so there is
+also a &quot;free&quot; list for them in the MonoTreeMover.
+
+The tree mover code has been added to all the relevant functions that
+participate in consprop and copyprop, particularly:
+- mono_cprop_copy_values takes care of variable uses (transitions from
+  states [D] to [U] and [U] to [E] because of killing),
+- mono_cprop_invalidate_values takes care of side effects (indirect
+  accesses, calls...),
+- mono_local_cprop_bb sets up and cleans the traversals for each BB,
+  and for each MonoInst it takes care of variable definitions.
+To each of them has been added a MonoTreeMover parameter, which is not
+NULL if the tree mover is running.
+After mono_local_cprop_bb has run for all BBs, the MonoTreeMover has
+the list of all the pending moves, which must be walked to actually
+perform the moves (when possible, because &quot;unsafe&quot; flags, &quot;affected&quot;
+moves and &quot;must be dead&quot; slots can still have their effects, which
+must be handled now because they are fully known only at the end of
+the CFG traversal).
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: treeprop.patch
+Type: text/x-patch
+Size: 46135 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20060221/8cd63b87/attachment-0001.bin">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20060221/8cd63b87/attachment-0001.bin</A> 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="017266.html">[Mono-dev] Invalid IL code in gtksharp_gnome_program_init
+</A></li>
+	<LI>Next message: <A HREF="017273.html">[Mono-dev] [PATCH] Tree mover, again
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#17265">[ date ]</a>
+              <a href="thread.html#17265">[ thread ]</a>
+              <a href="subject.html#17265">[ subject ]</a>
+              <a href="author.html#17265">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

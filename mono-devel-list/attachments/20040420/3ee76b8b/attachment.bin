@@ -1,0 +1,3494 @@
+--- System.Text.RegularExpressions/arch.cs	2004-04-18 21:41:00.000000000 -0400
++++ System.Text.RegularExpressions/arch.cs	2004-04-20 13:39:03.747681240 -0400
+@@ -50,7 +50,9 @@
+ 
+ 		// miscellaneous
+ 		
+-		Info			// pattern information
++		Info,			// pattern information
++		Undefined,               // used by CILCompiler
++		Orphan	
+ 	}
+ 
+ 	[Flags]
+--- System.Text.RegularExpressions/category.cs	2004-04-18 21:39:30.000000000 -0400
++++ System.Text.RegularExpressions/category.cs	2004-04-20 13:39:03.748681088 -0400
+@@ -10,8 +10,9 @@
+ using System.Globalization;
+ 
+ namespace System.Text.RegularExpressions {
+-
+-	enum Category : ushort {
++	
++	[CLSCompliantAttribute(false)]
++	public enum Category : ushort {
+ 		None,
+ 
+ 		// canonical classes
+@@ -177,7 +178,8 @@
+ 		UnicodeTags
+ 	}
+ 
+-	class CategoryUtils {
++	[CLSCompliantAttribute(false)]
++	public class CategoryUtils {
+ 		public static Category CategoryFromName (string name) {
+ 			try {
+ 				if (name.StartsWith ("Is"))	// remove prefix from block range
+--- System.Text.RegularExpressions/Checkpoint.cs	1969-12-31 19:00:00.000000000 -0500
++++ System.Text.RegularExpressions/Checkpoint.cs	2004-04-20 13:39:03.746681392 -0400
+@@ -0,0 +1,138 @@
++//
++// assembly:	System
++// namespace:	System.Text.RegularExpressions
++// file:	Checkpoint.cs
++//
++// Authors:	Eric Durand-Tremblay (eric.durand-tremblay.1@ulaval.ca
++//
++// (c) 2004 Eric Durand-Tremblay
++//
++
++using System;
++using System.Collections;
++using System.Diagnostics;
++
++namespace System.Text.RegularExpressions {
++	public interface ICheckpointStack {	    
++		Checkpoint pop();
++		Checkpoint peek();
++		void clear();
++		void delete();
++		void push(Checkpoint cp);
++	}
++       
++	public unsafe class ArrayCheckpointStack : ICheckpointStack {
++		private const int STEP = 8;
++
++		public ArrayCheckpointStack () 
++		{
++			checkpoints = new Checkpoint[STEP];
++			nb = -1;
++		}
++	    
++		public Checkpoint pop() {
++			Debug.Assert(nb != -1, "Regex", "Empty Checkpoint Stack" );		
++			
++			return checkpoints[nb--];
++		}
++
++		public Checkpoint peek() {
++			Debug.Assert(nb != -1, "Regex", "Empty Checkpoint Stack" );		
++			return checkpoints[nb];
++		}
++
++		public void push(Checkpoint cp) {
++
++			if(++nb == checkpoints.Length) {
++				Checkpoint[] tmp = new Checkpoint[nb + STEP];
++				checkpoints.CopyTo(tmp, 0);
++				checkpoints = tmp;
++			}
++
++			checkpoints[nb] = cp;
++		}
++
++		public void clear() {
++			nb = 0;
++		}
++
++		public void delete() {
++			nb--;
++		}
++
++		private Checkpoint[] checkpoints; //Storage
++		private int nb; //Number of checkpoint stored
++	}
++
++
++	public unsafe class StaticCheckpointStack : ICheckpointStack {
++		
++		public StaticCheckpointStack () 
++		{
++		}
++	    
++		public Checkpoint pop() {
++			return checkpoint;
++		}
++
++		public Checkpoint peek() {
++			return checkpoint;
++		}
++
++		public void push(Checkpoint cp) {
++			checkpoint = cp;
++		}
++
++		public void clear() {			
++		}
++
++		public void delete() {
++		}
++		
++		private Checkpoint checkpoint; //Storage
++	}
++	
++	public unsafe class StackCheckpointStack : ICheckpointStack {
++		
++		public StackCheckpointStack () 
++		{
++			checkpoints = new Stack();
++		}
++	    
++		public Checkpoint pop() {
++			return (Checkpoint)checkpoints.Pop();
++		}
++
++		public Checkpoint peek() {
++			return (Checkpoint)checkpoints.Peek();
++		}
++
++		public void push(Checkpoint cp) {
++			checkpoints.Push(cp);
++		}
++
++		public void clear() {		
++			checkpoints.Clear();
++		}
++
++		public void delete() {
++			checkpoints.Pop();
++		}
++		
++		private Stack checkpoints; //Storage
++	}
++
++	[CLSCompliantAttribute(false)]
++	public unsafe struct Checkpoint {
++		[CLSCompliantAttribute(false)]
++		public Checkpoint(int mark_start, char* scan_ptr) {
++			this.mark_start = mark_start;
++			this.scan_ptr = scan_ptr;
++		}
++		
++		public int mark_start;
++		
++		[CLSCompliantAttribute(false)]
++		public char* scan_ptr;
++	}
++}
+--- System.Text.RegularExpressions/CILCompiler.cs	1969-12-31 19:00:00.000000000 -0500
++++ System.Text.RegularExpression/CILCompiler.cs	2004-04-20 13:44:01.003491488 -0400
+@@ -0,0 +1,2842 @@
++//
++// assembly:	System
++// namespace:	System.Text.RegularExpressions
++// file:	CILCompiler.cs
++//
++// author:      Francois Beauchemin ( beauche@softhome.net ) 
++//              Eric Durand ( eric.durand-tremblay.1@ulaval.ca ) 
++// 		(c) 2004
++
++using System;
++using System.Reflection;
++using System.Reflection.Emit;
++using System.Collections;
++using System.Diagnostics;
++using System.Runtime.CompilerServices;
++using System.Runtime.InteropServices;
++
++namespace System.Text.RegularExpressions {
++
++	class CILFactory : IMachineFactory {
++		public CILFactory (Type typeMachine, int group_count ) {
++			this.typeMachine = typeMachine;
++			this.group_count = group_count;
++		}
++
++		public IMachine NewInstance () {
++			return (IMachine) Activator.CreateInstance (this.typeMachine);
++		}
++
++		public int GroupCount {
++			get { return group_count; }
++		}
++		
++		public IDictionary Mapping {
++			get { return mapping; }
++			set { mapping = value; }
++		}
++
++		private IDictionary mapping;
++		private Type typeMachine;
++		private int group_count;
++	}
++
++	
++	public enum  ComplexRegexStatus {
++			NotFinished =0, 
++			Finished, 
++			NotBegan,
++			Maybe
++		}
++       
++
++	//Provide property and utility method for CILMachinesCallerType
++	[CLSCompliantAttribute(false)]
++	public abstract class CILMachineBase : IMachine{
++		
++		protected CILMachineBase(int nbCheckpoint, int nbRepeatCounter, 
++		                         int nbAlternation, int nbComplexRegex, CallerType []types) {
++
++			cpStack = new ICheckpointStack[nbCheckpoint];
++			for(int i =  0; i<nbCheckpoint; i++) {
++				switch(types[i]) {
++				case CallerType.BRANCH: case CallerType.LAZYREPEAT:
++					cpStack[i] = new StaticCheckpointStack();
++					break;
++			        case CallerType.REPEAT:
++					cpStack[i] = new ArrayCheckpointStack();
++					break;
++				}
++			}
++
++			rpCountStack = new int[nbRepeatCounter];
++			altLastBranch = new int[nbAlternation];
++		                         	
++			complexRegexStatus = new ComplexRegexStatus[nbComplexRegex];                         	
++			for ( int i = 0; i < nbComplexRegex; i++)
++				complexRegexStatus[i] = ComplexRegexStatus.NotBegan;
++				
++					                         	
++			                         	
++		}
++
++		abstract public Match Scan (Regex regex, string text, int start, int end);
++		
++		protected int CreateMark (int previous) {
++			if (mark_end == marks.Length) {
++				Mark [] dest = new Mark [marks.Length * 2];
++				marks.CopyTo (dest, 0);
++				marks = dest;
++			}
++			
++			int m = mark_end ++;
++			marks [m].Start = marks [m].End = -1;
++			marks [m].Previous = previous;
++			
++			return m;
++		}
++		
++		protected void Open (int gid, int ptr) {
++			int m = groups [gid];
++			if (m < mark_start || marks [m].IsDefined) {
++				m = CreateMark (m);
++				groups [gid] = m;
++			}
++			
++			marks [m].Start = ptr;
++		}
++
++		protected void Close (int gid, int ptr) {
++			marks [groups [gid]].End = ptr;
++		}
++
++		protected void Reset () {
++			ResetGroups ();
++			//fast = repeat = null;
++		}
++
++		protected void ResetGroups () {
++			int n = groups.Length;
++			if (marks == null)
++				marks = new Mark [n * 10];
++			
++
++			for (int i = 0; i < n; ++ i) {
++				groups [i] = i;
++				marks [i].Start = -1;
++				marks [i].End = -1;
++				marks [i].Previous = -1;
++			}
++			
++			mark_start = 0;
++			mark_end = n;
++			
++		
++		}
++		
++		[CLSCompliantAttribute(false)]
++		protected unsafe void Checkpoint (int idCp, char* scan_ptr) {
++			mark_start = mark_end; 			
++			cpStack[idCp].push(new Checkpoint(mark_start, scan_ptr));
++		}
++
++		[CLSCompliantAttribute(false)]
++		protected unsafe char* Backtrack (int idCp) {
++			Checkpoint cp = cpStack[idCp].pop();
++
++			Debug.Assert (cp.mark_start > mark_start, "Regex", "Attempt to backtrack forwards");
++
++			for (int i = 0; i < groups.Length; ++ i) {
++				int m = groups [i];
++				while (cp.mark_start <= m)
++					m = marks [m].Previous;
++
++				groups [i] = m;
++			}
++
++			return cp.scan_ptr;
++		}
++
++
++		protected int GetLastDefined (int gid) {
++			int m = groups [gid];
++
++			while (m >= 0 && !marks [m].IsDefined)
++				m = marks [m].Previous;
++			return m;
++		}
++
++
++	        protected void ClearCheckpoints() {
++			for(int i = 0; i<cpStack.Length; i++) {
++				cpStack[i].clear();
++			}
++		}
++
++		
++		protected Match GenerateMatch(Regex regex)
++		{
++			int[][] grps = new int[groups.Length][];
++			ArrayList caps = new ArrayList ();
++
++			for (int gid = 0; gid < groups.Length; ++ gid) {
++				caps.Clear ();
++				for (int m = groups[gid]; m >= 0; m = marks[m].Previous) {
++					if (!marks[m].IsDefined)
++						continue;
++					caps.Add (marks[m].Index);
++					caps.Add (marks[m].Length);
++				}
++
++				grps[gid] = (int[])caps.ToArray (typeof (int));
++			}
++
++			return new Match (regex, this, text, text_end, grps);
++		}
++
++		protected bool IsWordChar (char c) {
++			return CategoryUtils.IsCategory (Category.Word, c);
++		}
++
++		//Repeat Count  Stack
++
++		protected void InitRepeatCount(int idRp) {
++			rpCountStack[idRp] = -1;
++		}
++
++		protected void IncRepeatCount(int idRp) {
++			(rpCountStack[idRp])++; 
++		}
++
++		protected int GetCurRepeatCount(int idRp) {
++			return rpCountStack[idRp];
++		}
++		
++		protected void DecRepeatCount(int idRp) {
++			(rpCountStack[idRp])--; 
++		}
++
++		// Protected Members
++		protected string text;		// input text
++		protected int text_end;		// end of input text (last character + 1)
++		protected int scan_ptr;         // Current position of scan.
++	
++		protected Mark[] marks = null;	// mark stack
++		protected int mark_start;	// start of current checkpoint
++		protected int mark_end;	        // end of checkpoint/next free mark
++		
++		protected ComplexRegexStatus[] complexRegexStatus; // keep track if complex regex has finished
++
++	
++
++		protected int[] groups;	        // current group definitions
++
++		protected int group_count;
++
++		protected QuickSearch qs;       // fast substring matcher
++		
++		// Keep track of check points.
++		protected ICheckpointStack[] cpStack;
++
++		// Keep track of the counts in Repeat construct.
++		protected int[] rpCountStack;
++		
++		// Keep track of the latest branch tested
++		protected int[] altLastBranch;
++
++
++	}
++
++	internal class CILCompiler : ICompiler {
++
++	     static CILCompiler() {
++			inst_count = 0;
++
++			// Get the current application domain for the current thread.
++			AppDomain currentDomain = AppDomain.CurrentDomain;
++		       
++			asmName = new AssemblyName();
++			asmName.Name = "InnerRegexAssembly";
++
++
++			// Define a dynamic assembly in the current application domain.			
++			asmBuilder = currentDomain.DefineDynamicAssembly (asmName, AssemblyBuilderAccess.Run);
++
++			// Define a dynamic module in this assembly.			
++			modBuilder = asmBuilder.DefineDynamicModule("InnerRegexModule");
++	     	
++			unsafe{
++				sizeofchar = sizeof(char);
++			}
++			
++		}
++
++		public CILCompiler () : this(modBuilder, ++inst_count) {
++			
++		}
++
++		public CILCompiler(ModuleBuilder moduleBuilder, int machineNumber)
++		{		
++			// Define a runtime class with specified name and attributes.
++			builder = moduleBuilder.DefineType("IMachine" + machineNumber.ToString() ,
++							   TypeAttributes.Public, 
++							   typeof(CILMachineBase), 
++							   new Type[]{typeof(IMachine)});
++			
++
++			//Define default constructor
++			ConstructorBuilder ctorBuilder = builder.DefineConstructor(MethodAttributes.Public,
++										   CallingConventions.Standard,
++										   new Type[] {});
++
++			ctorILGen = ctorBuilder.GetILGenerator();
++
++
++			//Define Scan Method
++			MethodBuilder scanMethodBuilder = builder.DefineMethod("Scan", MethodAttributes.Public | MethodAttributes.Virtual ,
++									       typeof(Match), 
++									       new Type[]{typeof(Regex), 
++											  typeof(string), 
++											  typeof(int), 
++											  typeof(int)}); 
++		    
++			builder.DefineMethodOverride(scanMethodBuilder, typeof(IMachine).GetMethod("Scan"));
++			scanILGen = scanMethodBuilder.GetILGenerator();
++			
++			//Define Eval Method (For recursion)
++			MethodBuilder evalMethodBuilder = builder.DefineMethod("Eval", 
++									       MethodAttributes.Private,
++									       typeof(bool), 
++									       new Type[]{});			  
++											  
++		
++			evalILGen = evalMethodBuilder.GetILGenerator();
++	
++
++			//Declare Locals
++
++			Var_ptr = evalILGen.DeclareLocal(CharPtr);			
++			Var_scan_ptr = evalILGen.DeclareLocal(CharPtr);
++			Var_initial_ptr = evalILGen.DeclareLocal(CharPtr);
++			
++			Var_text_end_ptr = evalILGen.DeclareLocal(CharPtr);
++			Var_anch_ptr = evalILGen.DeclareLocal(CharPtr);
++			Var_anch_end = evalILGen.DeclareLocal(CharPtr);
++
++			//Var_test = evalILGen.DeclareLocal(typeof(int));
++
++
++			//Initialize fields
++			scanILGen.Emit(OpCodes.Ldarg_0);
++			scanILGen.Emit(OpCodes.Ldarg_2);
++			scanILGen.Emit(OpCodes.Stfld, cText); 
++				       
++			scanILGen.Emit(OpCodes.Ldarg_0);
++			scanILGen.Emit(OpCodes.Ldarg_3);
++			scanILGen.Emit(OpCodes.Stfld, cScanPtr);
++
++			scanILGen.Emit(OpCodes.Ldarg_0);
++			scanILGen.Emit(OpCodes.Ldarg_S, (byte)4);
++			scanILGen.Emit(OpCodes.Stfld, cTextEnd);
++
++			// call eval method.
++			scanILGen.Emit(OpCodes.Ldarg_0);
++  			scanILGen.Emit(OpCodes.Call, evalMethodBuilder);
++
++			//Initialize initial_ptr
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cText);
++			evalILGen.Emit(OpCodes.Conv_I);
++			evalILGen.Emit(OpCodes.Call, cmRuntimeHelpers_getOffsetToStringData);
++			evalILGen.Emit(OpCodes.Add);
++			evalILGen.Emit(OpCodes.Stloc, Var_initial_ptr);
++
++			//Initialize ptr
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cScanPtr);
++			evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++			evalILGen.Emit(OpCodes.Mul);
++			evalILGen.Emit(OpCodes.Conv_I);
++			evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr); 
++			evalILGen.Emit(OpCodes.Add);
++			evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++
++			//Initialze scan_ptr
++			evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++			evalILGen.Emit(OpCodes.Stloc, Var_scan_ptr);
++
++			//Initialize text_end_ptr
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cTextEnd);
++			evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++			evalILGen.Emit(OpCodes.Mul);
++			evalILGen.Emit(OpCodes.Conv_I);
++			evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr); 
++			evalILGen.Emit(OpCodes.Add);
++			evalILGen.Emit(OpCodes.Stloc, Var_text_end_ptr);
++		}
++
++		// Do some close code for the generated method.
++		public Type Close() {
++			ctorILGen.Emit(OpCodes.Ldarg_0);
++			ctorILGen.Emit(OpCodes.Ldc_I4, nbDefinedCheckpoint);
++			ctorILGen.Emit(OpCodes.Ldc_I4, nbDefinedCounterId);
++			ctorILGen.Emit(OpCodes.Ldc_I4, nbDefinedAlternation);
++			ctorILGen.Emit(OpCodes.Ldc_I4, nbDefinedComplexRegex);
++			
++			ctorILGen.Emit(OpCodes.Ldc_I4, nbDefinedCheckpoint);
++			ctorILGen.Emit(OpCodes.Newarr,  Type.GetType("System.Text.RegularExpressions.CallerType[]"));
++			
++			if(CheckpointsCallerTypes != null) {
++				int i = 0;
++				foreach(CallerType type in CheckpointsCallerTypes) {
++					ctorILGen.Emit(OpCodes.Dup);
++					ctorILGen.Emit(OpCodes.Ldc_I4, i);
++					ctorILGen.Emit(OpCodes.Ldc_I4, (int)type);
++					ctorILGen.Emit(OpCodes.Stelem_I4);
++					i++;
++				}
++			}
++	
++			ctorILGen.Emit(OpCodes.Call, 
++				       typeof(CILMachineBase).GetConstructor(BindingFlags.Instance | 
++									     BindingFlags.NonPublic, 
++				       null, 
++				       new Type[]{typeof(int), typeof(int), typeof(int), typeof(int), 
++				       			  Type.GetType("System.Text.RegularExpressions.CallerType[]")},
++				       null));
++			
++			//Close the constructor
++			ctorILGen.Emit(OpCodes.Ldarg_0);
++			ctorILGen.Emit(OpCodes.Ldc_I4, group_count);
++			ctorILGen.Emit(OpCodes.Stfld, cGroupCount);
++
++			ctorILGen.Emit(OpCodes.Ldarg_0);
++			ctorILGen.Emit(OpCodes.Ldc_I4, group_count);
++			ctorILGen.Emit(OpCodes.Newarr, typeof(int));
++			ctorILGen.Emit(OpCodes.Stfld, cGroups);
++
++			ctorILGen.Emit(OpCodes.Ret);
++
++			//Close the Scan method
++
++			Label lblELSE =  scanILGen.DefineLabel();
++			Label lblEND_IF =  scanILGen.DefineLabel();
++			// Assertion : The last operation emitted for scan is the call to eval.
++			scanILGen.Emit(OpCodes.Brfalse, lblELSE);
++
++
++
++			// if eval returned true		
++			scanILGen.Emit(OpCodes.Ldarg_0);
++			scanILGen.Emit(OpCodes.Ldarg_1); //Put a ref to  regex passed to scan on the stack
++  			scanILGen.Emit(OpCodes.Call, cmCILMachineBase_GenerateMatch);
++			scanILGen.Emit(OpCodes.Br, lblEND_IF);
++
++			// else
++			scanILGen.MarkLabel(lblELSE);
++
++			scanILGen.Emit(OpCodes.Call, cpMatchEmpty.GetGetMethod());
++
++			scanILGen.MarkLabel(lblEND_IF);
++
++			//Clear checkpoints.
++			scanILGen.Emit(OpCodes.Ldarg_0);
++			scanILGen.Emit(OpCodes.Call, cmCILMachineBase_ClearCheckpoints);
++
++			scanILGen.Emit(OpCodes.Ret);
++
++
++			//Close Eval method
++			//Close Group 0
++			//marks [groups [0]].End = ptr;
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cMarks);
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cGroups);
++			evalILGen.Emit(OpCodes.Ldc_I4_0);
++			evalILGen.Emit(OpCodes.Ldelem_I4);
++			evalILGen.Emit(OpCodes.Ldelema, typeof(Mark));
++		
++			evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++			evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++			evalILGen.Emit(OpCodes.Sub);
++			evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++			evalILGen.Emit(OpCodes.Div);
++			evalILGen.Emit(OpCodes.Conv_I4);
++
++			evalILGen.Emit(OpCodes.Stfld, cfMark_End);
++
++			evalILGen.Emit(OpCodes.Ldc_I4_1); // return true when the eval method had finish.
++			evalILGen.Emit(OpCodes.Ret);
++			
++			return builder.CreateType();
++		}
++
++		// ICompiler implementation
++
++		public void Reset () {
++
++		}
++
++		public IMachineFactory GetMachineFactory () {
++			Debug.Assert (group_count != -1 , "Regex", "group_count uninitialize");			
++		
++			return new CILFactory(Close(), this.group_count) ;
++
++		}
++
++		// instruction emission
++
++		public void EmitFalse () {
++			ContextNode curContext = (ContextNode)context.Peek();
++			
++			switch (curContext.op) {
++			case OpCode.In:
++				// If an In construct pass here, it is a Failure.
++				EmitFail(curContext);
++				
++				context.Pop();  // In construct finished.. kill context
++				break;
++			default:
++				EmitFail(curContext);
++				break;
++			}
++			
++		}
++
++		public void EmitTrue() {
++			ContextNode curContext = (ContextNode)context.Pop();
++			
++			switch (curContext.op) {
++			case OpCode.Position: case OpCode.String:
++				if (IsAnchorMode) {
++					// Do not pop yet.
++					context.Push(curContext);
++				}
++				else {
++					EmitPass(curContext);
++				}
++								
++				break;
++			case OpCode.Anchor:
++				if (IsAnchorMode) {
++					//No Anchor
++					Label lblWHILE = evalILGen.DefineLabel();
++					Label lblFAIL = evalILGen.DefineLabel();
++					Label lblTOP = evalILGen.DefineLabel();
++					
++					//**Inverted WHILE***
++
++					evalILGen.Emit(OpCodes.Br, lblWHILE);
++					evalILGen.MarkLabel(lblTOP);
++					
++					//ptr = anch_ptr;
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++
++					//TryMatch
++					EmitTryMatch(anchorTail);
++					
++					evalILGen.MarkLabel(lblFAIL);
++
++					// anch_reverse ? anch_ptr-- : anch_ptr++
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++					if ( curContext.reverse ) 
++						evalILGen.Emit(OpCodes.Sub);
++					else
++						evalILGen.Emit(OpCodes.Add);
++					evalILGen.Emit(OpCodes.Stloc_S, Var_anch_ptr);
++
++
++					evalILGen.MarkLabel(lblWHILE);
++					if ( curContext.reverse ) {
++						//while (anch_ptr >= 0 ) {
++						evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);	
++						
++						evalILGen.Emit(OpCodes.Bge, lblTOP);
++						
++					}
++					else {												
++						//while (anch_ptr <= anch_end) {
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_end);
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Bge, lblTOP);
++					}		
++
++					//Return false
++					evalILGen.Emit(OpCodes.Ldc_I4_0);
++					evalILGen.Emit(OpCodes.Ret);
++
++					//Set context to come back to FAIL on failure
++					context.Push(new ContextNode(OpCode.Position, new CILLinkRef(), new CILLinkRef(lblFAIL)));
++					break;
++
++				}
++
++				//EmitPass(curContext);
++				break;
++
++			case OpCode.In:
++				// If an In construct pass here, it is a Failure.
++				EmitFail(curContext);
++					
++				break;
++				
++			default:
++				break;
++			}
++
++			IsAnchorMode = false;
++		}
++
++		// character matching
++
++		public void EmitCharacter (char c, bool negate, bool ignore, bool reverse) {
++			ContextNode curContext = (ContextNode)context.Peek();
++ 			
++			//Declare local
++			if(EmitEvalChar_c == null)
++				EmitEvalChar_c = evalILGen.DeclareLocal(typeof(char));
++
++			Label lblPASS = evalILGen.DefineLabel();
++			Label lblFAIL = evalILGen.DefineLabel();
++			
++			if(curContext.op == OpCode.In) {
++				//In construct
++				if(!InConsumed) {
++					EmitConsumeCharacter(reverse, lblFAIL);
++					InConsumed = true;
++				}
++			}
++			//Regular construct
++			else if( !curContext.fail.IsEmpty() )
++				EmitConsumeCharacter(reverse, curContext.fail.ToLabel());
++			else
++				EmitConsumeCharacter(reverse, lblFAIL);
++
++			evalILGen.Emit(OpCodes.Ldloc, EmitEvalChar_c);
++		  
++			if (ignore) {
++			        c = Char.ToLower(c);
++				evalILGen.Emit(OpCodes.Call, cmChar_ToLower);	
++			}
++			
++			// c2 = c
++			evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)c);
++			
++			if (!negate) {
++				//if c1 == c2 pass
++
++				if( !curContext.pass.IsEmpty())
++					evalILGen.Emit(OpCodes.Beq,  curContext.pass.ToLabel());
++				else
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++			}
++			else {
++				//if c1 != c2 pass
++				if( !curContext.pass.IsEmpty()) {
++					evalILGen.Emit(OpCodes.Ceq);				
++					evalILGen.Emit(OpCodes.Brfalse, curContext.pass.ToLabel());				
++				}
++				else {
++					evalILGen.Emit(OpCodes.Ceq);				
++					evalILGen.Emit(OpCodes.Brfalse, lblPASS);
++				}
++			}
++			
++			if(curContext.op == OpCode.In) {
++				//Try next case.
++				evalILGen.Emit(OpCodes.Br, lblPASS);
++			}
++			
++			// FAIL
++			evalILGen.MarkLabel(lblFAIL);
++			EmitFail(curContext);
++			
++			// PASS
++			evalILGen.MarkLabel(lblPASS);
++		}	       
++		
++
++		public void EmitCategory (Category cat, bool negate, bool reverse) {
++			ContextNode curContext = (ContextNode)context.Peek();
++ 			
++			//Declare local
++			if(EmitEvalChar_c == null)
++				EmitEvalChar_c = evalILGen.DeclareLocal(typeof(char));
++
++			Label lblPASS = evalILGen.DefineLabel();
++			Label lblFAIL = evalILGen.DefineLabel();
++			
++			if(curContext.op == OpCode.In) {
++				//In construct
++				if(!InConsumed) {
++					EmitConsumeCharacter(reverse, lblFAIL);
++					InConsumed = true;
++				}
++			}
++			//Regular construct
++			else if( !curContext.fail.IsEmpty() )
++				EmitConsumeCharacter(reverse, curContext.fail.ToLabel());
++			else
++				EmitConsumeCharacter(reverse, lblFAIL);
++			
++			
++			//isCategory(cat, c);
++			evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)cat);
++			evalILGen.Emit(OpCodes.Ldloc, EmitEvalChar_c);
++
++			evalILGen.Emit(OpCodes.Call, CategoryUtils_IsCategory);
++			
++			if (!negate) {
++				//if c isCategory cat  pass
++				if( !curContext.pass.IsEmpty()) 	
++					evalILGen.Emit(OpCodes.Brtrue,  curContext.pass.ToLabel());				
++				else
++					evalILGen.Emit(OpCodes.Brtrue, lblPASS);
++			}
++			else {
++				//if c !isCategory cat pass
++				if( !curContext.pass.IsEmpty()) {				
++					evalILGen.Emit(OpCodes.Brfalse, curContext.pass.ToLabel());				
++				}
++				else {				
++					evalILGen.Emit(OpCodes.Brfalse, lblPASS);
++				}
++			}
++			
++			if(curContext.op == OpCode.In) {
++				//Try next case.
++				evalILGen.Emit(OpCodes.Br, lblPASS);
++			}
++			
++			// FAIL
++			evalILGen.MarkLabel(lblFAIL);
++			EmitFail(curContext);
++			
++			// PASS
++			evalILGen.MarkLabel(lblPASS);
++		}
++
++		public void EmitRange (char lo, char hi, bool negate, bool ignore, bool reverse) {
++			ContextNode curContext = (ContextNode)context.Peek();
++ 			
++			//Declare local
++			if(EmitEvalChar_c == null)
++				EmitEvalChar_c = evalILGen.DeclareLocal(typeof(char));
++
++			Label lblPASS = evalILGen.DefineLabel();
++			Label lblPREFAIL = evalILGen.DefineLabel();
++			Label lblFAIL = evalILGen.DefineLabel();
++			
++			if(curContext.op == OpCode.In) {
++				//In construct
++				if(!InConsumed) {
++					EmitConsumeCharacter(reverse, lblFAIL);
++					InConsumed = true;
++				}
++			}
++			//Regular construct
++			else if( !curContext.fail.IsEmpty() )
++				EmitConsumeCharacter(reverse, curContext.fail.ToLabel());
++			else
++				EmitConsumeCharacter(reverse, lblFAIL);
++			
++			evalILGen.Emit(OpCodes.Ldloc, EmitEvalChar_c);
++			
++			if (ignore) {
++				evalILGen.Emit(OpCodes.Call, cmChar_ToLower);
++				evalILGen.Emit(OpCodes.Stloc, EmitEvalChar_c);
++				evalILGen.Emit(OpCodes.Ldloc, EmitEvalChar_c);
++			}
++			
++
++		        //  low <= c1 <= hi
++			
++			evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)lo);
++			
++			if (!negate) {
++				//if c1 < low : fail
++				evalILGen.Emit(OpCodes.Blt, lblPREFAIL);
++				
++				//if c1 <= hi : pass
++				evalILGen.Emit(OpCodes.Ldloc, EmitEvalChar_c);
++				evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)hi);
++				if( !curContext.pass.IsEmpty()) 	
++					evalILGen.Emit(OpCodes.Ble,  curContext.pass.ToLabel());				
++				else
++					evalILGen.Emit(OpCodes.Ble, lblPASS);
++				
++				
++			}
++			else {
++				if( !curContext.pass.IsEmpty()) {
++					//if c1 < lo pass
++					evalILGen.Emit(OpCodes.Blt, curContext.pass.ToLabel());
++
++					//if c1 > hi pass
++					evalILGen.Emit(OpCodes.Ldloc, EmitEvalChar_c);
++					evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)hi);
++					evalILGen.Emit(OpCodes.Bgt, curContext.pass.ToLabel());
++					
++				}
++				else {			
++					//if c1 < lo pass
++					evalILGen.Emit(OpCodes.Blt, lblPASS);
++					
++					//if c1 > hi pass
++					evalILGen.Emit(OpCodes.Ldloc, EmitEvalChar_c);
++					evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)hi);
++					evalILGen.Emit(OpCodes.Bgt, lblPASS);
++				}
++
++				
++			}
++				       
++			evalILGen.MarkLabel(lblPREFAIL);
++							   
++			if(curContext.op == OpCode.In) {
++				//Try next case.
++				evalILGen.Emit(OpCodes.Br, lblPASS);
++			}
++			
++			// FAIL
++			evalILGen.MarkLabel(lblFAIL);
++			EmitFail(curContext);
++			
++			// PASS
++			evalILGen.MarkLabel(lblPASS);
++		}
++
++		public void EmitSet (char lo, BitArray set, bool negate, bool ignore, bool reverse) {
++			ContextNode curContext = (ContextNode)context.Peek();
++			
++			//Declare local
++			if(EmitEvalChar_c == null)
++				EmitEvalChar_c = evalILGen.DeclareLocal(typeof(char));
++
++			if(EmitSet_bytes_ptr == null) {
++				EmitSet_bytes_ptr = evalILGen.DeclareLocal(BytePtr);
++				EmitSet_bytes_cur_ptr = evalILGen.DeclareLocal(BytePtr);
++				EmitSet_i = evalILGen.DeclareLocal(typeof(int));
++			}
++
++			Label lblPASS = evalILGen.DefineLabel();
++			Label lblPREFAIL = evalILGen.DefineLabel();
++			Label lblFAIL = evalILGen.DefineLabel();
++			
++			
++			if(curContext.op == OpCode.In) {
++				//In construct
++				if(!InConsumed) {
++					EmitConsumeCharacter(reverse, lblFAIL);
++					InConsumed = true;
++				}
++			}
++			//Regular construct
++			else if( !curContext.fail.IsEmpty() )
++				EmitConsumeCharacter(reverse, curContext.fail.ToLabel());
++			else
++				EmitConsumeCharacter(reverse, lblFAIL);
++			
++			evalILGen.Emit(OpCodes.Ldloc, EmitEvalChar_c);
++			
++			if (ignore) {
++				evalILGen.Emit(OpCodes.Call, cmChar_ToLower);	
++			}
++			
++			//int i = (int)c - lo;
++			evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)lo);
++			evalILGen.Emit(OpCodes.Sub);
++			evalILGen.Emit(OpCodes.Conv_I4);
++			evalILGen.Emit(OpCodes.Stloc, EmitSet_i);
++			
++			// if (i < 0 ) : fail
++			evalILGen.Emit(OpCodes.Ldloc, EmitSet_i);
++			evalILGen.Emit(OpCodes.Ldc_I4_0);
++			evalILGen.Emit(OpCodes.Blt, lblPREFAIL);
++
++			// if(i> len before shift) : fail
++			evalILGen.Emit(OpCodes.Ldloc, EmitSet_i);
++			evalILGen.Emit(OpCodes.Ldc_I4, (int) set.Length + 0xf);
++			evalILGen.Emit(OpCodes.Bgt, lblPREFAIL);
++
++			
++
++			//We are in the range, now test with the bitmask
++
++		        //  load bytes to test.
++			int len = (set.Length + 0xf) >> 4;
++
++			evalILGen.Emit(OpCodes.Ldc_I4, len);
++			evalILGen.Emit(OpCodes.Localloc);
++			evalILGen.Emit(OpCodes.Stloc, EmitSet_bytes_ptr);
++			evalILGen.Emit(OpCodes.Ldloc, EmitSet_bytes_ptr);
++			evalILGen.Emit(OpCodes.Stloc, EmitSet_bytes_cur_ptr);
++
++			int b = 0;
++			while (len -- != 0) {
++				ushort word = 0;
++				for (int i = 0; i < 16; ++ i) {
++					if (b >= set.Length)
++						break;
++				
++					if (set[b ++])
++						word |= (ushort)(1 << i);
++				}
++
++			        evalILGen.Emit(OpCodes.Ldloc, EmitSet_bytes_cur_ptr);
++				evalILGen.Emit(OpCodes.Ldc_I4, word);
++				evalILGen.Emit(OpCodes.Stind_I2);
++				evalILGen.Emit(OpCodes.Ldloc, EmitSet_bytes_cur_ptr);
++				evalILGen.Emit(OpCodes.Ldc_I4, Marshal.SizeOf(typeof(ushort)));
++				evalILGen.Emit(OpCodes.Add);
++				evalILGen.Emit(OpCodes.Stloc, EmitSet_bytes_cur_ptr);
++			}
++
++			//arg1 = *(bytes_ptr + (i >> 4)* sizeof(ushort))
++			evalILGen.Emit(OpCodes.Ldloc, EmitSet_bytes_ptr);
++			evalILGen.Emit(OpCodes.Ldloc, EmitSet_i);
++			evalILGen.Emit(OpCodes.Ldc_I4_4);
++			evalILGen.Emit(OpCodes.Shr);
++			evalILGen.Emit(OpCodes.Ldc_I4, Marshal.SizeOf(typeof(ushort)));
++			evalILGen.Emit(OpCodes.Mul);
++			evalILGen.Emit(OpCodes.Add);
++			evalILGen.Emit(OpCodes.Ldind_U2);
++
++			//arg2 =  (1 << (i & 0xf)))
++			evalILGen.Emit(OpCodes.Ldc_I4_1);
++			evalILGen.Emit(OpCodes.Ldloc, EmitSet_i);
++			evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)0xf);
++			evalILGen.Emit(OpCodes.And);
++			evalILGen.Emit(OpCodes.Shl);
++
++			// arg1 & arg2
++			evalILGen.Emit(OpCodes.And);
++			evalILGen.Emit(OpCodes.Ldc_I4_0);
++
++			if (!negate) {
++				//If arg1&arg2 != 0 : pass
++				if( !curContext.pass.IsEmpty()) {
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse,  curContext.pass.ToLabel());
++				}
++				else {
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, lblPASS);
++				}
++			}
++			else {
++				//If arg1&arg2 == 0 : pass
++				if( !curContext.pass.IsEmpty())
++					evalILGen.Emit(OpCodes.Beq, curContext.pass.ToLabel());
++				else 			
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++			}
++				       
++			evalILGen.MarkLabel(lblPREFAIL);
++							   
++			if(curContext.op == OpCode.In) {
++				//Try next case.
++				evalILGen.Emit(OpCodes.Br, lblPASS);
++			}
++			
++			// FAIL
++			evalILGen.MarkLabel(lblFAIL);
++			EmitFail(curContext);
++			
++			// PASS
++			evalILGen.MarkLabel(lblPASS);
++		}
++
++		// other operators
++
++		public void EmitString (string str, bool ignore, bool reverse) {
++			ContextNode curContext = (ContextNode)context.Peek();
++			
++			//Position Anchor			
++			if(curContext.op == OpCode.Anchor) {
++				//String anchor
++									
++				Label lblWHILE = evalILGen.DefineLabel();
++				Label lblFAIL = evalILGen.DefineLabel();
++				Label lblEND = evalILGen.DefineLabel();
++
++				//if (qs == null) {
++				evalILGen.Emit(OpCodes.Ldnull);
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldfld, cQS);
++				evalILGen.Emit(OpCodes.Ceq);
++				evalILGen.Emit(OpCodes.Brfalse, lblWHILE);
++				
++				//qs = new QuickSearch (substring, ignore, reverse);
++				
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldstr, str);
++
++				if( ignore )
++					evalILGen.Emit(OpCodes.Ldc_I4_1);
++				else
++					evalILGen.Emit(OpCodes.Ldc_I4_0);
++
++				if ( reverse ) 
++					evalILGen.Emit(OpCodes.Ldc_I4_1);
++				else
++					evalILGen.Emit(OpCodes.Ldc_I4_0);
++					
++				evalILGen.Emit(OpCodes.Newobj, cmQuickSearch_Ctor);
++				evalILGen.Emit(OpCodes.Stfld, cQS);	
++
++				evalILGen.MarkLabel(lblWHILE);					
++
++
++				if(reverse) {					
++					//while (anch_ptr >= 0 ) {
++					evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Ldc_I4_0);	
++
++					evalILGen.Emit(OpCodes.Blt, lblEND);
++
++					//anch_ptr = qs.reverseSearch (text, anch_ptr, 0);
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldfld, cQS);
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_initial_ptr);
++					//					evalILGen.Emit(OpCodes.Ldc_I4_0);
++
++					evalILGen.Emit(OpCodes.Call, cmQuickSearch_Search);
++					evalILGen.Emit(OpCodes.Stloc, Var_anch_ptr);
++
++					//	evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);	
++
++					// if (anch_ptr == null) 
++					//    break;
++					evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Brfalse, lblEND);
++
++					//  anch_ptr += str.Length
++					evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Ldc_I4, str.Length *  sizeofchar );
++					evalILGen.Emit(OpCodes.Add);
++
++					evalILGen.Emit(OpCodes.Stloc, Var_anch_ptr);
++
++				}
++				else {
++					//while (anch_ptr <= anch_end) {
++					evalILGen.Emit(OpCodes.Ldloc, Var_anch_end);
++					evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Blt, lblEND);				
++
++					//anch_ptr = qs.Search (text, anch_ptr, anch_end);
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldfld, cQS);
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_end);
++
++					evalILGen.Emit(OpCodes.Call, cmQuickSearch_Search);
++					evalILGen.Emit(OpCodes.Stloc, Var_anch_ptr);
++					
++					//if (anch_ptr == null)
++					//  break;
++					evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Ldnull);
++					evalILGen.Emit(OpCodes.Beq, lblEND);
++					
++				}
++			
++				//ptr = anch_ptr - anch_offset;
++				evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++				if ( anchor_offset > 0 ) {					
++					
++					evalILGen.Emit(OpCodes.Ldc_I4, anchor_offset * sizeofchar);
++					if ( reverse ) 
++						evalILGen.Emit(OpCodes.Add);
++					else
++						evalILGen.Emit(OpCodes.Sub);
++				}
++				evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++
++						  
++
++				//TryMatch
++				EmitTryMatch(anchorTail);	
++
++				//Final failure
++				evalILGen.MarkLabel(lblEND);
++				evalILGen.Emit(OpCodes.Ldc_I4_0);
++				evalILGen.Emit(OpCodes.Ret);		
++
++				//FAIL Handling
++				evalILGen.MarkLabel(lblFAIL);
++
++				//reverse ? anch_ptr -= 2 : anch_ptr++, 
++				if ( reverse ) 	{
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Ldc_I4, 2 * sizeofchar);
++					evalILGen.Emit(OpCodes.Sub);
++					evalILGen.Emit(OpCodes.Stloc_S, Var_anch_ptr);
++				}
++				else {
++					evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Add);
++					evalILGen.Emit(OpCodes.Stloc_S, Var_anch_ptr);
++				}
++						
++				//goto WHILE
++				evalILGen.Emit(OpCodes.Br, lblWHILE);
++
++				
++
++				//Keep track of Failure
++				context.Push(new ContextNode(OpCode.Position, new CILLinkRef(), new CILLinkRef(lblFAIL)));
++			}
++			else {
++				//Define Locals
++				if(EmitString_str_ptr == null)
++					EmitString_str_ptr = evalILGen.DeclareLocal(CharPtr);
++				
++				if(EmitString_str_end_ptr == null)
++					EmitString_str_end_ptr = evalILGen.DeclareLocal(CharPtr);
++
++				//Regular string match
++				Label lblFAIL = evalILGen.DefineLabel();
++				Label lblNEXT = evalILGen.DefineLabel();
++				Label lblEND = evalILGen.DefineLabel();
++				
++				if(ignore) {
++					str = str.ToLower();
++				}
++
++				int len = str.Length;
++				if(reverse) {
++					
++					//ptr -= len;			
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldc_I4, len * sizeofchar);
++					evalILGen.Emit(OpCodes.Sub);
++					evalILGen.Emit(OpCodes.Stloc, Var_ptr);				
++
++					//if (ptr < 0)
++					//	goto Fail;
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					
++					evalILGen.Emit(OpCodes.Blt, lblFAIL);
++					
++				}
++				else {
++					//if (ptr + len > text_end_ptr)
++					//    goto Fail;
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldc_I4, len);
++					evalILGen.Emit(OpCodes.Add);
++					evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Bgt, lblFAIL);
++				}
++
++				//Load the string to match and get a pointer to it
++				evalILGen.Emit(OpCodes.Ldstr, str);
++				evalILGen.Emit(OpCodes.Conv_I);
++				evalILGen.Emit(OpCodes.Call, cmRuntimeHelpers_getOffsetToStringData);
++				evalILGen.Emit(OpCodes.Add);
++				evalILGen.Emit(OpCodes.Stloc, EmitString_str_ptr);				
++
++				// str_end_ptr = str_ptr + len
++				evalILGen.Emit(OpCodes.Ldloc, EmitString_str_ptr);
++				evalILGen.Emit(OpCodes.Ldc_I4, len* sizeofchar);
++				evalILGen.Emit(OpCodes.Add);
++				evalILGen.Emit(OpCodes.Stloc, EmitString_str_end_ptr);
++
++				evalILGen.MarkLabel(lblNEXT);
++				
++				// If str_ptr >= str_end_ptr
++				//   goto END
++				evalILGen.Emit(OpCodes.Ldloc, EmitString_str_ptr);
++				evalILGen.Emit(OpCodes.Ldloc, EmitString_str_end_ptr);
++				evalILGen.Emit(OpCodes.Bge, lblEND);
++				
++
++				//Load char
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldind_U2);
++
++				if (ignore) {
++					evalILGen.Emit(OpCodes.Call, cmChar_ToLower);
++				}
++				
++				// if *ptr != *str_ptr
++				//    goto Fail;
++				evalILGen.Emit(OpCodes.Ldloc, EmitString_str_ptr);
++				evalILGen.Emit(OpCodes.Ldind_U2);
++				
++
++				evalILGen.Emit(OpCodes.Ceq);
++				evalILGen.Emit(OpCodes.Brfalse, lblFAIL);
++				
++				// str_ptr ++
++				evalILGen.Emit(OpCodes.Ldloc, EmitString_str_ptr);
++				evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++				evalILGen.Emit(OpCodes.Add);
++			    evalILGen.Emit(OpCodes.Stloc, EmitString_str_ptr);
++				
++				// ptr++
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++				evalILGen.Emit(OpCodes.Add);
++			        evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++
++				//Loop
++				evalILGen.Emit(OpCodes.Br, lblNEXT);
++				
++				//We fail
++				evalILGen.MarkLabel(lblFAIL);				
++				EmitFail(curContext);
++
++				//We pass
++				evalILGen.MarkLabel(lblEND);
++
++				if (reverse) {
++					//ptr -= len;								       
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);	
++
++					evalILGen.Emit(OpCodes.Ldc_I4, len * sizeofchar);
++					evalILGen.Emit(OpCodes.Sub);
++					evalILGen.Emit(OpCodes.Stloc, Var_ptr);				       
++				}
++				
++				EmitPass(curContext);
++			}
++		}		
++
++		public void EmitPosition (Position pos) {
++			ContextNode curContext = (ContextNode)context.Peek();
++
++			//Position Anchor			
++			if(curContext.op == OpCode.Anchor) {
++				switch (pos) {
++				case Position.StartOfString:
++				{
++
++					Label lblELSE = evalILGen.DefineLabel();
++
++					
++					if ( curContext.reverse ) {
++						evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++						//ptr = anchor_offset;
++						if (anchor_offset > 0 ) {
++							evalILGen.Emit(OpCodes.Ldc_I4, anchor_offset * sizeofchar);
++							evalILGen.Emit(OpCodes.Add);
++						}
++
++						evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++					}
++					else {
++							
++						//if (anch_ptr == 0) {
++						evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++						evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Ceq);
++						evalILGen.Emit(OpCodes.Brfalse, lblELSE); 
++						
++						//ptr = 0;
++						evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++						evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++					}
++
++					//TryMatch
++					EmitTryMatch(anchorTail);
++
++					if ( !curContext.reverse ) {
++						//Else
++						evalILGen.MarkLabel(lblELSE);
++						
++						//Return false
++						evalILGen.Emit(OpCodes.Ldc_I4_0);
++						evalILGen.Emit(OpCodes.Ret);
++					}
++    
++					//Set context
++					context.Push(new ContextNode(OpCode.Position, new CILLinkRef(), new CILLinkRef()));
++					break;
++				
++				}
++				case Position.StartOfLine:
++				{	
++      					Label lblFAIL = evalILGen.DefineLabel();
++					Label lblWHILE = evalILGen.DefineLabel();
++					Label lblTOP = evalILGen.DefineLabel();
++
++					//if (anch_ptr == 0) {
++					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, lblWHILE); 
++
++					//ptr = initial_ptr;	
++					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++				
++					//TryMatch
++					EmitTryMatch(anchorTail);
++
++					if ( curContext.reverse ) {
++						
++
++						//** inverted while **
++						evalILGen.Emit(OpCodes.Br, lblWHILE);
++						evalILGen.MarkLabel(lblTOP);
++
++						//if (anch_ptr == Var_initial_ptr || *(anchor_ptr - 1) == '\n') {
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_initial_ptr);
++						evalILGen.Emit(OpCodes.Ceq);
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++						evalILGen.Emit(OpCodes.Sub);
++						evalILGen.Emit(OpCodes.Ldind_U2);
++						evalILGen.Emit(OpCodes.Ldc_I4_S, (int)'\n');
++						evalILGen.Emit(OpCodes.Ceq);
++						evalILGen.Emit(OpCodes.Or);
++						evalILGen.Emit(OpCodes.Brfalse, lblFAIL);
++						
++						//ptr = anch_offset > 0 ? anch_ptr + anch_offset: anch_ptr;
++						if ( anchor_offset > 0 ) {	
++							Label lblELSE = evalILGen.DefineLabel();
++							Label lblENDIF = evalILGen.DefineLabel();
++							// if anch_ptr == anch_end
++							evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++							evalILGen.Emit(OpCodes.Ldloc, Var_anch_end);
++							evalILGen.Emit(OpCodes.Ceq);
++							evalILGen.Emit(OpCodes.Brfalse, lblELSE);
++							
++							evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++							evalILGen.Emit(OpCodes.Brfalse, lblENDIF);
++							evalILGen.MarkLabel(lblELSE);
++
++							evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++							evalILGen.Emit(OpCodes.Ldc_I4, anchor_offset * sizeofchar);
++							evalILGen.Emit(OpCodes.Add);
++							
++							evalILGen.MarkLabel(lblENDIF);
++						}
++						else {
++							evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++						}
++														
++						evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++
++						//TryMatch
++						EmitTryMatch(anchorTail);
++						
++						//FAIL Section.
++						evalILGen.MarkLabel(lblFAIL);
++			
++						// else anch_ptr--, goto WHILE
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++						evalILGen.Emit(OpCodes.Sub);
++						evalILGen.Emit(OpCodes.Stloc_S, Var_anch_ptr);
++
++
++						//while (anch_ptr >= 0) {
++						evalILGen.MarkLabel(lblWHILE);
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Ldc_I4_0);
++						evalILGen.Emit(OpCodes.Bge, lblTOP);
++
++						//Return false
++						evalILGen.Emit(OpCodes.Ldc_I4_0);
++						evalILGen.Emit(OpCodes.Ret);
++					} 
++					else {
++						//** Inverted While***
++					      
++						evalILGen.Emit(OpCodes.Br, lblWHILE);
++						evalILGen.MarkLabel(lblTOP);
++
++						//if (*(anchor_ptr - 1) == '\n') {
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++						evalILGen.Emit(OpCodes.Sub);
++						evalILGen.Emit(OpCodes.Ldind_U2);
++						evalILGen.Emit(OpCodes.Ldc_I4_S, (int)'\n');
++						evalILGen.Emit(OpCodes.Ceq);
++						evalILGen.Emit(OpCodes.Brfalse, lblFAIL);
++						
++						//ptr = anch_ptr - anch_offset;
++						evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Ldc_I4, anchor_offset * sizeofchar);
++						evalILGen.Emit(OpCodes.Sub);
++						
++						evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++
++						//TryMatch
++						EmitTryMatch(anchorTail);
++						
++						//FAIL Section.
++						evalILGen.MarkLabel(lblFAIL);
++			
++						// else anch_ptr++
++						evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Add);
++						evalILGen.Emit(OpCodes.Stloc_S, Var_anch_ptr);
++						
++						//while (anch_ptr <= anch_end) {
++						evalILGen.MarkLabel(lblWHILE);
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_end);
++						evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++						evalILGen.Emit(OpCodes.Bge, lblTOP);
++
++						//Return false
++						evalILGen.Emit(OpCodes.Ldc_I4_0);
++						evalILGen.Emit(OpCodes.Ret);
++					}
++
++					//Keep track of Failure
++					context.Push(new ContextNode(OpCode.Position, new CILLinkRef(), new CILLinkRef(lblFAIL)));
++					break;
++				}	
++				case Position.StartOfScan:
++			        {
++					/*
++					if (anch_ptr == scan_ptr) {
++						ptr = scan_ptr - anch_offset;
++						if (TryMatch (ref ptr, pc + skip))
++							goto Pass;
++					}
++					*/
++
++					Label lblELSE = evalILGen.DefineLabel();
++					
++					//if (anch_ptr == scan_ptr) {
++					evalILGen.Emit(OpCodes.Ldloc, Var_anch_ptr);
++					//					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_scan_ptr );
++					
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, lblELSE); 
++
++
++
++						
++					//ptr = anch_reverse ? anch_ptr + anch_offset : anch_ptr - anch_offset;				
++					evalILGen.Emit(OpCodes.Ldloc_S, Var_anch_ptr);
++					
++					if ( anchor_offset > 0 ) {
++						evalILGen.Emit(OpCodes.Ldc_I4, anchor_offset * sizeofchar);
++						if ( curContext.reverse ) 
++							evalILGen.Emit(OpCodes.Add);
++						else
++							evalILGen.Emit(OpCodes.Sub);
++					}
++				
++					evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++
++					//TryMatch
++					EmitTryMatch(anchorTail);
++
++					//Else
++					evalILGen.MarkLabel(lblELSE);
++					
++					//Return false
++					evalILGen.Emit(OpCodes.Ldc_I4_0);
++					evalILGen.Emit(OpCodes.Ret);
++
++					//Set context
++					context.Push(new ContextNode(OpCode.Position, new CILLinkRef(), new CILLinkRef()));
++					break;
++				}	
++				default:
++					Debug.Assert(false, "Regex", "Invalid Position. This should not appen.");
++					break;
++				}
++			}
++
++			//Regular Position Test
++			else {
++				Label lblPASS = evalILGen.DefineLabel();
++				Label lblFAIL = evalILGen.DefineLabel();
++				
++				switch (pos) {
++				case Position.Start: case Position.StartOfString:
++					//return ptr == initial_ptr;
++					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++					break;
++				case Position.StartOfLine:
++					//return ptr == initial_ptr || *(ptr -1) == '\n';
++					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++					evalILGen.Emit(OpCodes.Sub);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)'\n');
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++					break;
++				case Position.StartOfScan:
++					//return ptr == scan_ptr;
++					evalILGen.Emit(OpCodes.Ldloc, Var_scan_ptr);		
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++					break;
++				case Position.End:
++					//return ptr == text_end ||
++					evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++					
++					//(ptr == text_end - 1 && 
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++					evalILGen.Emit(OpCodes.Sub);
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, lblFAIL);
++					
++					//text[ptr] == '\n');
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)'\n');
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++					
++					break;
++				case Position.EndOfLine:
++					//return ptr == text_end || 
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++					
++					//text[ptr] == '\n';
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Ldc_I4_S, (byte)'\n');
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++
++					break;
++				case Position.EndOfString:
++					//return ptr == text_end;
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++					break;
++				case Position.Boundary:
++				{
++					Label lblELSEIF = evalILGen.DefineLabel();
++					Label lblELSE = evalILGen.DefineLabel();
++									
++					//if (text_end_ptr == initial_ptr)
++					//  return false;
++					evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Beq, lblFAIL);
++
++					
++					//if (ptr == initial_ptr)
++					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, lblELSEIF);
++
++				        //  return IsWordChar (*ptr);
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Callvirt, cmCILMachineBase_IsWordChar);
++					evalILGen.Emit(OpCodes.Brfalse, lblFAIL);
++					evalILGen.Emit(OpCodes.Br, lblPASS);
++					
++					evalILGen.MarkLabel(lblELSEIF);
++					
++					// else if (ptr == text_end
++					evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, lblELSE);
++					
++					//return IsWordChar (*(ptr -1));
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				        evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++					evalILGen.Emit(OpCodes.Sub);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Call, cmCILMachineBase_IsWordChar);
++					evalILGen.Emit(OpCodes.Brfalse, lblFAIL);
++					evalILGen.Emit(OpCodes.Br, lblPASS);
++
++					evalILGen.MarkLabel(lblELSE);
++					//return IsWordChar (*ptr) != IsWordChar (*(ptr -1));
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Call, cmCILMachineBase_IsWordChar);
++					
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				        evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++					evalILGen.Emit(OpCodes.Sub);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Call, cmCILMachineBase_IsWordChar);
++					
++					evalILGen.Emit(OpCodes.Beq, lblFAIL);
++					evalILGen.Emit(OpCodes.Br, lblPASS);
++
++					break;
++				}
++				case Position.NonBoundary:
++			        {
++					Label lblELSEIF = evalILGen.DefineLabel();
++					Label lblELSE = evalILGen.DefineLabel();
++
++					//if (text_end == 0)
++					//  return false;
++					evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Beq, lblFAIL);
++
++					//if (ptr == initial_ptr)
++					evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, lblELSEIF);
++
++				        //  return !IsWordChar (*ptr);
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Call, cmCILMachineBase_IsWordChar);
++					evalILGen.Emit(OpCodes.Brtrue, lblFAIL);
++					evalILGen.Emit(OpCodes.Br, lblPASS);
++					
++					evalILGen.MarkLabel(lblELSEIF);
++					
++					// else if (ptr == text_end
++					evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, lblELSE);
++					
++					//return !IsWordChar (*(ptr -1));
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				        evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++					evalILGen.Emit(OpCodes.Sub);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Call, cmCILMachineBase_IsWordChar);
++					evalILGen.Emit(OpCodes.Brtrue, lblFAIL);
++					evalILGen.Emit(OpCodes.Br, lblPASS);
++
++					evalILGen.MarkLabel(lblELSE);
++					//return IsWordChar (*ptr) == IsWordChar (*(ptr -1));
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Call, cmCILMachineBase_IsWordChar);
++					
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				        evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++					evalILGen.Emit(OpCodes.Sub);
++					evalILGen.Emit(OpCodes.Ldind_U2);
++					evalILGen.Emit(OpCodes.Call, cmCILMachineBase_IsWordChar);
++
++					evalILGen.Emit(OpCodes.Beq, lblPASS);
++					evalILGen.Emit(OpCodes.Br, lblFAIL);
++				
++
++					break;
++				}
++
++				default:
++					//return false;
++					break;
++				}
++			
++				evalILGen.MarkLabel(lblFAIL);				
++				EmitFail(curContext);
++
++				evalILGen.MarkLabel(lblPASS);
++				EmitPass(curContext);
++			}
++		}
++
++		public void EmitOpen (int gid) {
++
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4, gid);
++			evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++			evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++			evalILGen.Emit(OpCodes.Sub);
++			evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++			evalILGen.Emit(OpCodes.Div);
++			evalILGen.Emit(OpCodes.Callvirt, cmCILMachineBase_Open);	
++		}
++
++		public void EmitClose (int gid) {
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4, gid);
++			evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++			evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++			evalILGen.Emit(OpCodes.Sub);
++			evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++			evalILGen.Emit(OpCodes.Div);
++			evalILGen.Emit(OpCodes.Call, cmCILMachineBase_Close);
++		}
++
++		public void EmitBalanceStart (int gid, int balance, bool capture, LinkRef tail) {
++
++		}
++
++		public void EmitBalance () {
++
++		}
++		
++		public void EmitReference (int gid, bool ignore, bool reverse) {
++			ContextNode curContext = (ContextNode)context.Peek();
++
++			if ( EmitReference_str == null) 
++				EmitReference_str = evalILGen.DeclareLocal(CharPtr);
++
++			if ( EmitReference_len == null) 
++				EmitReference_len = evalILGen.DeclareLocal(typeof(int));
++
++			if ( EmitReference_m == null) 
++				EmitReference_m = evalILGen.DeclareLocal(typeof(int));
++
++			if ( EmitReference_i == null) 
++				EmitReference_i = evalILGen.DeclareLocal(typeof(int));
++
++			// m = GetLastDefined(gid)
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4, gid);
++			evalILGen.Emit(OpCodes.Call, cmCILMachineBase_GetLastDefined);
++			evalILGen.Emit(OpCodes.Stloc, EmitReference_m);
++
++
++			//if ( m < 0 ) 
++			evalILGen.Emit(OpCodes.Ldloc, EmitReference_m);
++			evalILGen.Emit(OpCodes.Ldc_I4_0);
++			evalILGen.Emit(OpCodes.Blt, curContext.fail.ToLabel());
++			
++			//int str = marks [m].Index;
++			evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cMarks);
++			evalILGen.Emit(OpCodes.Ldloc, EmitReference_m);
++			evalILGen.Emit(OpCodes.Ldelema, typeof(Mark));			
++
++
++			evalILGen.Emit(OpCodes.Call, cpMark_Index.GetGetMethod());
++		
++			evalILGen.Emit(OpCodes.Ldc_I4,  sizeofchar);
++			evalILGen.Emit(OpCodes.Mul);
++			evalILGen.Emit(OpCodes.Add);
++			evalILGen.Emit(OpCodes.Stloc, EmitReference_str);
++
++
++			//int len = marks [m].Length;
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cMarks);
++			evalILGen.Emit(OpCodes.Ldloc, EmitReference_m);
++			evalILGen.Emit(OpCodes.Ldelema, typeof(Mark));		       
++			evalILGen.Emit(OpCodes.Call, cpMark_Length.GetGetMethod());
++			evalILGen.Emit(OpCodes.Stloc, EmitReference_len);
++
++
++
++			if (reverse) {
++				// ptr -= len
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldloc, EmitReference_len);
++				evalILGen.Emit(OpCodes.Ldc_I4,  sizeofchar);
++				evalILGen.Emit(OpCodes.Mul);
++				evalILGen.Emit(OpCodes.Sub);
++				evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++
++				//if ( ptr < 0 ) goto fail;
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++				evalILGen.Emit(OpCodes.Blt, curContext.fail.ToLabel());						
++			} else {
++				//if ( ptr + len > text_end  ) goto fail;				
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldloc, EmitReference_len);
++				evalILGen.Emit(OpCodes.Ldc_I4,  sizeofchar);
++				evalILGen.Emit(OpCodes.Mul);
++				evalILGen.Emit(OpCodes.Add);
++				evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++				evalILGen.Emit(OpCodes.Bgt, curContext.fail.ToLabel());	
++			}
++
++		
++			// **** for(i=0; i<len; i++);
++			Label lblFOR_TOP = evalILGen.DefineLabel();
++			Label lblFOR_TEST = evalILGen.DefineLabel();
++
++			// i = 0;
++			evalILGen.Emit(OpCodes.Ldc_I4_0);
++			evalILGen.Emit(OpCodes.Stloc, EmitReference_i);
++			
++			evalILGen.Emit(OpCodes.Br, lblFOR_TEST);
++			evalILGen.MarkLabel(lblFOR_TOP);
++
++			//if (text[ptr + i] != text[str + i])
++			//	goto Fail;
++			evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++			evalILGen.Emit(OpCodes.Ldloc, EmitReference_i);
++			evalILGen.Emit(OpCodes.Ldc_I4,  sizeofchar);
++			evalILGen.Emit(OpCodes.Mul);
++			evalILGen.Emit(OpCodes.Add);
++			evalILGen.Emit(OpCodes.Ldind_U2);
++			if ( ignore) {
++				evalILGen.Emit(OpCodes.Call, cmChar_ToLower);
++			}
++
++			evalILGen.Emit(OpCodes.Ldloc, EmitReference_str);
++			evalILGen.Emit(OpCodes.Ldloc, EmitReference_i);
++			evalILGen.Emit(OpCodes.Ldc_I4,  sizeofchar);
++			evalILGen.Emit(OpCodes.Mul);
++			evalILGen.Emit(OpCodes.Add);
++			evalILGen.Emit(OpCodes.Ldind_U2);
++			if ( ignore) {
++				evalILGen.Emit(OpCodes.Call, cmChar_ToLower);
++			}
++		
++			evalILGen.Emit(OpCodes.Ceq);
++			evalILGen.Emit(OpCodes.Brfalse, curContext.fail.ToLabel());
++
++			//i++
++			evalILGen.Emit(OpCodes.Ldloc, EmitReference_i);
++			evalILGen.Emit(OpCodes.Ldc_I4_1);
++			evalILGen.Emit(OpCodes.Add);
++			evalILGen.Emit(OpCodes.Stloc, EmitReference_i);
++			
++			evalILGen.MarkLabel(lblFOR_TEST);
++			// i<len
++			evalILGen.Emit(OpCodes.Ldloc, EmitReference_i);
++			evalILGen.Emit(OpCodes.Ldloc, EmitReference_len);
++			evalILGen.Emit(OpCodes.Blt, lblFOR_TOP);
++
++
++			if ( !reverse ) {
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldloc, EmitReference_len);
++				evalILGen.Emit(OpCodes.Ldc_I4,  sizeofchar);				
++				evalILGen.Emit(OpCodes.Mul);
++				evalILGen.Emit(OpCodes.Add);
++				evalILGen.Emit(OpCodes.Stloc, Var_ptr);	
++			}
++			
++			EmitPass(curContext);
++
++			
++
++		}		
++
++		// constructs
++
++		public void EmitIfDefined (int gid, LinkRef tail) {
++			Debug.Assert(typeof(CILLinkRef).IsInstanceOfType(tail), "Regex", "Invalid LinkRef. Expected CILLinkRef");
++
++
++			// GetLastDefined(gid)
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4, gid);
++			evalILGen.Emit(OpCodes.Call, cmCILMachineBase_GetLastDefined);
++
++			//if ( GetLastDefined(gid) < 0 ) 
++			evalILGen.Emit(OpCodes.Ldc_I4_0);
++			evalILGen.Emit(OpCodes.Blt, ((CILLinkRef)tail).ToLabel());
++			
++			
++			
++
++		}
++
++		public void EmitSub (LinkRef tail) {
++			ContextNode curContext = (ContextNode)context.Peek();
++
++			context.Push(new ContextNode(OpCode.Sub, (CILLinkRef)tail, curContext.fail));
++
++		}
++
++		public void EmitTest (LinkRef yes, LinkRef tail) {
++			
++
++		}
++
++		public void EmitAlternationStart() {
++			AlternationContext altContext = new AlternationContext(nbDefinedAlternation++, nbDefinedComplexRegex++);
++		
++			if (alternationContext == null)
++				alternationContext = new Stack();
++			alternationContext.Push(altContext);
++		
++			//nbDefinedAlternation++;
++			//AlternationBranch.Add(new ArrayList());
++			if(brachCheckpointStack == null)
++				brachCheckpointStack = new Stack();
++			
++			brachCheckpointStack.Push(EmitCheckpoint(CallerType.BRANCH));
++			
++			
++			
++			// ComplexsRegexFinished[id of this alternation] = false
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++			evalILGen.Emit(OpCodes.Ldc_I4, altContext.idComplexRegex);
++			evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.NotFinished);
++			evalILGen.Emit(OpCodes.Stelem_I4);
++			
++		}
++		
++		public void EmitBranch(LinkRef next) {}
++
++		public void EmitBranch (LinkRef next, int idBranch) {
++			Debug.Assert(typeof(CILLinkRef).IsInstanceOfType(next), "Regex", "Invalid LinkRef. Expected CILLinkRef");		
++			AlternationContext altContext = (AlternationContext)alternationContext.Peek();
++	    			
++			//Catch the failure of a branch
++			context.Push(new ContextNode(OpCode.Branch, new CILLinkRef(), (CILLinkRef)next));
++
++			evalILGen.Emit(OpCodes.Ldarg_0);	
++			evalILGen.Emit(OpCodes.Ldfld, cfAltLastBranch);
++			evalILGen.Emit(OpCodes.Ldc_I4, altContext.idAlt);
++			evalILGen.Emit(OpCodes.Ldc_I4, idBranch);
++	  		evalILGen.Emit(OpCodes.Stelem_I4);  	
++		
++
++		}
++		
++		public void EmitBranchEnd()
++		{
++			AlternationContext altContext = (AlternationContext)alternationContext.Peek();
++					
++			ContextNode lastContext = (ContextNode)context.Pop();
++			if (lastContext.op != OpCode.Branch)							
++			        while(((ContextNode)context.Pop()).op != OpCode.Branch);
++			       		
++				
++
++			altContext.branchContext.Add(lastContext);					
++		       
++			//Bactrack
++			int idCp = (int)brachCheckpointStack.Peek();
++			EmitBacktrack(idCp);
++
++			
++		}
++
++		public void EmitAlternationEnd(LinkRef[] branchs, LinkRef tail)
++		{
++			
++			ContextNode curContext = (ContextNode)context.Peek();
++			AlternationContext altContext = (AlternationContext)alternationContext.Pop();
++
++			Label tailFail = evalILGen.DefineLabel();
++			
++			
++			evalILGen.MarkLabel(tailFail);
++			ArrayList branchsContext = altContext.branchContext;
++			int idCp = (int)brachCheckpointStack.Pop();
++
++			for(int i = 0; i < branchs.Length; i++) {
++				ContextNode lastContext = ((ContextNode)branchsContext[i]);
++											
++				Label nextBranchTest = evalILGen.DefineLabel();
++				if ( lastContext.op == OpCode.Branch ) {
++					if (i + 1 < branchs.Length) {
++						evalILGen.Emit(OpCodes.Ldarg_0);
++						evalILGen.Emit(OpCodes.Ldfld, cfAltLastBranch);
++						evalILGen.Emit(OpCodes.Ldc_I4, altContext.idAlt);
++						evalILGen.Emit(OpCodes.Ldelem_I4);
++
++						evalILGen.Emit(OpCodes.Ldc_I4, i);	
++						evalILGen.Emit(OpCodes.Ceq);
++						evalILGen.Emit(OpCodes.Brfalse, nextBranchTest);
++
++						EmitBacktrack(idCp);
++						evalILGen.Emit(OpCodes.Br, ((CILLinkRef)branchs[i + 1]).ToLabel());
++					}
++											
++				} else {
++					Debug.Assert(lastContext.idComplexRegex >= 0, "Regex", "An Orphan does not have an valid idComplexRegex");
++					Label lblCONTINUE = evalILGen.DefineLabel();
++					
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldfld, cfAltLastBranch);
++					evalILGen.Emit(OpCodes.Ldc_I4, altContext.idAlt);
++					evalILGen.Emit(OpCodes.Ldelem_I4);					
++
++					// if lastBranch == branch[i]
++					// if ComplexRegexFinished jump curContext.Fail
++					evalILGen.Emit(OpCodes.Ldc_I4, i);										
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, nextBranchTest);
++					
++					//evalILGen.Emit(OpCodes.Ldloc, ComplexRegexFinished);
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++					evalILGen.Emit(OpCodes.Ldc_I4, lastContext.idComplexRegex);
++					evalILGen.Emit(OpCodes.Ldelem_I4);
++					evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++					evalILGen.Emit(OpCodes.Beq, lblCONTINUE);
++					
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);	
++					evalILGen.Emit(OpCodes.Ldc_I4, altContext.idComplexRegex);
++					evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++					evalILGen.Emit(OpCodes.Stelem_I4);
++
++					evalILGen.Emit(OpCodes.Br, lastContext.fail.ToLabel());
++
++					evalILGen.MarkLabel(lblCONTINUE);
++					if ( i + 1 < branchs.Length ) {
++						EmitBacktrack(idCp);
++						evalILGen.Emit(OpCodes.Br, ((CILLinkRef)branchs[i]).ToLabel());						
++					}
++					
++
++				}
++
++				evalILGen.MarkLabel(nextBranchTest);	
++			}
++			
++
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);	
++			evalILGen.Emit(OpCodes.Ldc_I4, altContext.idComplexRegex);
++			evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++			evalILGen.Emit(OpCodes.Stelem_I4);
++
++
++			EmitFail(curContext);
++
++			context.Push(new ContextNode(OpCode.Orphan, 
++			                             curContext.pass, 
++			                             new CILLinkRef(tailFail), 
++			                             curContext.reverse, 
++			                             altContext.idComplexRegex));
++		}
++
++		public void EmitJump (LinkRef target) {
++			Debug.Assert(typeof(CILLinkRef).IsInstanceOfType(target), "Regex", "Invalid LinkRef. Expected CILLinkRef");
++			
++			evalILGen.Emit(OpCodes.Br, ((CILLinkRef)target).ToLabel());
++		}
++
++		public void EmitRepeat (int min, int max, bool lazy, LinkRef until) {
++			Debug.Assert(typeof(CILLinkRef).IsInstanceOfType(until), "Regex", "Invalid LinkRef. Expected CILLinkRef");
++
++
++			ContextNode curContext = (ContextNode)context.Peek();
++			
++			Label lblHANDLEFAIL = evalILGen.DefineLabel();
++			Label lblSUBREGEX = evalILGen.DefineLabel();
++			Label lblUNTIL = ((CILLinkRef)until).ToLabel();
++			RepeatContext newRepeatContext = new RepeatContext(min, max, lazy, lblUNTIL,
++			                                                   lblSUBREGEX, 
++			                                                   nbDefinedCounterId++, 
++			                                                   nbDefinedComplexRegex++);
++
++			if(repeatContext == null) {
++				//Alloc
++				repeatContext = new Stack();
++			}
++					
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4, newRepeatContext.counterId);
++			evalILGen.Emit(OpCodes.Call, cmCILMachineBase_InitRepeatCount);
++
++			// ComplexsRegexFinished[id of this repeat] = false
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++			evalILGen.Emit(OpCodes.Ldc_I4, newRepeatContext.complexRegexId);
++			evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.NotFinished);
++			evalILGen.Emit(OpCodes.Stelem_I4);
++
++			evalILGen.Emit(OpCodes.Br, lblUNTIL);
++			evalILGen.MarkLabel(lblSUBREGEX);
++			
++			//Set context			
++			repeatContext.Push(newRepeatContext);
++			context.Push(new ContextNode(OpCode.Repeat, new CILLinkRef(), new CILLinkRef(lblHANDLEFAIL),
++						     false,newRepeatContext.complexRegexId )); 
++			
++		}
++
++		public void EmitUntil (LinkRef repeat) {
++
++			Debug.Assert(typeof(CILLinkRef).IsInstanceOfType(repeat), "Regex", "Invalid LinkRef. Expected CILLinkRef");
++			
++			Label lblEND = evalILGen.DefineLabel();
++			Label lblREPEAT = ((CILLinkRef)repeat).ToLabel();
++			Label lblGOTMAX = evalILGen.DefineLabel();
++			Label lblENDBACKTRACK = evalILGen.DefineLabel();
++
++	
++			//Store the contex put by repeat
++			ContextNode byRepeatContext = (ContextNode)context.Pop();
++			
++			//Store the contexted orphaned by a sub regex (nested alternation or repetion)
++			ContextNode nestedContext = new ContextNode(OpCode.Undefined, new CILLinkRef(), new CILLinkRef());
++			
++			while( byRepeatContext.op != OpCode.Repeat) {
++				nestedContext =  byRepeatContext;
++				byRepeatContext = (ContextNode)context.Pop();
++			}
++
++			//Context that existed before the repetition.
++			ContextNode curContext = (ContextNode)context.Peek();
++			
++			//Containt the min max lazy infos.
++			RepeatContext curRepeatContext = (RepeatContext)repeatContext.Pop();
++	
++			//Jump to nested regex
++			evalILGen.Emit(OpCodes.Br, lblREPEAT);
++
++			//Handle Failures
++			evalILGen.MarkLabel(byRepeatContext.fail.ToLabel());
++	
++
++			if(!curRepeatContext.lazy) {
++				//If we have enough, match tail.
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldc_I4,  curRepeatContext.counterId);
++				evalILGen.Emit(OpCodes.Call,  cmCILMachineBase_GetCurRepeatCount);
++				evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.min);
++				evalILGen.Emit(OpCodes.Bge,  lblENDBACKTRACK);
++			}
++
++			if(nestedContext.op == OpCode.Undefined) {
++
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++				evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.complexRegexId);
++				evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++				evalILGen.Emit(OpCodes.Stelem_I4);
++				EmitFail(curContext);
++			}
++			else {
++				//If there is a nested complex regex
++				//evalILGen.Emit(OpCodes.Ldloc,  ComplexRegexFinished);
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++				evalILGen.Emit(OpCodes.Ldc_I4, nestedContext.idComplexRegex);
++				evalILGen.Emit(OpCodes.Ldelem_I4);
++				evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++				evalILGen.Emit(OpCodes.Ceq);
++				if(!curContext.fail.IsEmpty()) {
++					evalILGen.Emit(OpCodes.Brtrue, curContext.fail.ToLabel());
++				}
++				else {
++					
++					Label lblJUMP = evalILGen.DefineLabel();
++					evalILGen.Emit(OpCodes.Brfalse, lblJUMP);
++					evalILGen.Emit(OpCodes.Ldnull);
++					evalILGen.Emit(OpCodes.Ret);
++					evalILGen.MarkLabel(lblJUMP);
++				}
++										
++				evalILGen.Emit(OpCodes.Br, nestedContext.fail.ToLabel());
++			}
++
++
++		
++
++			//Mark the repeat label
++			evalILGen.MarkLabel(lblREPEAT);
++		
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4,  curRepeatContext.counterId);
++			evalILGen.Emit(OpCodes.Call, cmCILMachineBase_IncRepeatCount);
++
++			Label lblMINPASSED = evalILGen.DefineLabel();
++			//Check if we attained the minimum number of match. Match more if not enough.
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4,  curRepeatContext.counterId);
++			evalILGen.Emit(OpCodes.Call,  cmCILMachineBase_GetCurRepeatCount);
++			evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.min);
++			evalILGen.Emit(OpCodes.Blt, curRepeatContext.subRegex);
++
++			if(curRepeatContext.lazy) {
++				Label lblFAIL = evalILGen.DefineLabel();
++				Label lblTOTALFAIL = evalILGen.DefineLabel();
++
++				//Checkpoint
++				int idCp = EmitCheckpoint(CallerType.LAZYREPEAT);
++				
++
++				//Match Tail first
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++				evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.complexRegexId);
++				evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Maybe);
++				evalILGen.Emit(OpCodes.Stelem_I4);
++				evalILGen.Emit(OpCodes.Br, lblEND);
++
++				evalILGen.MarkLabel(lblFAIL);
++			
++				//Backtrack
++
++				if ( nestedContext.op != OpCode.Undefined ) {
++				
++					Label lblCONTINUE = evalILGen.DefineLabel();
++
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++					evalILGen.Emit(OpCodes.Ldc_I4, nestedContext.idComplexRegex);
++					evalILGen.Emit(OpCodes.Ldelem_I4);
++					evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++					evalILGen.Emit(OpCodes.Beq, lblCONTINUE);
++					
++					EmitCheckpoint(idCp);
++
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++					evalILGen.Emit(OpCodes.Ldc_I4, nestedContext.idComplexRegex);
++					evalILGen.Emit(OpCodes.Ldelem_I4);
++					evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.NotBegan);
++					evalILGen.Emit(OpCodes.Beq, curRepeatContext.subRegex);
++					
++					evalILGen.Emit(OpCodes.Br, nestedContext.fail.ToLabel());
++
++					evalILGen.MarkLabel(lblCONTINUE);
++				}
++
++			
++				EmitBacktrack(idCp);
++
++				if ( nestedContext.op != OpCode.Undefined ) {
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++					evalILGen.Emit(OpCodes.Ldc_I4, nestedContext.idComplexRegex);
++					evalILGen.Emit(OpCodes.Ldelem_I4);
++					evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++					evalILGen.Emit(OpCodes.Beq, lblTOTALFAIL);				
++				}
++
++				//if (!current.IsMaximum) : Match subRegex one more Time
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldc_I4,  curRepeatContext.counterId);
++				evalILGen.Emit(OpCodes.Call,  cmCILMachineBase_GetCurRepeatCount);
++				evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.max);
++				evalILGen.Emit(OpCodes.Blt, curRepeatContext.subRegex);
++				
++			
++
++				evalILGen.MarkLabel(lblTOTALFAIL);
++
++				//else total failure
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++				evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.complexRegexId);
++				evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++				evalILGen.Emit(OpCodes.Stelem_I4);
++				EmitFail(curContext);
++
++				evalILGen.MarkLabel(lblEND);
++
++				//Set context
++				context.Push(new ContextNode(OpCode.Until, curContext.pass, new CILLinkRef(lblFAIL),
++							     false, curRepeatContext.complexRegexId)); 
++			}
++			else {
++				Label lblFAIL = evalILGen.DefineLabel();
++				
++				//if (!current.IsMaximum) : Match subRegex one more Time
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldc_I4,  curRepeatContext.counterId);
++				evalILGen.Emit(OpCodes.Call,  cmCILMachineBase_GetCurRepeatCount);
++				evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.max);
++				evalILGen.Emit(OpCodes.Bge, lblEND);
++
++				//Checkpoint
++
++				int idCp = EmitCheckpoint(CallerType.REPEAT);
++			
++				//Matche one more time
++				evalILGen.Emit(OpCodes.Br, curRepeatContext.subRegex);
++
++				//Tail failure
++				evalILGen.MarkLabel(lblFAIL);
++
++				if ( nestedContext.op != OpCode.Undefined ) {
++
++					Label lblCONTINUE = evalILGen.DefineLabel();
++					evalILGen.Emit(OpCodes.Ldarg_0);
++					evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++					evalILGen.Emit(OpCodes.Ldc_I4, nestedContext.idComplexRegex);
++					evalILGen.Emit(OpCodes.Ldelem_I4);
++					evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Maybe);
++					evalILGen.Emit(OpCodes.Ceq);
++					evalILGen.Emit(OpCodes.Brfalse, lblCONTINUE);
++
++					EmitCheckpoint(idCp);
++
++					evalILGen.Emit(OpCodes.Br, nestedContext.fail.ToLabel());
++
++					evalILGen.MarkLabel(lblCONTINUE);
++
++				}				
++
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldc_I4,  curRepeatContext.counterId);
++				evalILGen.Emit(OpCodes.Call, cmCILMachineBase_DecRepeatCount);
++
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldc_I4,  curRepeatContext.counterId);
++				evalILGen.Emit(OpCodes.Call,  cmCILMachineBase_GetCurRepeatCount);
++				evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.min);
++				evalILGen.Emit(OpCodes.Bge, lblENDBACKTRACK);
++
++				//Total failure
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++				evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.complexRegexId);
++				evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++				evalILGen.Emit(OpCodes.Stelem_I4);
++				EmitFail(curContext);
++
++				//Backtrack				
++				evalILGen.MarkLabel(lblENDBACKTRACK);
++				evalILGen.Emit(OpCodes.Ldarg_0);
++				evalILGen.Emit(OpCodes.Ldfld, cfComplexRegexStatus);
++				evalILGen.Emit(OpCodes.Ldc_I4, curRepeatContext.complexRegexId);
++				evalILGen.Emit(OpCodes.Ldc_I4, (int)ComplexRegexStatus.Finished);
++				evalILGen.Emit(OpCodes.Stelem_I4);
++
++				EmitBacktrack(idCp);
++			
++				// match tail.
++				evalILGen.MarkLabel(lblEND);
++
++				context.Push(new ContextNode(OpCode.Until, curContext.pass, new CILLinkRef(lblFAIL),
++							     false,curRepeatContext.complexRegexId )); 
++
++			}	
++		}
++
++		public void EmitIn (LinkRef tail) {
++			Debug.Assert(typeof(CILLinkRef).IsInstanceOfType(tail), "Regex", "Invalid LinkRef. Expected CILLinkRef");
++			
++		        ContextNode curContext = (ContextNode)context.Peek();
++			InConsumed = false;
++			
++			//Set Context
++			if(!curContext.pass.IsEmpty())
++				context.Push(new ContextNode(OpCode.In, curContext.pass, curContext.fail));
++			else
++				context.Push(new ContextNode(OpCode.In, (CILLinkRef)(tail), curContext.fail));
++		}
++
++
++		public void EmitInfo (int count, int min, int max) {
++			group_count = count + 1;
++			match_min = min;
++			match_max = max;
++		}
++
++		public void EmitFastRepeat (int min, int max, bool lazy, LinkRef tail) {
++
++		}
++
++		public void EmitAnchor (bool reverse, int offset, LinkRef tail) {
++			Debug.Assert(typeof(CILLinkRef).IsInstanceOfType(tail), "Regex", "Invalid LinkRef. Expected CILLinkRef");
++
++			IsAnchorMode = true;
++
++			anchor_offset = offset;
++			
++			Label lblPASS = evalILGen.DefineLabel();
++			Label lblCONTINUE = evalILGen.DefineLabel();
++
++			
++			// int anch_ptr = reverse ? ptr - anch_offset : ptr + anch_offset;			
++			evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++			if ( offset > 0 ) {
++				evalILGen.Emit(OpCodes.Ldc_I4, offset * sizeofchar);
++				if ( reverse ) 
++					evalILGen.Emit(OpCodes.Sub);
++				else
++					evalILGen.Emit(OpCodes.Add);
++			}
++			evalILGen.Emit(OpCodes.Stloc_S, Var_anch_ptr);
++
++			// int anch_end = text_end_ptr - match_min + anch_offset;
++			evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++			evalILGen.Emit(OpCodes.Ldc_I4, (offset - match_min) * sizeofchar);
++			evalILGen.Emit(OpCodes.Add);
++			evalILGen.Emit(OpCodes.Stloc_S, Var_anch_end);		
++					
++			//Set Context
++			anchorTail = ((CILLinkRef)tail).ToLabel();
++			context.Push(new ContextNode(OpCode.Anchor, new CILLinkRef(lblPASS), new CILLinkRef(), reverse));
++		}
++
++		public LinkRef NewLink () {
++			return new CILLinkRef(evalILGen.DefineLabel());
++		}
++
++		public void ResolveLink (LinkRef link) {		
++			Debug.Assert(typeof(CILLinkRef).IsInstanceOfType(link), "Regex", "Invalid LinkRef. Expected CILLinkRef");
++			
++			evalILGen.MarkLabel(((CILLinkRef)link).ToLabel());
++		}
++	
++		private void EmitPass(ContextNode context)
++		{
++			if( !context.pass.IsEmpty() ) {
++				evalILGen.Emit(OpCodes.Br, context.pass.ToLabel());				
++			}
++		}
++		
++		private void EmitFail(ContextNode context)
++		{
++			if( !context.fail.IsEmpty() ) {
++				evalILGen.Emit(OpCodes.Br, context.fail.ToLabel());				
++			}
++			else {
++				//Return false
++				evalILGen.Emit(OpCodes.Ldc_I4_0);
++				evalILGen.Emit(OpCodes.Ret);
++			}
++
++		}
++
++		private void EmitTryMatch(Label lblTOMATCH)
++		{
++			//Reset ();
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Call, cmCILMachineBase_Reset);
++
++			//marks [groups [0]].Start = ptr;
++		
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cMarks);
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldfld, cGroups);
++			evalILGen.Emit(OpCodes.Ldc_I4_0);
++			evalILGen.Emit(OpCodes.Ldelem_I4);
++			evalILGen.Emit(OpCodes.Ldelema, typeof(Mark));		
++			
++			evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++			evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++			evalILGen.Emit(OpCodes.Sub);
++			evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++			evalILGen.Emit(OpCodes.Div);
++			evalILGen.Emit(OpCodes.Conv_I4);
++
++			evalILGen.Emit(OpCodes.Stfld, cfMark_Start);
++
++			//Go to the regex
++			evalILGen.Emit(OpCodes.Br , lblTOMATCH);
++		}
++		
++		//Result is stored in EmitEvalChar_c
++		private void EmitConsumeCharacter(bool reverse, Label lblFAIL)
++		{
++			// Consume character
++			if ( reverse ) {
++				// Right to left 	
++				
++				// if (ptrtr == initial_ptr)
++				//  FAIL
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldloc, Var_initial_ptr);
++				evalILGen.Emit(OpCodes.Beq, lblFAIL);
++				
++				// --scanPtr
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++				evalILGen.Emit(OpCodes.Sub);
++				evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++				
++				// c1= *ptr;
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldind_U2);
++				evalILGen.Emit(OpCodes.Stloc, EmitEvalChar_c);
++			}
++			else {
++				// if (ptr >= text_end_ptr)
++				//   FAIL
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldloc, Var_text_end_ptr);
++				evalILGen.Emit(OpCodes.Bge, lblFAIL);
++				
++				// c1 = *ptr;
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++				evalILGen.Emit(OpCodes.Ldind_U2);
++				evalILGen.Emit(OpCodes.Stloc, EmitEvalChar_c);
++				
++				//scanPtr ++;
++				evalILGen.Emit(OpCodes.Ldloc, Var_ptr);			
++				evalILGen.Emit(OpCodes.Ldc_I4, sizeofchar);
++				evalILGen.Emit(OpCodes.Add);
++				evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++			}			
++		}
++		
++		private int EmitCheckpoint(CallerType type) {
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4, nbDefinedCheckpoint);
++			evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++			evalILGen.Emit(OpCodes.Call, cmCILMachineBase_Checkpoint);
++			
++			if(CheckpointsCallerTypes == null)
++				CheckpointsCallerTypes = new ArrayList();
++
++			CheckpointsCallerTypes.Add(type);
++
++			return nbDefinedCheckpoint++;
++		}
++
++		private int EmitCheckpoint(int idCp) {
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4, idCp);
++			evalILGen.Emit(OpCodes.Ldloc, Var_ptr);
++			evalILGen.Emit(OpCodes.Call, cmCILMachineBase_Checkpoint);
++			
++			return idCp;
++		}
++
++		private void EmitBacktrack(int cpId) {
++			evalILGen.Emit(OpCodes.Ldarg_0);
++			evalILGen.Emit(OpCodes.Ldc_I4, cpId);
++			evalILGen.Emit(OpCodes.Call, cmCILMachineBase_Backtrack);
++			evalILGen.Emit(OpCodes.Stloc, Var_ptr);
++		}
++
++		// eval local variables numbers
++		LocalBuilder Var_ptr;
++		LocalBuilder Var_scan_ptr;
++		LocalBuilder Var_initial_ptr;
++
++		LocalBuilder Var_text_end_ptr;		
++
++		LocalBuilder Var_anch_ptr;
++		LocalBuilder Var_anch_end;
++
++		LocalBuilder EmitString_str_ptr;
++		LocalBuilder EmitString_str_end_ptr;
++		
++		LocalBuilder EmitEvalChar_c;
++		
++		LocalBuilder EmitSet_bytes_ptr;
++		LocalBuilder EmitSet_bytes_cur_ptr;
++		LocalBuilder EmitSet_i;
++
++		LocalBuilder EmitReference_str;
++		LocalBuilder EmitReference_m;
++		LocalBuilder EmitReference_len;
++		LocalBuilder EmitReference_i;
++
++		//	LocalBuilder Var_test;
++			
++		//Constants for Field Type reference 
++		private static FieldInfo cGroups = typeof(CILMachineBase).GetField("groups", 
++										 BindingFlags.Instance | 
++										 BindingFlags.NonPublic);
++
++		private static FieldInfo cGroupCount = typeof(CILMachineBase).GetField("group_count", 
++										 BindingFlags.Instance | 
++										 BindingFlags.NonPublic);
++
++		private static FieldInfo cText = typeof(CILMachineBase).GetField("text", 
++										 BindingFlags.Instance | 
++										 BindingFlags.NonPublic);
++
++		private static FieldInfo cTextEnd = typeof(CILMachineBase).GetField("text_end", 
++										 BindingFlags.Instance | 
++										 BindingFlags.NonPublic);
++
++		private static FieldInfo cScanPtr = typeof(CILMachineBase).GetField("scan_ptr", 
++										 BindingFlags.Instance | 
++										 BindingFlags.NonPublic);
++
++		private static FieldInfo cMarks = typeof(CILMachineBase).GetField("marks", 
++										 BindingFlags.Instance | 
++										 BindingFlags.NonPublic);
++
++
++		private static FieldInfo cMarkStart = typeof(CILMachineBase).GetField("mark_start", 
++										 BindingFlags.Instance | 
++										 BindingFlags.NonPublic);
++
++		private static FieldInfo cMarkEnd = typeof(CILMachineBase).GetField("mark_end", 
++										 BindingFlags.Instance | 
++										 BindingFlags.NonPublic);
++
++		private static FieldInfo cQS = typeof(CILMachineBase).GetField("qs", 
++									       BindingFlags.Instance | 
++									       BindingFlags.NonPublic);
++		
++		
++		private static PropertyInfo cpMatchEmpty = typeof(Match).GetProperty("Empty");
++	
++
++		private static MethodInfo cmCILMachineBase_CreateMark = typeof(CILMachineBase).GetMethod("CreateMark", 
++													 BindingFlags.Instance | 
++													 BindingFlags.NonPublic);
++
++		
++
++		private static MethodInfo cmString_getChars = typeof(String).GetMethod("get_Chars");
++
++		private static MethodInfo cmChar_ToLower = typeof(char).GetMethod("ToLower", new Type[] {typeof(char)});
++
++		private static PropertyInfo cpMark_IsDefined = typeof(Mark).GetProperty("IsDefined");
++		private static PropertyInfo cpMark_Index = typeof(Mark).GetProperty("Index");
++		private static PropertyInfo cpMark_Length = typeof(Mark).GetProperty("Length");
++		
++		private static FieldInfo cfMark_End = typeof(Mark).GetField("End");
++		private static FieldInfo cfMark_Start = typeof(Mark).GetField("Start");
++		private static FieldInfo cfMark_Previous = typeof(Mark).GetField("Previous");
++		private static FieldInfo cfAltLastBranch= typeof(CILMachineBase).GetField("altLastBranch", 
++											  BindingFlags.Instance | 
++											  BindingFlags.NonPublic);
++
++		private static FieldInfo cfComplexRegexStatus= typeof(CILMachineBase).GetField("complexRegexStatus", 
++												  BindingFlags.Instance | 
++												  BindingFlags.NonPublic);
++
++
++		private static MethodInfo cmCILMachineBase_GenerateMatch = typeof(CILMachineBase).GetMethod("GenerateMatch", 
++													    BindingFlags.Instance | 
++													    BindingFlags.NonPublic);
++		
++		private static MethodInfo cmCILMachineBase_Reset = typeof(CILMachineBase).GetMethod("Reset", 
++												    BindingFlags.Instance | 
++												    BindingFlags.NonPublic);
++
++
++		private static MethodInfo cmCILMachineBase_Open = typeof(CILMachineBase).GetMethod("Open", 
++												   BindingFlags.Instance | 
++												   BindingFlags.NonPublic);
++
++		
++		private static MethodInfo cmCILMachineBase_Close = typeof(CILMachineBase).GetMethod("Close", 
++												    BindingFlags.Instance | 
++												    BindingFlags.NonPublic);
++
++
++		private static MethodInfo cmCILMachineBase_Checkpoint = typeof(CILMachineBase).GetMethod("Checkpoint", 
++													 BindingFlags.Instance | 
++													 BindingFlags.NonPublic);
++
++		private static MethodInfo cmCILMachineBase_ClearCheckpoints = typeof(CILMachineBase).GetMethod("ClearCheckpoints", 
++													       BindingFlags.Instance | 
++													       BindingFlags.NonPublic);
++
++		
++		private static MethodInfo cmCILMachineBase_Backtrack = typeof(CILMachineBase).GetMethod("Backtrack", 
++												       BindingFlags.Instance | 
++												       BindingFlags.NonPublic);		
++
++		private static MethodInfo cmCILMachineBase_IsWordChar = typeof(CILMachineBase).GetMethod("IsWordChar", 
++												    BindingFlags.Instance | 
++												    BindingFlags.NonPublic);
++
++
++		private static MethodInfo cmCILMachineBase_InitRepeatCount = typeof(CILMachineBase).GetMethod("InitRepeatCount", 
++													      BindingFlags.Instance | 
++													      BindingFlags.NonPublic);
++
++		private static MethodInfo cmCILMachineBase_IncRepeatCount = typeof(CILMachineBase).GetMethod("IncRepeatCount", 
++													     BindingFlags.Instance | 
++													     BindingFlags.NonPublic);
++
++		private static MethodInfo cmCILMachineBase_DecRepeatCount = typeof(CILMachineBase).GetMethod("DecRepeatCount", 
++													     BindingFlags.Instance | 
++													     BindingFlags.NonPublic);
++		
++		private static MethodInfo cmCILMachineBase_GetCurRepeatCount = typeof(CILMachineBase).GetMethod("GetCurRepeatCount", 
++														BindingFlags.Instance | 
++														BindingFlags.NonPublic);
++		
++
++		private static MethodInfo cmCILMachineBase_GetLastDefined = typeof(CILMachineBase).GetMethod("GetLastDefined", 
++														BindingFlags.Instance | 
++														BindingFlags.NonPublic);		
++
++		
++
++		private static MethodInfo cmRuntimeHelpers_getOffsetToStringData = typeof(RuntimeHelpers).GetMethod("get_OffsetToStringData");
++		private static MethodInfo CategoryUtils_IsCategory = typeof(CategoryUtils).GetMethod("IsCategory");
++
++		private static ConstructorInfo cmQuickSearch_Ctor = typeof(QuickSearch_unsafe).GetConstructor(new Type[]{typeof(string), 
++															 typeof(bool), 
++															 typeof(bool)});
++
++		private static MethodInfo cmQuickSearch_Search = typeof(QuickSearch_unsafe).GetMethod("Search");
++
++	        //Context
++		internal class CILLinkRef : LinkRef
++		{
++			public CILLinkRef()
++			{
++				isEmpty = true;
++			}
++
++			public CILLinkRef(Label label)
++			{
++				this.label = label;
++				isEmpty = false;
++			}
++			
++			public bool IsEmpty()
++			{
++				return isEmpty;
++			}
++
++			public Label ToLabel()
++			{
++				Debug.Assert(!isEmpty, "Regex", "CILLinkRef should not be empty.");
++				return label; 
++			}
++
++			//Members
++			private Label label;
++			private bool isEmpty;
++		}
++
++		private struct ContextNode {
++			
++			public ContextNode(OpCode op, CILLinkRef pass, CILLinkRef fail,  
++			                   bool reverse, int idComplexRegex)
++			{
++				this.op = op;
++				this.pass = pass;
++				this.fail = fail;
++				this.reverse = reverse;
++				this.idComplexRegex = idComplexRegex;
++			}
++			
++			public ContextNode(OpCode op, CILLinkRef pass, CILLinkRef fail,  bool reverse)
++				: this(op, pass, fail, reverse, -1)
++			{}
++
++			public ContextNode(OpCode op, CILLinkRef pass, CILLinkRef fail)
++				: this(op, pass, fail, false, -1)
++			{}
++
++			//Members
++			public OpCode op;
++			public CILLinkRef pass;
++			public CILLinkRef fail;
++			public bool reverse;
++			public int idComplexRegex;
++		}
++
++		private struct RepeatContext {
++			public RepeatContext(int min, int max, bool lazy, Label until, Label subRegex, int counterId, int complexRegexId)
++			{
++				this.min = min;
++				this.max = max;
++				this.lazy = lazy;
++				this.until = until;
++				this.subRegex = subRegex;
++				this.counterId = counterId;
++				this.complexRegexId = complexRegexId;
++			}
++
++			public bool Equals(RepeatContext b){
++				return  min == b.min && 
++					max == b.max && 
++					lazy == b.lazy && 
++					until.Equals(b.until) && 
++					subRegex.Equals(b.subRegex) &&
++					counterId == b. counterId &&
++					complexRegexId == b.complexRegexId;
++					
++			}
++
++			//Members
++			public int min;
++			public int max;
++			public bool lazy;
++			public Label until;
++			public Label subRegex;
++			public int counterId;
++			public int complexRegexId;
++		}
++		
++		private struct AlternationContext
++		{
++			public AlternationContext(int idAlt, int idComplexRegex)
++			{
++				this.idAlt = idAlt;				
++				this.idComplexRegex = idComplexRegex;
++				branchContext = new ArrayList();
++			}
++			
++			public int idAlt;
++			public int idComplexRegex;		
++			public ArrayList branchContext;
++			
++		}
++
++        private Stack context = new Stack();
++		private Stack repeatContext;
++		private Stack alternationContext;
++		
++		//Utility
++		private Label anchorTail; // Used by EmitAnchor
++		private int anchor_offset; //Necessary to remember offset for EmitPosition and EmitString
++		private bool anchor_reverse; // Indicate if the anchor is in RightToLeft
++		private bool IsAnchorMode = false; //For the weird EmitTrue in EmitAnchor
++		private bool InConsumed = true;   // For In construct.
++		
++		private int nbDefinedCheckpoint = 0; //number of actually defined checkpoint
++		private Stack brachCheckpointStack; //Keep track of the numbers of the checkpoints for a Branch construct
++		private int nbDefinedAlternation = 0; // Number of actually defined alternation
++		private int nbDefinedComplexRegex = 0; // Number of defined complex regex (alternation and repeat...)
++
++		private int nbDefinedCounterId = 0; //number of actually defined counter (for repeat construct)
++
++		private ArrayList CheckpointsCallerTypes;		
++
++		//Usefull type
++		private static Type CharPtr = Type.GetType("System.Char*");
++		private static Type BytePtr  = Type.GetType("System.Byte*");	
++		private static int sizeofchar;
++
++		//Current TypeBuilder
++		private TypeBuilder builder;
++		
++		//Methods ILGenerator
++		ILGenerator ctorILGen;
++		ILGenerator scanILGen;
++		ILGenerator evalILGen;
++
++		private int group_count = -1;
++		private int match_min;
++		private int match_max;
++
++		private static AssemblyName asmName;
++		private static AssemblyBuilder asmBuilder;
++		private static ModuleBuilder modBuilder;
++		private static int inst_count;
++		
++	}
++
++	public enum CallerType 
++	{
++		BRANCH=0,  
++		REPEAT, 
++		LAZYREPEAT
++	}
++}
+--- System.Text.RegularExpressions/compiler.cs	2004-04-18 21:41:00.000000000 -0400
++++ System.Text.RegularExpressions/compiler.cs	2004-04-20 13:39:03.746681392 -0400
+@@ -54,10 +54,6 @@
+ 		void EmitFastRepeat (int min, int max, bool lazy, LinkRef tail);
+ 		void EmitAnchor (bool reverse, int offset, LinkRef tail);
+ 
+-		// event for the CILCompiler
+-		void EmitBranchEnd();
+-		void EmitAlternationEnd();
+-
+ 		LinkRef NewLink ();
+ 		void ResolveLink (LinkRef link);
+ 	}
+@@ -293,9 +289,6 @@
+ 				pgm[stack.OffsetAddress] = (ushort)stack.GetOffset (CurrentAddress);
+ 		}
+ 
+-		public void EmitBranchEnd(){}
+-		public void EmitAlternationEnd(){}
+-
+ 		// private members
+ 
+ 		private static OpFlags MakeFlags (bool negate, bool ignore, bool reverse, bool lazy) {
+@@ -395,7 +388,7 @@
+ 	}
+ 
+ 	//Used by CILCompiler and Interpreter
+-	internal struct Mark {
++	public struct Mark {
+ 		public int Start, End;
+ 		public int Previous;
+ 		
+--- System.Text.RegularExpressions/interpreter.cs	2004-04-18 21:41:00.000000000 -0400
++++ System.Text.RegularExpressions/interpreter.cs	2004-04-20 13:39:03.747681240 -0400
+@@ -103,12 +103,13 @@
+ 								++ anch_ptr;
+ 							}
+ 
+-							while ((anch_reverse && anch_ptr >= 0) || (!anch_reverse && anch_ptr <= anch_end)) {  
++							while ((anch_reverse && anch_ptr >= 0) || 
++							       (!anch_reverse && anch_ptr <= anch_end)) {								
+ 								if (anch_ptr == 0 || text[anch_ptr - 1] == '\n') {
+ 									if (anch_reverse)
+-										ptr = anch_ptr == anch_end ? anch_ptr : anch_ptr + anch_offset;
+-									else
+-										ptr = anch_ptr == 0 ? anch_ptr : anch_ptr - anch_offset;
++										ptr = anch_ptr == anch_end ? anch_ptr : anch_ptr + anch_offset  ;
++									else											
++										ptr = anch_ptr == 0 ? anch_ptr : anch_ptr - anch_offset  ;
+ 									if (TryMatch (ref ptr, pc + skip))
+ 										goto Pass;
+ 								}
+@@ -147,9 +148,8 @@
+ 
+ 							qs = new QuickSearch (substring, ignore, reverse);
+ 						}
+-						while ((anch_reverse && anch_ptr >= anch_begin) 
+-						       || (!anch_reverse && anch_ptr <= anch_end)) {
+-
++						while ((anch_reverse && anch_ptr >= anch_begin) || 
++						       (!anch_reverse && anch_ptr <= anch_end)) {
+ 							if (reverse) 	
+ 							{
+ 								anch_ptr = qs.Search (text, anch_ptr, anch_begin);
+@@ -172,14 +172,13 @@
+ 								++ anch_ptr;
+ 						}
+ 					}
+-					else if (anch_op == OpCode.True) {					// no anchor
++					else if (anch_op == OpCode.True) {                                      // no anchor
+ 						// Anchor
+ 						//	True
+ 
+ 					
+-						while ((anch_reverse && anch_ptr >= anch_begin) 
+-						       || (!anch_reverse && anch_ptr <= anch_end)) {
+-
++						while ((anch_reverse && anch_ptr >= anch_begin) || 
++						       (!anch_reverse && anch_ptr <= anch_end)) {
+ 							ptr = anch_ptr;
+ 							if (TryMatch (ref ptr, pc + skip))
+ 								goto Pass;
+@@ -194,8 +193,8 @@
+ 						//	<expr>
+ 						//	True
+ 
+-						while ((anch_reverse && anch_ptr >= anch_begin) 
+-						       || (!anch_reverse && anch_ptr <= anch_end)) {
++						while ((anch_reverse && anch_ptr >= anch_begin) || 
++					               (!anch_reverse && anch_ptr <= anch_end)) {		
+ 
+ 							ptr = anch_ptr;
+ 							if (Eval (Mode.Match, ref ptr, pc + 3)) {
+@@ -416,7 +415,7 @@
+ 				case OpCode.Until: {
+ 					RepeatContext current = this.repeat;
+ 					int start = current.Start;
+-
++     
+ 					if (!current.IsMinimum) {
+ 						++ current.Count;
+ 						current.Start = ptr;
+@@ -648,7 +647,7 @@
+ 			char c = '\0';
+ 			bool negate;
+ 			bool ignore;
+-		
++
+ 			do {
+ 				ushort word = program[pc];
+ 				OpCode op = (OpCode)(word & 0x00ff);
+@@ -815,8 +814,9 @@
+ 
+ 		// capture management
+ 
+-		private void Open (int gid, int ptr) {
++		private void Open (int gid, int ptr) {		
+ 			int m = groups [gid];
++
+ 			if (m < mark_start || marks [m].IsDefined) {
+ 				m = CreateMark (m);
+ 				groups [gid] = m;
+--- System.Text.RegularExpressions/quicksearch_unsafe.cs	1969-12-31 19:00:00.000000000 -0500
++++ System.Text.RegularExpressions/quicksearch_unsafe.cs	2004-04-20 13:39:03.747681240 -0400
+@@ -0,0 +1,186 @@
++//
++// assembly:	System
++// namespace:	System.Text.RegularExpressions
++// file:	quicksearch.cs
++//
++// Authors:	Dan Lewis (dlewis@gmx.co.uk)
++//		Juraj Skripsky (juraj@hotfeet.ch)
++//
++// Modification Eric Durand-Tremblay (to unsafe)
++//
++// (c) 2002 Dan Lewis
++// (c) 2003 Juraj Skripsky
++//
++
++using System;
++using System.Collections;
++
++namespace System.Text.RegularExpressions {
++	
++[CLSCompliantAttribute(true)]
++	public unsafe class QuickSearch_unsafe {
++		// simplified boyer-moore for fast substring matching
++		// (for short strings, we use simple scans)
++		public QuickSearch_unsafe (string str, bool ignore) 
++			: this(str, ignore, false)
++		{
++		}
++	
++		public QuickSearch_unsafe (string str, bool ignore, bool reverse) {
++			this.str = str;
++			this.len = str.Length;
++			this.ignore = ignore;
++			this.reverse = reverse;
++
++			if (ignore)
++				str = str.ToLower ();
++
++			// create the shift table only for "long" search strings
++			if(len > THRESHOLD)
++				SetupShiftTable ();
++		}
++		
++		public string String {
++			get { return str; }
++		}
++
++		public int Length {
++			get { return len; }
++		}
++
++		public bool IgnoreCase {
++			get { return ignore; }
++		}
++
++		[CLSCompliantAttribute(false)]
++		public char* Search (char * text_start, char * text_end, char* start, char* end) {
++			char *ptr = start;
++			
++			fixed(char* str_pointer = this.str) 
++				{
++					char* pStr = str_pointer;
++					
++					if ( reverse )  {
++						
++						if (start < end)
++							return null;
++						
++						if ( ptr > text_end) {
++							ptr = text_end;
++						}
++						
++						// use simple scan for a single-character search string
++						if (len == 1) {
++							while (--ptr >= end) {
++								if(*pStr == GetChar(*ptr))
++									return ptr;
++							}
++							return null;
++						}
++						
++						
++						if ( end - text_start  < len)
++							end = text_start + len - 1;
++
++						ptr--;
++						
++						while (ptr >= end) {
++
++							int i = len - 1  ;
++							while (pStr[i] == GetChar(*(ptr - len +1 + i))) {
++								if (-- i <  0)	
++									{
++										
++										return ptr - len +1;
++									}
++									
++
++							}
++							
++							if (ptr > end) {
++								ptr -= GetShiftDistance (*(ptr - len));
++							}
++							else
++								break;
++						}
++						
++					}
++					else {
++						// use simple scan for a single-character search string
++						if (len == 1) {
++							while (ptr <= end) {
++								if(GetChar(*ptr) == *pStr)
++									return ptr;
++								else 
++									ptr++;
++							}	
++							return null;
++						}
++						
++						if(end > text_end - len)
++							end = text_end - len;
++						
++						while (ptr <= end) {
++							int i = len - 1;
++							
++							while (pStr[i] == GetChar(ptr[i])) {
++								if (-- i < 0)
++									return ptr;
++							}
++							
++							if (ptr < end) 
++								ptr += GetShiftDistance (ptr[len]);
++							else
++								break;
++						}
++					}
++				}	
++			return null;
++			
++		}
++		
++			// private
++
++		private void SetupShiftTable () {
++			shift = new Hashtable ();
++			if (reverse)
++			{
++				for (int i = len ; i > 0; -- i) 
++				{
++					char c = str[i -1];
++					shift[GetChar(c)] = i;
++				}
++			}
++			else
++			{
++				for (int i = 0; i < len; ++ i) 
++				{
++					char c = str[i];
++					shift[GetChar(c)] = len - i;
++				}
++			}
++			
++		}
++	    
++		private int GetShiftDistance (char c) {
++			if(shift == null)
++				return 1;
++
++			object s = shift[c];
++			return (s != null ? (int)s : len + 1);
++		}
++
++		private char GetChar(char c) {
++			return (!ignore ? c : Char.ToLower(c));
++		}
++		
++		private string str;
++		private int len;
++		private bool ignore;
++		private bool reverse;
++
++		private Hashtable shift;
++		private readonly static int THRESHOLD = 5;
++	}
++
++}
+--- System.Text.RegularExpressions/regex.cs	2004-04-18 21:39:30.000000000 -0400
++++ System.Text.RegularExpressions/regex.cs	2004-04-20 13:39:03.748681088 -0400
+@@ -56,11 +56,10 @@
+ 			(RegexCompilationInfo[] regexes, AssemblyName aname,
+ 			 CustomAttributeBuilder[] attribs, string resourceFile)
+ 		{
+-			throw new Exception ("Not fully implemented.");
+ 			// TODO : Make use of attribs and resourceFile parameters
+-			/*
++			
+ 			AssemblyBuilder asmBuilder = AppDomain.CurrentDomain.DefineDynamicAssembly (aname, AssemblyBuilderAccess.RunAndSave);
+-			ModuleBuilder modBuilder = asmBuilder.DefineDynamicModule("InnerRegexModule",aname.Name);
++			ModuleBuilder modBuilder = asmBuilder.DefineDynamicModule("InnerRegexModule",aname.Name + ".dll");
+ 			Parser psr = new Parser ();	
+ 			
+ 			System.Console.WriteLine("CompileToAssembly");
+@@ -83,8 +82,7 @@
+ 			// Define a runtime class with specified name and attributes.
+ 			TypeBuilder builder = modBuilder.DefineType("ITest");
+ 			builder.CreateType();
+-			asmBuilder.Save(aname.Name);
+-			*/
++			asmBuilder.Save(aname.Name + ".dll");
+ 		}
+ 		
+ 		public static string Escape (string str) {
+@@ -190,10 +188,10 @@
+ 				// compile
+ 				
+ 				ICompiler cmp;
+-				//if ((options & RegexOptions.Compiled) != 0)
+-				//	//throw new Exception ("Not implemented.");
+-				//	cmp = new CILCompiler ();
+-				//else
++				if ((options & RegexOptions.Compiled) != 0)
++					//throw new Exception ("Not implemented.");
++					cmp = new CILCompiler ();
++				else
+ 					cmp = new PatternCompiler ();
+ 
+ 				re.Compile (cmp, RightToLeft);
+--- System.Text.RegularExpressions/syntax.cs	2004-04-18 21:41:00.000000000 -0400
++++ System.Text.RegularExpressions/syntax.cs	2004-04-20 13:39:03.747681240 -0400
+@@ -145,9 +145,9 @@
+ 			for (int i = 0; i < count; ++ i) {
+ 				Expression e;
+ 				if (reverse)
+-					e = Expressions [count - i - 1];
++					e = Expressions[count - i - 1];
+ 				else
+-					e = Expressions [i];		
++					e = Expressions[i];		
+ 				
+ 				AnchorInfo info = e.GetAnchorInfo (reverse);
+ 				infos.Add (info);
+@@ -186,8 +186,10 @@
+ 				//foreach (AnchorInfo info in infos) {
+ 				for (int i = 0; i < infos.Count; ++ i) {
+ 					AnchorInfo info;
+-
+-					info = (AnchorInfo)infos[i];		
++//					if (reverse)
++//						info = (AnchorInfo)infos[infos.Count - i - 1];
++//					else
++						info = (AnchorInfo)infos[i];		
+ 					
+ 					if (info.IsSubstring && longest.Contains (info.GetInterval (ptr))) {
+ 						//str += info.Substring;	// TODO mark subexpressions
+@@ -205,9 +207,9 @@
+ 				for (int i = 0; i< strs.Count; ++i)
+ 				{
+ 					if (reverse)
+-						str += strs [strs.Count - i - 1];
++						str += strs[strs.Count - i - 1];
+ 					else
+-						str += strs [i];
++						str += strs[i];
+ 							
+ 					
+ 				}
+@@ -392,7 +394,9 @@
+ 		}
+ 
+ 		public override void Compile (ICompiler cmp, bool reverse) {
+-			if (Expression.IsComplex ()) {
++
++			//TODO : Enhance the IL Compiler with some tricks of the FastRepeat
++			if (Expression.IsComplex () || typeof(CILCompiler).IsInstanceOfType(cmp)) {
+ 				LinkRef until = cmp.NewLink ();
+ 				
+ 				cmp.EmitRepeat (min, max, lazy, until);
+@@ -620,21 +624,55 @@
+ 		}
+ 
+ 		public override void Compile (ICompiler cmp, bool reverse) {
+-			//			LinkRef next = cmp.NewLink ();
+-			LinkRef tail = cmp.NewLink ();
+-		
+-			foreach (Expression e in Alternatives) {
+-				LinkRef next = cmp.NewLink ();
+-				cmp.EmitBranch (next);
+-				e.Compile (cmp, reverse);
+-				cmp.EmitJump (tail);
+-				cmp.ResolveLink (next);
+-				cmp.EmitBranchEnd();
++		        
++			if ( typeof(CILCompiler).IsInstanceOfType(cmp)) {
++				CILCompiler CILcmp = (CILCompiler)cmp;
++				LinkRef tail = cmp.NewLink();
++				
++				LinkRef[] branch = new LinkRef[Alternatives.Count];
++				CILcmp.EmitAlternationStart();				
++				int j = 0;
++				foreach (Expression e in Alternatives) {
++					//Expression e = Alternatives[j];
++					LinkRef next = cmp.NewLink ();
++					branch[j] = cmp.NewLink();	
++				
++					cmp.ResolveLink(branch[j]);
++
++					CILcmp.EmitBranch(next, j);
++					e.Compile(cmp, reverse);				
++					cmp.EmitJump(tail);
++
++					cmp.ResolveLink(next);
++					CILcmp.EmitBranchEnd();	
++					j++;
++				}
++
++
++				
++				CILcmp.EmitAlternationEnd(branch, tail);
++				cmp.ResolveLink (tail);				
++			
++
++				
+ 			}
++			else {
++				
++				LinkRef tail = cmp.NewLink ();
++				
+ 
+-			cmp.EmitFalse ();
+-			cmp.ResolveLink (tail);
+-			cmp.EmitAlternationEnd();
++				foreach (Expression e in Alternatives) {
++					LinkRef next = cmp.NewLink ();
++					cmp.EmitBranch (next);
++					e.Compile (cmp, reverse);				
++					cmp.EmitJump (tail);
++					cmp.ResolveLink (next);				
++				}
++				
++				cmp.EmitFalse ();
++				cmp.ResolveLink (tail);
++
++			}
+ 		}
+ 
+ 		public override void GetWidth (out int min, out int max) {

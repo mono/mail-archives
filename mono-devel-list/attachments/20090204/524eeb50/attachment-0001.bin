@@ -1,0 +1,1254 @@
+Index: tests/ChangeLog
+===================================================================
+--- tests/ChangeLog	(revision 125506)
++++ tests/ChangeLog	(working copy)
+@@ -1,3 +1,11 @@
++2009-02-01  Scott Peterson  <lunchtimemama@gmail.com>
++
++	This patch is contributed under the MIT/X11 license.
++
++	* gtest-variance-1.cs: Added test for generic covariance.
++
++	* gtest-variance-2.cs: Added test for generic contravariance.
++
+ 2009-01-22  Jb Evain  <jbevain@novell.com>
+ 
+ 	* gtest-anontype-05.cs: update according to lastest changes in gmcs
+Index: tests/gtest-variance-2.cs
+===================================================================
+--- tests/gtest-variance-2.cs	(revision 0)
++++ tests/gtest-variance-2.cs	(revision 0)
+@@ -0,0 +1,33 @@
++// Compiler options: -langversion:future
++
++interface IFoo<in T>
++{
++	string Bar (T t);
++}
++
++class Foo : IFoo<object>
++{
++	public string Bar (object t)
++	{
++		return t.GetType ().FullName;
++	}
++}
++
++public class Test
++{
++	static int Main ()
++	{
++		IFoo<object> foo = new Foo ();
++		IFoo<string> foo2 = foo;
++
++		if (foo2.Bar ("blah") != typeof (string).FullName)
++			return 1;
++
++		foo2 = new Foo();
++		if (foo2.Bar ("blah") != typeof (string).FullName)
++			return 2;
++		
++
++		return 0;
++	}
++}
+Index: tests/gtest-variance-1.cs
+===================================================================
+--- tests/gtest-variance-1.cs	(revision 0)
++++ tests/gtest-variance-1.cs	(revision 0)
+@@ -0,0 +1,34 @@
++// Compiler options: -langversion:future
++
++interface IFoo<out T>
++{
++	T Bar { get; }
++}
++
++class Foo : IFoo<string>
++{
++	readonly string bar;
++	public Foo (string bar)
++	{
++		this.bar = bar;
++	}
++	public string Bar { get { return bar; } }
++}
++
++public class Test
++{
++	static int Main ()
++	{
++		string bar = "Who is John Galt?";
++		IFoo<string> foo = new Foo(bar);
++		IFoo<object> foo2 = foo;
++		if (!foo2.Bar.Equals (bar))
++			return 1;
++
++		foo2 = new Foo(bar);
++		if (foo2.Bar != bar)
++			return 2;
++
++		return 0;
++	}
++}
+Index: mcs/typemanager.cs
+===================================================================
+--- mcs/typemanager.cs	(revision 125506)
++++ mcs/typemanager.cs	(working copy)
+@@ -2135,7 +2135,7 @@
+ 
+ 			if (interfaces != null){
+ 				foreach (Type i in interfaces){
+-					if (i == iface)
++					if (i == iface || IsVariantOf (i, iface))
+ 						return true;
+ 				}
+ 			}
+@@ -2146,6 +2146,64 @@
+ 		return false;
+ 	}
+ 
++	public static bool VerifyNoVariantTypeParameters (Type type, Location loc)
++	{
++#if GMCS_SOURCE
++		if (type != null && type.IsGenericType) {
++			foreach (Type t in type.GetGenericArguments ()) {
++				if (t.IsGenericParameter) {
++					if ((t.GenericParameterAttributes & GenericParameterAttributes.Contravariant) != 0) {
++						Report.Error (-34, loc, "Contravariant type parameters can only be used " +
++						              "as input arguments to a method");
++						return false;
++					}
++					if ((t.GenericParameterAttributes & GenericParameterAttributes.Covariant) != 0) {
++						Report.Error (-35, loc, "Covariant type parameters can only be used as return types " +
++						              "or in interface inheritance");
++						return false;
++					}
++				} else if (!VerifyNoVariantTypeParameters (t, loc)) {
++					return false;
++				}
++			}
++		}
++#endif
++		return true;
++	}
++
++	public static bool IsVariantOf (Type type1, Type type2)
++	{
++#if GMCS_SOURCE
++		if (type1.IsGenericType && type2.IsGenericType) {
++			Type generic_target_type = type2.GetGenericTypeDefinition ();
++			if (type1.GetGenericTypeDefinition () == generic_target_type) {
++				Type [] t1 = type1.GetGenericArguments ();
++				Type [] t2 = type2.GetGenericArguments ();
++				int i = 0;
++				foreach (Type t in generic_target_type.GetGenericArguments ()) {
++					if ((t.GenericParameterAttributes & GenericParameterAttributes.VarianceMask) != 0) {
++						// FIXME this is not right
++						if (IsValueType (t1[i]) || IsValueType (t2[i])) {
++							return false;
++						}
++						if ((t.GenericParameterAttributes & GenericParameterAttributes.Covariant) != 0 && !t2[i].IsAssignableFrom (t1[i])) {
++							return false;
++						}
++						if ((t.GenericParameterAttributes & GenericParameterAttributes.Contravariant) != 0 && !t1[i].IsAssignableFrom (t2[i])) {
++							return false;
++						}
++					} else if (t1[i] != t2[i]) {
++						return false;
++					}
++					i++;
++				}
++				return true;
++			}
++		}
++#endif
++		return false;
++	}
++
+ 	static NumberFormatInfo nf_provider = CultureInfo.CurrentCulture.NumberFormat;
+ 
+ 	// This is a custom version of Convert.ChangeType() which works
+Index: mcs/generic.cs
+===================================================================
+--- mcs/generic.cs	(revision 125506)
++++ mcs/generic.cs	(working copy)
+@@ -124,6 +124,13 @@
+ 		}
+ 	}
+ 
++	public enum Variance
++	{
++		None,
++		Covariant,
++		Contravariant
++	}
++
+ 	public enum SpecialConstraint
+ 	{
+ 		Constructor,
+@@ -577,13 +584,18 @@
+ 		Constraints constraints;
+ 		GenericTypeParameterBuilder type;
+ 		MemberCache member_cache;
++		Variance variance;
+ 
+ 		public TypeParameter (DeclSpace parent, DeclSpace decl, string name,
+-				      Constraints constraints, Attributes attrs, Location loc)
++				      Constraints constraints, Attributes attrs, Variance variance, Location loc)
+ 			: base (parent, new MemberName (name, loc), attrs)
+ 		{
+ 			this.decl = decl;
+ 			this.constraints = constraints;
++			this.variance = variance;
++			if (variance != Variance.None && !(decl is Interface) && !(decl is Delegate)) {
++				Report.Error (-36, loc, "Generic variance can only be used with interfaces and delegates");
++			}
+ 		}
+ 
+ 		public GenericConstraints GenericConstraints {
+@@ -598,6 +610,10 @@
+ 			get { return decl; }
+ 		}
+ 
++		public Variance Variacne {
++			get { return variance; }
++		}
++
+ 		public Type Type {
+ 			get { return type; }
+ 		}
+@@ -746,15 +762,22 @@
+ 				gc = (GenericConstraints) constraints;
+ 			}
+ 
+-			if (gc == null)
+-				return true;
++			GenericParameterAttributes attr = GenericParameterAttributes.None;
++			if (variance == Variance.Contravariant)
++				attr |= GenericParameterAttributes.Contravariant;
++			else if (variance == Variance.Covariant)
++				attr |= GenericParameterAttributes.Covariant;
+ 
+-			if (gc.HasClassConstraint || gc.HasValueTypeConstraint)
+-				type.SetBaseTypeConstraint (gc.EffectiveBaseClass);
++			if (gc != null) {
++				if (gc.HasClassConstraint || gc.HasValueTypeConstraint)
++					type.SetBaseTypeConstraint (gc.EffectiveBaseClass);
+ 
+-			type.SetInterfaceConstraints (gc.InterfaceConstraints);
+-			type.SetGenericParameterAttributes (gc.Attributes);
+-			TypeManager.RegisterBuilder (type, gc.InterfaceConstraints);
++				attr |= gc.Attributes;
++				type.SetInterfaceConstraints (gc.InterfaceConstraints);
++				TypeManager.RegisterBuilder (type, gc.InterfaceConstraints);
++			}
++			
++			type.SetGenericParameterAttributes (attr);
+ 
+ 			return true;
+ 		}
+@@ -1167,11 +1190,18 @@
+ 	public class TypeParameterName : SimpleName
+ 	{
+ 		Attributes attributes;
++		Variance variance;
+ 
+ 		public TypeParameterName (string name, Attributes attrs, Location loc)
++			: this (name, attrs, Variance.None, loc)
++		{
++		}
++
++		public TypeParameterName (string name, Attributes attrs, Variance variance, Location loc)
+ 			: base (name, loc)
+ 		{
+ 			attributes = attrs;
++			this.variance = variance;
+ 		}
+ 
+ 		public Attributes OptAttributes {
+@@ -1179,6 +1209,12 @@
+ 				return attributes;
+ 			}
+ 		}
++
++		public Variance Variance {
++			get {
++				return variance;
++			}
++		}
+ 	}
+ 
+ 	/// <summary>
+Index: mcs/cs-tokenizer.cs
+===================================================================
+--- mcs/cs-tokenizer.cs	(revision 125506)
++++ mcs/cs-tokenizer.cs	(working copy)
+@@ -787,6 +787,8 @@
+ 					the_token = token ();
+ 				} while (the_token != Token.CLOSE_BRACKET);
+ 				the_token = token ();
++			} else if (the_token == Token.IN || the_token == Token.OUT) {
++				the_token = token ();
+ 			}
+ 			switch (the_token) {
+ 			case Token.IDENTIFIER:
+@@ -807,7 +809,6 @@
+ 			case Token.CHAR:
+ 			case Token.VOID:
+ 				break;
+-
+ 			case Token.OP_GENERICS_GT:
+ 				return true;
+ 
+Index: mcs/parameter.cs
+===================================================================
+--- mcs/parameter.cs	(revision 125506)
++++ mcs/parameter.cs	(working copy)
+@@ -396,6 +396,27 @@
+ 			return parameter_type;
+ 		}
+ 
++		public bool VerifyTypeVariance ()
++		{
++#if GMCS_SOURCE
++			if (parameter_type != null && parameter_type.IsGenericParameter) {
++				if ((parameter_type.GenericParameterAttributes & GenericParameterAttributes.Covariant) != 0) {
++					Report.Error (-38, Location, "Covariant type parameters cannot be used as method parameters");
++					return false;
++				} else if ((ModFlags & Modifier.ISBYREF) != 0 &&
++				           (parameter_type.GenericParameterAttributes & GenericParameterAttributes.Contravariant) != 0) {
++					Report.Error (-37, Location, "Contravariant type parameters cannot be used in output positions");
++					return false;
++				}
++			}
++
++			if (!TypeManager.VerifyNoVariantTypeParameters (parameter_type, Location)) {
++				return false;
++			}
++#endif
++			return true;
++		}
++
+ 		public void ResolveVariable (int idx)
+ 		{
+ 			this.idx = idx;
+@@ -1007,6 +1028,8 @@
+ 			if (types != null)
+ 				return true;
+ 
++			AbstractPropertyEventMethod dummy_method = ec as AbstractPropertyEventMethod;
++
+ 			types = new Type [Count];
+ 			
+ 			bool ok = true;
+@@ -1014,7 +1037,7 @@
+ 			for (int i = 0; i < FixedParameters.Length; ++i) {
+ 				p = this [i];
+ 				Type t = p.Resolve (ec);
+-				if (t == null) {
++				if (t == null || ((dummy_method == null || !dummy_method.IsDummy) && !p.VerifyTypeVariance())) {
+ 					ok = false;
+ 					continue;
+ 				}
+Index: mcs/decl.cs
+===================================================================
+--- mcs/decl.cs	(revision 125506)
++++ mcs/decl.cs	(working copy)
+@@ -1336,7 +1336,7 @@
+ 				}
+ 
+ 				type_params [i] = new TypeParameter (
+-					Parent, this, name.Name, constraints, name.OptAttributes,
++					Parent, this, name.Name, constraints, name.OptAttributes, name.Variance,
+ 					Location);
+ 
+ 				AddToContainer (type_params [i], name.Name);
+Index: mcs/convert.cs
+===================================================================
+--- mcs/convert.cs	(revision 125506)
++++ mcs/convert.cs	(working copy)
+@@ -369,10 +369,12 @@
+ 				(expr_type == TypeManager.delegate_type || TypeManager.IsDelegateType (expr_type)))
+ 				return true;
+ 
+-			// from a generic type definition to a generic instance.
+ 			if (TypeManager.IsEqual (expr_type, target_type))
+ 				return true;
+ 
++			if (TypeManager.IsVariantOf (expr_type, target_type))
++			    return true;
++
+ 			return false;
+ 		}
+ 
+@@ -1214,6 +1216,10 @@
+ 				return null;
+ 			}
+ 
++			if (TypeManager.IsVariantOf (expr_type, target_type)) {
++				return expr;
++			}
++
+ 			if (TypeManager.IsNullableType (target_type))
+ 				return ImplicitNulableConversion (ec, expr, target_type);
+ 
+Index: mcs/ChangeLog
+===================================================================
+--- mcs/ChangeLog	(revision 125506)
++++ mcs/ChangeLog	(working copy)
+@@ -1,3 +1,57 @@
++2009-02-03  Scott Peterson  <lunchtimemama@gmail.com>
++
++	This patch adds initial generic variance support to the compiler.
++	It is contributed under the MIT/X11 license.
++
++	* typemanager.cs: Modified ImplementsInterface to check variance.
++	Added VerifyVariantTypeParameters which checks the specified type to see
++	if it uses a variant type parameter as a type argument (which is not
++	allowed). Added IsVariantOf which determins if the first type is a
++	variant of the second. NOTE: This only supports reference types at
++	the moment to conform with the current level of VM support. When the
++	VM supports value types, this will follow step.
++
++	* generic.cs: Added the Variance enum. Added a Variance property to
++	TypeParameter and added variance support to definition phase. Added a
++	Variance property to TypeParameterName. Also check to make sure that
++	no variant types appear in generic method parameters.
++
++	* cs-tokenizer.cs: Modified parse_less_than to tokenize the variance
++	keywords if the langversion supports it.
++
++	* parameter.cs: Added Parameter.VerifyNoVariantTypeParameters to ensure
++	that variant types are only used in legal positions. Also added
++	ParametersCompiled.VerifyNoVariantTypeParameters to check all of its
++	parameters.
++
++	* decl.cs: Construct TypeParameter with the variance information.
++
++	* convert.cs: Checks variance in ImplicitReferenceConversionExists
++	and ImplicitConversionStandard.
++
++	* rootcontext.cs: Added new "Future" language version.
++
++	* class.cs: In TypeContainer.DoDefineMembers, ensure that contravariant
++	type parameters are not used as type arguments in interface inheritance.
++	In MemberBase.DoMemberDependentChecks, ensure that contravariant type
++	parameters are not used as method return types. In MemberBase.
++	ResolveMemberType, ensure that variant type parameters are not used
++	as type arguments. Also call VerifyNoVariantTypeParameters on every
++	set of parameters which are resolved.
++
++	* delegate.cs: Modified Delegate.Define to ensure that variant
++	parameters are not used as type arguments and that a contravariant
++	parameter is not used as the return type. Also call
++	VerifyNoVariantTypeParameters on the delegate parameters.
++
++	* cs-parser.jay: Modified grammar to support "in" and "out" keywords
++	to specify generic variance.
++
++	* driver.cs: Added support for LanguageVersion.Future in the form of
++	"-langversion:future".
++
++	* generic-mcs.cs: Stubbed out new members in generic.cs.
++
+ 2009-02-02  Marek Safar  <marek.safar@gmail.com>
+ 
+ 	A fix for bug #471213
+Index: mcs/rootcontext.cs
+===================================================================
+--- mcs/rootcontext.cs	(revision 125506)
++++ mcs/rootcontext.cs	(working copy)
+@@ -25,6 +25,7 @@
+ 		Default_MCS	= 2,
+ 		ISO_2		= 3,
+ 		LINQ		= 4,
++		Future		= 5,
+ 
+ #if GMCS_SOURCE
+ 		Default		= LINQ
+Index: mcs/class.cs
+===================================================================
+--- mcs/class.cs	(revision 125506)
++++ mcs/class.cs	(working copy)
+@@ -1270,8 +1270,18 @@
+ 							oa, iface.GetSignatureForError (), Location);
+ 
+ 					GenericTypeExpr ct = iface as GenericTypeExpr;
+-					if ((ct != null) && !ct.CheckConstraints (this))
+-						return false;
++					if (ct != null) {
++						if (!ct.CheckConstraints (this))
++							return false;
++#if GMCS_SOURCE
++						foreach (Type t in ct.TypeArguments.Arguments) {
++							if (t.IsGenericParameter && (t.GenericParameterAttributes & GenericParameterAttributes.Contravariant) != 0) {
++								Report.Error (-39, ct.Location, "Contravariant type parameters cannot be used " +
++								              "as arguments in interface inheritance");
++							}
++						}
++#endif
++					}
+ 				}
+ 			}
+ 
+@@ -5283,6 +5293,11 @@
+ 						      "accessible than field `" + GetSignatureForError () + "'");
+ 				}
+ 			}
++#if GMCS_SOURCE
++			if (MemberType.IsGenericParameter && (MemberType.GenericParameterAttributes & GenericParameterAttributes.Contravariant) != 0) {
++				Report.Error (-33, Location, "Contravariant type parameters can only be used in input positions");
++			}
++#endif
+ 		}
+ 
+ 		protected bool IsTypePermitted ()
+@@ -5315,6 +5330,10 @@
+ 			if (te == null)
+ 				return false;
+ 
++			if (!TypeManager.VerifyNoVariantTypeParameters (te.Type, te.Location)) {
++				return false;
++			}
++			
+ 			//
+ 			// Replace original type name, error reporting can use fully resolved name
+ 			//
+@@ -5944,7 +5963,7 @@
+ 		protected ToplevelBlock block;
+ 		protected ListDictionary declarative_security;
+ 
+-		// The accessor are created event if they are not wanted.
++		// The accessor are created even if they are not wanted.
+ 		// But we need them because their names are reserved.
+ 		// Field says whether accessor will be emited or not
+ 		public readonly bool IsDummy;
+@@ -6252,6 +6271,7 @@
+ 			public override MethodBuilder Define (DeclSpace parent)
+ 			{
+ 				parameters.Resolve (ResolveContext);
++				
+ 				base.Define (parent);
+ 
+ 				if (IsDummy)
+Index: mcs/delegate.cs
+===================================================================
+--- mcs/delegate.cs	(revision 125506)
++++ mcs/delegate.cs	(working copy)
+@@ -230,6 +230,17 @@
+ 				return false;
+ 			}
+ 
++			if (!TypeManager.VerifyNoVariantTypeParameters (ret_type, ReturnType.Location)) {
++				return false;
++			}
++
++#if GMCS_SOURCE
++			if (ret_type.IsGenericParameter && (ret_type.GenericParameterAttributes & GenericParameterAttributes.Contravariant) != 0) {
++				Report.Error (-33, Location, "Contravariant type parameters can only be used in input positions");
++				return false;
++			}
++#endif
++
+ 			//
+ 			// We don't have to check any others because they are all
+ 			// guaranteed to be accessible - they are standard types.
+Index: mcs/cs-parser.jay
+===================================================================
+--- mcs/cs-parser.jay	(revision 125506)
++++ mcs/cs-parser.jay	(working copy)
+@@ -2755,10 +2755,10 @@
+ 	;
+ 
+ type_parameter
+-	: opt_attributes IDENTIFIER
++	: opt_attributes opt_type_parameter_variance IDENTIFIER
+ 	  {
+-		LocatedToken lt = (LocatedToken)$2;
+-		$$ = new TypeParameterName (lt.Value, (Attributes)$1, lt.Location);
++		LocatedToken lt = (LocatedToken)$3;
++		$$ = new TypeParameterName (lt.Value, (Attributes)$1, (Variance)$2, lt.Location);
+   	  }
+   	| error
+   	  {
+@@ -4188,6 +4188,30 @@
+ 	  }
+ 	;
+ 
++opt_type_parameter_variance
++	: /* empty */
++	  {
++		$$ = Variance.None;
++	  }
++	| type_parameter_variance
++	  {
++		if (RootContext.Version < LanguageVersion.Future)
++			Report.FeatureIsNotAvailable (lexer.Location, "generic variance");
++		$$ = $1;
++	  }
++	;
++
++type_parameter_variance
++	: OUT
++	  {
++		$$ = Variance.Covariant;
++	  }
++	| IN
++	  {
++		$$ = Variance.Contravariant;
++	  }
++	;
++
+ //
+ // Statements (8.2)
+ //
+Index: mcs/driver.cs
+===================================================================
+--- mcs/driver.cs	(revision 125506)
++++ mcs/driver.cs	(working copy)
+@@ -239,7 +239,7 @@
+ 				"   -help                Lists all compiler options (short: -?)\n" + 
+ 				"   -keycontainer:NAME   The key pair container used to sign the output assembly\n" +
+ 				"   -keyfile:FILE        The key file used to strongname the ouput assembly\n" +
+-				"   -langversion:TEXT    Specifies language version modes: ISO-1, ISO-2, or Default\n" + 
++				"   -langversion:TEXT    Specifies language version: ISO-1, ISO-2, Default, or future\n" + 
+ 				"   -lib:PATH1[,PATHn]   Specifies the location of referenced assemblies\n" +
+ 				"   -main:CLASS          Specifies the class with the Main method (short: -m)\n" +
+ 				"   -noconfig            Disables implicitly referenced assemblies\n" +
+@@ -1497,6 +1497,9 @@
+ 				case "iso-2":
+ 					RootContext.Version = LanguageVersion.ISO_2;
+ 					return true;
++				case "future":
++					RootContext.Version = LanguageVersion.Future;
++					return true;
+ #endif
+ 				}
+ 				Report.Error (1617, "Invalid option `{0}' for /langversion. It must be either `ISO-1', `ISO-2' or `Default'", value);
+Index: mcs/generic-mcs.cs
+===================================================================
+--- mcs/generic-mcs.cs	(revision 125506)
++++ mcs/generic-mcs.cs	(working copy)
+@@ -13,6 +13,13 @@
+ 
+ namespace Mono.CSharp
+ {
++	public enum Variance
++	{
++		None,
++		Covariant,
++		Contravariant
++	}
++
+ 	public enum SpecialConstraint
+ 	{
+ 		Constructor,
+@@ -68,7 +75,7 @@
+ 	public class TypeParameter : MemberCore, IMemberContainer
+ 	{
+ 		public TypeParameter (DeclSpace parent, DeclSpace decl, string name,
+-				      Constraints constraints, Attributes attrs, Location loc)
++				      Constraints constraints, Attributes attrs, Variance variance, Location loc)
+ 			: base (parent, new MemberName (name, loc), attrs)
+ 		{
+ 			throw new NotImplementedException ();
+@@ -152,6 +159,10 @@
+ 			get { throw new NotImplementedException (); }
+ 		}
+ 
++		public Variance Variance {
++			get { throw new NotImplementedException (); }
++		}
++
+ 		MemberCache IMemberContainer.BaseCache {
+ 			get { throw new NotImplementedException (); }
+ 		}
+@@ -199,11 +210,18 @@
+ 	public class TypeParameterName : SimpleName
+ 	{
+ 		Attributes attributes;
++		Variance variance;
+ 
+ 		public TypeParameterName (string name, Attributes attrs, Location loc)
++			: this (name, attrs, Variance.None, loc)
++		{
++		}
++
++		public TypeParameterName (string name, Attributes attrs, Variance variance, Location loc)
+ 			: base (name, loc)
+ 		{
+ 			attributes = attrs;
++			this.variance = variance;
+ 		}
+ 
+ 		public Attributes OptAttributes {
+@@ -211,6 +229,12 @@
+ 				return attributes;
+ 			}
+ 		}
++
++		public Variance Variance {
++			get {
++				return variance;
++			}
++		}
+ 	}
+ 
+ 	public class GenericTypeExpr : TypeExpr
+Index: errors/gcs8036.cs
+===================================================================
+--- errors/gcs8036.cs	(revision 0)
++++ errors/gcs8036.cs	(revision 0)
+@@ -0,0 +1,7 @@
++// CS8036: Generic variance can only be used with interfaces and delegates
++// Line: 5
++// Compiler options: -langversion:future
++
++class A<out T>
++{
++}
+Index: errors/gcs1644-16.cs
+===================================================================
+--- errors/gcs1644-16.cs	(revision 0)
++++ errors/gcs1644-16.cs	(revision 0)
+@@ -0,0 +1,6 @@
++// CS1644: Feature `generic variance' cannot be used because it is not part of the C# 2.0 language specification
++// Line: 5
++// Compiler options: -langversion:iso-2
++
++ public interface IFoo<in T> {
++ }
+Index: errors/gcs8034-3.cs
+===================================================================
+--- errors/gcs8034-3.cs	(revision 0)
++++ errors/gcs8034-3.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<in T>
++{
++	A<T> C();
++}
+Index: errors/gcs8035-5.cs
+===================================================================
+--- errors/gcs8035-5.cs	(revision 0)
++++ errors/gcs8035-5.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<out T>
++{
++	void C(A<T> a);
++}
+Index: errors/gcs8034-7.cs
+===================================================================
+--- errors/gcs8034-7.cs	(revision 0)
++++ errors/gcs8034-7.cs	(revision 0)
+@@ -0,0 +1,9 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 9
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++delegate A<T> B<in T> ();
+Index: errors/gcs8038-3.cs
+===================================================================
+--- errors/gcs8038-3.cs	(revision 0)
++++ errors/gcs8038-3.cs	(revision 0)
+@@ -0,0 +1,8 @@
++// CS8038: Covariant type parameters cannot be used as method parameters
++// Line: 7
++// Compiler options: -langversion:future
++
++interface A<out T>
++{
++	void B(ref T t);
++}
+Index: errors/gcs8034-10.cs
+===================================================================
+--- errors/gcs8034-10.cs	(revision 0)
++++ errors/gcs8034-10.cs	(revision 0)
+@@ -0,0 +1,9 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 9
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++delegate void B<in T> (A<A<T>> a);
+Index: errors/gcs8035-9.cs
+===================================================================
+--- errors/gcs8035-9.cs	(revision 0)
++++ errors/gcs8035-9.cs	(revision 0)
+@@ -0,0 +1,9 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 9
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++delegate void B<out T> (A<T> a);
+Index: errors/gcs8035.cs
+===================================================================
+--- errors/gcs8035.cs	(revision 0)
++++ errors/gcs8035.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<out T>
++{
++	A<T> A { get; }
++}
+Index: errors/gcs1644-15.cs
+===================================================================
+--- errors/gcs1644-15.cs	(revision 0)
++++ errors/gcs1644-15.cs	(revision 0)
+@@ -0,0 +1,6 @@
++// CS1644: Feature `generic variance' cannot be used because it is not part of the C# 2.0 language specification
++// Line: 5
++// Compiler options: -langversion:iso-2
++
++ public interface IFoo<out T> {
++ }
+Index: errors/gcs8034-2.cs
+===================================================================
+--- errors/gcs8034-2.cs	(revision 0)
++++ errors/gcs8034-2.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<in T>
++{
++	A<A<T>> A { get; }
++}
+Index: errors/gcs8036-2.cs
+===================================================================
+--- errors/gcs8036-2.cs	(revision 0)
++++ errors/gcs8036-2.cs	(revision 0)
+@@ -0,0 +1,7 @@
++// CS8036: Generic variance can only be used with interfaces and delegates
++// Line: 5
++// Compiler options: -langversion:future
++
++class A<in T>
++{
++}
+Index: errors/gcs8039.cs
+===================================================================
+--- errors/gcs8039.cs	(revision 0)
++++ errors/gcs8039.cs	(revision 0)
+@@ -0,0 +1,11 @@
++// CS8039: Contravariant type parameters cannot be used as arguments in interface inheritance
++// Line: 9
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<in T> : A<T>
++{
++}
+Index: errors/gcs8035-4.cs
+===================================================================
+--- errors/gcs8035-4.cs	(revision 0)
++++ errors/gcs8035-4.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<out T>
++{
++	A<A<T>> C();
++}
+Index: errors/gcs8034-6.cs
+===================================================================
+--- errors/gcs8034-6.cs	(revision 0)
++++ errors/gcs8034-6.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<in T>
++{
++	void C(A<A<T>> a);
++}
+Index: errors/gcs8038-2.cs
+===================================================================
+--- errors/gcs8038-2.cs	(revision 0)
++++ errors/gcs8038-2.cs	(revision 0)
+@@ -0,0 +1,8 @@
++// CS8038: Covariant type parameters cannot be used as method parameters
++// Line: 7
++// Compiler options: -langversion:future
++
++interface A<out T>
++{
++	void B(out T t);
++}
+Index: errors/gcs8035-8.cs
+===================================================================
+--- errors/gcs8035-8.cs	(revision 0)
++++ errors/gcs8035-8.cs	(revision 0)
+@@ -0,0 +1,9 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 9
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++delegate A<A<T>> B<out T> ();
+Index: errors/gcs8034.cs
+===================================================================
+--- errors/gcs8034.cs	(revision 0)
++++ errors/gcs8034.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<in T>
++{
++	A<T> A { get; }
++}
+Index: errors/errors.txt
+===================================================================
+--- errors/errors.txt	(revision 125506)
++++ errors/errors.txt	(working copy)
+@@ -91,6 +91,24 @@
+ 
+ -31     Internal compiler error during the method emit phase.
+ 
++-32     Internal compiler error during parsing.
++
++-33     Contravariant type parameters cannot be the return type.
++
++-34     Contravariant type parameters cannot be used as type arguments.
++
++-35     Covariant type parameters cannot be used as type arguments except
++        for inherited interfaces.
++
++-36     Variant type parameters can only be used with interface and
++        delegate types.
++
++-37     Contravariant type parameters cannot be byref method parameters.
++
++-38     Covariant type parameters cannot be used as method parameters.
++
++-39     Contravariant type parameters cannot be used in interface inheritance.
++
+ ----------
+ 
+ Errors that we have allocated that will have corresponding errors in
+Index: errors/gcs8038.cs
+===================================================================
+--- errors/gcs8038.cs	(revision 0)
++++ errors/gcs8038.cs	(revision 0)
+@@ -0,0 +1,8 @@
++// CS8038: Covariant type parameters cannot be used as method parameters
++// Line: 7
++// Compiler options: -langversion:future
++
++interface A<out T>
++{
++	void B(T t);
++}
+Index: errors/gcs8035-3.cs
+===================================================================
+--- errors/gcs8035-3.cs	(revision 0)
++++ errors/gcs8035-3.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<out T>
++{
++	A<T> C();
++}
+Index: errors/ChangeLog
+===================================================================
+--- errors/ChangeLog	(revision 125506)
++++ errors/ChangeLog	(working copy)
+@@ -1,3 +1,46 @@
++2009-02-01  Scott Peterson  <lunchtimemama@gmail.com>
++
++	This patch is contributed under the MIT/X11 license.
++
++	* errors.txt: Added new mono-specific errors codes -33 to -39 pertaining
++	to generic variance.
++
++	* gcs8033.cs:
++	* gcs8033-2.cs:
++	* gcs8034.cs:
++	* gcs8034-2.cs:
++	* gcs8034-3.cs:
++	* gcs8034-4.cs:
++	* gcs8034-5.cs:
++	* gcs8034-6.cs:
++	* gcs8034-7.cs:
++	* gcs8034-8.cs:
++	* gcs8034-9.cs:
++	* gcs8034-10.cs:
++	* gcs8035.cs:
++	* gcs8035-2.cs:
++	* gcs8035-3.cs:
++	* gcs8035-4.cs:
++	* gcs8035-5.cs:
++	* gcs8035-6.cs:
++	* gcs8035-7.cs:
++	* gcs8035-8.cs:
++	* gcs8035-9.cs:
++	* gcs8035-10.cs:
++	* gcs8036.cs:
++	* gcs8036-2.cs:
++	* gcs8037.cs:
++	* gcs8037-2.cs:
++	* gcs8038.cs:
++	* gcs8038-2.cs:
++	* gcs8038-3.cs:
++	* gcs8039.cs: Added tests for new error codes.
++
++	* gcs1525.cs: Updated error message to jive with new grammar.
++
++	* gcs1644-15.cs:
++	* gcs1644-16.cs: Add tests for "unsupported feature" error in iso-2.
++
+ 2009-01-19  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* Makefile (check): Add a standard check target.
+Index: errors/gcs8034-5.cs
+===================================================================
+--- errors/gcs8034-5.cs	(revision 0)
++++ errors/gcs8034-5.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<in T>
++{
++	void C(A<T> a);
++}
+Index: errors/gcs8035-7.cs
+===================================================================
+--- errors/gcs8035-7.cs	(revision 0)
++++ errors/gcs8035-7.cs	(revision 0)
+@@ -0,0 +1,9 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 9
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++delegate A<T> B<out T> ();
+Index: errors/gcs8034-9.cs
+===================================================================
+--- errors/gcs8034-9.cs	(revision 0)
++++ errors/gcs8034-9.cs	(revision 0)
+@@ -0,0 +1,9 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 9
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++delegate void B<in T> (A<T> a);
+Index: errors/gcs8033.cs
+===================================================================
+--- errors/gcs8033.cs	(revision 0)
++++ errors/gcs8033.cs	(revision 0)
+@@ -0,0 +1,8 @@
++// CS8033: Contravariant type parameters can only be used in input positions
++// Line: 7
++// Compiler options: -langversion:future
++
++interface A<in T>
++{
++	T B();
++}
+Index: errors/gcs8033-2.cs
+===================================================================
+--- errors/gcs8033-2.cs	(revision 0)
++++ errors/gcs8033-2.cs	(revision 0)
+@@ -0,0 +1,5 @@
++// CS8033: Contravariant type parameters can only be used in input positions
++// Line: 5
++// Compiler options: -langversion:future
++
++delegate T D<in T> ();
+Index: errors/gcs8037.cs
+===================================================================
+--- errors/gcs8037.cs	(revision 0)
++++ errors/gcs8037.cs	(revision 0)
+@@ -0,0 +1,8 @@
++// CS8037: Contravariant type parameters cannot be used in output positions
++// Line: 7
++// Compiler options: -langversion:future
++
++interface A<in T>
++{
++	void B(out T t);
++}
+Index: errors/gcs8035-2.cs
+===================================================================
+--- errors/gcs8035-2.cs	(revision 0)
++++ errors/gcs8035-2.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<out T>
++{
++	A<A<T>> A { get; }
++}
+Index: errors/gcs8034-4.cs
+===================================================================
+--- errors/gcs8034-4.cs	(revision 0)
++++ errors/gcs8034-4.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<in T>
++{
++	A<A<T>> C();
++}
+Index: errors/gcs1525.cs
+===================================================================
+--- errors/gcs1525.cs	(revision 125506)
++++ errors/gcs1525.cs	(working copy)
+@@ -1,4 +1,4 @@
+-// CS1525: Unexpected symbol `>', expecting `[', or `identifier'
++// CS1525: Unexpected symbol `>', expecting `[', `identifier', `in', or `out'
+ // Line: 4
+ 
+ public class C<>
+Index: errors/gcs8037-2.cs
+===================================================================
+--- errors/gcs8037-2.cs	(revision 0)
++++ errors/gcs8037-2.cs	(revision 0)
+@@ -0,0 +1,8 @@
++// CS8037: Contravariant type parameters cannot be used in output positions
++// Line: 7
++// Compiler options: -langversion:future
++
++interface A<in T>
++{
++	void B(ref T t);
++}
+Index: errors/gcs8035-6.cs
+===================================================================
+--- errors/gcs8035-6.cs	(revision 0)
++++ errors/gcs8035-6.cs	(revision 0)
+@@ -0,0 +1,12 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 11
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++interface B<out T>
++{
++	void C(A<A<T>> a);
++}
+Index: errors/gcs8034-8.cs
+===================================================================
+--- errors/gcs8034-8.cs	(revision 0)
++++ errors/gcs8034-8.cs	(revision 0)
+@@ -0,0 +1,9 @@
++// CS8034: Contravariant type parameters can only be used as input arguments to a method
++// Line: 9
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++delegate A<A<T>> B<in T> ();
+Index: errors/gcs8035-10.cs
+===================================================================
+--- errors/gcs8035-10.cs	(revision 0)
++++ errors/gcs8035-10.cs	(revision 0)
+@@ -0,0 +1,9 @@
++// CS8035: Covariant type parameters can only be used as return types or in interface inheritance
++// Line: 9
++// Compiler options: -langversion:future
++
++interface A<T>
++{
++}
++
++delegate void B<out T> (A<A<T>> a);

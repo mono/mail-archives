@@ -1,0 +1,323 @@
+Index: mono/metadata/appdomain.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/appdomain.c,v
+retrieving revision 1.136
+diff -u -r1.136 appdomain.c
+--- mono/metadata/appdomain.c	13 May 2004 18:11:44 -0000	1.136
++++ mono/metadata/appdomain.c	14 May 2004 14:05:01 -0000
+@@ -35,6 +35,10 @@
+ 
+ static gboolean shutting_down = FALSE;
+ 
++extern gboolean allow_user_gac;
++static gchar *system_gac;
++static gchar *user_gac;
++
+ static MonoAssembly *
+ mono_domain_assembly_preload (MonoAssemblyName *aname,
+ 			      gchar **assemblies_path,
+@@ -43,6 +47,9 @@
+ static void
+ mono_domain_fire_assembly_load (MonoAssembly *assembly, gpointer user_data);
+ 
++static void
++mono_domain_check_assembly_strongname_hook (MonoAssembly *assembly, gpointer user_data);
++
+ static MonoMethod *
+ look_for_method_by_name (MonoClass *klass, const gchar *name);
+ 
+@@ -72,8 +79,12 @@
+ 	
+ 	mono_marshal_init ();
+ 	
++	system_gac = g_build_path (G_DIR_SEPARATOR_S, MONO_ASSEMBLIES, "mono", "gac", NULL);
++	user_gac = g_build_path (G_DIR_SEPARATOR_S, g_get_home_dir (), ".mono", "gac", NULL);
++	
+ 	mono_install_assembly_preload_hook (mono_domain_assembly_preload, NULL);
+ 	mono_install_assembly_load_hook (mono_domain_fire_assembly_load, NULL);
++	mono_install_assembly_load_hook (mono_domain_check_assembly_strongname_hook, NULL);
+ 	mono_install_lookup_dynamic_token (mono_reflection_lookup_dynamic_token);
+ 
+ 	mono_thread_init (start_cb, attach_cb);
+@@ -118,6 +129,18 @@
+ 	return;
+ }
+ 
++const gchar*
++mono_get_system_gac_path (void)
++{
++	return system_gac;
++}
++
++const gchar*
++mono_get_user_gac_path (void)
++{
++	return user_gac;
++}
++
+ static int
+ mono_get_corlib_version (void)
+ {
+@@ -513,6 +536,170 @@
+ 	if (ass->image->references)
+ 		for (i = 0; ass->image->references [i] != NULL; i++)
+ 			add_assemblies_to_domain (domain, ass->image->references [i]);
++}
++
++static void
++mono_strongname_init (MonoDomain *domain) 
++{
++	MonoMethod *method = NULL;
++	gpointer args [1];
++	int i;
++	gchar *fullpath;
++	
++	MonoClass *klass = mono_class_from_name (mono_defaults.corlib, 
++		"Mono.Security", "StrongNameManager");
++	g_assert (klass);
++	if (!klass->inited)
++		mono_class_init (klass);
++		
++	for (i = 0; i < klass->method.count; ++i) {
++		method = klass->methods [i];
++		if (!strcmp ("LoadConfig", method->name) &&
++			(method->signature->param_count == 1) &&
++			(method->flags & METHOD_ATTRIBUTE_STATIC))
++			break;
++		method = NULL;
++	}
++	g_assert (method);
++	
++	fullpath = g_build_path (G_DIR_SEPARATOR_S, mono_get_system_gac_path (), 
++		"strongnames.config", NULL);
++	args [0] = mono_string_new (domain, fullpath);
++	mono_runtime_invoke (method, NULL, args, NULL);
++	
++	if (allow_user_gac) {
++		free (fullpath);
++		// fusion/override configuration from system GAC with user GAC
++		fullpath = g_build_path (G_DIR_SEPARATOR_S,  
++			mono_get_user_gac_path (), "strongnames.config", NULL);
++		args [0] = mono_string_new (domain, fullpath);
++		mono_runtime_invoke (method, NULL, args, NULL);
++	}
++	free (fullpath);
++	
++	klass = mono_class_from_name (mono_defaults.corlib, "Mono.Security", 
++		"StrongName");
++	g_assert (klass);
++	if (!klass->inited)
++		mono_class_init (klass);
++	
++	for (i = 0; i < klass->method.count; ++i) {
++		method = klass->methods [i];
++		if (!strcmp ("IsAssemblyStrongnamed", method->name) &&
++			(method->signature->param_count == 1) &&
++			(method->flags & METHOD_ATTRIBUTE_STATIC))
++			break;
++		method = NULL;
++	}
++	g_assert (method);
++	mono_defaults.mono_strongname_method = method;
++}
++
++static void
++mono_domain_check_assembly_strongname_hook (MonoAssembly *assembly, gpointer user_data)
++{
++	gchar *gacpath;
++	int n;
++	gpointer args [1];
++	MonoObject *retval;
++	MonoDomain *domain;
++	gboolean debug = FALSE;
++
++	/* To be removed after beta 2 */
++	/* FIXME - DEBUG - TEST - REMOVE - TEMP - HACK */
++	if (getenv ("SNDEBUG") != NULL) {
++		debug = TRUE;
++		g_warning (assembly->image->name);
++	}
++
++	assembly->in_gac = FALSE;
++
++	/* To be removed after beta 2 */
++	/* FIXME - DEBUG - TEST - REMOVE - TEMP - HACK */
++	if (getenv ("SNSKIP") != NULL) {
++		if (debug)
++			g_warning ("Strongname validation skipped by environment variable!");
++		assembly->strongname = MONO_STRONGNAME_VALID;
++		return;
++	}
++	
++	// not all assemblies are strongnamed
++	if (!assembly->aname.public_key) {
++		if (debug)
++			g_warning ("No public key so no validation required");
++		assembly->strongname = MONO_STRONGNAME_NONE;
++		return;
++	}
++
++	// trust is implied for mscorlib - anyway we could validate
++	// it's signature without calling it's code (nor would it be
++	// loaded to do it)
++	if (strcmp (assembly->aname.name, "mscorlib") == 0) {
++		if (debug)
++			g_warning ("mscorlib.dll is implicitly trusted");
++		assembly->strongname = MONO_STRONGNAME_VALID;
++		return;
++	}
++	
++	// assemblies in GAC are strongnamed but not checked at runtime
++	// instead they are checked at install time with gacutil
++	gacpath = g_build_path (G_DIR_SEPARATOR_S, mono_get_system_gac_path (),
++		assembly->aname.name, NULL);
++	n = strlen (gacpath);
++	if (strncmp (assembly->image->name, gacpath, n) == 0) {
++		if (debug)
++			g_warning ("no verification for assemblies in the System GAC");
++		assembly->strongname = MONO_STRONGNAME_VALID;
++		assembly->in_gac = TRUE;
++		g_free (gacpath);
++		return;
++	}
++	else {
++		g_free (gacpath);
++		/* second chance with the user GAC */
++		gacpath = g_build_path (G_DIR_SEPARATOR_S, 
++			mono_get_user_gac_path (), assembly->aname.name, NULL);
++		n = strlen (gacpath);
++		if (strncmp (assembly->image->name, gacpath, n) == 0) {
++			if (debug)
++				g_warning ("no verification for assemblies in the User GAC");
++			assembly->strongname = MONO_STRONGNAME_VALID;
++			assembly->in_gac = TRUE;
++			g_free (gacpath);
++			return;
++		}
++	}
++	g_free (gacpath);
++
++ 	domain = mono_domain_get ();
++	// lazy load of the strongname validation method
++	if (!mono_defaults.mono_strongname_method) {
++		mono_strongname_init (domain);
++	}
++	
++	args [0] = mono_string_new (domain, assembly->image->name);
++	
++	retval = mono_runtime_invoke (mono_defaults.mono_strongname_method, NULL, args, NULL);
++	if (*(MonoBoolean *) mono_object_unbox (retval)) {
++		assembly->strongname = MONO_STRONGNAME_VALID;
++		if (debug)
++			g_warning ("Strongname verified and valid");
++	}
++	else {
++		/* To be removed after beta 2 */
++		/* FIXME - DEBUG - TEST - REMOVE - TEMP - HACK */
++		if (getenv ("SNPASS") != NULL) {
++			if (debug)
++				g_warning ("Invalid strongname but runtime validation results have been turned off!");
++			assembly->strongname = MONO_STRONGNAME_VALID;
++			return;
++		}
++		if (debug)
++			g_warning ("Invalid strongname");
++		assembly->strongname = MONO_STRONGNAME_INVALID;
++		/* later we won't have the assembly name which failed validation */
++		mono_raise_exception (mono_get_exception_file_not_found (args [0]));
++	}
+ }
+ 
+ static void
+Index: mono/metadata/appdomain.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/appdomain.h,v
+retrieving revision 1.68
+diff -u -r1.68 appdomain.h
+--- mono/metadata/appdomain.h	23 Feb 2004 14:09:13 -0000	1.68
++++ mono/metadata/appdomain.h	14 May 2004 14:05:01 -0000
+@@ -298,5 +298,10 @@
+ MonoString *
+ ves_icall_System_AppDomain_InternalGetProcessGuid (MonoString* newguid);
+ 
++const gchar*
++mono_get_system_gac_path (void);
++
++const gchar*
++mono_get_user_gac_path (void);
+ 
+ #endif /* _MONO_METADATA_APPDOMAIN_H_ */
+Index: mono/metadata/assembly.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/assembly.c,v
+retrieving revision 1.95
+diff -u -r1.95 assembly.c
+--- mono/metadata/assembly.c	12 May 2004 01:58:21 -0000	1.95
++++ mono/metadata/assembly.c	14 May 2004 14:05:01 -0000
+@@ -53,7 +53,7 @@
+ /* A hastable of thread->assembly list mappings */
+ static GHashTable *assemblies_loading;
+ 
+-static gboolean allow_user_gac = FALSE;
++extern gboolean allow_user_gac = FALSE;
+ 
+ static gchar*
+ encode_public_tok (const guchar *token, gint32 len)
+@@ -1017,4 +1017,3 @@
+ {
+ 	allow_user_gac = allow;
+ }
+-
+Index: mono/metadata/image.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/image.h,v
+retrieving revision 1.60
+diff -u -r1.60 image.h
+--- mono/metadata/image.h	26 Apr 2004 19:26:41 -0000	1.60
++++ mono/metadata/image.h	14 May 2004 14:05:01 -0000
+@@ -19,6 +19,12 @@
+ 	guint16 major, minor, build, revision;
+ } MonoAssemblyName;
+ 
++typedef enum {
++	MONO_STRONGNAME_NONE,
++	MONO_STRONGNAME_VALID,
++	MONO_STRONGNAME_INVALID
++} MonoStrongNameStatus;
++
+ typedef struct {
+ 	int   ref_count;
+ 	char *basedir;
+@@ -28,6 +34,7 @@
+ 	MonoImage *image;
+ 	/* Load files here */
+ 	gboolean dynamic;
++	MonoStrongNameStatus strongname;
+ } MonoAssembly;
+ 
+ typedef struct {
+@@ -161,7 +168,8 @@
+ 	MONO_IMAGE_OK,
+ 	MONO_IMAGE_ERROR_ERRNO,
+ 	MONO_IMAGE_MISSING_ASSEMBLYREF,
+-	MONO_IMAGE_IMAGE_INVALID
++	MONO_IMAGE_IMAGE_INVALID,
++	MONO_IMAGE_STRONGNAME_INVALID
+ } MonoImageOpenStatus;
+ 
+ void          mono_images_init    (void);
+Index: mono/metadata/loader.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/loader.h,v
+retrieving revision 1.67
+diff -u -r1.67 loader.h
+--- mono/metadata/loader.h	26 Apr 2004 19:26:41 -0000	1.67
++++ mono/metadata/loader.h	14 May 2004 14:05:01 -0000
+@@ -118,6 +118,7 @@
+ 	MonoClass *marshalbyrefobject_class;
+ 	MonoClass *monitor_class;
+ 	MonoClass *iremotingtypeinfo_class;
++	MonoMethod *mono_strongname_method;
+ } MonoDefaults;
+ 
+ extern MonoDefaults mono_defaults;

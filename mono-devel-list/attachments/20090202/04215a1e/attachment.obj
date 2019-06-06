@@ -1,0 +1,167 @@
+Index: signal.c
+===================================================================
+--- signal.c	(revision 123183)
++++ signal.c	(working copy)
+@@ -101,16 +101,19 @@
+ #ifdef WAPI_ATOMIC_ASM
+ 	#define mph_int_get(p)     InterlockedExchangeAdd ((p), 0)
+ 	#define mph_int_inc(p)     InterlockedIncrement ((p))
++	#define mph_int_dec_test(p)     InterlockedDecrement ((p)) == 0
+ 	#define mph_int_set(p,o,n) InterlockedExchange ((p), (n))
+ #elif GLIB_CHECK_VERSION(2,4,0)
+ 	#define mph_int_get(p) g_atomic_int_get ((p))
+  	#define mph_int_inc(p) do {g_atomic_int_inc ((p));} while (0)
++	#define mph_int_dec_test(p) g_atomic_int_dec_and_test ((p))
+ 	#define mph_int_set(p,o,n) do {                                 \
+ 		while (!g_atomic_int_compare_and_exchange ((p), (o), (n))) {} \
+ 	} while (0)
+ #else
+ 	#define mph_int_get(p) (*(p))
+ 	#define mph_int_inc(p) do { (*(p))++; } while (0)
++	#define mph_int_dec_test(p) --(*(p)) == 0
+ 	#define mph_int_set(p,o,n) do { *(p) = n; } while (0)
+ #endif
+ 
+@@ -128,7 +131,8 @@
+ static void
+ default_handler (int signum)
+ {
+-	int i;
++	int i,j;
++	int pipecounter;
+ 	for (i = 0; i < NUM_SIGNALS; ++i) {
+ 		int fd;
+ 		signal_info* h = &signals [i];
+@@ -138,7 +142,9 @@
+ 		fd = mph_int_get (&h->write_fd);
+ 		if (fd > 0) {
+ 			char c = signum;
+-			write (fd, &c, 1);
++			pipecounter = mph_int_get (&h->pipecnt);
++			for (j = 0; j < pipecounter; ++j)
++				write (fd, &c, 1);
+ 		}
+ 	}
+ }
+@@ -182,7 +188,7 @@
+ 				break;
+ 			}
+ 			else {
+-				h->have_handler = 1;
++				h->state = 1;
+ 			}
+ 		}
+ 		if (!have_handler && signals [i].signum == sig &&
+@@ -195,13 +201,14 @@
+ 	}
+ 
+ 	if (h && have_handler) {
+-		h->have_handler = 1;
++		h->state = 1;
+ 		h->handler      = handler;
+ 	}
+ 
+ 	if (h) {
+ 		mph_int_set (&h->count, h->count, 0);
+ 		mph_int_set (&h->signum, h->signum, sig);
++		mph_int_set (&h->pipecnt, h->pipecnt, 0);
+ 	}
+ 
+ 	pthread_mutex_unlock (&signals_mutex);
+@@ -239,12 +246,12 @@
+ 		errno = EINVAL;
+ 	else {
+ 		/* last UnixSignal -- we can unregister */
+-		if (h->have_handler && count_handlers (h->signum) == 1) {
++		if (h->state && count_handlers (h->signum) == 1) {
+ 			mph_sighandler_t p = signal (h->signum, h->handler);
+ 			if (p != SIG_ERR)
+ 				r = 0;
+ 			h->handler      = NULL;
+-			h->have_handler = 0;
++			h->state = 0;
+ 		}
+ 		h->signum = 0;
+ 	}
+@@ -262,14 +269,18 @@
+ 		signal_info* h;
+ 		int filedes[2];
+ 
+-		if ((r = pipe (filedes)) != 0) {
+-			break;
++		h = signals [i];
++
++		if (mph_int_get (&h->pipecnt) == 0) {
++			if ((r = pipe (filedes)) != 0) {
++				break;
++			}
++			h->read_fd  = filedes [0];
++			h->write_fd = filedes [1];
++			if (h->read_fd > *max_fd)
++				*max_fd = h->read_fd;
+ 		}
+-		h = signals [i];
+-		h->read_fd  = filedes [0];
+-		h->write_fd = filedes [1];
+-		if (h->read_fd > *max_fd)
+-			*max_fd = h->read_fd;
++		mph_int_inc (&h->pipecnt);
+ 		FD_SET (h->read_fd, read_fds);
+ 	}
+ 	return r;
+@@ -281,12 +292,15 @@
+ 	int i;
+ 	for (i = 0; i < count; ++i) {
+ 		signal_info* h = signals [i];
+-		if (h->read_fd != 0)
+-			close (h->read_fd);
+-		if (h->write_fd != 0)
+-			close (h->write_fd);
+-		h->read_fd  = 0;
+-		h->write_fd = 0;
++
++		if (mph_int_dec_test (&h->pipecnt)) {
++			if (h->read_fd != 0)
++				close (h->read_fd);
++			if (h->write_fd != 0)
++				close (h->write_fd);
++			h->read_fd  = 0;
++			h->write_fd = 0;
++		}
+ 	}
+ }
+ 
+@@ -348,9 +362,19 @@
+ 	FD_ZERO (&read_fds);
+ 
+ 	r = setup_pipes (signals, count, &read_fds, &max_fd);
++
++	pthread_mutex_unlock (&signals_mutex);
++
+ 	if (r == 0) {
+ 		r = wait_for_any (signals, count, max_fd, &read_fds, timeout);
+ 	}
++
++	mr = pthread_mutex_lock (&signals_mutex);
++	if (mr != 0) {
++		errno = mr;
++		return -1;
++	}
++
+ 	teardown_pipes (signals, count);
+ 
+ 	pthread_mutex_unlock (&signals_mutex);
+Index: map.h
+===================================================================
+--- map.h	(revision 123183)
++++ map.h	(working copy)
+@@ -1567,7 +1567,8 @@
+ 	int   count;
+ 	int   read_fd;
+ 	int   write_fd;
+-	int   have_handler;
++	int   state;
++	int   pipecnt;
+ 	void* handler;
+ };
+ 

@@ -1,0 +1,464 @@
+Index: DataRow.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataRow.cs,v
+retrieving revision 1.42
+diff -u -w -r1.42 DataRow.cs
+--- DataRow.cs	3 Nov 2003 12:35:50 -0000	1.42
++++ DataRow.cs	4 Nov 2003 11:08:13 -0000
+@@ -38,6 +38,7 @@
+ 		internal int xmlRowID = 0;
+ 		internal bool _nullConstraintViolation;
+ 		private bool editing = false;
++		private bool _hasParentCollection;
+ 
+ 		#endregion
+ 
+@@ -71,7 +72,6 @@
+ 					this [Col] = Col.AutoIncrementValue();
+ 				}
+ 			}
+-
+ 			_table.Columns.CollectionChanged += new System.ComponentModel.CollectionChangeEventHandler(CollectionChanged);
+ 		}
+ 
+@@ -243,7 +243,7 @@
+ 			object newval = null;
+ 			DataColumn col = _table.Columns[index];
+ 			
+-			if (col.ReadOnly && v != this[index])
++			if (_hasParentCollection && col.ReadOnly && v != this[index])
+ 				throw new ReadOnlyException ();
+ 
+ 			if (v == null)
+@@ -405,6 +405,7 @@
+ 		//from a Datatable so I added this method. Delete if there is a better way.
+ 		internal void DetachRow() {
+ 			proposed = null;
++			_hasParentCollection = false;
+ 			rowState = DataRowState.Detached;
+ 		}
+ 
+@@ -529,22 +530,36 @@
+ 			// 3. find if there are any constraint on the table that the row is in.
+ 			if (_table.DataSet != null && _table.DataSet.EnforceConstraints && _table.Constraints.Count > 0)
+ 			{
+-				// loop on all relations of the dataset.
+-				DataRelationCollection relCollection = _table.DataSet.Relations;
+-				for (int i = 0; i < relCollection.Count; i++)
+-				{
+-					DataRelation rel = relCollection[i];
+-					// we want only relations that their parent table is the table this row is in.
+-					// that is because we interesting only in relations that the row is a parent of
+-					// other rows.
+-					if (rel.ParentTable == _table)
++				foreach (DataTable table in _table.DataSet.Tables)
++				{
++					// loop on all constraints of the table.
++					ConstraintCollection constraintsCollection = table.Constraints;
++					for (int i = 0; i < constraintsCollection.Count; i++)
++					{
++						ForeignKeyConstraint fk = null;
++						if (constraintsCollection[i] is ForeignKeyConstraint)
++						{
++							fk = (ForeignKeyConstraint)constraintsCollection[i];
++							if (fk.RelatedTable == _table)
+ 					{
++								//we create a dummy relation because we do not want to duplicate code of GetChild().
++								// we use the dummy relation to find child rows.
++								DataRelation rel = new DataRelation("dummy", fk.RelatedColumns, fk.Columns, false);
+ 						Rule rule;
+ 						if (action == DataRowAction.Delete)
+-							rule = rel.ChildKeyConstraint.DeleteRule;
++									rule = fk.DeleteRule;
+ 						else
+-							rule = rel.ChildKeyConstraint.UpdateRule;
++									rule = fk.UpdateRule;
++								CheckChildRows(rel, action, rule);
++							}
++						}			
++					}
++				}
++			}
++		}
+ 						
++		private void CheckChildRows(DataRelation rel, DataRowAction action, Rule rule)
++		{				
+ 						DataRow[] childRows = GetChildRows(rel);
+ 						switch (rule)
+ 						{
+@@ -553,9 +568,12 @@
+ 								{
+ 									for (int j = 0; j < childRows.Length; j++)
+ 									{
+-										// if action is delete we delte all child rows
++							// if action is delete we delete all child rows
+ 										if (action == DataRowAction.Delete)
++							{
++								if (childRows[j].RowState != DataRowState.Deleted)
+ 											childRows[j].Delete();
++							}
+ 										// if action is change we change the values in the child row
+ 										else if (action == DataRowAction.Change)
+ 										{
+@@ -570,11 +588,17 @@
+ 							case Rule.None: // throw an exception if there are any child rows.
+ 								if (childRows != null)
+ 								{
++						for (int j = 0; j < childRows.Length; j++)
++						{
++							if (childRows[j].RowState != DataRowState.Deleted)
++							{
+ 									string changeStr = "Cannot change this row because constraints are enforced on relation " + rel.RelationName +", and changing this row will strand child rows.";
+ 									string delStr = "Cannot delete this row because constraints are enforced on relation " + rel.RelationName +", and deleting this row will strand child rows.";
+ 									string message = action == DataRowAction.Delete ? delStr : changeStr;
+ 									throw new InvalidConstraintException(message);
+ 								}
++						}
++					}
+ 								break;
+ 							case Rule.SetDefault: // set the values in the child rows to the defult value of the columns.
+ 								if (childRows != null)
+@@ -582,11 +606,14 @@
+ 									for (int j = 0; j < childRows.Length; j++)
+ 									{
+ 										DataRow child = childRows[j];
++							if (childRows[j].RowState != DataRowState.Deleted)
++							{
+ 										//set only the key columns to default
+ 										for (int k = 0; k < rel.ChildColumns.Length; k++)
+ 											child[rel.ChildColumns[k]] = rel.ChildColumns[k].DefaultValue;
+ 									}
+ 								}
++					}
+ 								break;
+ 							case Rule.SetNull: // set the values in the child row to null.
+ 								if (childRows != null)
+@@ -594,18 +621,18 @@
+ 									for (int j = 0; j < childRows.Length; j++)
+ 									{
+ 										DataRow child = childRows[j];
++							if (childRows[j].RowState != DataRowState.Deleted)
++							{
+ 										// set only the key columns to DBNull
+ 										for (int k = 0; k < rel.ChildColumns.Length; k++)
+ 											child.SetNull(rel.ChildColumns[k]);
+ 									}
+ 								}
++					}
+ 								break;
+ 						}
+ 							
+ 					}
+-				}
+-			}
+-		}
+ 
+ 		/// <summary>
+ 		/// Ends the edit occurring on the row.
+@@ -665,6 +692,15 @@
+ 		/// </summary>
+ 		public DataRow[] GetChildRows (DataRelation relation, DataRowVersion version) 
+ 		{
++			if (relation == null)
++				return new DataRow[0];
++
++			if (this.Table == null)
++				throw new RowNotInTableException();
++
++			if (relation.DataSet != this.Table.DataSet)
++				throw new ArgumentException();
++
+ 			// TODO: Caching for better preformance
+ 			ArrayList rows = new ArrayList();
+ 			DataColumn[] parentColumns = relation.ParentColumns;
+@@ -810,6 +846,15 @@
+ 		public DataRow[] GetParentRows (DataRelation relation, DataRowVersion version) 
+ 		{
+ 			// TODO: Caching for better preformance
++			if (relation == null)
++				return new DataRow[0];
++
++			if (this.Table == null)
++				throw new RowNotInTableException();
++
++			if (relation.DataSet != this.Table.DataSet)
++				throw new ArgumentException();
++
+ 			ArrayList rows = new ArrayList();
+ 			DataColumn[] parentColumns = relation.ParentColumns;
+ 			DataColumn[] childColumns = relation.ChildColumns;
+@@ -822,10 +867,10 @@
+ 					if (row.HasVersion(DataRowVersion.Default))
+ 					{
+ 						allColumnsMatch = true;
+-						for (int columnCnt = 0; columnCnt < numColumn; ++columnCnt) 
++						for (int columnCnt = 0; columnCnt < numColumn; columnCnt++) 
+ 						{
+-							if (!this[parentColumns[columnCnt], version].Equals(
+-								row[childColumns[columnCnt], DataRowVersion.Default])) 
++							if (!this[childColumns[columnCnt], version].Equals(
++								row[parentColumns[columnCnt], DataRowVersion.Default])) 
+ 							{
+ 								allColumnsMatch = false;
+ 								break;
+@@ -992,7 +1037,7 @@
+ 		[MonoTODO]
+ 		public void SetParentRow (DataRow parentRow) 
+ 		{
+-			throw new NotImplementedException ();
++			SetParentRow(parentRow, null);
+ 		}
+ 
+ 		/// <summary>
+@@ -1002,7 +1047,44 @@
+ 		[MonoTODO]
+ 		public void SetParentRow (DataRow parentRow, DataRelation relation) 
+ 		{
+-			throw new NotImplementedException ();
++			if (_table == null || parentRow.Table == null)
++				throw new RowNotInTableException();
++
++			if (parentRow != null && _table.DataSet != parentRow.Table.DataSet)
++				throw new ArgumentException();
++			
++			BeginEdit();
++			if (relation == null)
++			{
++				foreach (DataRelation parentRel in _table.ParentRelations)
++				{
++					DataColumn[] childCols = parentRel.ChildKeyConstraint.Columns;
++					DataColumn[] parentCols = parentRel.ChildKeyConstraint.RelatedColumns;
++					
++					for (int i = 0; i < parentCols.Length; i++)
++					{
++						if (parentRow == null)
++							this[childCols[i].Ordinal] = DBNull.Value;
++						else
++							this[childCols[i].Ordinal] = parentRow[parentCols[i]];
++					}
++					
++				}
++			}
++			else
++			{
++				DataColumn[] childCols = relation.ChildKeyConstraint.Columns;
++				DataColumn[] parentCols = relation.ChildKeyConstraint.RelatedColumns;
++					
++				for (int i = 0; i < parentCols.Length; i++)
++				{
++					if (parentRow == null)
++						this[childCols[i].Ordinal] = DBNull.Value;
++					else
++						this[childCols[i].Ordinal] = parentRow[parentCols[i]];
++				}
++			}
++			EndEdit();
+ 		}
+ 		
+ 		//Copy all values of this DataaRow to the row parameter.
+@@ -1110,6 +1192,18 @@
+ 			return false;
+ 		}
+ 
++		internal bool HasParentCollection
++		{
++			get
++			{
++				return _hasParentCollection;
++			}
++			set
++			{
++				_hasParentCollection = value;
++			}
++		}
++
+ 		#endregion // Methods
+ 	}
+ 
+Index: DataRowCollection.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataRowCollection.cs,v
+retrieving revision 1.22
+diff -u -w -r1.22 DataRowCollection.cs
+--- DataRowCollection.cs	3 Nov 2003 12:35:50 -0000	1.22
++++ DataRowCollection.cs	4 Nov 2003 11:08:13 -0000
+@@ -62,13 +62,18 @@
+ 			if (row == null)
+ 				throw new ArgumentNullException("row", "'row' argument cannot be null.");
+ 
++			if (row.Table != this.table)
++				throw new ArgumentException ("This row already belongs to another table.");
++
+ 			if (list.IndexOf(row) != -1)
+ 				throw new ArgumentException ("This row already belongs to this table.");
+ 			
+-			if (table.DataSet == null || table.DataSet.EnforceConstraints)
++
++			if ((table.DataSet == null || table.DataSet.EnforceConstraints) && !table._duringDataLoad)
+ 				// we have to check that the new row doesn't colide with existing row
+ 				ValidateDataRowInternal(row);
+ 			
++			row.HasParentCollection = true;
+ 			list.Add (row);
+ 			row.AttachRow ();
+ 			row.Table.ChangedDataRow (row, DataRowAction.Add);
+Index: DataTable.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataTable.cs,v
+retrieving revision 1.41
+diff -u -w -r1.41 DataTable.cs
+--- DataTable.cs	3 Nov 2003 12:35:50 -0000	1.41
++++ DataTable.cs	4 Nov 2003 11:08:15 -0000
+@@ -574,12 +574,13 @@
+ 
+ 			// we can not simply copy the row values (NewRow [C.ColumnName] = Row [C.ColumnName])
+ 			// because if the row state is deleted we get an exception.
++			Copy._duringDataLoad = true;
+ 			foreach (DataRow Row in Rows) {
+ 				DataRow NewRow = Copy.NewRow ();
+ 				Copy.Rows.Add (NewRow);
+ 				Row.CopyValuesToRow(NewRow);
+ 			}
+-		       			
++		       	Copy._duringDataLoad = false;		
+ 			return Copy;
+ 		}
+ 
+Index: ForeignKeyConstraint.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/ForeignKeyConstraint.cs,v
+retrieving revision 1.11
+diff -u -w -r1.11 ForeignKeyConstraint.cs
+--- ForeignKeyConstraint.cs	3 Nov 2003 12:35:50 -0000	1.11
++++ ForeignKeyConstraint.cs	4 Nov 2003 11:08:15 -0000
+@@ -23,9 +23,9 @@
+ 		private UniqueConstraint _parentUniqueConstraint;
+ 		private DataColumn [] _parentColumns;
+ 		private DataColumn [] _childColumns;
+-		private Rule _deleteRule;
+-		private Rule _updateRule;
+-		private AcceptRejectRule _acceptRejectRule;
++		private Rule _deleteRule = Rule.Cascade;
++		private Rule _updateRule = Rule.Cascade;
++		private AcceptRejectRule _acceptRejectRule = AcceptRejectRule.None;
+ 		
+ 		#region Constructors
+ 
+@@ -383,17 +383,29 @@
+ 		[MonoTODO]
+ 		internal override void AssertConstraint(DataRow row)
+ 		{
+-			//Implement: this should be used to validate ForeignKeys constraints 
+-			//when modifiying the DataRow values of a DataTable.
++			// first we check if all values in _childColumns place are DBNull.
++			// if yes we return.
++			bool allNull = true;
++			for (int i = 0; i < _childColumns.Length; i++)
++			{
++				if (row[_childColumns[i]] != DBNull.Value)
++				{
++					allNull = false;
++					break;
++				}
++			}
+ 
++			if (allNull)
++				return;
++			
++			// check that there is a parent for this row.
+ 			foreach (DataRow parentRow in this.RelatedTable.Rows)
+ 			{
+ 				if (parentRow.RowState != DataRowState.Deleted)
+ 				{
+ 					bool match = true;
+ 					// check if the values in the constraints columns are equal
+-					int i = 0;
+-					for (; i < _parentColumns.Length; i++)
++					for (int i = 0; i < _parentColumns.Length; i++)
+ 					{
+ 						if (!row[_childColumns[i]].Equals(parentRow[_parentColumns[i]]))
+ 						{
+@@ -401,10 +413,19 @@
+ 							break;
+ 						}	
+ 					}
+-					if (!match)
+-						throw new InvalidConstraintException("ForeignKeyConstraint " + ConstraintName + " requires the child key values (" + row[_childColumns[i]].ToString() + ") to exist in the parent table.");					
++					if (match) // there is a parent row for this row.
++						return;
++				}
+ 				}
++			
++			string values = "";
++			for (int i = 0; i < _childColumns.Length; i++)
++			{
++				values += row[_childColumns[0]].ToString();
++				if (i != _childColumns.Length - 1)
++					values += ",";
+ 			}
++			throw new InvalidConstraintException("ForeignKeyConstraint " + ConstraintName + " requires the child key values (" + values + ") to exist in the parent table.");
+ 		}
+ 		
+ 		#endregion // Methods
+Index: MergeManager.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/MergeManager.cs,v
+retrieving revision 1.3
+diff -u -w -r1.3 MergeManager.cs
+--- MergeManager.cs	3 Nov 2003 12:35:50 -0000	1.3
++++ MergeManager.cs	4 Nov 2003 11:08:16 -0000
+@@ -29,8 +29,12 @@
+ 			
+ 			if (!AdjustSchema(targetSet, sourceTable, missingSchemaAction))
+ 				return;
+-			checkColumnTypes(targetSet.Tables[sourceTable.TableName], sourceTable); // check that the colums datatype is the same
+-			fillData(targetSet.Tables[sourceTable.TableName], sourceTable, preserveChanges);
++			DataTable targetTable = targetSet.Tables[sourceTable.TableName];
++			if (targetTable != null)
++			{
++				checkColumnTypes(targetTable, sourceTable); // check that the colums datatype is the same
++				fillData(targetTable, sourceTable, preserveChanges);
++			}
+ 			
+ 		}
+ 
+@@ -47,8 +51,12 @@
+ 				DataTable sourceTable = row.Table;
+ 				if (!AdjustSchema(targetSet, sourceTable, missingSchemaAction))
+ 					return;
+-				checkColumnTypes(targetSet.Tables[row.Table.TableName], row.Table);
+-				MergeRow(targetSet.Tables[sourceTable.TableName], row, preserveChanges);
++				DataTable targetTable = targetSet.Tables[row.Table.TableName];
++				if (targetTable != null)
++				{
++					checkColumnTypes(targetTable, row.Table);
++					MergeRow(targetTable, row, preserveChanges);
++				}
+ 			}
+ 		}
+ 
+@@ -207,7 +215,7 @@
+ 			{
+ 				DataColumn fromCol = sourceTable.Columns[i];
+ 				DataColumn toCol = targetTable.Columns[fromCol.ColumnName];
+-				if(toCol.DataType != fromCol.DataType)
++				if((toCol != null) && (toCol.DataType != fromCol.DataType))
+ 					throw new DataException("<target>." + fromCol.ColumnName + " and <source>." + fromCol.ColumnName + " have conflicting properties: DataType property mismatch.");
+ 			}
+ 		}
+Index: UniqueConstraint.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/UniqueConstraint.cs,v
+retrieving revision 1.17
+diff -u -w -r1.17 UniqueConstraint.cs
+--- UniqueConstraint.cs	22 Oct 2003 05:55:54 -0000	1.17
++++ UniqueConstraint.cs	4 Nov 2003 11:08:16 -0000
+@@ -385,7 +385,7 @@
+ 						}	
+ 					}
+ 					if (match)
+-						throw new InvalidConstraintException (String.Format ("Column '{0}' contains non-unique values", this._dataColumns[0]));					
++						throw new ConstraintException (String.Format ("Column '{0}' contains non-unique values", this._dataColumns[0]));					
+ 				}
+ 			}
+ 

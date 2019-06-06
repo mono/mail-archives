@@ -1,0 +1,95 @@
+diff --git a/mono/metadata/ChangeLog b/mono/metadata/ChangeLog
+index 0a64469..937d342 100644
+--- a/mono/metadata/ChangeLog
++++ b/mono/metadata/ChangeLog
+@@ -1,5 +1,16 @@
+ 2010-05-24 Rodrigo Kumpera  <rkumpera@novell.com>
+ 
++	* sgen-marksweep.c (ms_alloc_block): Register with block map.
++
++	* sgen-marksweep.c (major_copy_or_mark_object): Use block map to figure out
++	where the object lives.
++
++	* sgen-marksweep.c (major_sweep): Deregister from the block map;
++
++	Performance is stable on modified binary-tree (no structs). 
++
++2010-05-24 Rodrigo Kumpera  <rkumpera@novell.com>
++
+ 	* sgen-major-copying.c (alloc_major_section): Register with block map.
+ 
+ 	* sgen-major-copying.c (major_copy_or_mark_object): Use block map to figure out
+diff --git a/mono/metadata/sgen-marksweep.c b/mono/metadata/sgen-marksweep.c
+index 7f82131..809a2c7 100644
+--- a/mono/metadata/sgen-marksweep.c
++++ b/mono/metadata/sgen-marksweep.c
+@@ -25,6 +25,7 @@
+ 
+ typedef struct _MSBlockInfo MSBlockInfo;
+ struct _MSBlockInfo {
++	Block block_info; /* FIXME this wastes a full pointer since Block::next is unused */
+ 	int obj_size;
+ 	gboolean pinned;
+ 	gboolean has_references;
+@@ -243,10 +244,13 @@ ms_alloc_block (int size_index, gboolean pinned, gboolean has_references)
+ 	info->pinned = pinned;
+ 	info->has_references = has_references;
+ 	info->block = ms_get_empty_block ();
++	info->block_info.role = MEMORY_ROLE_GEN1;
+ 
+ 	header = (MSBlockHeader*) info->block;
+ 	header->info = info;
+ 
++	block_map_register_block (&info->block_info, (mword)info->block, (mword)(info->block + MS_BLOCK_SIZE));
++
+ 	/* build free list */
+ 	obj_start = info->block + MS_BLOCK_SKIP;
+ 	info->free_list = (void**)obj_start;
+@@ -493,13 +497,16 @@ major_copy_or_mark_object (void **ptr)
+ 	void *obj = *ptr;
+ 	mword objsize;
+ 	MSBlockInfo *block;
++	Block *mblock = block_map_find_block ((mword)obj);
++	unsigned char role = mblock->role;
++
+ 
+ 	HEAVY_STAT (++stat_copy_object_called_major);
+ 
+ 	DEBUG (9, g_assert (obj));
+ 	DEBUG (9, g_assert (current_collection_generation == GENERATION_OLD));
+ 
+-	if (ptr_in_nursery (obj)) {
++	if (role == MEMORY_ROLE_GEN0) {
+ 		int word, bit;
+ 		char *forwarded;
+ 
+@@ -528,11 +535,7 @@ major_copy_or_mark_object (void **ptr)
+ 		return;
+ 	}
+ 
+-	objsize = safe_object_get_size ((MonoObject*)obj);
+-	objsize += ALLOC_ALIGN - 1;
+-	objsize &= ~(ALLOC_ALIGN - 1);
+-
+-	if (objsize > MAX_SMALL_OBJ_SIZE) {
++	if (role >= MEMORY_ROLE_LOS_GEN1) {
+ 		if (object_is_pinned (obj))
+ 			return;
+ 		binary_protocol_pin (obj, (gpointer)LOAD_VTABLE (obj), safe_object_get_size ((MonoObject*)obj));
+@@ -542,7 +545,7 @@ major_copy_or_mark_object (void **ptr)
+ 		return;
+ 	}
+ 
+-	block = MS_BLOCK_FOR_OBJ (obj);
++	block = (MSBlockInfo*)mblock;
+ 	MS_MARK_OBJECT_AND_ENQUEUE (obj, block);
+ }
+ 
+@@ -634,6 +637,7 @@ major_sweep (void)
+ 			 */
+ 			*iter = block->next;
+ 
++			block_map_deregister_block ((mword)block->block, (mword)(block->block + MS_BLOCK_SIZE));
+ 			ms_free_block (block->block);
+ 			free_internal_mem (block, INTERNAL_MEM_MS_BLOCK_INFO);
+ 

@@ -1,0 +1,164 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Cross application domain call optimization
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Cross%20application%20domain%20call%20optimization&In-Reply-To=1097873614.6550.53.camel%40portatil.aticatac">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008328.html">
+   <LINK REL="Next"  HREF="008345.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Cross application domain call optimization</H1>
+    <B>Ben Maurer</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Cross%20application%20domain%20call%20optimization&In-Reply-To=1097873614.6550.53.camel%40portatil.aticatac"
+       TITLE="[Mono-devel-list] Cross application domain call optimization">bmaurer at ximian.com
+       </A><BR>
+    <I>Fri Oct 15 18:40:27 EDT 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008328.html">[Mono-devel-list] Cross application domain call optimization
+</A></li>
+        <LI>Next message: <A HREF="008345.html">[Mono-devel-list] Cross application domain call optimization
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8330">[ date ]</a>
+              <a href="thread.html#8330">[ thread ]</a>
+              <a href="subject.html#8330">[ subject ]</a>
+              <a href="author.html#8330">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Fri, 2004-10-15 at 22:53 +0200, Lluis Sanchez wrote:
+&gt;<i> Here is the first version of a patch that improves the performance of
+</I>&gt;<i> cross app domain calls. I still have a small regression when using
+</I>&gt;<i> ContextBoundObjects but I hope I'll fix it soon. Other than that, the
+</I>&gt;<i> patch is fully working.
+</I>
+WOW! WOW! WOW! WOW!
+
+You are my hero!
+
+That having been said, let me pick apart your patch :-).
+
+&gt;<i> The performance improvement varies depending on the signature of the
+</I>&gt;<i> method, since different types have different marshalling needs, and some
+</I>&gt;<i> marshalling operations can be faster than others.
+</I>&gt;<i> 
+</I>&gt;<i> Here are some numbers. I ran a series of 100.000 method invocations
+</I>&gt;<i> using different method signatures, which are the following: &lt;...&gt;
+</I>&gt;<i> We are getting an important speed up, 10x in some cases. The worst case
+</I>&gt;<i> is the one with the Data instance, since it needs to use serialization
+</I>&gt;<i> and most of the time is spent in BinaryFormatter. The other cases
+</I>&gt;<i> (primitive types and arrays of primitive types) don't need serialization
+</I>&gt;<i> and the improvement is really noticeable.
+</I>Can you please check this benchmark into mono/mono/benchmarks. You
+should do it before we check in the patch.
+
+&gt;<i> However, there is a drawback: we need to generate two additional methods
+</I>&gt;<i> for each remotable method. As an example, a monodevelop run creates
+</I>&gt;<i> around 80 wrapper methods + 80 helper methods, averaging 435 bytes of IL
+</I>&gt;<i> per couple, which means 34kb of IL code (plus the memory of internal
+</I>&gt;<i> data structures). And all this is dead code, since monodevelop does not
+</I>&gt;<i> use app domains, but the wrappers are generated for every call to a non-
+</I>&gt;<i> virtual MarshalByRefObject method. The reason is that those calls are
+</I>&gt;<i> made through the remoting-invoke-with-check wrapper, wich has a
+</I>&gt;<i> reference to the other wrappers.
+</I>
+Nope, this doesn't have to be done. What we do is: you emit this code:
+
+call trampoline
+
+That method will go into the runtime, generate the IL for the wrapper
+method, and jit it. Then, it takes that jitted code and dynamically
+patches the address so that it refers to the new method. This avoids the
+lookup.
+
+One other option would be to always call functions in MBRO's virtually.
+It may end up being faster than having to do the call, etc.
+
+Ok, now specific patch comments:
+
+
+&gt;<i> +	object get_xappdomain_target (RealProxy rp)
+</I>&gt;<i> +	{
+</I>
+Why not actually write this method in C# and call it from the marshal
+stuff?
+
+
+&gt;<i> +	Exception mono_serialize_exception (Exception ex)
+</I>&gt;<i> +	{
+</I>&gt;<i> +		Exception loc_exc = ex;
+</I>&gt;<i> +		byte[] loc_data;
+</I>&gt;<i> +		int retry = 4;
+</I>&gt;<i> +		
+</I>&gt;<i> +		do {
+</I>&gt;<i> +			try {
+</I>&gt;<i> +				mono_thread_force_interruption_checkpoint ();
+</I>&gt;<i> +				loc_data = RemotingServices.SerializeObject (loc_exc);
+</I>&gt;<i> +				return loc_data;
+</I>
+Same comment here. Also, why do we need the interruption checkpoint?
+
+&gt;<i> -static MonoMethod *
+</I>&gt;<i> -look_for_method_by_name (MonoClass *klass, const gchar *name);
+</I>&gt;<i> ...
+</I>&gt;<i> +MonoMethod *
+</I>&gt;<i> +mono_class_get_method_from_name (MonoClass *klass, const char *name, int param_count)
+</I>
+We should do this in another patch. This should help with the size of
+the patch.
+
+Also, you added this to the public header. I think this is a good idea,
+but it needs a bit more approval.
+
+&gt;<i> +	mono_mb_emit_byte (mb, CEE_LDC_I4_M1);
+</I>Use mono_mb_emit_icon (MonoMethodBuilder *mb, gint32 value), it is a bit
+cleaner (it does the optimization for you).
+
+
+&gt;<i> +		val-&gt;vtable = mono_class_vtable (domain, val-&gt;vtable-&gt;klass);
+</I>use the mono_object_class macro.
+
+
+&gt;<i> +		return (MonoObject *) mono_string_new_utf16 (domain, (guint16 *) &amp;(str-&gt;chars), str-&gt;length);
+</I>Use the macro for strings and chars.
+
+
+&gt;<i> +			int i, len = mono_array_length (acopy);
+</I>&gt;<i> +			for (i = 0; i &lt; len; i++) {
+</I>GCC is smart enough to do CSE. No need to do that for it.
+
+Thats all for now, I'll think of more later.
+
+Great job.
+
+-- 
+Ben Maurer &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">bmaurer at ximian.com</A>&gt;
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008328.html">[Mono-devel-list] Cross application domain call optimization
+</A></li>
+	<LI>Next message: <A HREF="008345.html">[Mono-devel-list] Cross application domain call optimization
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8330">[ date ]</a>
+              <a href="thread.html#8330">[ thread ]</a>
+              <a href="subject.html#8330">[ subject ]</a>
+              <a href="author.html#8330">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

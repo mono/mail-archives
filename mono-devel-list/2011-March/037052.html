@@ -1,0 +1,143 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] mixed-mode assemblies in wine
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20mixed-mode%20assemblies%20in%20wine&In-Reply-To=4D6CC657.5070702%40gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="037051.html">
+   <LINK REL="Next"  HREF="037055.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] mixed-mode assemblies in wine</H1>
+    <B>Vincent Povirk</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20mixed-mode%20assemblies%20in%20wine&In-Reply-To=4D6CC657.5070702%40gmail.com"
+       TITLE="[Mono-dev] mixed-mode assemblies in wine">madewokherd at gmail.com
+       </A><BR>
+    <I>Tue Mar  1 13:35:54 EST 2011</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="037051.html">[Mono-dev] mixed-mode assemblies in wine
+</A></li>
+        <LI>Next message: <A HREF="037055.html">[Mono-dev] Testing / Building Mono for 64 bit Windows
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#37052">[ date ]</a>
+              <a href="thread.html#37052">[ thread ]</a>
+              <a href="subject.html#37052">[ subject ]</a>
+              <a href="author.html#37052">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>2011/3/1 Korn&#233;l P&#225;l &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">kornelpal at gmail.com</A>&gt;:
+&gt;&gt;<i> Another possible approach, if we don't share mscoree.dll code, would
+</I>&gt;&gt;<i> be for Wine and Mono to both implement ICLRMetaHost
+</I>&gt;&gt;<i> (<A HREF="http://msdn.microsoft.com/en-us/library/dd233134.aspx">http://msdn.microsoft.com/en-us/library/dd233134.aspx</A>) and
+</I>&gt;&gt;<i> ICLRRuntimeInfo, both of which can be accessed before a runtime is
+</I>&gt;&gt;<i> chosen and loaded, and for only Mono to implement ICLRRuntimeHost,
+</I>&gt;&gt;<i> which requires a loaded runtime. Wine's mscoree.dll's other functions
+</I>&gt;&gt;<i> (except for the _Cor functions which will have to be special) could
+</I>&gt;&gt;<i> then work based on those interfaces.
+</I>&gt;<i>
+</I>&gt;<i> This could work but if we keep the embedding API implementation MIT
+</I>&gt;<i> licensed, then any other project can reuse it and customize to its needs if
+</I>&gt;<i> needed.
+</I>
+Yes, I assume adding code to the Mono runtime implies an MIT license.
+
+Let's see if we can flesh out this approach more fully.
+
+This would mean that both Wine and Mono would implement the
+CLRCreateInstance function:
+<A HREF="http://msdn.microsoft.com/en-us/library/dd537633.aspx">http://msdn.microsoft.com/en-us/library/dd537633.aspx</A>
+
+Mono's CLRCreateInstance function would be part of the embedding API
+(possibly with a different name), not Mono's mscoree, so that Wine can
+access it directly.
+
+Mono's mscoree would forward its CLRCreateInstance export to the
+embedding API function.
+
+All other exports in mscoree would be written based on
+CLRCreateInstance and the IMetaHost interface (although Wine would use
+its internal IMetaHost interface and Mono's mscoree would presumably
+use one from the embedding api), except for the _Cor functions. Wine
+would search for Mono installs and their runtimes the same way it does
+now.
+
+The methods GetInterface and GetProcAddress on Wine's ICLRRuntimeInfo
+(<A HREF="http://msdn.microsoft.com/en-us/library/dd233121.aspx">http://msdn.microsoft.com/en-us/library/dd233121.aspx</A>) would load the
+appropriate libmono dll and then forward to its ICLRRuntimeInfo
+implementation. LoadLibrary would forward only if Wine is unable to
+handle the call itself. IsLoaded and IsStarted would forward only if
+the appropriate libmono.dll is already loaded.
+
+You should probably think about how you want LoadLibrary
+(LoadLibraryShim) to work. AFAIK it's only generally used to load
+fusion.dll. Wine already has an implementation of fusion.dll. You may
+be able to use the native fusion.dll without any changes, or you may
+want to have your own for some reason.
+
+I think _CorValidateImage should always be implemented in mscoree.dll,
+as it shouldn't require a runtime, and it is too early to select one.
+
+As for _CorExeMain, _CorExeMain2, and _CorDllMain, those require a
+runtime selection. I'm not sure how this selection should work. We
+probably want the runtime version to be calculated by mscoree, and
+when we forward those calls to Mono, we'll want to specify a runtime.
+However, we probably want to make sure we use the same runtime version
+for each call to one of these functions. Maybe we should select a
+runtime on the first call to one of these functions, then use that
+same selection on subsequent calls?
+
+I'm inclined to forward _CorImageUnloading to the mono runtime if one
+is loaded, even though you don't seem to use it at the moment.
+
+It's not obvious to me how ClrCreateManagedInstance is supposed to map
+to the .NET 4 interfaces (even though MSDN implies it can), and so I
+currently use internal methods of Wine's ICLRRuntimeHost objects for
+this. It really boils down to a call to the class's constructor with
+no arguments, followed by a call to
+System.Runtime.InteropServices.GetIUnknownForObject, but I can't
+figure out how to do either of those things in the new API.
+
+Both mscoree.dll's will need a way to notify the runtime that they
+want libraries to be loaded with LoadLibrary instead of mapped
+read-only in memory. Since this implies a promise to forward _Cor*Main
+calls to the runtime, it may not be as difficult as I originally
+thought.
+
+Wine's mscoree currently uses an assembly preload hook to search the
+Windows GAC for assemblies. You'll probably want to do that, but I
+guess a preload hook is inappropriate on Windows because you'd end up
+loading standard libraries from .NET. I'd really prefer to have Mono
+doing this search (so it can ensure the proper order, and because its
+GAC-searching code is probably better than ours), but my bug for this
+was closed either INVALID or WONTFIX.
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="037051.html">[Mono-dev] mixed-mode assemblies in wine
+</A></li>
+	<LI>Next message: <A HREF="037055.html">[Mono-dev] Testing / Building Mono for 64 bit Windows
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#37052">[ date ]</a>
+              <a href="thread.html#37052">[ thread ]</a>
+              <a href="subject.html#37052">[ subject ]</a>
+              <a href="author.html#37052">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

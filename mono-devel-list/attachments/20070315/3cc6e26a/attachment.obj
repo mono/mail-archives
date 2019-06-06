@@ -1,0 +1,149 @@
+Index: System.Web.Services.Protocols/ServerType.cs
+===================================================================
+--- System.Web.Services.Protocols/ServerType.cs	(revision 74062)
++++ System.Web.Services.Protocols/ServerType.cs	(working copy)
+@@ -30,6 +30,7 @@
+ using System.Reflection;
+ using System.Web.Services;
+ using System.Web.Services.Description;
++using System.Collections;
+ 
+ namespace System.Web.Services.Protocols
+ {
+@@ -90,11 +91,63 @@
+ 			string sep = WebServiceNamespace.EndsWith ("/") ? "" : "/";
+ 
+ 			WebServiceAbstractNamespace = WebServiceNamespace + sep + "AbstractTypes";
++#if ONLY_1_1
++			MethodInfo [] type_methods = Type.GetMethods (BindingFlags.Instance | BindingFlags.Public);
++#else
++			MethodInfo [] type_methods = Type.GetMethods (BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
++			ArrayList list = new ArrayList (type_methods.Length);
++			foreach (MethodInfo mi in type_methods) {
++				if (mi.IsPublic && mi.GetCustomAttributes (typeof (WebMethodAttribute), false).Length > 0)
++					list.Add (mi);
++				else {
++					foreach (Type ifaceType in Type.GetInterfaces ()) {
++						if (ifaceType.GetCustomAttributes (typeof (WebServiceBindingAttribute), false).Length > 0) {
++							MethodInfo found = FindInInterface (ifaceType, mi);
++							if (found != null) {
++								if (found.GetCustomAttributes (typeof (WebMethodAttribute), false).Length > 0)
++									list.Add (found);
+ 
+-			MethodInfo [] type_methods = Type.GetMethods (BindingFlags.Instance | BindingFlags.Public);
++								break;
++							}
++						}
++					}
++				}
++			}
++			type_methods = (MethodInfo[]) list.ToArray (typeof (MethodInfo));
++#endif
+ 			logicalMethods = LogicalMethodInfo.Create (type_methods, LogicalMethodTypes.Sync);
+ 		}
+ 
++		static MethodInfo FindInInterface (Type ifaceType, MethodInfo method) {
++			int nameStartIndex = 0;
++			if (method.IsPrivate) {
++				nameStartIndex = method.Name.LastIndexOf ('.') + 1;
++				if (nameStartIndex < 0)
++					nameStartIndex = 0;
++			}
++			foreach (MethodInfo mi in ifaceType.GetMembers ()) {
++				if (method.ReturnType == mi.ReturnType &&
++					String.CompareOrdinal(method.Name, nameStartIndex, mi.Name, 0, mi.Name.Length) == 0) {
++					ParameterInfo [] rpi = method.GetParameters ();
++					ParameterInfo [] lpi = mi.GetParameters ();
++					if (rpi.Length == lpi.Length) {
++						bool match = true;
++						for (int i = 0; i < rpi.Length; i++) {
++							if (rpi [i].ParameterType != lpi [i].ParameterType) {
++								match = false;
++								break;
++							}
++						}
++
++						if (match)
++							return mi;
++					}
++				}
++			}
++
++			return null;
++		}
++
+ 		internal bool UseEncoded {
+ 			get { return useEncoded; }
+ 		}
+Index: System.Web.Services.Protocols/Methods.cs
+===================================================================
+--- System.Web.Services.Protocols/Methods.cs	(revision 74349)
++++ System.Web.Services.Protocols/Methods.cs	(working copy)
+@@ -124,6 +124,8 @@
+ 				ParameterStyle = parent.ParameterStyle;
+ 				SoapBindingStyle = parent.SoapBindingStyle;
+ 				OneWay = false;
++				if (parent.Type != source.DeclaringType)
++					Binding = source.DeclaringType.Name + parent.ProtocolName;
+ 			}
+ 			else if (kind is SoapDocumentMethodAttribute){
+ 				SoapDocumentMethodAttribute dma = (SoapDocumentMethodAttribute) kind;
+Index: System.Web.Services.Protocols/TypeStubManager.cs
+===================================================================
+--- System.Web.Services.Protocols/TypeStubManager.cs	(revision 74062)
++++ System.Web.Services.Protocols/TypeStubManager.cs	(working copy)
+@@ -102,6 +102,15 @@
+ 					AddBinding (new BindingInfo (at, defaultBindingName, LogicalType.WebServiceNamespace));
+ 			else 
+ 				AddBinding (new BindingInfo (null, defaultBindingName, logicalType.WebServiceNamespace));
++
++			foreach (Type ifaceType in Type.GetInterfaces ()) {
++				o = ifaceType.GetCustomAttributes (typeof (WebServiceBindingAttribute), false);
++				if (o.Length > 0) {
++					defaultBindingName = ifaceType.Name + ProtocolName;
++					foreach (WebServiceBindingAttribute at in o)
++						AddBinding (new BindingInfo (at, defaultBindingName, LogicalType.WebServiceNamespace));
++				}
++			}
+ 		}
+ 		
+ #if NET_2_0
+Index: System.Web.Services.Description/BasicProfileChecker.cs
+===================================================================
+--- System.Web.Services.Description/BasicProfileChecker.cs	(revision 74064)
++++ System.Web.Services.Description/BasicProfileChecker.cs	(working copy)
+@@ -56,7 +56,7 @@
+ 			if (!new Uri (value.Namespace, UriKind.RelativeOrAbsolute).IsAbsoluteUri)
+ 				ctx.ReportRuleViolation (value, BasicProfileRules.R2803);
+ 			
+-			object doc = ctx.GetDocument (value.Location);
++			object doc = ctx.GetDocument (value.Location, value.Namespace);
+ 			if (doc == null) ctx.ReportError (value, "Document '" + value.Location + "' not found");
+ 			
+ 			if (doc is XmlSchema)
+@@ -449,7 +449,7 @@
+ 		
+ 		public override void Check (ConformanceCheckContext ctx, XmlSchemaImport value)
+ 		{
+-			XmlSchema doc = ctx.GetDocument (value.SchemaLocation) as XmlSchema;
++			XmlSchema doc = ctx.GetDocument (value.SchemaLocation, value.Namespace) as XmlSchema;
+ 			if (doc == null) ctx.ReportError (value, "Schema '" + value.SchemaLocation + "' not found");
+ 		}
+ 		
+Index: System.Web.Services.Description/ConformanceChecker.cs
+===================================================================
+--- System.Web.Services.Description/ConformanceChecker.cs	(revision 74064)
++++ System.Web.Services.Description/ConformanceChecker.cs	(working copy)
+@@ -156,10 +156,10 @@
+ 			get { return services; }
+ 		}
+ 		
+-		public object GetDocument (string url)
++		public object GetDocument (string url, string ns)
+ 		{
+ 			if (collection != null)
+-				return null;
++				return collection[ns];
+ 			else
+ 				return webReference.Documents [url];
+ 		}

@@ -1,0 +1,131 @@
+Index: marshal.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/marshal.c,v
+retrieving revision 1.111
+diff -u -r1.111 marshal.c
+--- marshal.c	18 Jul 2003 11:27:24 -0000	1.111
++++ marshal.c	19 Aug 2003 23:59:00 -0000
+@@ -972,6 +972,30 @@
+ 
+ 	g_assert (delegate);
+ 
++	if (delegate->target && delegate->target->vtable->klass == mono_defaults.transparent_proxy_class) {
++
++		MonoTransparentProxy* tp = (MonoTransparentProxy *)delegate->target;
++		if (!tp->klass->contextbound || tp->rp->context != (MonoObject *) mono_context_get ()) {
++
++			// If the target is a proxy, make a direct call. Is proxy's work
++			// to make the call asynchronous.
++
++			MonoAsyncResult *ares;
++			MonoObject *exc;
++			MonoArray *out_args;
++			method = delegate->method_info->method;
++
++			msg = mono_method_call_message_new (method, params, NULL, &async_callback, &state);
++			HANDLE handle = CreateEvent (NULL, TRUE, FALSE, NULL);
++			ares = mono_async_result_new (mono_domain_get (), handle, state, handle);
++			ares->async_delegate = (MonoObject *)async_callback;
++			msg->async_result = ares;
++
++			mono_remoting_invoke ((MonoObject *)tp->rp, msg, &exc, &out_args);
++			return ares;
++		}
++	}
++
+ 	klass = delegate->object.vtable->klass;
+ 
+ 	method = mono_get_delegate_invoke (klass);
+@@ -986,7 +1010,6 @@
+ 	g_assert (method != NULL);
+ 
+ 	im = mono_get_delegate_invoke (method->klass);
+-	
+ 	msg = mono_method_call_message_new (method, params, im, &async_callback, &state);
+ 
+ 	return mono_thread_pool_add ((MonoObject *)delegate, msg, async_callback, state);
+@@ -1146,7 +1169,15 @@
+ 	ares = mono_array_get (msg->args, gpointer, sig->param_count - 1);
+ 	g_assert (ares);
+ 
+-	res = mono_thread_pool_finish (ares, &out_args, &exc);
++	if (delegate->target && delegate->target->vtable->klass == mono_defaults.transparent_proxy_class) {
++		/* wait until we are really finished */
++		WaitForSingleObject ((HANDLE)ares->data, INFINITE);
++		out_args = ares->remoting_args;
++		res = ares->remoting_rval;
++		exc = ares->remoting_exc;
++	}
++	else
++		res = mono_thread_pool_finish (ares, &out_args, &exc);
+ 
+ 	if (exc) {
+ 		char *strace = mono_string_to_utf8 (((MonoException*)exc)->stack_trace);
+Index: object.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/object.c,v
+retrieving revision 1.175
+diff -u -r1.175 object.c
+--- object.c	29 Jul 2003 13:15:21 -0000	1.175
++++ object.c	19 Aug 2003 23:59:05 -0000
+@@ -2301,12 +2301,13 @@
+ 		mono_array_set (msg->args, gpointer, i, arg);
+ 	}
+ 
+-	if (invoke) {
++	if (cb != NULL && state != NULL) {
+ 		*cb = *((MonoDelegate **)params [i]);
+ 		i++;
+ 		*state = *((MonoObject **)params [i]);
+ 	}
+ 
++	msg->async_result = NULL;
+ 	return msg;
+ }
+ 
+Index: object.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/object.h,v
+retrieving revision 1.98
+diff -u -r1.98 object.h
+--- object.h	24 Jul 2003 12:54:23 -0000	1.98
++++ object.h	19 Aug 2003 23:59:05 -0000
+@@ -176,6 +176,9 @@
+ 	MonoBoolean  sync_completed;
+ 	MonoBoolean  completed;
+ 	MonoBoolean  endinvoke_called;
++	MonoArray   *remoting_args;
++	MonoObject  *remoting_rval;
++	MonoObject  *remoting_exc;
+ } MonoAsyncResult;
+ 
+ typedef struct {
+@@ -206,6 +209,7 @@
+ 	MonoObject *ctx;
+ 	MonoObject *rval;
+ 	MonoObject *exc;
++	MonoAsyncResult *async_result;
+ } MonoMethodMessage;
+ 
+ typedef struct {
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/ChangeLog,v
+retrieving revision 1.1056
+diff -u -r1.1056 ChangeLog
+--- ChangeLog	19 Aug 2003 16:32:49 -0000	1.1056
++++ ChangeLog	19 Aug 2003 23:59:11 -0000
+@@ -1,3 +1,13 @@
++2003-08-20  Lluis Sanchez Gual  <lluis@ximian.com>
++
++	* marshal.c: mono_delegate_begin_invoke(): If the target is a proxy,
++	  make a direct call. It is proxy's work to make the call asynchronous.
++	  mono_delegate_end_invoke(): If the targe is a proxy, just collect
++	  the return values.
++	* object.cs: mono_method_call_message_new(): read AsyncResult and
++	  state object from parameters list, if this info is requested.
++	* object.h: Added fields to store remote call output values in
++	  MonoAsyncResult. Added AsyncResult field in MonoMethodMessage.
+ 
+ Tue Aug 19 18:22:08 CEST 2003 Paolo Molaro <lupus@ximian.com>
+ 

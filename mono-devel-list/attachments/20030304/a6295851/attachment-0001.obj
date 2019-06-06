@@ -1,0 +1,211 @@
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <glib.h>
+#include <gc/gc.h>
+
+#include "mono-logger.h"
+
+typedef struct {
+	GLogLevelFlags	level;
+	MonoTraceMask	mask;
+} MonoLogLevelEntry;
+
+static GLogLevelFlags current_level		= G_LOG_LEVEL_INFO;
+static MonoTraceMask current_mask		= MONO_TRACE_ALL;
+
+static const char	*mono_log_domain	= "Mono";
+static GQueue		*level_stack		= NULL;
+static GC_warn_proc	original_warnproc	= NULL;
+
+/*
+ * mono_gc_warn_handler:
+ *
+ * Private method for GC Warning messages redirection.
+ */
+static void mono_gc_warn_handler(char *msg, GC_word arg)
+{
+	mono_trace_warning(MONO_TRACE_GC, msg, arg);
+}
+
+/**
+ * mono_trace_init:
+ *
+ * Initializes the mono tracer.
+ */
+void 
+mono_trace_init (void)
+{
+	const char *env_level	= getenv("MONO_LOG_LEVEL");
+	const char *env_mask	= getenv("MONO_LOG_MASK");
+
+	if(level_stack != NULL) {
+		g_warning(G_GNUC_PRETTY_FUNCTION ": Init already called.");
+	} else {
+		level_stack = g_queue_new();
+	}
+
+	/* Hook up to the GC Warning callback */
+	original_warnproc = GC_set_warn_proc(mono_gc_warn_handler);
+
+	/* Grab the possible environment variables values */
+	if(env_level)
+		sscanf(env_level, "%d", (int*)&current_level);
+
+	if(env_mask)
+		sscanf(env_mask, "%d", (int*)&current_mask);
+}
+
+/**
+ * mono_trace_cleanup:
+ *
+ * Releases the mono tracer.
+ */
+void 
+mono_trace_cleanup (void)
+{
+	if(level_stack != NULL) {
+		while(!g_queue_is_empty (level_stack)) {
+			g_free (g_queue_pop_head (level_stack));
+		}
+
+		g_queue_free (level_stack);
+		level_stack = NULL;
+	}
+
+	/* Restore the original GC Warning callback */
+	GC_set_warn_proc(original_warnproc);
+}
+
+/**
+ * mono_trace:
+ *
+ *	@level: Verbose level of the specified message
+ *	@mask: Type of the specified message
+ *
+ * Traces a new message, depending on the current logging level
+ * and trace mask.
+ */
+void
+mono_trace(GLogLevelFlags level, MonoTraceMask mask, const char *format, ...) 
+{
+	if(level <= current_level && mask & current_mask) {
+		va_list args;
+		va_start (args, format);
+		g_logv (mono_log_domain, level, format, args);
+		va_end (args);
+	}
+}
+
+/**
+ * mono_tracev:
+ *
+ *	@level: Verbose level of the specified message
+ *	@mask: Type of the specified message
+ *
+ * Traces a new message, depending on the current logging level
+ * and trace mask.
+ */
+void 
+mono_tracev (GLogLevelFlags level, MonoTraceMask mask, const char *format, va_list args)
+{
+	if(level <= current_level && mask & current_mask)
+		g_logv (mono_log_domain, level, format, args);
+}
+
+/**
+ * mono_trace_set:
+ *
+ *	@level: Verbose level to set
+ *	@mask: Mask of visible message types.
+ *
+ * Sets the current logging level and mask. Every subsequent call to
+ * mono_trace will check the visibility of a message against these
+ * values.
+ */
+void 
+mono_trace_set (GLogLevelFlags level, MonoTraceMask mask)
+{
+	current_level = level;
+	current_mask	= mask;
+}
+
+/**
+ * mono_trace_set_level:
+ *
+ *	@level: Verbose level to set
+ *
+ * Sets the current logging level. Every subsequent call to
+ * mono_trace will check the visibility of a message against this
+ * value.
+ */
+void 
+mono_trace_set_level (GLogLevelFlags level)
+{
+	current_level = level;
+}
+
+/**
+ * mono_trace_set_mask:
+ *
+ *	@mask: Mask of visible message types.
+ *
+ * Sets the current logging level. Every subsequent call to
+ * mono_trace will check the visibility of a message against this
+ * value.
+ */
+void 
+mono_trace_set_mask (MonoTraceMask mask)
+{
+	current_mask	= mask;
+}
+
+/**
+ * mono_trace_push:
+ *
+ *	@level: Verbose level to set
+ *	@mask: Mask of visible message types.
+ *
+ * Saves the current values of level and mask then calls mono_trace_set
+ * with the specified new values.
+ */
+void 
+mono_trace_push (GLogLevelFlags level, MonoTraceMask mask)
+{
+	if(level_stack == NULL)
+		g_error(G_GNUC_PRETTY_FUNCTION ": cannot use mono_trace_push without calling mono_trace_init first.");
+	else {
+		MonoLogLevelEntry *entry = g_malloc(sizeof(MonoLogLevelEntry));
+		entry->level	= current_level;
+		entry->mask		= current_mask;
+
+        g_queue_push_head (level_stack, (gpointer)entry);
+
+		/* Set the new level and mask
+		 */
+		mono_trace_set (level, mask);
+	}
+}
+
+/**
+ * mono_trace_pop:
+ *
+ * Restores level and mask values saved from a previous call to mono_trace_push.
+ */
+void 
+mono_trace_pop (void)
+{
+	if(level_stack == NULL)
+		g_error(G_GNUC_PRETTY_FUNCTION ": cannot use mono_trace_pop without calling mono_trace_init first.");
+	else {
+		if(!g_queue_is_empty (level_stack)) {
+			MonoLogLevelEntry *entry = (MonoLogLevelEntry*)g_queue_pop_head (level_stack);
+
+			/*	Restore previous level and mask
+			 */
+			mono_trace_set (entry->level, entry->mask);
+
+			g_free (entry);
+		}
+	}
+}

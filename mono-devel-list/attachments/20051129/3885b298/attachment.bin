@@ -1,0 +1,552 @@
+Index: SqliteDataReader.cs
+===================================================================
+--- SqliteDataReader.cs	(revision 53531)
++++ SqliteDataReader.cs	(working copy)
+@@ -43,29 +43,30 @@
+ 		#region Fields
+ 		
+ 		private SqliteCommand command;
+-		private ArrayList rows;
++		private IntPtr pVm;
++		private int version;
++
++		private ArrayList current_row;
++
+ 		private ArrayList columns;
+ 		private Hashtable column_names;
+-		private int current_row;
+ 		private bool closed;
+-		private bool reading;
+-		private int records_affected;
+ 		
+ 		#endregion
+ 
+ 		#region Constructors and destructors
+ 		
+-		internal SqliteDataReader (SqliteCommand cmd, IntPtr pVm, int version)
++		internal SqliteDataReader (SqliteCommand cmd, IntPtr _pVm, int _version)
+ 		{
+ 			command = cmd;
+-			rows = new ArrayList ();
++			pVm = _pVm;
++			version = _version;
++
++			current_row = new ArrayList ();
++
+ 			columns = new ArrayList ();
+ 			column_names = new Hashtable ();
+ 			closed = false;
+-			current_row = -1;
+-			reading = true;
+-			ReadpVm (pVm, version);
+-			ReadingDone ();
+ 		}
+ 		
+ 		#endregion
+@@ -81,11 +82,11 @@
+ 		}
+ 		
+ 		public object this[string name] {
+-			get { return ((ArrayList) rows[current_row])[(int) column_names[name]]; }
++			get { return current_row [(int) column_names[name]]; }
+ 		}
+ 		
+ 		public object this[int i] {
+-			get { return ((ArrayList) rows[current_row])[i]; }
++			get { return current_row [i]; }
+ 		}
+ 		
+ 		public bool IsClosed {
+@@ -93,90 +94,90 @@
+ 		}
+ 		
+ 		public int RecordsAffected {
+-			get { return records_affected; }
++			get { return command.NumChanges (); }
+ 		}
+ 		
+ 		#endregion
+ 
+ 		#region Internal Methods
+-		
+-		internal void ReadpVm (IntPtr pVm, int version)
++
++		internal bool ReadNextColumn ()
+ 		{
+ 			int pN = 0;
+ 			IntPtr pazValue = IntPtr.Zero;
+ 			IntPtr pazColName = IntPtr.Zero;
+ 			SqliteError res;
+ 
+-			while (true) {
+-				if (version == 3) {
+-					res = Sqlite.sqlite3_step (pVm);
+-					pN = Sqlite.sqlite3_column_count (pVm);
+-				} else
+-					res = Sqlite.sqlite_step (pVm, out pN, out pazValue, out pazColName);
+-				if (res == SqliteError.ERROR) {		
+-					throw new ApplicationException ("Sqlite error");
+-				}
+-				if (res == SqliteError.DONE) {
+-					break;
+-				}
+-				// We have some data; lets read it
+-				if (column_names.Count == 0) {
+-					for (int i = 0; i < pN; i++) {
+-						string colName = "";
+-						if (version == 2) {
+-							IntPtr fieldPtr = (IntPtr)Marshal.ReadInt32 (pazColName, i*IntPtr.Size);
+-							colName = Marshal.PtrToStringAnsi (fieldPtr);
+-						} else {
+-							colName = Marshal.PtrToStringAnsi (Sqlite.sqlite3_column_name (pVm, i));
+-						}
+-						columns.Add (colName);
+-						column_names [colName] = i;
+-					}
+-				}
+-				ArrayList data_row = new ArrayList (pN);
++			if (version == 3) {
++				res = Sqlite.sqlite3_step (pVm);
++				pN = Sqlite.sqlite3_column_count (pVm);
++			} else
++				res = Sqlite.sqlite_step (pVm, out pN, out pazValue, out pazColName);
++
++			if (res == SqliteError.DONE) {
++				return false;
++			}
++
++			if (res != SqliteError.ROW)
++				throw new SqliteException (res);
++
++			// We have some data; lets read it
++
++			// If we are reading the first column, populate the column names
++			if (column_names.Count == 0) {
+ 				for (int i = 0; i < pN; i++) {
+-					string colData = "";
++					string colName = "";
+ 					if (version == 2) {
+-						IntPtr fieldPtr = (IntPtr)Marshal.ReadInt32 (pazValue, i*IntPtr.Size);
+-						colData = Marshal.PtrToStringAnsi (fieldPtr);
+-						data_row.Add (Marshal.PtrToStringAnsi (fieldPtr));
++						IntPtr fieldPtr = (IntPtr)Marshal.ReadInt32 (pazColName, i*IntPtr.Size);
++						colName = Marshal.PtrToStringAnsi (fieldPtr);
+ 					} else {
+-						switch (Sqlite.sqlite3_column_type (pVm, i)) {
+-							case 1:
+-								Int64 sqliteint64 = Sqlite.sqlite3_column_int64 (pVm, i);
+-								data_row.Add (sqliteint64.ToString ());
+-								break;
+-							case 2:
+-								double sqlitedouble = Sqlite.sqlite3_column_double (pVm, i);
+-								data_row.Add (sqlitedouble.ToString ());
+-								break;
+-							case 3:
+-								colData = Marshal.PtrToStringAnsi (Sqlite.sqlite3_column_text (pVm, i));
+-								data_row.Add (colData);
+-								break;
+-							case 4:
+-								int blobbytes = Sqlite.sqlite3_column_bytes (pVm, i);
+-								IntPtr blobptr = Sqlite.sqlite3_column_blob (pVm, i);
+-								byte[] blob = new byte[blobbytes];
+-								Marshal.Copy (blobptr, blob, 0, blobbytes);
+-								data_row.Add (blob);
+-								break;
+-							case 5:
+-								data_row.Add (null);
+-								break;
+-							default:
+-								throw new ApplicationException ("FATAL: Unknown sqlite3_column_type");
+-						}
+-					}	
++						colName = Marshal.PtrToStringAnsi (Sqlite.sqlite3_column_name (pVm, i));
++					}
++					columns.Add (colName);
++					column_names [colName] = i;
+ 				}
+-				rows.Add (data_row);
+ 			}
++
++			// Now read the actual data
++			current_row.Clear ();
++			for (int i = 0; i < pN; i++) {
++				string colData = "";
++				if (version == 2) {
++					IntPtr fieldPtr = (IntPtr)Marshal.ReadInt32 (pazValue, i*IntPtr.Size);
++					colData = Marshal.PtrToStringAnsi (fieldPtr);
++					current_row.Add (Marshal.PtrToStringAnsi (fieldPtr));
++				} else {
++					switch (Sqlite.sqlite3_column_type (pVm, i)) {
++					case 1:
++						Int64 sqliteint64 = Sqlite.sqlite3_column_int64 (pVm, i);
++						current_row.Add (sqliteint64.ToString ());
++						break;
++					case 2:
++						double sqlitedouble = Sqlite.sqlite3_column_double (pVm, i);
++						current_row.Add (sqlitedouble.ToString ());
++						break;
++					case 3:
++						colData = Marshal.PtrToStringAnsi (Sqlite.sqlite3_column_text (pVm, i));
++						current_row.Add (colData);
++						break;
++					case 4:
++						int blobbytes = Sqlite.sqlite3_column_bytes (pVm, i);
++						IntPtr blobptr = Sqlite.sqlite3_column_blob (pVm, i);
++						byte[] blob = new byte[blobbytes];
++						Marshal.Copy (blobptr, blob, 0, blobbytes);
++						current_row.Add (blob);
++						break;
++					case 5:
++						current_row.Add (null);
++						break;
++					default:
++						throw new ApplicationException ("FATAL: Unknown sqlite3_column_type");
++					}
++				}	
++			}
++			
++			return true;
+ 		}
+-		internal void ReadingDone ()
+-		{
+-			records_affected = command.NumChanges ();
+-			reading = false;
+-		}
+ 		
+ 		#endregion
+ 
+@@ -185,6 +186,15 @@
+ 		public void Close ()
+ 		{
+ 			closed = true;
++
++			if (pVm != IntPtr.Zero) {
++				IntPtr errMsg;
++				if (version == 3)
++					Sqlite.sqlite3_finalize (pVm);
++				else
++					Sqlite.sqlite_finalize (pVm, out errMsg);
++				pVm = IntPtr.Zero;
++			}
+ 		}
+ 		
+ 		public void Dispose ()
+@@ -262,14 +272,12 @@
+ 		
+ 		public bool NextResult ()
+ 		{
+-			current_row++;
+-			
+-			return (current_row < rows.Count);
++			return ReadNextColumn ();
+ 		}
+ 		
+ 		public bool Read ()
+ 		{
+-			return NextResult ();
++			return ReadNextColumn ();
+ 		}
+ 
+ 		#endregion
+@@ -278,12 +286,12 @@
+ 		
+ 		public bool GetBoolean (int i)
+ 		{
+-			return Convert.ToBoolean ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToBoolean ((string) current_row [i]);
+ 		}
+ 		
+ 		public byte GetByte (int i)
+ 		{
+-			return Convert.ToByte ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToByte ((string) current_row [i]);
+ 		}
+ 		
+ 		public long GetBytes (int i, long fieldOffset, byte[] buffer, int bufferOffset, int length)
+@@ -293,7 +301,7 @@
+ 		
+ 		public char GetChar (int i)
+ 		{
+-			return Convert.ToChar ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToChar ((string) current_row [i]);
+ 		}
+ 		
+ 		public long GetChars (int i, long fieldOffset, char[] buffer, int bufferOffset, int length)
+@@ -313,17 +321,17 @@
+ 		
+ 		public DateTime GetDateTime (int i)
+ 		{
+-			return Convert.ToDateTime ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToDateTime ((string) current_row [i]);
+ 		}
+ 		
+ 		public decimal GetDecimal (int i)
+ 		{
+-			return Convert.ToDecimal ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToDecimal ((string) current_row [i]);
+ 		}
+ 		
+ 		public double GetDouble (int i)
+ 		{
+-			return Convert.ToDouble ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToDouble ((string) current_row [i]);
+ 		}
+ 		
+ 		public Type GetFieldType (int i)
+@@ -333,7 +341,7 @@
+ 		
+ 		public float GetFloat (int i)
+ 		{
+-			return Convert.ToSingle ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToSingle ((string) current_row [i]);
+ 		}
+ 		
+ 		public Guid GetGuid (int i)
+@@ -343,17 +351,17 @@
+ 		
+ 		public short GetInt16 (int i)
+ 		{
+-			return Convert.ToInt16 ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToInt16 ((string) current_row [i]);
+ 		}
+ 		
+ 		public int GetInt32 (int i)
+ 		{
+-			return Convert.ToInt32 ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToInt32 ((string) current_row [i]);
+ 		}
+ 		
+ 		public long GetInt64 (int i)
+ 		{
+-			return Convert.ToInt64 ((string) ((ArrayList) rows[current_row])[i]);
++			return Convert.ToInt64 ((string) current_row [i]);
+ 		}
+ 		
+ 		public string GetName (int i)
+@@ -368,20 +376,20 @@
+ 		
+ 		public string GetString (int i)
+ 		{
+-			return ((string) ((ArrayList) rows[current_row])[i]);
++			return (string) current_row [i];
+ 		}
+ 		
+ 		public object GetValue (int i)
+ 		{
+-			return ((ArrayList) rows[current_row])[i];
++			return current_row [i];
+ 		}
+ 		
+ 		public int GetValues (object[] values)
+ 		{
+ 			int num_to_fill = System.Math.Min (values.Length, columns.Count);
+ 			for (int i = 0; i < num_to_fill; i++) {
+-				if (((ArrayList) rows[current_row])[i] != null) {
+-					values[i] = ((ArrayList) rows[current_row])[i];
++				if (current_row [i] != null) {
++					values[i] = current_row [i];
+ 				} else {
+ 					values[i] = DBNull.Value;
+ 				}
+@@ -391,7 +399,7 @@
+ 		
+ 		public bool IsDBNull (int i)
+ 		{
+-			return (((ArrayList) rows[current_row])[i] == null);
++			return current_row [i] == null;
+ 		}
+ 		        
+ 		#endregion
+Index: SqliteCommand.cs
+===================================================================
+--- SqliteCommand.cs	(revision 53531)
++++ SqliteCommand.cs	(working copy)
+@@ -35,7 +35,7 @@
+ using System;
+ using System.Collections;
+ using System.Text;
+-using Mono.Unix;
++using Mono.Unix.Native;
+ using System.Runtime.InteropServices;
+ using System.Text.RegularExpressions;
+ using System.Data;
+@@ -46,6 +46,7 @@
+ {
+ 	public class SqliteCommand : IDbCommand
+ 	{
++
+ 		#region Fields
+ 		
+ 		private SqliteConnection parent_conn;
+@@ -232,7 +233,7 @@
+ 			}
+ 			
+ 			SqliteError err = SqliteError.OK;
+-			IntPtr psql = UnixMarshal.StringToAlloc(sqlcmds);
++			IntPtr psql = UnixMarshal.StringToHeap(sqlcmds);
+ 			IntPtr pzTail = psql;
+ 			try {
+ 				do { // sql may contain multiple sql commands, loop until they're all processed
+@@ -242,7 +243,7 @@
+ 						err = Sqlite.sqlite3_prepare (parent_conn.Handle, pzTail, sql.Length, out pStmt, out pzTail);
+ 						if (err != SqliteError.OK) {
+ 							string msg = Marshal.PtrToStringAnsi (Sqlite.sqlite3_errmsg (parent_conn.Handle));
+-							throw new ApplicationException (msg);
++							throw new SqliteException (err, msg);
+ 						}
+ 					}
+ 					else
+@@ -258,7 +259,7 @@
+ 								msg = Marshal.PtrToStringAnsi (errMsg);
+ 								Sqlite.sqliteFree (errMsg);
+ 							}
+-							throw new ApplicationException ("Sqlite error: " + msg);
++							throw new SqliteException (err, msg);
+ 						}
+ 					}
+ 						
+@@ -345,7 +346,7 @@
+ 					}
+ 				} while ((int)pzTail - (int)psql < sql.Length);
+ 			} finally {
+-				UnixMarshal.Free(psql);
++				UnixMarshal.FreeHeap(psql);
+ 			}
+ 			prepared=true;
+ 		}
+@@ -364,7 +365,8 @@
+ 		public int ExecuteNonQuery ()
+ 		{
+ 			int rows_affected;
+-			SqliteDataReader r = ExecuteReader (CommandBehavior.Default, false, out rows_affected);
++			// Since want_results is false, this always returns null
++			ExecuteReader (CommandBehavior.Default, false, out rows_affected);
+ 			return rows_affected;
+ 		}
+ 		
+@@ -426,6 +428,7 @@
+ 					} 
+ 					
+ 					// Execute but ignore the results of these statements.
++
+ 					if (parent_conn.Version == 3) 
+ 					{
+ 						err = Sqlite.sqlite3_step (pStmt);
+@@ -443,16 +446,18 @@
+ 			}
+ 			finally 
+ 			{	
+-				foreach (IntPtr pStmt in pStmts) {
+-					if (parent_conn.Version == 3) 
+-					{
+-						err = Sqlite.sqlite3_finalize (pStmt);
++				if (! want_results)
++					foreach (IntPtr pStmt in pStmts) {
++						if (parent_conn.Version == 3) 
++						{
++							err = Sqlite.sqlite3_finalize (pStmt);
++						}
++						else
++						{
++							err = Sqlite.sqlite_finalize (pStmt, out errMsg);
++						}
+ 					}
+-					else
+-					{
+-						err = Sqlite.sqlite_finalize (pStmt, out errMsg);
+-					}
+-				}
++
+ 				parent_conn.EndExec ();
+ 				prepared = false;
+ 			}
+@@ -461,11 +466,11 @@
+ 			    err != SqliteError.DONE &&
+ 			    err != SqliteError.ROW) 
+ 			{
+- 				if (errMsg != IntPtr.Zero) 
++				if (errMsg != IntPtr.Zero) 
+ 				{
+ 					// TODO: Get the message text
+ 				}
+-				throw new ApplicationException ("Sqlite error");
++				throw new SqliteException (err);
+ 			}
+ 			rows_affected = NumChanges ();
+ 			return reader;
+Index: SqliteException.cs
+===================================================================
+--- SqliteException.cs	(revision 0)
++++ SqliteException.cs	(revision 0)
+@@ -0,0 +1,58 @@
++//
++// Mono.Data.SqliteClient.SqliteException.cs
++//
++// An exception that wraps an SqliteError value.
++// 
++// Author(s): Jon Trowbridge <trow@novell.com>
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++// 
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++// 
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++using System;
++
++namespace Mono.Data.SqliteClient
++{
++	public class SqliteException : Exception
++	{
++		public readonly SqliteError SqliteError;
++
++		private string message;
++
++		public SqliteException (SqliteError err, string message)
++		{
++			this.SqliteError = err;
++
++			if (message == null)
++				message = String.Format ("Sqlite returned '{0}'", err);
++			else
++				message = String.Format ("Sqlite returned '{0}': {1}", err, message);
++			this.message = message;
++		}
++
++		public SqliteException (SqliteError err) : this (err, null)
++		{
++
++		}
++
++		override public string Message {
++			get { return message; }
++		}
++	}
++}
+Index: Sqlite.cs
+===================================================================
+--- Sqlite.cs	(revision 53531)
++++ Sqlite.cs	(working copy)
+@@ -39,7 +39,7 @@
+ 	/// <summary>
+ 	/// Represents the return values for sqlite_exec() and sqlite_step()
+ 	/// </summary>
+-	internal enum SqliteError : int {
++	public enum SqliteError : int {
+ 		/// <value>Successful result</value>
+ 		OK        =  0,
+ 		/// <value>SQL error or missing database</value>

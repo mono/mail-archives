@@ -1,0 +1,333 @@
+Index: System.Web/HttpApplication.cs
+===================================================================
+--- System.Web/HttpApplication.cs	(revision 55426)
++++ System.Web/HttpApplication.cs	(working copy)
+@@ -658,6 +658,92 @@
+ 		//    true:  processing of the pipeline must be stopped
+ 		//    false: processing of the pipeline must not be stopped
+ 		//
++#if TARGET_JVM && !NET_2_0
++		class RunHooksEnumerator : IEnumerable, IEnumerator {
++			Delegate [] delegates;
++			int currentStep = 0;
++			HttpApplication app;
++
++			internal RunHooksEnumerator(HttpApplication app, Delegate list) {
++				this.app = app;
++				delegates = list.GetInvocationList ();
++			}
++
++			public virtual IEnumerator GetEnumerator() { return this; }
++			public virtual object Current { get{ return app.stop_processing; } }
++			public virtual void Reset() {
++				throw new NotImplementedException("HttpApplication.RunHooksEnumerator.Reset called.");
++			}
++			public virtual bool MoveNext () {
++				while (currentStep < delegates.Length) {
++					if (ProcessDelegate((EventHandler)delegates[currentStep++]))
++						return true;
++				}
++				return false;
++			}
++
++			bool ProcessDelegate(EventHandler d) {
++				if (d.Target != null && (d.Target is AsyncInvoker)){
++					app.current_ai = (AsyncInvoker) d.Target;
++
++					try {
++						app.must_yield = true;
++						app.in_begin = true;
++						app.context.BeginTimeoutPossible ();
++						app.current_ai.begin (app, EventArgs.Empty, new AsyncCallback(app.async_callback_completed_cb), app.current_ai.data);
++					}
++					catch (ThreadAbortException taex){
++						object obj = taex.ExceptionState;
++						Thread.ResetAbort ();
++						app.stop_processing = true;
++						if (obj is StepTimeout)
++							app.ProcessError (new HttpException ("The request timed out."));
++					}
++					catch (Exception e){
++						app.ProcessError (e);
++					}
++					finally {
++						app.in_begin = false;
++						app.context.EndTimeoutPossible ();
++					}
++
++					//
++					// If things are still moving forward, yield this
++					// thread now
++					//
++					if (app.must_yield)
++						return true;
++					else if (app.stop_processing)
++						return true;
++				}
++				else {
++					try {
++						app.context.BeginTimeoutPossible ();
++						d (app, EventArgs.Empty);
++					} catch (ThreadAbortException taex){
++						object obj = taex.ExceptionState;
++						Thread.ResetAbort ();
++						app.stop_processing = true;
++						if (obj is StepTimeout)
++							app.ProcessError (new HttpException ("The request timed out."));
++					}
++					catch (Exception e){
++						app.ProcessError (e);
++					}
++					finally {
++						app.context.EndTimeoutPossible ();
++					}
++					if (app.stop_processing)
++						return true;
++				}
++				return false;
++			}
++		}
++
++		IEnumerable RunHooks (Delegate list) {
++			return new RunHooksEnumerator(this, list);
++		}
++#else
+ 		IEnumerable RunHooks (Delegate list)
+ 		{
+ 			Delegate [] delegates = list.GetInvocationList ();
+@@ -712,6 +798,7 @@
+ 				}
+ 			}
+ 		}
++#endif
+ 
+ 		static void FinalErrorWrite (HttpResponse response, string error)
+ 		{
+@@ -810,6 +897,204 @@
+ 		// Events fired as described in `Http Runtime Support, HttpModules,
+ 		// Handling Public Events'
+ 		//
++#if TARGET_JVM && !NET_2_0
++		class PipeLineEnumerator : IEnumerator {
++			HttpApplication app;
++			IEnumerator currentEnumerator = null;
++			int currentStep = 0;
++			bool pipelineFinished = false;
++			IHttpHandler handler = null;
++			bool currentVal;
++			InternalStepDelegate AllocateHandlerDel;
++			InternalStepDelegate ProcessHandlerDel;
++			InternalStepDelegate ReleaseHandlerDel;
++
++			// true means that we need to yield and return the current value;
++			// false means that we need to go on to the next delegate and return
++			// values from there.
++			delegate bool InternalStepDelegate();
++
++			internal PipeLineEnumerator(HttpApplication app) {
++				this.app = app;
++				AllocateHandlerDel = new InternalStepDelegate(AllocateHandler);
++				ProcessHandlerDel = new InternalStepDelegate(ProcessHandler);
++				ReleaseHandlerDel = new InternalStepDelegate(ReleaseHandler);
++			}
++
++			public virtual object Current {
++				get {
++					if (currentEnumerator != null)
++						return currentEnumerator.Current;
++					return currentVal;
++				}
++			}
++
++			// See InternalStepDelegate for meaning of true/false return value
++			bool AllocateHandler() {
++				// Obtain the handler for the request.
++				try {
++					handler = app.GetHandler (app.context);
++				}
++				catch (FileNotFoundException fnf){
++					if (app.context.Request.IsLocal)
++						app.ProcessError (new HttpException (404, String.Format ("File not found {0}", fnf.FileName), fnf));
++					else
++						app.ProcessError (new HttpException (404, "File not found", fnf));
++				} catch (DirectoryNotFoundException dnf){
++					app.ProcessError (new HttpException (404, "Directory not found", dnf));
++				} catch (Exception e) {
++					app.ProcessError (e);
++				}
++
++				if (app.stop_processing) {
++					currentVal = false;
++					return true;
++				}
++				return false;
++			}
++
++			// See InternalStepDelegate for meaning of true/false return value
++			bool ProcessHandler() {
++				//
++				// From this point on, we need to ensure that we call
++				// ReleaseRequestState, so the code below jumps to
++				// `release:' to guarantee it rather than yielding.
++				//
++				if (app.PreRequestHandlerExecute != null)
++					foreach (bool stop in app.RunHooks (app.PreRequestHandlerExecute))
++						if (stop)
++							return false;
++
++				try {
++					app.context.BeginTimeoutPossible ();
++					if (handler != null){
++						IHttpAsyncHandler async_handler = handler as IHttpAsyncHandler;
++					
++						if (async_handler != null){
++							app.must_yield = true;
++							app.in_begin = true;
++							async_handler.BeginProcessRequest (app.context, new AsyncCallback(app.async_handler_complete_cb), handler);
++						} else {
++							app.must_yield = false;
++							handler.ProcessRequest (app.context);
++						}
++					}
++				}
++				catch (ThreadAbortException taex){
++					object obj = taex.ExceptionState;
++					Thread.ResetAbort ();
++					app.stop_processing = true;
++					if (obj is StepTimeout)
++						app.ProcessError (new HttpException ("The request timed out."));
++				}
++				catch (Exception e){
++					app.ProcessError (e);
++				}
++				finally {
++					app.in_begin = false;
++					app.context.EndTimeoutPossible ();
++				}
++				if (app.must_yield) {
++					currentVal = app.stop_processing;
++					return true;
++				}
++				else if (app.stop_processing)
++					return false;
++			
++				// These are executed after the application has returned
++				if (app.PostRequestHandlerExecute != null)
++					foreach (bool stop in app.RunHooks (app.PostRequestHandlerExecute))
++						if (stop)
++							return false;
++
++				return false;
++			}
++
++			// See InternalStepDelegate for meaning of true/false return value
++			bool ReleaseHandler() {
++				if (app.ReleaseRequestState != null){
++					foreach (bool stop in app.RunHooks (app.ReleaseRequestState)){
++						//
++						// Ignore the stop signal while release the state
++						//
++					}
++				}
++
++				if (app.stop_processing) {
++					currentVal = true;
++					return true;
++				}
++				return false;
++			}
++
++			Delegate FindNextDelegate () {
++				switch(currentStep++) {
++					case  1: return app.BeginRequest;
++					case  2: return app.AuthenticateRequest;
++					case  3: return app.DefaultAuthentication;
++#if NET_2_0
++					case  4: return app.PostAuthenticateRequest;
++#endif
++					case  5: return app.AuthorizeRequest;
++#if NET_2_0
++					case  6: return app.PostAuthorizeRequest;
++#endif
++					case  7: return app.ResolveRequestCache;
++					case  8: return AllocateHandlerDel;
++#if NET_2_0
++					case  9: return app.PostResolveRequestCache;
++#endif
++#if NET_2_0
++					case 10: return app.PostMapRequestHandler;
++#endif
++					case 11: return app.AcquireRequestState;
++#if NET_2_0
++					case 12: return app.PostAcquireRequestState;
++#endif
++					case 13: return app.ResolveRequestCache;
++					case 14: return ProcessHandlerDel;
++					case 15: return ReleaseHandlerDel;
++#if NET_2_0
++					case 16: return app.PostReleaseRequestState;
++#endif
++					case 17: return app.UpdateRequestCache;
++#if NET_2_0
++					case 18: return app.PostUpdateRequestCache;
++#endif
++					case 19: pipelineFinished = true; return null;
++				}
++				return null;
++			}
++
++			public virtual bool MoveNext () {
++				while (!pipelineFinished) {
++					if (currentEnumerator != null && currentEnumerator.MoveNext())
++						return true;
++					currentEnumerator = null;
++
++					Delegate d = FindNextDelegate();
++					InternalStepDelegate d1 = d as InternalStepDelegate;
++					if (d1 != null) {
++						if (d1())
++							return true;
++					}
++					else if (d != null)
++						currentEnumerator = app.RunHooks(d).GetEnumerator();
++				}
++
++				app.PipelineDone ();
++				return false;
++			}
++
++			public virtual void Reset() {
++				throw new NotImplementedException("HttpApplication.PipelineEnumerator.Reset called.");
++			}
++		}
++
++		IEnumerator Pipeline () {
++			return new PipeLineEnumerator(this);
++		}
++#else
+ 		IEnumerator Pipeline ()
+ 		{
+ 			if (stop_processing)
+@@ -935,14 +1220,12 @@
+ 			
+ 		release:
+ 			if (ReleaseRequestState != null){
+-#pragma warning disable 168
+ 				foreach (bool stop in RunHooks (ReleaseRequestState)){
+ 					//
+ 					// Ignore the stop signal while release the state
+ 					//
+ 					
+ 				}
+-#pragma warning restore 168
+ 			}
+ 			
+ 			if (stop_processing)
+@@ -968,6 +1251,7 @@
+ #endif
+ 			PipelineDone ();
+ 		}
++#endif
+ 
+ 		void PreStart ()
+ 		{

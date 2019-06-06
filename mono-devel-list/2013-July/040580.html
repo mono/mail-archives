@@ -1,0 +1,182 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Anonymous Pipe Stream Implementation
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=Re%3A%20%5BMono-dev%5D%20Anonymous%20Pipe%20Stream%20Implementation&In-Reply-To=%3CCALAOgmZ5rTrLkigzJ6a_Mo5um0v4%3D_de-jRGmAMZT3CDNtoJEA%40mail.gmail.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="040579.html">
+   <LINK REL="Next"  HREF="040581.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Anonymous Pipe Stream Implementation</H1>
+    <B>SmokingRope</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=Re%3A%20%5BMono-dev%5D%20Anonymous%20Pipe%20Stream%20Implementation&In-Reply-To=%3CCALAOgmZ5rTrLkigzJ6a_Mo5um0v4%3D_de-jRGmAMZT3CDNtoJEA%40mail.gmail.com%3E"
+       TITLE="[Mono-dev] Anonymous Pipe Stream Implementation">smokingrope at gmail.com
+       </A><BR>
+    <I>Sat Jul  6 14:50:02 UTC 2013</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="040579.html">[Mono-dev] Status of HttpContext.AcceptWebSocketRequest ?
+</A></li>
+        <LI>Next message: <A HREF="040581.html">[Mono-dev] Anonymous Pipe Stream Implementation
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#40580">[ date ]</a>
+              <a href="thread.html#40580">[ thread ]</a>
+              <a href="subject.html#40580">[ subject ]</a>
+              <a href="author.html#40580">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi, I'm poking through the pieces of the System.Core/System.IO.Pipes code
+looking to build out anonymous pipes. I have at least a basic working Unix
+implementation now. Though i imagine Win32 and Named pipes have been broken
+(if they ever worked) in the process, and there is undoubtedly some cleanup
+work required. I'd like to get some feedback from people more knowledgeable
+than myself about mono at this point so i can try and wrap this project up
+into a pull request.
+
+My initial test case is this example from MSDN:
+<A HREF="http://msdn.microsoft.com/en-us/library/bb546102.aspx">http://msdn.microsoft.com/en-us/library/bb546102.aspx</A>
+
+Handle Inheritance
+-------------------------
+Presently, Process.Start() arbitrarily closes all handles in the fork()'d
+process, except stdin / stdout / stderr. There exists a todo comment in
+this same code (io-layer/processes.c) pointing out that (when
+inherit_handles is TRUE, which it is) that something should be done
+differently than when not...
+
+		if (*inherit_handles* != TRUE) {
+
+			/* FIXME: do something here */
+
+		}
+
+
+Without a far more expansive knowledge of mono i can't make a very well
+informed decision about the liberties i can take in addressing this.
+The cleanest solution might be to use FD_CLOEXEC on all the existing fd's
+and (at least in process.Start case) the handles that should be cleaned up
+would be closed automatically / inherited automatically. Are there
+compatibility reasons this cannot be done? Has there been any consideration
+for this that could be drawn upon?
+&gt;<i>From information i do have, it seems like these pipe handles could also be
+</I>flagged as 'inheritable' in the internal handle registry and then after
+fork() mono could leave those open, while closing everything else.
+
+In addition to this basic test case, i'm not currently aware of how
+anonymous pipes should behave when you invoke Process.Start() several times
+with an anonymous pipe. Without using FD_CLOEXEC it would be difficult and
+messy to (in a 'execd' child process) to identify all the pipe handles at
+startup and register them in the mono handle registry as inheritable again
+(so that Process.Start in that child process would pass these handles on
+again to its children). If anonymous pipes are supposed to support this, it
+lends further support for the FD_CLOEXEC solution.
+
+API Methods Difficult To Implement In Unix
+-------------------------
+There doesn't seem to be a clear specification for the anonymous pipe
+feature and i've so far had to make some little assumptions / inferences
+based on the documentation on MSDN. That said, the posix anonymous pipe
+standard lacks a few features which are pertinent to the API for anonymous
+pipe streams. In particular there are two conflicting features:
+
+     * WaitForPipeDrain&lt;<A HREF="http://msdn.microsoft.com/en-us/library/system.io.pipes.pipestream.waitforpipedrain.aspx">http://msdn.microsoft.com/en-us/library/system.io.pipes.pipestream.waitforpipedrain.aspx</A>&gt;()
+defined on the AnonymousPipeStream requires some ability to peak into an
+anonymous pipe and wait for the pipe's buffer to become empty
+     * Write / Read / etc... is supposed to throw an IOException if the
+other end of the pipe stream has been closed (i have interpreted the
+wording 'pipe is broken' from the msdn docs to mean this, although there is
+a chance i am mis-interpreting this too)
+
+These two features conflict when trying to implement them in unix through
+minor hacks / workarounds.
+
+I can implement WaitForPipeDrain() by leaving the read end of the pipe
+handle open in the writer process, and calling poll(3) on the read end
+repeatedly until the POLL_IN flag is gone.
+
+I can detect that the pipe is broken by closing the read end on the writer,
+(and the write end on the reader) and calling poll(3), throwing this &quot;pipe
+broken&quot; error when a POLLERR /. POLLHUP is issued. One of these two flags
+will be set if all handles to the other end of the pipe have been closed.
+
+In order to implement both of these conflicting features i actually need to
+create two pipes (one where i can leave the read end open on the writer
+process, and one where i can close it). This is not very nice in the case
+that system resources might be at a premium, however i haven't been able to
+devise any other way to get both features either. Would there be any major
+objection to implementing it like this (which as i have noted seems to be
+the only way)?
+
+Using two separate pipes like this, the GetClientHandleAsString() method is
+going to be significantly different from the win32 version. When the client
+is supposed to be the writer, the client handle as string must contain
+three separate fds. When the client is the reader two fd's must be passed.
+I don't see any reason that this would bother anybody, but if it's relevant
+let me know!
+
+Compatibility
+-------------------------
+I can create pipes and manipulate them without adding any new library
+references but i do depend on using the poll(3) function more heavily than
+it seems to be presently (it's only exposed for Network Sockets presently).
+Are there any portability / compatibility considerations with poll(3) that
+might need to be addressed?
+
+Versioning
+-------------------------
+I'm not familiar with how versioning between .NET 1/2/3/etc... is being
+handled. Anonymous pipes are introduced in .NET 3.5. Do these classes need
+to be hidden to older versions, etc... Maybe there is a wiki page i haven't
+found discussing some of this?
+
+I have added several new internal calls to the MonoIO utility, specifically
+for poll(3) and pipe handle manipulation. Does adding internal calls
+require any versioning considerations?
+
+Testing
+-------------------------
+In order to write a test suite for anonymous pipes i need to start new
+processes and i will need to use some sort of IPC mechanism to communicate
+certain errors back to the test process. This seems like a rather unique
+challenge compared to most of the testing needed for mono.
+
+Has any of this multi-process unit testing been done before in mono, or are
+there any considerations that might be relevant?
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20130706/802313bd/attachment.html">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20130706/802313bd/attachment.html</A>&gt;
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="040579.html">[Mono-dev] Status of HttpContext.AcceptWebSocketRequest ?
+</A></li>
+	<LI>Next message: <A HREF="040581.html">[Mono-dev] Anonymous Pipe Stream Implementation
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#40580">[ date ]</a>
+              <a href="thread.html#40580">[ thread ]</a>
+              <a href="subject.html#40580">[ subject ]</a>
+              <a href="author.html#40580">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

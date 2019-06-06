@@ -1,0 +1,394 @@
+Index: signal.c
+===================================================================
+--- signal.c	(revision 123183)
++++ signal.c	(working copy)
+@@ -4,9 +4,11 @@
+  * Authors:
+  *   Jonathan Pryor (jonpryor@vt.edu)
+  *   Jonathan Pryor (jpryor@novell.com)
++ *   Tim Jenks (tim.jenks@realtimeworlds.com)
+  *
+  * Copyright (C) 2004-2005 Jonathan Pryor
+  * Copyright (C) 2008 Novell, Inc.
++ * Copyright (C) 2008 Realtime Worlds Ltd.
+  */
+ 
+ #include <signal.h>
+@@ -101,17 +103,21 @@
+ #ifdef WAPI_ATOMIC_ASM
+ 	#define mph_int_get(p)     InterlockedExchangeAdd ((p), 0)
+ 	#define mph_int_inc(p)     InterlockedIncrement ((p))
+-	#define mph_int_set(p,o,n) InterlockedExchange ((p), (n))
++	#define mph_int_dec(p)     InterlockedDecrement ((p))
++	#define mph_int_set(p,n) do { InterlockedExchange ((p), (n)); } while (0)
++	#define mph_int_cas(p,o,n) InterlockedCompareExchange ((p), (n), (o)) == (o)
+ #elif GLIB_CHECK_VERSION(2,4,0)
+ 	#define mph_int_get(p) g_atomic_int_get ((p))
+- 	#define mph_int_inc(p) do {g_atomic_int_inc ((p));} while (0)
+-	#define mph_int_set(p,o,n) do {                                 \
+-		while (!g_atomic_int_compare_and_exchange ((p), (o), (n))) {} \
+-	} while (0)
++ 	#define mph_int_inc(p) g_atomic_int_inc ((p))
++ 	#define mph_int_dec(p) g_atomic_int_dec ((p))
++	#define mph_int_set(p,n) g_atomic_set ((p), (n))
++	#define mph_int_cas(p,o,n) g_atomic_int_compare_and_exchange ((p), (o), (n))
+ #else
+ 	#define mph_int_get(p) (*(p))
+-	#define mph_int_inc(p) do { (*(p))++; } while (0)
+-	#define mph_int_set(p,o,n) do { *(p) = n; } while (0)
++	#define mph_int_inc(p) ++(*(p))
++	#define mph_int_dec(p) --(*(p))
++	#define mph_int_set(p,n) do { *(p) = n; } while (0)
++	#define mph_int_cas(p,o,n) do { *(p) = n; return true; }
+ #endif
+ 
+ int
+@@ -122,90 +128,106 @@
+ 	return errno == 0 ? 0 : -1;
+ }
+ 
+-#define NUM_SIGNALS 64
+-static signal_info signals[NUM_SIGNALS];
++#define STATE_UNASSIGNED 0
++#define STATE_INITIALISING 1
++#define STATE_ASSIGNED 2
++#define STATE_SIGNALLING 3
++#define STATE_WAITING_DISPOSE 4
++#define STATE_DISPOSING 5
+ 
++#if defined(NSIG)
++#define SUPPORTED_SIGNALS NSIG
++#elif defined(_NSIG)
++#define SUPPORTED_SIGNALS _NSIG
++#elif defined(__NSIG)
++#define SUPPORTED_SIGNALS __NSIG
++#else
++#define SUPPORTED_SIGNALS 32
++#endif
++
++#define NUM_UNIXSIGNAL_INSTANCES 8
++static signal_info signals[SUPPORTED_SIGNALS][NUM_UNIXSIGNAL_INSTANCES];
++
+ static void
+ default_handler (int signum)
+ {
+-	int i;
+-	for (i = 0; i < NUM_SIGNALS; ++i) {
+-		int fd;
+-		signal_info* h = &signals [i];
+-		if (mph_int_get (&h->signum) != signum)
++	int i, fd, state;
++	for (i = 0; i < NUM_UNIXSIGNAL_INSTANCES; ++i) {
++		signal_info* h = &signals [signum] [i];
++		state = mph_int_get (&h->have_handler);
++		/* only allow signal if we're ready to rx one */
++		if (state != STATE_ASSIGNED && state != STATE_SIGNALLING)
+ 			continue;
++		/* wait until any other signal handler for this handle has completed */
++		while (!mph_int_cas (&h->have_handler, STATE_ASSIGNED, STATE_SIGNALLING)) { }
+ 		mph_int_inc (&h->count);
+-		fd = mph_int_get (&h->write_fd);
++		fd = h->write_fd;
+ 		if (fd > 0) {
+ 			char c = signum;
+ 			write (fd, &c, 1);
+ 		}
++		mph_int_set (&h->have_handler, STATE_ASSIGNED);
+ 	}
+ }
+ 
+-static pthread_mutex_t signals_mutex = PTHREAD_MUTEX_INITIALIZER;
+-
+ void*
+ Mono_Unix_UnixSignal_install (int sig)
+ {
+-	int i, mr;
++	int i;
+ 	signal_info* h = NULL; 
+ 	int have_handler = 0;
+ 	void* handler = NULL;
+ 
+-	mr = pthread_mutex_lock (&signals_mutex);
+-	if (mr != 0) {
+-		errno = mr;
+-		return NULL;
+-	}
+-
+ #if defined (SIGRTMIN) && defined (SIGRTMAX)
+ 	/*The runtime uses some rt signals for itself so it's important to not override them.*/
+ 	if (sig >= SIGRTMIN && sig <= SIGRTMAX && count_handlers (sig) == 0) {
+ 		struct sigaction sinfo;
+ 		sigaction (sig, NULL, &sinfo);
+ 		if (sinfo.sa_handler != SIG_DFL || (void*)sinfo.sa_sigaction != (void*)SIG_DFL) {
+-			pthread_mutex_unlock (&signals_mutex);
+ 			errno = EADDRINUSE;
+ 			return NULL;
+ 		}
+ 	}
+ #endif /*defined (SIGRTMIN) && defined (SIGRTMAX)*/
+ 
+-	for (i = 0; i < NUM_SIGNALS; ++i) {
+-		if (h == NULL && signals [i].signum == 0) {
+-			h = &signals [i];
++	for (i = 0; i < NUM_UNIXSIGNAL_INSTANCES; ++i) {
++		h = &signals [sig] [i];
++		if (mph_int_get (&h->have_handler) == STATE_UNASSIGNED) {
++			if (!mph_int_cas (&h->have_handler, STATE_UNASSIGNED, STATE_INITIALISING))
++				continue;
+ 			h->handler = signal (sig, default_handler);
+ 			if (h->handler == SIG_ERR) {
+ 				h->handler = NULL;
+ 				h = NULL;
++				mph_int_set (&h->have_handler, STATE_UNASSIGNED);
+ 				break;
+ 			}
+ 			else {
+-				h->have_handler = 1;
++				handler = h->handler;
++				have_handler = 1;
+ 			}
+ 		}
+-		if (!have_handler && signals [i].signum == sig &&
+-				signals [i].handler != default_handler) {
+-			have_handler = 1;
+-			handler = signals [i].handler;
+-		}
+ 		if (h && have_handler)
+ 			break;
+ 	}
+ 
++	/* initialise and setup pipes for wait-on-multiple */
+ 	if (h && have_handler) {
+-		h->have_handler = 1;
+-		h->handler      = handler;
+-	}
++		int filedes[2];
+ 
+-	if (h) {
+-		mph_int_set (&h->count, h->count, 0);
+-		mph_int_set (&h->signum, h->signum, sig);
++		if (pipe (filedes) != 0) {
++			errno = EIO;
++			return NULL;
++		}
++
++		h->read_fd = filedes [0];
++		h->write_fd = filedes [1];
++		h->count = 0;
++		h->signum = sig;
++		h->wait_counter = 0;
++		mph_int_set (&h->have_handler, STATE_ASSIGNED);
+ 	}
+ 
+-	pthread_mutex_unlock (&signals_mutex);
+-
+ 	return h;
+ }
+ 
+@@ -214,86 +236,96 @@
+ {
+ 	int i;
+ 	int count = 0;
+-	for (i = 0; i < NUM_SIGNALS; ++i) {
+-		if (signals [i].signum == signum)
++	for (i = 0; i < NUM_UNIXSIGNAL_INSTANCES; ++i) {
++		if (mph_int_get (&signals [signum] [i].have_handler) > STATE_UNASSIGNED)
+ 			++count;
+ 	}
+ 	return count;
+ }
+ 
++static void
++teardown_signalinfo (signal_info* h)
++{
++	while (mph_int_get (&h->wait_counter) > 0) {} /* block until there are no pending waits on this handle */
++
++	mph_int_set (&h->have_handler, STATE_DISPOSING);
++	/* tear down pipes */
++	if (h->read_fd != 0)
++		close (h->read_fd);
++	if (h->write_fd != 0)
++		close (h->write_fd);
++	h->read_fd = 0;
++	h->write_fd = 0;
++
++	/* last UnixSignal -- we can unregister */
++	if (h->have_handler && count_handlers (h->signum) == 1) {
++		signal (h->signum, h->handler);
++		h->handler      = NULL;
++	}
++	h->signum = 0;
++	mph_int_set (&h->have_handler, STATE_UNASSIGNED);
++}
++
+ int
+ Mono_Unix_UnixSignal_uninstall (void* info)
+ {
+ 	signal_info* h;
+-	int mr, r = -1;
++	int waiting,fd,i = 0;
+ 
+-	mr = pthread_mutex_lock (&signals_mutex);
+-	if (mr != 0) {
+-		errno = mr;
+-		return -1;
+-	}
+-
+ 	h = info;
+ 
+-	if (h == NULL || h < signals || h > &signals [NUM_SIGNALS])
++	if (h == NULL || h < &signals [0] [0] || h > &signals [SUPPORTED_SIGNALS] [NUM_UNIXSIGNAL_INSTANCES]) {
+ 		errno = EINVAL;
++		return 0;
++	}
+ 	else {
+-		/* last UnixSignal -- we can unregister */
+-		if (h->have_handler && count_handlers (h->signum) == 1) {
+-			mph_sighandler_t p = signal (h->signum, h->handler);
+-			if (p != SIG_ERR)
+-				r = 0;
+-			h->handler      = NULL;
+-			h->have_handler = 0;
++		/* wait until we are not being signalled, then move to disposed */
++		while (!mph_int_cas (&h->have_handler, STATE_ASSIGNED, STATE_WAITING_DISPOSE)) { }
++
++		/* send something to the pipe before closing to unblock any waiting threads */
++		waiting = mph_int_get(&h->wait_counter);
++		if (waiting > 0) {
++			fd = h->write_fd;
++			if (fd > 0) {
++				char c = h->signum;
++				for (i=0;i<waiting;++i)
++				{
++					write (fd, &c, 1);
++				}
++			}
+ 		}
+-		h->signum = 0;
++		else { /* if no threads are waiting, teardown now */
++			teardown_signalinfo(h);
++		}
++
+ 	}
+ 
+-	pthread_mutex_unlock (&signals_mutex);
+-
+-	return r;
++	return 0;
+ }
+ 
+ static int
+ setup_pipes (signal_info** signals, int count, fd_set *read_fds, int *max_fd)
+ {
+-	int i, r;
++	int i, state;
+ 	for (i = 0; i < count; ++i) {
+ 		signal_info* h;
+-		int filedes[2];
+-
+-		if ((r = pipe (filedes)) != 0) {
+-			break;
++		h = signals [i];
++		mph_int_inc (&h->wait_counter); /* increment wait counter */
++		state = mph_int_get (&h->have_handler);
++		if ((state == STATE_ASSIGNED) || (state == STATE_SIGNALLING))
++		{
++			if (h->read_fd > *max_fd)
++				*max_fd = h->read_fd;
++			FD_SET (h->read_fd, read_fds);
+ 		}
+-		h = signals [i];
+-		h->read_fd  = filedes [0];
+-		h->write_fd = filedes [1];
+-		if (h->read_fd > *max_fd)
+-			*max_fd = h->read_fd;
+-		FD_SET (h->read_fd, read_fds);
+ 	}
+-	return r;
++	return 0;
+ }
+ 
+-static void
+-teardown_pipes (signal_info** signals, int count)
+-{
+-	int i;
+-	for (i = 0; i < count; ++i) {
+-		signal_info* h = signals [i];
+-		if (h->read_fd != 0)
+-			close (h->read_fd);
+-		if (h->write_fd != 0)
+-			close (h->write_fd);
+-		h->read_fd  = 0;
+-		h->write_fd = 0;
+-	}
+-}
+-
+ static int
+ wait_for_any (signal_info** signals, int count, int max_fd, fd_set* read_fds, int timeout)
+ {
+-	int r, idx;
++	int r, i, idx;
+ 	do {
+ 		struct timeval tv;
+ 		struct timeval *ptv = NULL;
+@@ -310,18 +342,18 @@
+ 	if (r == 0)
+ 		idx = timeout;
+ 	else if (r > 0) {
+-		int i;
+ 		for (i = 0; i < count; ++i) {
+ 			signal_info* h = signals [i];
+ 			if (FD_ISSET (h->read_fd, read_fds)) {
+ 				char c;
+ 				read (h->read_fd, &c, 1); /* ignore any error */
+-				if (idx == -1)
++				if (idx == -1) {
+ 					idx = i;
++					break;
++				}
+ 			}
+ 		}
+ 	}
+-
+ 	return idx;
+ }
+ 
+@@ -334,27 +366,28 @@
+ Mono_Unix_UnixSignal_WaitAny (void** _signals, int count, int timeout /* milliseconds */)
+ {
+ 	fd_set read_fds;
+-	int mr, r;
++	int r = 0;
+ 	int max_fd = 0;
++	int i = 0;
+ 
+ 	signal_info** signals = (signal_info**) _signals;
+ 
+-	mr = pthread_mutex_lock (&signals_mutex);
+-	if (mr != 0) {
+-		errno = mr;
+-		return -1;
+-	}
+-
+ 	FD_ZERO (&read_fds);
+ 
+ 	r = setup_pipes (signals, count, &read_fds, &max_fd);
+ 	if (r == 0) {
+ 		r = wait_for_any (signals, count, max_fd, &read_fds, timeout);
+ 	}
+-	teardown_pipes (signals, count);
+ 
+-	pthread_mutex_unlock (&signals_mutex);
+-
++	/* decrement wait counter */
++	for (i = 0; i < count; ++i) {
++		signal_info* h;
++		h = signals [i];
++		mph_int_dec (&h->wait_counter); /* decrement wait counter */
++		/* if this handle has been disposed during this wait, tear it down */
++		if (mph_int_get (&h->have_handler) == STATE_WAITING_DISPOSE)
++			teardown_signalinfo (h);
++	}
+ 	return r;
+ }
+ 

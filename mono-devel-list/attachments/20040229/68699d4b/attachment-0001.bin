@@ -1,0 +1,745 @@
+Index: icall.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/icall.c,v
+retrieving revision 1.424
+diff -u -r1.424 icall.c
+--- icall.c	27 Feb 2004 02:34:45 -0000	1.424
++++ icall.c	29 Feb 2004 23:21:28 -0000
+@@ -4938,7 +4938,9 @@
+ };
+ 
+ static const IcallEntry customattrs_icalls [] = {
+-	{"GetCustomAttributes", mono_reflection_get_custom_attrs}
++	{"GetSingleAttribute", mono_reflection_get_single_attribute},
++	{"InternalCustomAttributesForType", mono_reflection_get_custom_attrs_for_type},
++	{"IsCustomAttrDefined", mono_reflection_is_custom_attr_defined}
+ };
+ 
+ static const IcallEntry enuminfo_icalls [] = {
+Index: object.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/object.c,v
+retrieving revision 1.202
+diff -u -r1.202 object.c
+--- object.c	19 Feb 2004 18:16:59 -0000	1.202
++++ object.c	29 Feb 2004 23:21:29 -0000
+@@ -324,6 +324,23 @@
+ }
+ #endif /* CREATION_SPEEDUP */
+ 
++static MonoCustomAttributeSearchResult
++field_is_special_static_collector (MonoCustomAttrEntry *entry, gint32 *ret)
++{
++	MonoClass *klass = entry->ctor->klass;
++	
++	if (klass->image == mono_defaults.corlib) {
++		if (strcmp (klass->name, "ThreadStaticAttribute") == 0)
++			*ret = SPECIAL_STATIC_THREAD;
++		else if (strcmp (klass->name, "ContextStaticAttribute") == 0)
++			*ret = SPECIAL_STATIC_CONTEXT;
++	}
++	
++	return *ret != SPECIAL_STATIC_NONE ?
++		MONO_CUSTOM_ATTRIBUTE_FILTER_STOP :
++		MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE;
++}
++
+ /**
+  * field_is_special_static:
+  *
+@@ -331,28 +348,11 @@
+  * SPECIAL_STATIC_NONE otherwise.
+  */
+ static gint32
+-field_is_special_static (MonoClass *fklass, MonoClassField *field)
++field_is_special_static (MonoClassField *field)
+ {
+-	MonoCustomAttrInfo *ainfo;
+-	int i;
+-	ainfo = mono_custom_attrs_from_field (fklass, field);
+-	if (!ainfo)
+-		return FALSE;
+-	for (i = 0; i < ainfo->num_attrs; ++i) {
+-		MonoClass *klass = ainfo->attrs [i].ctor->klass;
+-		if (klass->image == mono_defaults.corlib) {
+-			if (strcmp (klass->name, "ThreadStaticAttribute") == 0) {
+-				mono_custom_attrs_free (ainfo);
+-				return SPECIAL_STATIC_THREAD;
+-			}
+-			else if (strcmp (klass->name, "ContextStaticAttribute") == 0) {
+-				mono_custom_attrs_free (ainfo);
+-				return SPECIAL_STATIC_CONTEXT;
+-			}
+-		}
+-	}
+-	mono_custom_attrs_free (ainfo);
+-	return SPECIAL_STATIC_NONE;
++	gint32 ret = SPECIAL_STATIC_NONE;
++	mono_custom_attrs_from_field (field, (MonoCustomAttributeCollector) field_is_special_static_collector, &ret);
++	return ret;
+ }
+ 
+ /**
+@@ -441,7 +441,7 @@
+ 		if (mono_field_is_deleted (field))
+ 			continue;
+ 		if (!(field->type->attrs & FIELD_ATTRIBUTE_LITERAL)) {
+-			gint32 special_static = field_is_special_static (class, field);
++			gint32 special_static = field_is_special_static (field);
+ 			if (special_static != SPECIAL_STATIC_NONE) {
+ 				guint32 size, align, offset;
+ 				size = mono_type_size (field->type, &align);
+Index: reflection.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/reflection.c,v
+retrieving revision 1.293
+diff -u -r1.293 reflection.c
+--- reflection.c	27 Feb 2004 02:34:45 -0000	1.293
++++ reflection.c	29 Feb 2004 23:21:29 -0000
+@@ -138,6 +138,7 @@
+ static void    ensure_runtime_vtable (MonoClass *klass);
+ static gpointer resolve_object (MonoImage *image, MonoObject *obj);
+ static void    encode_type (MonoDynamicImage *assembly, MonoType *type, char *p, char **endbuf);
++static MonoMethod* get_method_base (MonoMethod *method);
+ 
+ static void
+ alloc_table (MonoDynamicTable *table, guint nrows)
+@@ -5603,15 +5604,19 @@
+ }
+ 
+ static MonoObject*
+-create_custom_attr (MonoImage *image, MonoMethod *method, 
+-					const char *data, guint32 len)
++create_custom_attr (MonoCustomAttrEntry* entry)
+ {
++	MonoImage *image = entry->ctor->klass->image;
++	MonoMethod *method = entry->ctor;
++	const char *data = entry->data;
++	guint32 len = entry->data_size;
+ 	const char *p = data;
+ 	const char *named;
+ 	guint32 i, j, num_named;
+ 	MonoObject *attr;
+ 	void **params;
+ 
++
+ 	if (len < 2 || read16 (p) != 0x0001) /* Prolog */
+ 		return NULL;
+ 
+@@ -5682,53 +5687,29 @@
+ 	return attr;
+ }
+ 
+-MonoArray*
+-mono_custom_attrs_construct (MonoCustomAttrInfo *cinfo)
+-{
+-	MonoArray *result;
+-	MonoClass *klass;
+-	MonoObject *attr;
+-	int i;
+-
+-	klass = mono_class_from_name (mono_defaults.corlib, "System", "Attribute");
+-	result = mono_array_new (mono_domain_get (), klass, cinfo->num_attrs);
+-	for (i = 0; i < cinfo->num_attrs; ++i) {
+-		attr = create_custom_attr (cinfo->image, cinfo->attrs [i].ctor, cinfo->attrs [i].data, cinfo->attrs [i].data_size);
+-		mono_array_set (result, gpointer, i, attr);
+-	}
+-	return result;
+-}
+-
+-MonoCustomAttrInfo*
+-mono_custom_attrs_from_index (MonoImage *image, guint32 idx)
++static MonoCustomAttributeSearchResult
++mono_custom_attrs_from_index (MonoImage *image, guint32 idx, MonoCustomAttributeCollector collect, gpointer user_data)
+ {
+-	guint32 mtoken, i, len;
++	guint32 mtoken, i;
+ 	guint32 cols [MONO_CUSTOM_ATTR_SIZE];
+ 	MonoTableInfo *ca;
+-	MonoCustomAttrInfo *ainfo;
+-	GList *tmp, *list = NULL;
+-	const char *data;
++	MonoCustomAttributeSearchResult result = MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE;
++	g_assert (collect);
+ 
+ 	ca = &image->tables [MONO_TABLE_CUSTOMATTRIBUTE];
+ 
+ 	i = mono_metadata_custom_attrs_from_index (image, idx);
+ 	if (!i)
+-		return NULL;
++		return MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE;
+ 	i --;
+ 	while (i < ca->rows) {
++		MonoCustomAttrEntry entry = { 0, };
++		const char *data;
++		
+ 		if (mono_metadata_decode_row_col (ca, i, MONO_CUSTOM_ATTR_PARENT) != idx)
+ 			break;
+-		list = g_list_prepend (list, GUINT_TO_POINTER (i));
+-		++i;
+-	}
+-	len = g_list_length (list);
+-	if (!len)
+-		return NULL;
+-	ainfo = g_malloc0 (sizeof (MonoCustomAttrInfo) + sizeof (MonoCustomAttrEntry) * (len - MONO_ZERO_LEN_ARRAY));
+-	ainfo->num_attrs = len;
+-	ainfo->image = image;
+-	for (i = 0, tmp = list; i < len; ++i, tmp = tmp->next) {
+-		mono_metadata_decode_row (ca, GPOINTER_TO_UINT (tmp->data), cols, MONO_CUSTOM_ATTR_SIZE);
++		
++		mono_metadata_decode_row (ca, i, cols, MONO_CUSTOM_ATTR_SIZE);
+ 		mtoken = cols [MONO_CUSTOM_ATTR_TYPE] >> CUSTOM_ATTR_TYPE_BITS;
+ 		switch (cols [MONO_CUSTOM_ATTR_TYPE] & CUSTOM_ATTR_TYPE_MASK) {
+ 		case CUSTOM_ATTR_TYPE_METHODDEF:
+@@ -5741,118 +5722,202 @@
+ 			g_error ("Unknown table for custom attr type %08x", cols [MONO_CUSTOM_ATTR_TYPE]);
+ 			break;
+ 		}
+-		ainfo->attrs [i].ctor = mono_get_method (image, mtoken, NULL);
+-		if (!ainfo->attrs [i].ctor)
++		
++		entry.ctor = mono_get_method (image, mtoken, NULL);
++		if (!entry.ctor)
+ 			g_error ("Can't find custom attr constructor image: %s mtoken: 0x%08x", image->name, mtoken);
+ 		data = mono_metadata_blob_heap (image, cols [MONO_CUSTOM_ATTR_VALUE]);
+-		ainfo->attrs [i].data_size = mono_metadata_decode_value (data, &data);
+-		ainfo->attrs [i].data = data;
++		entry.data_size = mono_metadata_decode_value (data, &data);
++		entry.data = data;
++		
++		if ((result = collect (&entry, user_data)) == MONO_CUSTOM_ATTRIBUTE_FILTER_STOP)
++			return MONO_CUSTOM_ATTRIBUTE_FILTER_STOP;
++		
++		++i;
+ 	}
+-	g_list_free (list);
++	
++	return result;
++}
+ 
+-	return ainfo;
++static MonoCustomAttributeSearchResult
++mono_custom_attrs_search_attr_info (MonoCustomAttrInfo *cinfo, MonoCustomAttributeCollector collect, gpointer user_data)
++{
++	int i;
++	MonoCustomAttributeSearchResult result = MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE;
++	g_assert (collect);
++	
++	for (i = 0; i < cinfo->num_attrs; ++i) {
++		if ((result = collect (& cinfo->attrs [i], user_data)) == MONO_CUSTOM_ATTRIBUTE_FILTER_STOP)
++			return MONO_CUSTOM_ATTRIBUTE_FILTER_STOP;
++	}
++	
++	return result;
+ }
+ 
+-MonoCustomAttrInfo*
+-mono_custom_attrs_from_method (MonoMethod *method)
++static MonoMethod*
++get_method_base (MonoMethod *method)
++{
++	MonoMethod *result = NULL;
++	MonoClass *klass;
++
++	if (!(method->flags & METHOD_ATTRIBUTE_VIRTUAL) ||
++	     method->klass->flags & TYPE_ATTRIBUTE_INTERFACE ||
++	     method->flags & METHOD_ATTRIBUTE_NEW_SLOT)
++		return NULL;
++
++	if (method->klass == NULL || (klass = method->klass->parent) == NULL)
++		return NULL;
++
++	while (result == NULL && klass != NULL && (klass->vtable_size > method->slot))
++	{
++		result = klass->vtable [method->slot];
++		if (result == NULL) {
++			/* It is an abstract method */
++			int i;
++			for (i=0; i<klass->method.count; i++) {
++				if (klass->methods [i]->slot == method->slot) {
++					result = klass->methods [i];
++					break;
++				}
++			}
++		}
++		klass = klass->parent;
++	}
++
++	return result;
++}
++
++void
++mono_custom_attrs_from_method (MonoMethod *method, MonoCustomAttributeCollector collect, gpointer user_data, gboolean inherit)
+ {
+ 	MonoCustomAttrInfo *cinfo;
+ 	guint32 idx;
++	MonoCustomAttributeSearchResult result;
++
++parent:
++	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, method))) {
++		result = mono_custom_attrs_search_attr_info (cinfo, collect, user_data);
++	} else {
++		idx = find_method_index (method);
++		idx <<= CUSTOM_ATTR_BITS;
++		idx |= CUSTOM_ATTR_METHODDEF;
++		result = mono_custom_attrs_from_index (method->klass->image, idx, collect, user_data);
++	}
+ 	
+-	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, method)))
+-		return cinfo;
+-	idx = find_method_index (method);
+-	idx <<= CUSTOM_ATTR_BITS;
+-	idx |= CUSTOM_ATTR_METHODDEF;
+-	return mono_custom_attrs_from_index (method->klass->image, idx);
++	if (inherit && (result == MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE) && (method = get_method_base (method)))
++		goto parent;
++		
+ }
+ 
+-MonoCustomAttrInfo*
+-mono_custom_attrs_from_class (MonoClass *klass)
++void
++mono_custom_attrs_from_class (MonoClass *klass, MonoCustomAttributeCollector collect, gpointer user_data, gboolean inherit)
+ {
+ 	MonoCustomAttrInfo *cinfo;
+ 	guint32 idx;
++	MonoCustomAttributeSearchResult result;
++
++parent:
++	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, klass))) {
++		result = mono_custom_attrs_search_attr_info (cinfo, collect, user_data);
++	} else {
++		idx = mono_metadata_token_index (klass->type_token);
++		idx <<= CUSTOM_ATTR_BITS;
++		idx |= CUSTOM_ATTR_TYPEDEF;
++		result = mono_custom_attrs_from_index (klass->image, idx, collect, user_data);
++	}
+ 	
+-	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, klass)))
+-		return cinfo;
+-	idx = mono_metadata_token_index (klass->type_token);
+-	idx <<= CUSTOM_ATTR_BITS;
+-	idx |= CUSTOM_ATTR_TYPEDEF;
+-	return mono_custom_attrs_from_index (klass->image, idx);
++	if (inherit && (result == MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE) && (klass = klass->parent))
++		goto parent;
+ }
+ 
+-MonoCustomAttrInfo*
+-mono_custom_attrs_from_assembly (MonoAssembly *assembly)
++void
++mono_custom_attrs_from_assembly (MonoAssembly *assembly, MonoCustomAttributeCollector collect, gpointer user_data)
+ {
+ 	MonoCustomAttrInfo *cinfo;
+ 	guint32 idx;
+ 	
+-	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, assembly)))
+-		return cinfo;
++	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, assembly))) {
++		mono_custom_attrs_search_attr_info (cinfo, collect, user_data);
++		return;
++	}
++	
+ 	idx = 1; /* there is only one assembly */
+ 	idx <<= CUSTOM_ATTR_BITS;
+ 	idx |= CUSTOM_ATTR_ASSEMBLY;
+-	return mono_custom_attrs_from_index (assembly->image, idx);
++	mono_custom_attrs_from_index (assembly->image, idx, collect, user_data);
+ }
+ 
+-static MonoCustomAttrInfo*
+-mono_custom_attrs_from_module (MonoImage *image)
++void
++mono_custom_attrs_from_module (MonoImage *image, MonoCustomAttributeCollector collect, gpointer user_data)
+ {
+ 	MonoCustomAttrInfo *cinfo;
+ 	guint32 idx;
+ 	
+-	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, image)))
+-		return cinfo;
++	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, image))) {
++		mono_custom_attrs_search_attr_info (cinfo, collect, user_data);
++		return;
++	}
++	
+ 	idx = 1; /* there is only one module */
+ 	idx <<= CUSTOM_ATTR_BITS;
+ 	idx |= CUSTOM_ATTR_MODULE;
+-	return mono_custom_attrs_from_index (image, idx);
++	mono_custom_attrs_from_index (image, idx, collect, user_data);
+ }
+ 
+-MonoCustomAttrInfo*
+-mono_custom_attrs_from_property (MonoClass *klass, MonoProperty *property)
++void
++mono_custom_attrs_from_property (MonoClass *klass, MonoProperty *property, MonoCustomAttributeCollector collect, gpointer user_data)
+ {
+ 	MonoCustomAttrInfo *cinfo;
+ 	guint32 idx;
+ 	
+-	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, property)))
+-		return cinfo;
++	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, property))) {
++		mono_custom_attrs_search_attr_info (cinfo, collect, user_data);
++		return;
++	}
++	
+ 	idx = find_property_index (klass, property);
+ 	idx <<= CUSTOM_ATTR_BITS;
+ 	idx |= CUSTOM_ATTR_PROPERTY;
+-	return mono_custom_attrs_from_index (klass->image, idx);
++	mono_custom_attrs_from_index (klass->image, idx, collect, user_data);
+ }
+ 
+-MonoCustomAttrInfo*
+-mono_custom_attrs_from_event (MonoClass *klass, MonoEvent *event)
++void
++mono_custom_attrs_from_event (MonoClass *klass, MonoEvent *event, MonoCustomAttributeCollector collect, gpointer user_data)
+ {
+ 	MonoCustomAttrInfo *cinfo;
+ 	guint32 idx;
+ 	
+-	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, event)))
+-		return cinfo;
++	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, event))) {
++		mono_custom_attrs_search_attr_info (cinfo, collect, user_data);
++		return;
++	}
++	
+ 	idx = find_event_index (klass, event);
+ 	idx <<= CUSTOM_ATTR_BITS;
+ 	idx |= CUSTOM_ATTR_EVENT;
+-	return mono_custom_attrs_from_index (klass->image, idx);
++	mono_custom_attrs_from_index (klass->image, idx, collect, user_data);
+ }
+ 
+-MonoCustomAttrInfo*
+-mono_custom_attrs_from_field (MonoClass *klass, MonoClassField *field)
++void
++mono_custom_attrs_from_field (MonoClassField *field, MonoCustomAttributeCollector collect, gpointer user_data)
+ {
++	MonoClass *klass = field->parent;
+ 	MonoCustomAttrInfo *cinfo;
+ 	guint32 idx;
+ 	
+-	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, field)))
+-		return cinfo;
++	if (dynamic_custom_attrs && (cinfo = g_hash_table_lookup (dynamic_custom_attrs, field))) {
++		mono_custom_attrs_search_attr_info (cinfo, collect, user_data);
++		return;
++	}
++	
+ 	idx = find_field_index (klass, field);
+ 	idx <<= CUSTOM_ATTR_BITS;
+ 	idx |= CUSTOM_ATTR_FIELDDEF;
+-	return mono_custom_attrs_from_index (klass->image, idx);
++	mono_custom_attrs_from_index (klass->image, idx, collect, user_data);
+ }
+ 
+-MonoCustomAttrInfo*
+-mono_custom_attrs_from_param (MonoMethod *method, guint32 param)
++void
++mono_custom_attrs_from_param (MonoMethod *method, guint32 param, MonoCustomAttributeCollector collect, gpointer user_data)
+ {
+ 	MonoTableInfo *ca;
+ 	guint32 i, idx, method_index;
+@@ -5863,8 +5928,10 @@
+ 	if (method->klass->image->dynamic) {
+ 		aux = mono_g_hash_table_lookup (((MonoDynamicImage*)method->klass->image)->method_aux_hash, method);
+ 		if (!aux || !aux->param_cattr)
+-			return NULL;
+-		return aux->param_cattr [param];
++			return;
++		
++		mono_custom_attrs_search_attr_info (aux->param_cattr [param], collect, user_data);
++		return;
+ 	}
+ 
+ 	image = method->klass->image;
+@@ -5874,7 +5941,7 @@
+ 	if (method->klass->generic_inst || method->klass->gen_params ||
+ 	    method->signature->generic_param_count) {
+ 		// FIXME FIXME FIXME
+-		return NULL;
++		return;
+ 	}
+ 
+ 	param_list = mono_metadata_decode_row_col (ca, method_index - 1, MONO_METHOD_PARAMLIST);
+@@ -5894,76 +5961,186 @@
+ 		}
+ 	}
+ 	if (!found)
+-		return NULL;
++		return;
+ 	idx = i;
+ 	idx <<= CUSTOM_ATTR_BITS;
+ 	idx |= CUSTOM_ATTR_PARAMDEF;
+-	return mono_custom_attrs_from_index (image, idx);
++	mono_custom_attrs_from_index (method->klass->image, idx, collect, user_data);
+ }
+ 
+-/*
+- * mono_reflection_get_custom_attrs:
+- * @obj: a reflection object handle
+- *
+- * Return an array with all the custom attributes defined of the
+- * reflection handle @obj. The objects are fully build.
+- */
+-MonoArray*
+-mono_reflection_get_custom_attrs (MonoObject *obj)
++static void
++get_custom_attribute_info_for_object (MonoObject *obj, MonoCustomAttributeCollector collect, gpointer user_data, gboolean inherit)
+ {
+-	MonoClass *klass;
+-	MonoArray *result;
+-	MonoCustomAttrInfo *cinfo = NULL;
+-	
+-	MONO_ARCH_SAVE_REGS;
+-
+-	klass = obj->vtable->klass;
++	MonoClass *klass = obj->vtable->klass;
+ 	/* FIXME: need to handle: Module */
++parent_typebuilder:
+ 	if (klass == mono_defaults.monotype_class) {
+-		MonoReflectionType *rtype = (MonoReflectionType*)obj;
++		MonoReflectionType *rtype = (MonoReflectionType*) obj;
+ 		klass = mono_class_from_mono_type (rtype->type);
+-		cinfo = mono_custom_attrs_from_class (klass);
++		mono_custom_attrs_from_class (klass, collect, user_data, inherit);
+ 	} else if (strcmp ("Assembly", klass->name) == 0) {
+ 		MonoReflectionAssembly *rassembly = (MonoReflectionAssembly*)obj;
+-		cinfo = mono_custom_attrs_from_assembly (rassembly->assembly);
++		mono_custom_attrs_from_assembly (rassembly->assembly, collect, user_data);
+ 	} else if (strcmp ("Module", klass->name) == 0) {
+ 		MonoReflectionModule *module = (MonoReflectionModule*)obj;
+-		cinfo = mono_custom_attrs_from_module (module->image);
++		mono_custom_attrs_from_module (module->image, collect, user_data);
+ 	} else if (strcmp ("MonoProperty", klass->name) == 0) {
+ 		MonoReflectionProperty *rprop = (MonoReflectionProperty*)obj;
+-		cinfo = mono_custom_attrs_from_property (rprop->klass, rprop->property);
++		mono_custom_attrs_from_property (rprop->klass, rprop->property, collect, user_data);
+ 	} else if (strcmp ("MonoEvent", klass->name) == 0) {
+ 		MonoReflectionEvent *revent = (MonoReflectionEvent*)obj;
+-		cinfo = mono_custom_attrs_from_event (revent->klass, revent->event);
++		mono_custom_attrs_from_event (revent->klass, revent->event, collect, user_data);
+ 	} else if (strcmp ("MonoField", klass->name) == 0) {
+ 		MonoReflectionField *rfield = (MonoReflectionField*)obj;
+-		cinfo = mono_custom_attrs_from_field (rfield->klass, rfield->field);
++		mono_custom_attrs_from_field (rfield->field, collect, user_data);
+ 	} else if ((strcmp ("MonoMethod", klass->name) == 0) || (strcmp ("MonoCMethod", klass->name) == 0)) {
+ 		MonoReflectionMethod *rmethod = (MonoReflectionMethod*)obj;
+-		cinfo = mono_custom_attrs_from_method (rmethod->method);
++		mono_custom_attrs_from_method (rmethod->method, collect, user_data, inherit);
+ 	} else if (strcmp ("ParameterInfo", klass->name) == 0) {
+ 		MonoReflectionParameter *param = (MonoReflectionParameter*)obj;
+ 		MonoReflectionMethod *rmethod = (MonoReflectionMethod*)param->MemberImpl;
+-		cinfo = mono_custom_attrs_from_param (rmethod->method, param->PositionImpl + 1);
++		mono_custom_attrs_from_param (rmethod->method, param->PositionImpl + 1, collect, user_data);
+ 	} else if (strcmp ("AssemblyBuilder", klass->name) == 0) {
+ 		MonoReflectionAssemblyBuilder *assemblyb = (MonoReflectionAssemblyBuilder*)obj;
+-		cinfo = mono_custom_attrs_from_builders (assemblyb->assembly.assembly->image, assemblyb->cattrs);
++		MonoCustomAttrInfo* cinfo = mono_custom_attrs_from_builders (assemblyb->assembly.assembly->image, assemblyb->cattrs);
++		mono_custom_attrs_search_attr_info (cinfo, collect, user_data);
++		mono_custom_attrs_free (cinfo);
+ 	} else if (strcmp ("TypeBuilder", klass->name) == 0) {
+ 		MonoReflectionTypeBuilder *tb = (MonoReflectionTypeBuilder*)obj;
+-		cinfo = mono_custom_attrs_from_builders (&tb->module->dynamic_image->image, tb->cattrs);
++		MonoCustomAttributeSearchResult result;
++		MonoCustomAttrInfo* cinfo = mono_custom_attrs_from_builders (&tb->module->dynamic_image->image, tb->cattrs);
++		MonoClass *klass = mono_class_from_mono_type (tb->type.type);
++		
++		result = mono_custom_attrs_search_attr_info (cinfo, collect, user_data);
++		mono_custom_attrs_free (cinfo);
++	
++		if (inherit && (result == MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE) && klass->parent) {
++			obj = (MonoObject *) mono_type_get_object (mono_object_domain (obj), &klass->parent->byval_arg);
++			goto parent_typebuilder;
++		}
+ 	} else { /* handle other types here... */
+ 		g_error ("get custom attrs not yet supported for %s", klass->name);
+ 	}
++}
+ 
+-	if (cinfo) {
+-		result = mono_custom_attrs_construct (cinfo);
+-	} else {
+-		klass = mono_class_from_name (mono_defaults.corlib, "System", "Attribute");
+-		result = mono_array_new (mono_domain_get (), klass, 0);
++typedef struct {
++	GSList* found;
++	MonoClass* klass;
++} GetCustomAttrsCollectorData;
++
++static MonoCustomAttributeSearchResult
++get_custom_attrs_collector (MonoCustomAttrEntry* entry, GetCustomAttrsCollectorData* data)
++{
++	if (data->klass && ! mono_class_is_assignable_from (data->klass, entry->ctor->klass ))
++		return MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE;
++	
++	MonoCustomAttrEntry* new_entry = g_new0 (MonoCustomAttrEntry, 1);
++	*new_entry = *entry;
++	
++	data->found = g_slist_prepend (data->found, new_entry);
++	return MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE;
++}
++
++MonoArray*
++mono_reflection_get_custom_attrs_for_type (MonoObject *obj, MonoReflectionType *type, MonoBoolean inherit)
++{
++	GSList* l;
++	GSList* list;
++	MonoClass* klass;
++	GetCustomAttrsCollectorData data = { 0, };
++	int len;
++	MONO_ARCH_SAVE_REGS;
++	klass = data.klass = mono_class_from_mono_type (type->type);
++
++	get_custom_attribute_info_for_object (obj, (MonoCustomAttributeCollector) get_custom_attrs_collector, & data, inherit);
++	
++	l = list = data.found;
++	len = g_slist_length (l);
++	
++	MonoArray *ret = mono_array_new (mono_domain_get (), klass, len);
++	
++	for (len = len - 1; l; l = l->next, len--) {
++		mono_array_set (ret, gpointer, len, create_custom_attr ((MonoCustomAttrEntry*) l->data));
++		g_free (l->data);
+ 	}
++	
++	g_slist_free (list);
++	return ret;
++}
+ 
+-	return result;
++typedef struct {
++	MonoClass* klass;
++	gboolean found;
++} IsCustomAttrDefinedCollectorData;
++
++static MonoCustomAttributeSearchResult
++is_custom_attr_defined_collector (MonoCustomAttrEntry *entry, IsCustomAttrDefinedCollectorData *data)
++{
++	if (entry->ctor->klass != data->klass)
++		return MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE;
++	
++	data->found = TRUE;
++	return MONO_CUSTOM_ATTRIBUTE_FILTER_STOP;
++}
++
++MonoBoolean
++mono_reflection_is_custom_attr_defined (MonoObject *obj, MonoReflectionType *type, MonoBoolean inherit)
++{
++	IsCustomAttrDefinedCollectorData data;
++	
++	MONO_ARCH_SAVE_REGS;
++	
++	data.klass = mono_class_from_mono_type (type->type);
++	data.found = FALSE;
++	
++	get_custom_attribute_info_for_object (obj, (MonoCustomAttributeCollector) is_custom_attr_defined_collector, & data, inherit);
++	return data.found;
+ }
++
++typedef struct {
++	MonoClass* klass;
++	gboolean found, dup;
++	MonoCustomAttrEntry result;
++} GetSignleAttributeData;
++
++static MonoCustomAttributeSearchResult
++get_single_attribute_data_collector (MonoCustomAttrEntry *entry, GetSignleAttributeData *data)
++{
++	g_assert (! data->dup);
++
++	if (data->klass && ! mono_class_is_assignable_from (data->klass, entry->ctor->klass))
++		return MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE;
++	
++	if (data->found) {
++		data->dup    = TRUE;
++		data->found  = FALSE;
++		return MONO_CUSTOM_ATTRIBUTE_FILTER_STOP;
++	}
++	
++	data->result = *entry;
++	data->found  = TRUE;
++	
++	/* we need to check for dups at *this* level, but not any further down. */
++	return MONO_CUSTOM_ATTRIBUTE_FILTER_STOP_AFTER_INHERIT_LEVEL;
++}
++
++MonoObject*
++mono_reflection_get_single_attribute (MonoObject *obj, MonoReflectionType *type, MonoBoolean inherit, MonoBoolean* is_dup)
++{
++	GetSignleAttributeData data = { 0, };
++	
++	MONO_ARCH_SAVE_REGS;
++	
++	data.klass = mono_class_from_mono_type (type->type);
++	
++	get_custom_attribute_info_for_object (obj, (MonoCustomAttributeCollector) get_single_attribute_data_collector, & data, inherit);
++	
++	*is_dup = data.dup;
++	if (! data.found)
++		return NULL;
++	return create_custom_attr (& data.result);
++}
++
+ 
+ static MonoMethodSignature*
+ parameters_to_signature (MonoArray *parameters) {
+Index: reflection.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/reflection.h,v
+retrieving revision 1.123
+diff -u -r1.123 reflection.h
+--- reflection.h	27 Feb 2004 02:34:45 -0000	1.123
++++ reflection.h	29 Feb 2004 23:21:29 -0000
+@@ -577,18 +577,38 @@
+ MonoArray* mono_param_get_objects  (MonoDomain *domain, MonoMethod *method);
+ 
+ MonoArray*  mono_reflection_get_custom_attrs (MonoObject *obj);
++MonoBoolean mono_reflection_is_custom_attr_defined (MonoObject *obj, MonoReflectionType* type, MonoBoolean inherit);
++MonoArray*  mono_reflection_get_custom_attrs_for_type (MonoObject *obj, MonoReflectionType *type, MonoBoolean inherit);
++MonoObject* mono_reflection_get_single_attribute (MonoObject *obj, MonoReflectionType *type, MonoBoolean inherit, MonoBoolean* is_dup);
+ MonoArray*  mono_reflection_get_custom_attrs_blob (MonoObject *ctor, MonoArray *ctorArgs, MonoArray *properties, MonoArray *porpValues, MonoArray *fields, MonoArray* fieldValues);
+ 
+-MonoArray*  mono_custom_attrs_construct (MonoCustomAttrInfo *cinfo);
+-MonoCustomAttrInfo* mono_custom_attrs_from_index    (MonoImage *image, guint32 idx);
+-MonoCustomAttrInfo* mono_custom_attrs_from_method   (MonoMethod *method);
+-MonoCustomAttrInfo* mono_custom_attrs_from_class    (MonoClass *klass);
+-MonoCustomAttrInfo* mono_custom_attrs_from_assembly (MonoAssembly *assembly);
+-MonoCustomAttrInfo* mono_custom_attrs_from_property (MonoClass *klass, MonoProperty *property);
+-MonoCustomAttrInfo* mono_custom_attrs_from_event    (MonoClass *klass, MonoEvent *event);
+-MonoCustomAttrInfo* mono_custom_attrs_from_field    (MonoClass *klass, MonoClassField *field);
+-MonoCustomAttrInfo* mono_custom_attrs_from_param    (MonoMethod *method, guint32 param);
+-void                mono_custom_attrs_free          (MonoCustomAttrInfo *ainfo);
++typedef enum {
++	/* Get more attributes */
++	MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE,
++	/* dont go on */
++	MONO_CUSTOM_ATTRIBUTE_FILTER_STOP,
++	/* Stop once we are about to go to the parent. */
++	MONO_CUSTOM_ATTRIBUTE_FILTER_STOP_AFTER_INHERIT_LEVEL
++	
++} MonoCustomAttributeSearchResult;
++
++/*
++ * Used by mono_custom_attrs_from_index so that you can collect the attributes you want.
++ * return MONO_CUSTOM_ATTRIBUTE_FILTER_CONTINUE to continue the search, or 
++ * MONO_CUSTOM_ATTRIBUTE_FILTER_STOP to stop searching.
++ */
++typedef MonoCustomAttributeSearchResult (*MonoCustomAttributeCollector) (MonoCustomAttrEntry* entry, gpointer user_data);
++
++void    mono_custom_attrs_from_assembly (MonoAssembly *assembly, MonoCustomAttributeCollector collect, gpointer user_data);
++void    mono_custom_attrs_from_class (MonoClass *klass, MonoCustomAttributeCollector collect, gpointer user_data, gboolean inherit);
++void    mono_custom_attrs_from_event (MonoClass *klass, MonoEvent *event, MonoCustomAttributeCollector collect, gpointer user_data);
++void    mono_custom_attrs_from_field (MonoClassField *field, MonoCustomAttributeCollector collect, gpointer user_data);
++void    mono_custom_attrs_from_method (MonoMethod *method, MonoCustomAttributeCollector collect, gpointer user_data, gboolean inherit);
++void    mono_custom_attrs_from_module (MonoImage *image, MonoCustomAttributeCollector collect, gpointer user_data);
++void    mono_custom_attrs_from_param (MonoMethod *method, guint32 param, MonoCustomAttributeCollector collect, gpointer user_data);
++void    mono_custom_attrs_from_property (MonoClass *klass, MonoProperty *property, MonoCustomAttributeCollector collect, gpointer user_data);
++void    mono_custom_attrs_free (MonoCustomAttrInfo *ainfo);
++
+ 
+ void        mono_reflection_setup_internal_class  (MonoReflectionTypeBuilder *tb);
+ 

@@ -1,0 +1,102 @@
+Index: mini-exceptions.c
+===================================================================
+--- mini-exceptions.c	(revision 43886)
++++ mini-exceptions.c	(working copy)
+@@ -447,9 +447,26 @@
+ 
+ typedef struct {
+ 	guint32 skips;
+-	GList *stack;
++	MonoArray *stack;
++	guint32 count;
++	guint32 maximum;
+ } MonoSecurityStack;
+ 
++static void
++grow_array (MonoSecurityStack *stack)
++{
++	MonoDomain *domain = mono_domain_get ();
++	guint32 newsize = (stack->maximum << 1);
++	MonoArray *newstack = mono_array_new (domain, mono_defaults.runtimesecurityframe_class, newsize);
++	int i;
++	for (i=0; i < stack->maximum; i++) {
++		gpointer frame = mono_array_get (stack->stack, gpointer, i);
++		mono_array_set (newstack, gpointer, i, frame);
++	}
++	stack->maximum = newsize;
++	stack->stack = newstack;
++}
++
+ static gboolean
+ callback_get_stack_frames_security_info (MonoDomain *domain, MonoContext *ctx, MonoJitInfo *ji, gpointer data)
+ {
+@@ -469,7 +486,10 @@
+ 		return FALSE;
+ 	}
+ 
+-	ss->stack = g_list_prepend (ss->stack, mono_declsec_create_frame (domain, ji));
++	if (ss->count == ss->maximum)
++		grow_array (ss);
++	
++	mono_array_set (ss->stack, gpointer, ss->count++, mono_declsec_create_frame (domain, ji));
+ 
+ 	/* continue down the stack */
+ 	return FALSE;
+@@ -510,7 +530,6 @@
+ 	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+ 	MonoSecurityStack ss;
+ 	MonoContext ctx;
+-	MonoArray *stack;
+ 
+ #ifdef _MSC_VER
+ 	/* seems that MSC doesn't like having __asm in macros */
+@@ -524,14 +543,12 @@
+ #endif
+ 
+ 	ss.skips = skip;
+-	ss.stack = NULL;
++	ss.count = 0;
++	ss.maximum = MONO_CAS_INITIAL_STACK_SIZE;
++	ss.stack = mono_array_new (domain, mono_defaults.runtimesecurityframe_class, ss.maximum);
+ 	mono_walk_stack (domain, jit_tls, &ctx, callback_get_stack_frames_security_info, (gpointer)&ss);
+-
+-	stack = glist_to_array (ss.stack, mono_defaults.runtimesecurityframe_class);
+-	if (ss.stack)
+-		g_list_free (ss.stack);
+-
+-	return stack;
++	/* g_warning ("STACK RESULT: %d out of %d", ss.count, ss.maximum); */
++	return ss.stack;
+ }
+ 
+ #ifndef CUSTOM_EXCEPTION_HANDLING
+Index: declsec.c
+===================================================================
+--- declsec.c	(revision 43886)
++++ declsec.c	(working copy)
+@@ -71,6 +71,7 @@
+ 	}
+ 
+ 	frame->method = mono_method_get_object (domain, jinfo->method, NULL);
++	frame->domain = domain->domain;
+ 
+ 	/* stack modifiers on methods have priority on (i.e. replaces) modifiers on class */
+ 
+Index: declsec.h
+===================================================================
+--- declsec.h	(revision 43886)
++++ declsec.h	(working copy)
+@@ -27,10 +27,13 @@
+ #define MONO_SECMAN_FLAG_GET_VALUE(x)		(x & 0x1)
+ #define MONO_SECMAN_FLAG_SET_VALUE(x,y)		do { x = ((y) ? 0x3 : 0x2); } while (0)
+ 
++#define	MONO_CAS_INITIAL_STACK_SIZE		6
+ 
++
+ /* keep in synch with RuntimeSecurityFrame in /mcs/class/corlib/System.Security/SecurityFrame.cs */
+ typedef struct {
+ 	MonoObject obj;
++	MonoAppDomain *domain;
+ 	MonoReflectionMethod *method;
+ 	MonoDeclSecurityEntry assert;
+ 	MonoDeclSecurityEntry deny;

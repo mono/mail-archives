@@ -1,0 +1,253 @@
+Index: System.Web/ChangeLog
+===================================================================
+--- System.Web/ChangeLog	(revision 87567)
++++ System.Web/ChangeLog	(working copy)
+@@ -1,3 +1,13 @@
++2007-10-17  Juraj Skripsky  <js@hotfeet.ch>
++
++	* StaticSiteMapProvider.cs: Don't allocate hashtables on-demand, there
++	will never be many Provider instances around.
++	AddNode(): Check for duplicate keys before adding any item to hashtables.
++	RemoveNode(): Use fact that Hashtable.Remove() never throws, remove item from
++	keyToNode as well, make symmetric to AddNode().
++	MapUrl(): Use VirtualPathUtility, allow for full urls
++	(e.g. http://www.google.com). 
++
+ 2007-10-15  Marek Habersack  <mhabersack@novell.com>
+ 
+ 	* HttpApplication.cs: do not return a non-existing bin directory
+Index: System.Web/StaticSiteMapProvider.cs
+===================================================================
+--- System.Web/StaticSiteMapProvider.cs	(revision 87567)
++++ System.Web/StaticSiteMapProvider.cs	(working copy)
+@@ -4,9 +4,11 @@
+ // Authors:
+ //	Lluis Sanchez Gual (lluis@novell.com)
+ //	Ben Maurer (bmaurer@users.sourceforge.net)
++// Juraj Skripsky (js@hotfeet.ch)
+ //
+ // (C) 2003 Ben Maurer
+ // (C) 2005 Novell, Inc (http://www.novell.com)
++// (C) 2007 HotFeet GmbH (http://www.hotfeet.ch)
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining
+ // a copy of this software and associated documentation files (the
+@@ -41,21 +43,23 @@
+ {
+ 	public abstract class StaticSiteMapProvider : SiteMapProvider
+ 	{
+-		Hashtable nodeToParent;
+-		Hashtable nodeToChildren;
+-		Hashtable urlToNode;
+-		Hashtable keyToNode;
+-		
++		Hashtable keyToNode = new Hashtable ();
++		Hashtable nodeToParent = new Hashtable ();
++		Hashtable nodeToChildren = new Hashtable ();
++		Hashtable urlToNode = new Hashtable (StringComparer.InvariantCultureIgnoreCase);
++
+ 		internal protected override void AddNode (SiteMapNode node, SiteMapNode parentNode)
+ 		{
+ 			if (node == null)
+ 				throw new ArgumentNullException ("node");
+-			
++
+ 			lock (this_lock) {
+-				string url = node.Url;
+-				if (url != null && url.Length > 0) {
+-					url = MapUrl (url);
++				if (FindSiteMapNodeFromKey (node.Key) != null)
++					throw new InvalidOperationException (string.Format ("A node with key '{0}' already exists.",node.Key));
+ 
++				if (!String.IsNullOrEmpty (node.Url)) {
++					string url = MapUrl (node.Url);
++					
+ 					if (FindSiteMapNode (url) != null)
+ 						throw new InvalidOperationException (String.Format (
+ 							"Multiple nodes with the same URL '{0}' were found. " + 
+@@ -63,12 +67,9 @@
+ 							node.Url
+ 						));
+ 				
+-					UrlToNode [url] = node;
++					urlToNode [url] = node;
+ 				}
+-				
+-				if (FindSiteMapNodeFromKey (node.Key) != null)
+-					throw new InvalidOperationException (string.Format ("A node with key {0} already exists.",node.Key));
+-				KeyToNode [node.Key] = node;
++				keyToNode [node.Key] = node;
+ 
+ 				if (node == RootNode)
+ 					return;
+@@ -76,66 +77,23 @@
+ 				if (parentNode == null)
+ 					parentNode = RootNode;
+ 
+-				NodeToParent [node] = parentNode;
+-				if (NodeToChildren [parentNode] == null)
+-					NodeToChildren [parentNode] = new SiteMapNodeCollection ();
+-					
+-				((SiteMapNodeCollection) NodeToChildren [parentNode]).Add (node);
++				nodeToParent [node] = parentNode;
++
++				SiteMapNodeCollection children = (SiteMapNodeCollection)nodeToChildren [parentNode]; 
++				if (children == null)
++					nodeToChildren [parentNode] = children = new SiteMapNodeCollection ();
++
++				children.Add (node);
+ 			}
+ 		}
+ 		
+-		Hashtable NodeToParent {
+-			get {
+-				lock (this_lock) {
+-					if (nodeToParent == null)
+-						nodeToParent = new Hashtable ();
+-				}
+-				return nodeToParent;
+-			}
+-		}
+-		
+-		Hashtable NodeToChildren {
+-			get {
+-				lock (this_lock) {
+-					if (nodeToChildren == null)
+-						nodeToChildren = new Hashtable ();
+-				}
+-				return nodeToChildren;
+-			}
+-		}
+-		
+-		Hashtable UrlToNode {
+-			get {
+-				lock (this_lock) {
+-					if (urlToNode == null) {
+-						urlToNode = new Hashtable (StringComparer.InvariantCultureIgnoreCase);
+-					}
+-				}
+-				return urlToNode;
+-			}
+-		}
+-		
+-		Hashtable KeyToNode {
+-			get {
+-				lock (this_lock) {
+-					if (keyToNode == null)
+-						keyToNode = new Hashtable ();
+-				}
+-				return keyToNode;
+-			}
+-		}
+-		
+ 		protected virtual void Clear ()
+ 		{
+ 			lock (this_lock) {
+-				if (urlToNode != null)
+-					urlToNode.Clear ();
+-				if (nodeToChildren != null)
+-					nodeToChildren.Clear ();
+-				if (nodeToParent != null)
+-					nodeToParent.Clear ();
+-				if (keyToNode != null)
+-					keyToNode.Clear ();
++				urlToNode.Clear ();
++				nodeToChildren.Clear ();
++				nodeToParent.Clear ();
++				keyToNode.Clear ();
+ 			}
+ 		}
+ 
+@@ -147,7 +105,7 @@
+ 			if (rawUrl.Length > 0) {
+ 				this.BuildSiteMap();
+ 				rawUrl = MapUrl (rawUrl);
+-				SiteMapNode node = (SiteMapNode) UrlToNode [rawUrl];
++				SiteMapNode node = (SiteMapNode) urlToNode [rawUrl];
+ 				if (node != null && IsAccessibleToUser (HttpContext.Current, node))
+ 					return node;
+ 			}
+@@ -160,7 +118,7 @@
+ 				throw new ArgumentNullException ("node");
+ 			
+ 			this.BuildSiteMap();
+-			SiteMapNodeCollection col = (SiteMapNodeCollection) NodeToChildren [node];
++			SiteMapNodeCollection col = (SiteMapNodeCollection) nodeToChildren [node];
+ 			if (col == null) return SiteMapNodeCollection.EmptyCollection;
+ 			
+ 			SiteMapNodeCollection ret = null;
+@@ -181,7 +139,6 @@
+ 				return SiteMapNodeCollection.ReadOnly (ret);
+ 			else
+ 				return SiteMapNodeCollection.EmptyCollection;
+-			
+ 		}
+ 		
+ 		public override SiteMapNode GetParentNode (SiteMapNode node)
+@@ -189,7 +146,7 @@
+ 			if (node == null)
+ 				throw new ArgumentNullException ("node");
+ 			this.BuildSiteMap();
+-			SiteMapNode parent = (SiteMapNode) NodeToParent [node];
++			SiteMapNode parent = (SiteMapNode) nodeToParent [node];
+ 			return parent != null && IsAccessibleToUser (HttpContext.Current, parent) ? parent : null;
+ 		}
+ 		
+@@ -199,18 +156,17 @@
+ 				throw new ArgumentNullException("node");
+ 			
+ 			lock (this_lock) {
+-				SiteMapNode parent = (SiteMapNode) NodeToParent [node];
+-				if (NodeToParent.Contains (node))
+-					NodeToParent.Remove (node);
+-				
+-				if (node.Url != null && node.Url.Length > 0 && UrlToNode.Contains (node.Url))
+-					UrlToNode.Remove (node.Url);
+-				
+-				if (parent != null) {
+-					SiteMapNodeCollection siblings = (SiteMapNodeCollection) NodeToChildren [parent];
+-					if (siblings != null && siblings.Contains (node))
+-						siblings.Remove (node);
+-				}
++				keyToNode.Remove (node.Key);
++				if (!String.IsNullOrEmpty (node.Url))
++					urlToNode.Remove (MapUrl (node.Url));
++
++				if (node == RootNode)
++					return;
++
++				SiteMapNode parent = (SiteMapNode) nodeToParent [node];
++				nodeToParent.Remove (node);
++				SiteMapNodeCollection children = (SiteMapNodeCollection) nodeToChildren [parent];
++				children.Remove (node);
+ 			}
+ 		}
+ 		
+@@ -219,7 +175,7 @@
+ 			if (key == null)
+ 				throw new ArgumentNullException ("key");
+ 			
+-			SiteMapNode ret = (SiteMapNode) KeyToNode [key];
++			SiteMapNode ret = (SiteMapNode) keyToNode [key];
+ 			return ret != null && IsAccessibleToUser (HttpContext.Current, ret) ? ret : null;
+ 		}
+ 
+@@ -227,15 +183,11 @@
+ 
+ 		string MapUrl (string url)
+ 		{
+-			if (HttpContext.Current == null)
+-				return url;
+-
+-			if (UrlUtils.IsRelativeUrl (url))
+-				return UrlUtils.Combine (HttpRuntime.AppDomainAppVirtualPath, url);
++			if (VirtualPathUtility.IsAppRelative (url))
++				return VirtualPathUtility.ToAbsolute (url);
+ 			else
+-				return UrlUtils.ResolveVirtualPathFromAppAbsolute (url);
++				return url;
+ 		}
+-
+ 	}
+ }
+ #endif

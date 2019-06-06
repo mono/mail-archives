@@ -1,0 +1,274 @@
+? AssemblyInfo.cs
+? AssemblyInfoModMono.cs
+? Makefile
+? XSPApplicationHost.cs.working
+? a.diff
+? vhosts.patch
+Index: XSPApplicationHost.cs
+===================================================================
+RCS file: /mono/xsp/server/XSPApplicationHost.cs,v
+retrieving revision 1.23
+diff -u -r1.23 XSPApplicationHost.cs
+--- XSPApplicationHost.cs	26 Nov 2003 12:13:30 -0000	1.23
++++ XSPApplicationHost.cs	6 Feb 2004 00:01:04 -0000
+@@ -89,7 +89,9 @@
+ 				InitialWorkerRequest ir = new InitialWorkerRequest (ns);
+ 				ir.ReadRequestData ();
+ 				rdata = ir.RequestData;
+-				host = server.GetApplicationForPath (rdata.Path, true);
++				string vhost = null; // TODO - how to get the host
++				int port = 80; // TODO - how to get the port?
++				host = server.GetApplicationForPath (vhost, port, rdata.Path, true);
+ 				if (host == null) {
+ 					byte [] nf = HttpErrors.NotFound (rdata.Path);
+ 					ns.Write (nf, 0, nf.Length);
+@@ -97,7 +99,9 @@
+ 				}
+ #else
+ 				RequestReader rr = new RequestReader (ns);
+-				host = server.GetApplicationForPath (rr.GetUriPath (), false);
++				string vhost = rr.Request.GetRequestHeader("Host");
++				int port = 80; // TODO - how to get the port?
++				host = server.GetApplicationForPath (vhost, port, rr.GetUriPath (), false);
+ 				if (host == null) {
+ 					rr.Decline ();
+ 					return;
+@@ -173,6 +177,38 @@
+ 		}
+ 	}
+ 
++	public class VPathToHost
++	{
++		public readonly int appId;
++		public readonly string vhost;
++		public readonly int vport;
++		public readonly string vpath;
++		public readonly string realPath;
++
++		public IApplicationHost appHost;
++
++		public VPathToHost(int appId, string vhost, int vport, string vpath, string realPath)
++		{
++			this.appId = appId;
++			this.vhost = vhost;
++			this.vport = vport;
++			this.vpath = vpath;
++			this.realPath = realPath;
++			this.appHost = null;
++		}
++
++		public void ClearHost()
++		{
++			this.appHost = null;
++		}
++
++		public void CreateHost()
++		{
++			Console.WriteLine("Creating apphost for #{0} in {1}", appId, realPath);
++			this.appHost = ApplicationHost.CreateApplicationHost(typeof (XSPApplicationHost), vpath, realPath) as IApplicationHost;
++		}
++	}
++
+ 	public class XSPApplicationServer
+ 	{
+ 		Socket listen_socket;
+@@ -182,8 +218,10 @@
+ 		IPEndPoint bindAddress;
+ #endif
+ 		Thread runner;
+- 		Hashtable appToDir;
+- 		Hashtable dirToHost;
++
++		// a sorted list of mappings. This is much faster than hashtable for typical cases.
++		VPathToHost[] vpathToHost;
++		
+  		object marker = new object ();
+ 
+ #if MODMONO_SERVER
+@@ -230,31 +268,67 @@
+ 		}
+ #endif
+ 
++		void AddApplication(string host, int port, string virtualPath, string fullPath)
++		{
++ 			Console.WriteLine ("http://{0}:{1}{2} -> {3}", host, port, virtualPath, fullPath);
++		}
++
+  		public void SetApplications (string applications)
+  		{
+  			if (applications == null)
+  				throw new ArgumentNullException ("applications");
+  
+- 			if (appToDir != null)
++ 			if (vpathToHost != null)
+  				throw new InvalidOperationException ("Already called");
+  
+  			if (applications == "")
+ 				return;
+ 
+- 			appToDir = new Hashtable ();
+- 			dirToHost = new Hashtable ();
+  			string [] apps = applications.Split (',');
+-			//Console.WriteLine ("applications: {0}", applications);
+- 			foreach (string str in apps) {
+- 				string [] app = str.Split (':');
+- 				if (app.Length != 2)
+- 					throw new ArgumentException ("Should be something like VPath:realpath");
++
++			vpathToHost = new VPathToHost[apps.Length];
++
++			int appCount = 0;
++			foreach (string str in apps) {
++				string [] app = str.Split (':');
++				if (app.Length < 2 || app.Length > 4)
++					throw new ArgumentException ("Should be something like [[hostname:]port:]VPath:realpath");
++
++				int vport;
++				string vhost;
++				string vpath;
++				string realpath;
++				int pos = 0;
++
++				if (app.Length >= 3) {
++					vhost = app[pos++];
++				} else {
++					vhost = null;
++				}
++
++				if (app.Length >= 4) {
++					vport = Convert.ToInt16(app[pos++]);
++				} else {
++					vport = -1;
++				}
++
++				vpath = app[pos++];
++				realpath = app[pos++];
++
++				if (!vpath.EndsWith("/"))
++					vpath += "/";
+  
+- 				string fp = System.IO.Path.GetFullPath (app [1]);
+- 				//Console.WriteLine ("{0} -> {1}", app [0], fp);
+- 				appToDir [app [0]] = fp;
+- 				dirToHost [fp] = marker;
++ 				string fullPath = System.IO.Path.GetFullPath(realpath);
++
++				Console.WriteLine("Registering application #{0}:", appCount);
++				Console.WriteLine("    Host:          {0}", (vhost != null) ? vhost : "any");
++				Console.WriteLine("    Port:          {0}", (vport != -1) ? vport.ToString() : "any");
++				Console.WriteLine("    Virtual path:  {0}", vpath);
++				Console.WriteLine("    Physical path: {0}", fullPath);
++
++				vpathToHost[appCount++] = new VPathToHost(appCount, vhost, vport, vpath, fullPath);
+  			}
++			// TODO - check for duplicates
+  		}
+  
+ 		public void Start ()
+@@ -262,7 +336,7 @@
+ 			if (started)
+ 				throw new InvalidOperationException ("The server is already started.");
+ 
+- 			if (appToDir == null)
++ 			if (vpathToHost == null)
+  				throw new InvalidOperationException ("SetApplications must be called first");
+ 
+ #if MODMONO_SERVER
+@@ -292,7 +366,11 @@
+ 
+ 			stop = true;	
+ 			listen_socket.Close ();
+-			dirToHost = new Hashtable ();
++			lock (vpathToHost) {
++				for (int i = 0; i < vpathToHost.Length; ++i) {
++					vpathToHost[i].ClearHost();
++				}
++			}
+ 			WebTrace.WriteLine ("Server stopped.");
+ 		}
+ 
+@@ -310,46 +388,50 @@
+ 			started = false;
+ 		}
+ 
+-		public static object CreateApplicationHost (string virtualPath, string baseDirectory)
++		public IApplicationHost GetApplicationForPath (string vhost, int port, string path, bool defaultToRoot)
+ 		{
+-			return ApplicationHost.CreateApplicationHost (typeof (XSPApplicationHost),
+-								      virtualPath,
+-								      baseDirectory);
+-		}
+-
+-		public IApplicationHost GetApplicationForPath (string path, bool defaultToRoot)
+-		{
+-			IApplicationHost bestFit = null;
+-			string [] parts = path.Split ('/');
+-			int count = parts.Length;
+-			while (count > 0) {
+-				string current = String.Join ("/", parts, 0, count);
+-				if (current == "")
+-					current = "/";
+-
+-				//Console.WriteLine ("current: {0} path: {1}", current, path);
+-				string dir = appToDir [current] as string;
+-				if (dir != null) {
+-					lock (dirToHost) {
+-						object o = dirToHost [dir];
+-						if (o == marker) {
+-							o = CreateApplicationHost (current, dir);
+-							dirToHost [dir] = o;
+-						}
+-						bestFit = o as IApplicationHost;
++			int bestMatchPosition = -1;
++			int bestMatchLength = 0;
++
++			// Console.WriteLine("GetApplicationForPath({0},{1},{2},{3})", vhost, port, path, defaultToRoot);
++			for (int i = 0; i < vpathToHost.Length; ++i)
++			{
++				if (vpathToHost[i].vport != -1) {
++					if (vpathToHost[i].vport != port)
++						continue;
++				}
++
++				if (vhost != null && vpathToHost[i].vhost != null) {
++					if (0 != String.CompareOrdinal(vhost, vpathToHost[i].vhost))
++						continue;
++				}
++
++				if (path.StartsWith(vpathToHost[i].vpath)) {
++					int matchLength = vpathToHost[i].vpath.Length;
++					if (matchLength > bestMatchLength) {
++						bestMatchLength = matchLength;
++						bestMatchPosition = i;
+ 					}
+-					break;
+ 				}
+-				
+-				count--;
+ 			}
+ 
+-			if (defaultToRoot && bestFit == null) {
+-				if (appToDir.ContainsKey ("/"))
+-					bestFit = dirToHost [appToDir ["/"]] as IApplicationHost;
++			if (bestMatchPosition != -1) {
++				// Console.WriteLine("bestMatchPosition: {0} bestMatchLength: {1}", bestMatchPosition, bestMatchLength);
++				if (vpathToHost[bestMatchPosition].appHost == null) {
++					lock (vpathToHost) {
++						if (vpathToHost[bestMatchPosition].appHost == null) {
++							vpathToHost[bestMatchPosition].CreateHost();
++						}
++					}
++				}
++				return vpathToHost[bestMatchPosition].appHost;
++			} else if (defaultToRoot) {
++				// Console.WriteLine("no match found. Defaulting to root vpath.");
++				return GetApplicationForPath(vhost, port, "/", false);
++			} else {
++				// Console.WriteLine("No application defined for: {0}:{1}{2}", vhost, port, path);
++				throw new InvalidOperationException("Invalid host!");
+ 			}
+-
+-			return bestFit;
+ 		}
+ 	}
+ }

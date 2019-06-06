@@ -1,0 +1,201 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] New error handling framework for mono
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20New%20error%20handling%20framework%20for%20mono&In-Reply-To=8cca42d80908201310m47087day45dff7ae91a51562%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032901.html">
+   <LINK REL="Next"  HREF="032939.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] New error handling framework for mono</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20New%20error%20handling%20framework%20for%20mono&In-Reply-To=8cca42d80908201310m47087day45dff7ae91a51562%40mail.gmail.com"
+       TITLE="[Mono-dev] New error handling framework for mono">lupus at ximian.com
+       </A><BR>
+    <I>Thu Sep  3 11:36:12 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032901.html">[Mono-dev] Debugger not working on trunk?
+</A></li>
+        <LI>Next message: <A HREF="032939.html">[Mono-dev] New error handling framework for mono
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32903">[ date ]</a>
+              <a href="thread.html#32903">[ thread ]</a>
+              <a href="subject.html#32903">[ subject ]</a>
+              <a href="author.html#32903">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 08/20/09 Rodrigo Kumpera wrote:
+&gt;<i> &gt; I don't like MONO_ERROR_ON_SIGNAL_CONTEXT: most code is not going to
+</I>&gt;<i> &gt; know in what mode it was called in. Simply always use the message
+</I>&gt;<i> &gt; buffer.
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> I changed this to have a MONO_ERROR_STORE_FULL_MESSAGE flag. My reasoning
+</I>&gt;<i> behind this is
+</I>&gt;<i> that some messages are exceptionally large, specially when it does include
+</I>&gt;<i> the assembly path. Look
+</I>&gt;<i> at loader.c:330, just the format string is more than 320 chars long and I
+</I>&gt;<i> don't want to embed it inside
+</I>&gt;<i> the MonoError machinery.
+</I>&gt;<i> 
+</I>&gt;<i> Now about MONO_ERROR_ON_SIGNAL_CONTEXT, it made sense to me when the caller
+</I>&gt;<i> did init
+</I>&gt;<i> MonoError . Now that this change, it has to change.
+</I>&gt;<i> 
+</I>&gt;<i> I've added a MONO_ERROR_DONT_COPY_STRINGS flag but, honestly, I don't think
+</I>&gt;<i> it is that
+</I>&gt;<i> helpfull and it doesn't help at all into make it safe for use under signal
+</I>&gt;<i> context.
+</I>
+I'm not happy with both the MONO_ERROR_STORE_FULL_MESSAGE and
+MONO_ERROR_DONT_COPY_STRINGS flags you introduced.
+For the message this could be handled automatically: if it doesn't fit
+into the buffer you can malloc it at set time, the code that initializes the
+MonoError has no way to know if the message will fit or not.
+Similarly, the initializing code can't know if any of the strings need
+to be strduped because it's far away from the code that sets it.
+This should be decided at the callsite, either passing a flag or calling
+a separate function that does the dup.
+
+A small note on overlong messages. I think we should have a policy like
+this:
+*) error messages should be short sentences
+*) any non-essential description of the error and suggestions for
+workarounds should go into either or both the logging mechanism and the
+documentation (wiki etc.)
+
+&gt;<i> But what should be done when we get an allocation failure on the
+</I>&gt;<i> mono_exception_set_*
+</I>&gt;<i> function? Should we just convert such error into an OOM, abort due to a
+</I>&gt;<i> double-fault or
+</I>&gt;<i> silently ignore those arguments (and print something on console).
+</I>
+It is tricky. In some cases we want to communicate an OOM exception to
+the managed code. In some others we can't: we need to give the caller
+code a chance to handle the error and not crash.
+Using a flag here can be helpful: something like MONO_ERROR_INCOMPLETE
+to signal that the full info was not stored for whatever reason.
+That should about strike a good balance between being robust and keeping
+track of as much info as we can. Aborting here is not an option, IMHO.
+
+&gt;<i> --- /dev/null
+</I>&gt;<i> +++ b/mono/utils/mono-error.c
+</I>&gt;<i> @@ -0,0 +1,385 @@
+</I>&gt;<i> +/*
+</I>&gt;<i> + * mono-error.c: Error handling code
+</I>&gt;<i> + *
+</I>&gt;<i> + * Authors:
+</I>&gt;<i> + *	Rodrigo Kumpera    (<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">rkumpera at novell.com</A>)
+</I>&gt;<i> + * Copyright 2009 Novell, Inc (<A HREF="http://www.novell.com">http://www.novell.com</A>)
+</I>&gt;<i> + */
+</I>&gt;<i> +#include &lt;glib.h&gt;
+</I>&gt;<i> +
+</I>&gt;<i> +#include &quot;mono-error.h&quot;
+</I>&gt;<i> +#include &quot;mono-error-internals.h&quot;
+</I>&gt;<i> +
+</I>&gt;<i> +#include &lt;mono/metadata/exception.h&gt;
+</I>&gt;<i> +#include &lt;mono/metadata/object-internals.h&gt;
+</I>&gt;<i> +#include &lt;mono/metadata/debug-helpers.h&gt;
+</I>&gt;<i> +
+</I>&gt;<i> +#define mono_error_get_message(E) ((E)-&gt;full_message? (E)-&gt;full_message : (E)-&gt;message)
+</I>&gt;<i> +
+</I>&gt;<i> +#define set_error_message() do { \
+</I>&gt;<i> +	va_start (args, msg_format); \
+</I>&gt;<i> +	if (error-&gt;flags &amp; MONO_ERROR_STORE_FULL_MESSAGE) \
+</I>&gt;<i> +		error-&gt;full_message = g_strdup_vprintf (msg_format, args); \
+</I>&gt;<i> +	else\
+</I>&gt;<i> +		g_vsnprintf (error-&gt;message, 128, msg_format, args); \
+</I>
+This should be sizeof (error-&gt;message) instead of the magic number 128.
+
+&gt;<i> +	va_end (args); \
+</I>&gt;<i> +} while (0)
+</I>&gt;<i> +
+</I>&gt;<i> +void
+</I>&gt;<i> +mono_error_init_flags (MonoError *oerror, unsigned short flags)
+</I>&gt;<i> +{
+</I>&gt;<i> +	MonoErrorInternal *error = (MonoErrorInternal*)oerror;
+</I>&gt;<i> +	g_assert (sizeof (MonoError) == sizeof (MonoErrorInternal));
+</I>&gt;<i> +
+</I>&gt;<i> +	error-&gt;error_code = MONO_ERROR_NONE;
+</I>&gt;<i> +	error-&gt;flags = flags;
+</I>&gt;<i> +	error-&gt;type_name = error-&gt;assembly_name = error-&gt;member_name = error-&gt;full_message = error-&gt;exception_name_space = error-&gt;exception_name = NULL;
+</I>&gt;<i> +	error-&gt;klass = NULL;
+</I>&gt;<i> +	error-&gt;message [0] = 0;
+</I>
+Performance tip: until error_code is MONO_ERROR_NONE there is no need to
+initialize all the other fields (except flags). This speeds up the
+common path. Of course you need to check error_code in the cleanup
+function.
+
+&gt;<i> +void
+</I>&gt;<i> +mono_error_set_corlib_exception (MonoError *oerror, const char *name_space, const char *name)
+</I>&gt;<i> +{
+</I>&gt;<i> +	MonoErrorInternal *error = (MonoErrorInternal*)oerror;
+</I>&gt;<i> +
+</I>&gt;<i> +	if (error-&gt;flags &amp; MONO_ERROR_DONT_COPY_STRINGS) {
+</I>&gt;<i> +		error-&gt;exception_name_space = name_space;
+</I>&gt;<i> +		error-&gt;exception_name = name;
+</I>&gt;<i> +	} else {
+</I>&gt;<i> +		error-&gt;exception_name_space = g_strdup (name_space);
+</I>&gt;<i> +		error-&gt;exception_name = g_strdup (name);
+</I>&gt;<i> +	}
+</I>
+This should set error_code as well (maybe have it passed as an argument).
+
+&gt;<i> +void
+</I>&gt;<i> +mono_error_set_out_of_memory (MonoError *oerror, const char *msg_format, ...)
+</I>&gt;<i> +{
+</I>&gt;<i> +	MonoErrorInternal *error = (MonoErrorInternal*)oerror;
+</I>&gt;<i> +	va_list args;
+</I>&gt;<i> +
+</I>&gt;<i> +	error-&gt;error_code = MONO_ERROR_OUT_OF_MEMORY;
+</I>&gt;<i> +	error-&gt;flags &amp;= ~MONO_ERROR_STORE_FULL_MESSAGE; /*Can't really allocate memory under OOM*/
+</I>&gt;<i> +	va_start (args, msg_format);
+</I>&gt;<i> +	g_vsnprintf (error-&gt;message, 128, msg_format, args);
+</I>
+Magic number here again.
+
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+</PRE>
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032901.html">[Mono-dev] Debugger not working on trunk?
+</A></li>
+	<LI>Next message: <A HREF="032939.html">[Mono-dev] New error handling framework for mono
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32903">[ date ]</a>
+              <a href="thread.html#32903">[ thread ]</a>
+              <a href="subject.html#32903">[ subject ]</a>
+              <a href="author.html#32903">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

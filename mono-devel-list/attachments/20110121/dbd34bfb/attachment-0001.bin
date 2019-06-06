@@ -1,0 +1,210 @@
+diff --git a/mcs/class/System.Core/System.Collections.Generic/HashSet.cs b/mcs/class/System.Core/System.Collections.Generic/HashSet.cs
+index c31134f..37fc075 100644
+--- a/mcs/class/System.Core/System.Collections.Generic/HashSet.cs
++++ b/mcs/class/System.Core/System.Collections.Generic/HashSet.cs
+@@ -3,6 +3,7 @@
+ //
+ // Authors:
+ //  Jb Evain  <jbevain@novell.com>
++//	Nicklas Overgaard <nicklas@isharp.dk> ( Added serialization support )
+ //
+ // Copyright (C) 2007 Novell, Inc (http://www.novell.com)
+ //
+@@ -53,6 +54,7 @@ namespace System.Collections.Generic {
+ 		const int NO_SLOT = -1;
+ 		const int HASH_FLAG = -2147483648;
+ 
++		[Serializable()]
+ 		struct Link {
+ 			public int HashCode;
+ 			public int Next;
+@@ -84,7 +86,8 @@ namespace System.Collections.Generic {
+ 
+ 		IEqualityComparer<T> comparer;
+ 		SerializationInfo si;
+-
++		StreamingContext context;
++		
+ 		// The number of changes made to this set. Used by enumerators
+ 		// to detect changes and invalidate themselves.
+ 		int generation;
+@@ -125,6 +128,8 @@ namespace System.Collections.Generic {
+ 		protected HashSet (SerializationInfo info, StreamingContext context)
+ 		{
+ 			si = info;
++			this.context = context;
++			this.OnDeserialization(this);
+ 		}
+ 
+ 		void Init (int capacity, IEqualityComparer<T> comparer)
+@@ -542,20 +547,35 @@ namespace System.Collections.Generic {
+ 			throw new NotImplementedException ();
+ 		}
+ 
+-		[MonoTODO]
+ 		[SecurityPermission (SecurityAction.LinkDemand, Flags = SecurityPermissionFlag.SerializationFormatter)]
+ 		public virtual void GetObjectData (SerializationInfo info, StreamingContext context)
+ 		{
+-			throw new NotImplementedException ();
++			info.AddValue("table", this.table, typeof(int[]));
++			info.AddValue("links", this.links, typeof(Link[]));
++			info.AddValue("slots", this.slots, this.slots.GetType());
++			info.AddValue("touched", this.touched);
++			info.AddValue("empty_slot", this.empty_slot);
++			info.AddValue("count", this.count);
++			info.AddValue("threshold", this.threshold);
++			info.AddValue("comparer", this.comparer, this.comparer.GetType());
++			info.AddValue("generation", this.generation);
+ 		}
+ 
+-		[MonoTODO]
+ 		public virtual void OnDeserialization (object sender)
+ 		{
+ 			if (si == null)
+ 				return;
+ 
+-			throw new NotImplementedException ();
++			
++			this.table = si.GetValue("table", typeof(int[])) as int[];
++			this.links = si.GetValue("links", typeof(Link[])) as Link[];
++			this.slots = si.GetValue("slots", typeof(T[])) as T[];
++			this.touched = si.GetInt32("touched");
++			this.empty_slot = si.GetInt32("empty_slot");
++			this.count = si.GetInt32("count");
++			this.threshold = si.GetInt32("threshold");
++			this.comparer = si.GetValue("comparer", typeof(IEqualityComparer<T>)) as IEqualityComparer<T>;
++			this.generation = si.GetInt32("generation");
+ 		}
+ 
+ 		IEnumerator<T> IEnumerable<T>.GetEnumerator ()
+@@ -730,5 +750,66 @@ namespace System.Collections.Generic {
+ 				return CalcPrime (x);
+ 			}
+ 		}
++		
++		/// <summary>
++		/// Method for testing if the internal values of a hash set have been restored
++		/// properly after deserialization
++		/// </summary>
++		/// <param name="other">
++		/// A <see cref="HashSet<T>"/> instance to check
++		/// </param>
++		/// <returns>
++		/// A <see cref="System.Boolean"/> which is true of the two set's internal structure are equal
++		/// </returns>
++		public bool UnittestEqualityCheck(HashSet<T> other)
++		{
++			if(other.Count != this.Count)
++				return false;
++			
++			
++			if(other.empty_slot != this.empty_slot)
++				return false;
++				
++			if(other.generation != this.generation)
++				return false;
++			
++			if(other.links.Length != this.links.Length)
++				return false;
++			else {// check contents
++			
++				for(int i = 0; i < this.links.Length; i++) {
++					if(this.links[i].HashCode != other.links[i].HashCode)
++						return false;
++					
++					if(this.links[i].Next != other.links[i].Next)
++						return false;
++				}
++			} // if we reach this point, all elements are the same
++			if(other.table.Length != this.table.Length)
++				return false;
++			else{ // check table contents
++			
++				for(int i = 0; i < this.table.Length; i++) {
++					if(this.table[i] != other.table[i])
++						return false;
++				}
++			}
++			
++			if(other.slots.Length != this.slots.Length)
++				return false;
++			else {
++				for(int i = 0; i < this.slots.Length; i++) {
++					if(!this.slots[i].Equals(other.slots[i]))
++						return false;
++				}
++			}
++			if(other.threshold != this.threshold)
++				return false;
++				
++			if(other.touched != this.touched)
++				return false;
++			
++			return true;
++		}
+ 	}
+ }
+diff --git a/mcs/class/System.Core/Test/System.Collections.Generic/HashSetTest.cs b/mcs/class/System.Core/Test/System.Collections.Generic/HashSetTest.cs
+index 7b0972f..3da0efd 100644
+--- a/mcs/class/System.Core/Test/System.Collections.Generic/HashSetTest.cs
++++ b/mcs/class/System.Core/Test/System.Collections.Generic/HashSetTest.cs
+@@ -435,6 +435,59 @@ namespace MonoTests.System.Collections.Generic {
+ 			AssertContainsOnly (new string [] { string.Empty, "a", "c" }, set);
+ 		}
+ 
++		[Test()]
++		public void TestSerializeDeserializeXML()
++		{
++			HashSet<int> theSet = new HashSet<int>();
++			
++			for(int i = 0; i < 10; i++)
++			{
++				theSet.Add(i);
++			}
++			theSet.Remove(8);
++			theSet.Add(10);
++			
++			XmlSerializer serial = new XmlSerializer(theSet.GetType());
++			TextWriter writer = new StreamWriter( @"unittest_serial.xml" );
++			serial.Serialize(writer, theSet);
++			writer.Close();
++
++			// now deserialize
++			TextReader reader = new StreamReader(@"HashSetSerial.xml");
++			HashSet<int> newSet = serial.Deserialize(reader) as HashSet<int>;
++			
++			Assert.IsTrue(theSet.UnittestEqualityCheck(newSet));
++		}
++		
++		[Test()]
++		public void TestSerializeDeserializeBinary()
++		{
++			HashSet<int> theSet = new HashSet<int>();
++			
++			for(int i = 0; i < 10; i++)
++			{
++				theSet.Add(i);
++			}
++			theSet.Remove(8);
++			theSet.Add(10);
++			
++			// serialize
++			Stream stream = File.Open("HashSetSerial.bin", FileMode.Create);
++			BinaryFormatter bformatter = new BinaryFormatter();
++			bformatter.Serialize(stream, theSet);
++			stream.Close();
++			
++			// deserialize
++			//Open the file written above and read values from it.
++
++			stream = File.Open("HashSetSerial.bin", FileMode.Open);
++			bformatter = new BinaryFormatter();
++			HashSet<int> newSet = bformatter.Deserialize(stream) as HashSet<int>;
++			stream.Close();
++			
++			Assert.IsTrue(theSet.UnittestEqualityCheck(newSet));
++		}
++		
+ 		private class StringComparerOrdinalLookAlike : IEqualityComparer<string>
+ 		{
+ 			public bool Equals(string x, string y)

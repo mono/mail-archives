@@ -1,0 +1,92 @@
+Index: metadata/domain.c
+===================================================================
+--- metadata/domain.c	(revision 40348)
++++ metadata/domain.c	(working copy)
+@@ -262,6 +262,7 @@
+ 	domain->class_init_trampoline_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
+ 	domain->jump_trampoline_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
+ 	domain->finalizable_objects_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
++	domain->jit_trampoline_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
+ 	domain->domain_id = InterlockedIncrement (&appdomain_id_counter);
+ 
+ 	InitializeCriticalSection (&domain->lock);
+@@ -820,6 +821,8 @@
+ 	domain->jump_trampoline_hash = NULL;
+ 	g_hash_table_destroy (domain->finalizable_objects_hash);
+ 	domain->finalizable_objects_hash = NULL;
++	g_hash_table_destroy (domain->jit_trampoline_hash);
++	domain->jit_trampoline_hash = NULL;
+ 	if (domain->special_static_fields) {
+ 		g_hash_table_destroy (domain->special_static_fields);
+ 		domain->special_static_fields = NULL;
+Index: metadata/class-internals.h
+===================================================================
+--- metadata/class-internals.h	(revision 40356)
++++ metadata/class-internals.h	(working copy)
+@@ -57,7 +57,6 @@
+ 	guint32 token;
+ 	MonoClass *klass;
+ 	MonoMethodSignature *signature;
+-	gpointer info; /* runtime info */
+ 	/* name is useful mostly for debugging */
+ 	const char *name;
+ 	/* this is used by the inlining algorithm */
+Index: metadata/domain-internals.h
+===================================================================
+--- metadata/domain-internals.h	(revision 40348)
++++ metadata/domain-internals.h	(working copy)
+@@ -122,6 +122,7 @@
+ 	GHashTable         *jump_target_hash;
+ 	GHashTable         *class_init_trampoline_hash;
+ 	GHashTable         *jump_trampoline_hash;
++	GHashTable         *jit_trampoline_hash;
+ 	/* 
+ 	 * This must be a GHashTable, since these objects can't be finalized
+ 	 * if the hashtable contains a GC visible reference to them.
+Index: mini/mini.c
+===================================================================
+--- mini/mini.c	(revision 40348)
++++ mini/mini.c	(working copy)
+@@ -6737,16 +6737,20 @@
+ 	MonoDomain *domain = mono_domain_get ();
+ 	gpointer tramp;
+ 
+-	/* Trampoline are domain specific, so cache only the one used in the root domain */
+-	if ((domain == mono_get_root_domain ()) && method->info)
+-		return method->info;
++	mono_domain_lock (domain);
++	tramp = g_hash_table_lookup (domain->jit_trampoline_hash, method);
++	mono_domain_unlock (domain);
++	if (tramp)
++		return tramp;
+ 
+ 	if (method->iflags & METHOD_IMPL_ATTRIBUTE_SYNCHRONIZED)
+ 		return mono_create_jit_trampoline (mono_marshal_get_synchronized_wrapper (method));
+ 
+ 	tramp = mono_arch_create_jit_trampoline (method);
+-	if (domain == mono_get_root_domain ())
+-		method->info = tramp;
++	
++	mono_domain_lock (domain);
++	g_hash_table_insert (domain->jit_trampoline_hash, method, tramp);
++	mono_domain_unlock (domain);
+ 
+ 	mono_jit_stats.method_trampolines++;
+ 
+Index: mini/driver.c
+===================================================================
+--- mini/driver.c	(revision 40348)
++++ mini/driver.c	(working copy)
+@@ -303,10 +303,8 @@
+ 		comp_time = elapsed = 0.0;
+ 
+ 		/* fixme: ugly hack - delete all previously compiled methods */
+-		for (i = 0; i < mono_image_get_table_rows (image, MONO_TABLE_METHOD); ++i) {
+-			method = mono_get_method (image, MONO_TOKEN_METHOD_DEF | (i + 1), NULL);
+-			method->info = NULL;
+-		}
++		g_hash_table_destroy (mono_domain_get ()->jit_trampoline_hash);
++		mono_domain_get ()->jit_trampoline_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
+ 
+ 		g_timer_start (timer);
+ 		if (mini_stats_fd)

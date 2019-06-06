@@ -1,0 +1,190 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Thread safety of readonly data members?
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Thread%20safety%20of%20readonly%20data%20members%3F&In-Reply-To=4032C19C.20501%40zeroc.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="004102.html">
+   <LINK REL="Next"  HREF="004115.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Thread safety of readonly data members?</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Thread%20safety%20of%20readonly%20data%20members%3F&In-Reply-To=4032C19C.20501%40zeroc.com"
+       TITLE="[Mono-devel-list] Thread safety of readonly data members?">jonpryor at vt.edu
+       </A><BR>
+    <I>Wed Feb 18 06:49:35 EST 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="004102.html">[Mono-devel-list] Thread safety of readonly data members?
+</A></li>
+        <LI>Next message: <A HREF="004115.html">[Mono-devel-list] Thread safety of readonly data members?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4103">[ date ]</a>
+              <a href="thread.html#4103">[ thread ]</a>
+              <a href="subject.html#4103">[ subject ]</a>
+              <a href="author.html#4103">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Below...
+
+On Tue, 2004-02-17 at 20:36, Michi Henning wrote:
+&gt;<i> I have a question regarding thread safety...
+</I>&gt;<i> 
+</I>&gt;<i> Consider:
+</I>&gt;<i> 
+</I>&gt;<i> class Class1
+</I>&gt;<i> {
+</I>&gt;<i>      Class1()
+</I>&gt;<i>      {
+</I>&gt;<i>          _val = 42;
+</I>&gt;<i>      }
+</I>&gt;<i> 
+</I>&gt;<i>      public int getVal()
+</I>&gt;<i>      {
+</I>&gt;<i>          return _val;
+</I>&gt;<i>      }
+</I>&gt;<i> 
+</I>&gt;<i>      private readonly int _val;
+</I>&gt;<i> }
+</I>&gt;<i> 
+</I>&gt;<i> In a threaded environment, is it necessary to interlock
+</I>&gt;<i> inside the constructor and getVal() to ensure that
+</I>&gt;<i> threads get the correct value?
+</I>&lt;snip/&gt;
+&gt;<i> In C++, the lock is necessary because, on SMP
+</I>&gt;<i> machines, memory consistency isn't guaranteed without
+</I>&gt;<i> the lock. But I don't know whether the same is true
+</I>&gt;<i> for C#.
+</I>
+I would think whether or not the lock is required, in either
+environment, would depend on how you create your class instances.  Do
+you allow your code to possibly invoke both the constructor and the
+method at the same time?
+
+In C++, if your object is globally allocated, locking isn't necessary
+(see the description about static members for an explanation).  If your
+object is heap allocated, then you need locks around all your callee
+code, NOT within your class, just to ensure that the pointer is non-null
+(avoiding crashes):
+
+	// This won't work...
+	Class1* pClass;
+	void thread1 () {pClass = new Class1();}
+	void thread2 () {pClass-&gt;getVal();}
+
+So no, the lock is NOT necessary in C++.  It depends on a number of
+factors.  The lock is only necessary if you had multiple member
+functions (NOT including the constructor) that could change the
+underlying member variable.  If you allow your code to invoke both a
+constructor and a member function at the same time, YOUR CODE IS BROKEN.
+
+Moving on to Mono, one major problem is that the CLI standard, as
+currently specified, uses effectively the same memory consistency model
+as Java.  Meaning, C++ techniques such as double-checked locking ARE NOT
+VALID:
+
+	private static Class1 foo;
+
+	public static Foo {
+		get {
+			// This will likely work on most platforms, such
+			// as x86, but it is NOT guaranteed to work on 
+			// all potential hardware platforms.
+			if (foo == null) {
+				lock (typeof(Something)) {
+					if (foo == null)
+						foo = new Class1();
+				}
+			}
+		}
+	}
+
+In C++, you could use code similar to the above, and you WOULD NOT need
+to lock both the class constructor and the accessor methods, as the
+calling code ensures that the class has properly constructed before
+invoking any member functions.
+
+The problem is that double-checked locking isn't really portable in
+.NET, so you either need to (a) always lock the code that will construct
+the object, or (b) use the static loader lock, described below.
+
+&gt;<i> What if the member variable is not readonly (but will
+</I>&gt;<i> never be modified, except for the initial assignment
+</I>&gt;<i> in the constructor)? Is accessing the value thread-safe
+</I>&gt;<i> without a lock in that case?
+</I>
+I would expect that this is similar/identical to the readonly variable
+case.  &quot;readonly&quot; only means that the compiler will check your code to
+ensure that the variables don't change after you've initialized them in
+the constructor.  The runtime may do some checking on them, but I'm not
+entirely sure about that.
+
+&gt;<i> What about const members? Is access to those safe without
+</I>&gt;<i> a lock?
+</I>
+Const members are safe, as these are &quot;burned&quot; into the CIL, and cannot
+be changed without recompiling.  They're just like enumeration members.
+You can't change enumeration values after you've compiled. :-)
+
+&gt;<i> And what about static members that are (conceptually)
+</I>&gt;<i> immutable (only initialized in the constructor and
+</I>&gt;<i> never assigned again)? Is the lock required there?
+</I>
+No.  Static members are initialized by the class constructor (&quot;.cctor&quot;),
+and the runtime has an internal lock to ensure that only one thread
+executes the class constructor.
+
+	// Initializing static members either &quot;inline&quot; or in the static
+	// class constructor is *always* thread safe.
+	public static readonly string Hello = &quot;Hello&quot;;
+	public static readonly Class1 Something;
+	static MyClass ()
+	{
+		Something = new Class1 ();
+	}
+
+You can think of them as C++ global variables, which are initialized by
+the C++ runtime libraries *before* main() is called, so you can assume
+that there will only be a single thread initializing the class.  On the
+other hand, the is no guarantee about order of initialization *between*
+global variables in different compilation units, so there are still
+problems with global variables in C++.
+
+&gt;<i> Any difference in memory consistency models between
+</I>&gt;<i> Mono and .NET? (I need to write code that is portable
+</I>&gt;<i> to both platforms.)
+</I>
+If there are, file them in bugzilla. :-)
+
+ - Jon
+
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="004102.html">[Mono-devel-list] Thread safety of readonly data members?
+</A></li>
+	<LI>Next message: <A HREF="004115.html">[Mono-devel-list] Thread safety of readonly data members?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#4103">[ date ]</a>
+              <a href="thread.html#4103">[ thread ]</a>
+              <a href="subject.html#4103">[ subject ]</a>
+              <a href="author.html#4103">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

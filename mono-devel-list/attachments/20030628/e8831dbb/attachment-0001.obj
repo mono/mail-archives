@@ -1,0 +1,1070 @@
+Index: class/System/list
+===================================================================
+RCS file: /mono/mcs/class/System/list,v
+retrieving revision 1.11
+diff -u -r1.11 list
+--- class/System/list	7 Dec 2002 22:16:41 -0000	1.11
++++ class/System/list	28 Jun 2003 13:37:34 -0000
+@@ -111,6 +111,7 @@
+ System.Net.Sockets\AddressFamily.cs
+ System.Net.Sockets\LingerOption.cs
+ System.Net.Sockets\MulticastOption.cs
++System.Net.Sockets\IPv6MulticastOption.cs
+ System.Net.Sockets\NetworkStream.cs
+ System.Net.Sockets\ProtocolFamily.cs
+ System.Net.Sockets\ProtocolType.cs
+Index: class/System/list.unix
+===================================================================
+RCS file: /mono/mcs/class/System/list.unix,v
+retrieving revision 1.44
+diff -u -r1.44 list.unix
+--- class/System/list.unix	23 Jun 2003 16:31:40 -0000	1.44
++++ class/System/list.unix	28 Jun 2003 13:37:34 -0000
+@@ -439,6 +439,7 @@
+ System.Net.Sockets/AddressFamily.cs
+ System.Net.Sockets/LingerOption.cs
+ System.Net.Sockets/MulticastOption.cs
++System.Net.Sockets/IPv6MulticastOption.cs
+ System.Net.Sockets/NetworkStream.cs
+ System.Net.Sockets/ProtocolFamily.cs
+ System.Net.Sockets/ProtocolType.cs
+Index: class/System/System.Net/Dns.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net/Dns.cs,v
+retrieving revision 1.15
+diff -u -r1.15 Dns.cs
+--- class/System/System.Net/Dns.cs	23 May 2003 11:07:21 -0000	1.15
++++ class/System/System.Net/Dns.cs	28 Jun 2003 13:37:35 -0000
+@@ -96,6 +96,10 @@
+ 						if (address.Equals ("0.0.0.0"))
+ 							return GetHostByAddress ("127.0.0.1");
+ 
++						/// Must check the IP format, might send an exception if 
++						/// invalid string.
++						IPAddress.Parse(address);
++
+                         string h_name;
+                         string[] h_aliases, h_addrlist;
+                         
+@@ -135,8 +139,8 @@
+                         
+                         bool ret = GetHostName_internal(out hostName);
+                         
+-			if (ret == false)
+-                                throw new SocketException(11001);
++						if (ret == false)
++							throw new SocketException(11001);
+ 
+                         return hostName;
+                 }
+@@ -153,7 +157,18 @@
+                         if (hostName == null)
+                                 throw new ArgumentNullException();
+ 
+-			return GetHostByName (hostName);
++					IPHostEntry ret;
++
++					try {
++						ret =  GetHostByAddress(hostName);
++					}
++					catch{}
++
++					if(ret == null) {
++						ret =  GetHostByName(hostName);
++					}
++
++					return ret;
+                 }
+         }
+ }
+Index: class/System/System.Net/IPAddress.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net/IPAddress.cs,v
+retrieving revision 1.15
+diff -u -r1.15 IPAddress.cs
+--- class/System/System.Net/IPAddress.cs	9 May 2002 10:43:34 -0000	1.15
++++ class/System/System.Net/IPAddress.cs	28 Jun 2003 13:37:37 -0000
+@@ -25,12 +25,19 @@
+ 		// Don't change the name of this field without also
+ 		// changing socket-io.c in the runtime
+ 		private long address;
++		private AddressFamily _family = AddressFamily.InterNetwork;
++		private ushort[] _numbers = new ushort[8];	/// ip6 Stored in network order (as ip4)
++		private long _scopeId = 0;
+ 
+ 		public static readonly IPAddress Any = new IPAddress(0);
+ 		public static readonly IPAddress Broadcast = IPAddress.Parse ("255.255.255.255");
+ 		public static readonly IPAddress Loopback = IPAddress.Parse ("127.0.0.1");
+ 		public static readonly IPAddress None = IPAddress.Parse ("255.255.255.255");
+ 
++		public static readonly IPAddress IPv6Any = IPAddress.Parse ("::");
++		public static readonly IPAddress IPv6Loopback = IPAddress.Parse ("::1");
++		public static readonly IPAddress IPv6None = IPAddress.Parse ("::");
++
+ 		private static short SwapShort (short number)
+ 		{
+ 			return (short) ( ((number >> 8) & 0xFF) + ((number << 8) & 0xFF00) );
+@@ -106,14 +113,50 @@
+ 		/// </summary>
+ 		public IPAddress (long addr)
+ 		{
+-			Address = addr;
++			address = addr;
++		}
++
++		public IPAddress(byte[] address) : this(address, 0)
++		{
++		}
++
++		public IPAddress(byte[] address, long scopeId)
++		{
++			if(address.Length != 16)
++				throw new ArgumentException("address");
++
++			Buffer.BlockCopy(address, 0, _numbers, 0, 16);
++			_family = AddressFamily.InterNetworkV6;
++			_scopeId = scopeId;
++		}
++
++		internal IPAddress(ushort[] address, long scopeId)
++		{
++			_numbers = address;
++
++			for(int i=0; i<8; i++)
++				_numbers[i] = (ushort)HostToNetworkOrder((short)_numbers[i]);
++
++			_family = AddressFamily.InterNetworkV6;
++			_scopeId = scopeId;
+ 		}
+ 
+ 		public static IPAddress Parse (string ip)
+ 		{
++			IPAddress ret;
++
+ 			if (ip == null)
+-				throw new ArgumentNullException ("null ip string");
++				throw new ArgumentNullException ("Value cannot be null.");
+ 				
++			if( (ret = ParseIPV4(ip)) == null)
++				if( (ret = ParseIPV6(ip)) == null)
++					throw new FormatException("An invalid IP address was specified.");
++
++			return ret;
++		}
++
++		private static IPAddress ParseIPV4 (string ip)
++		{
+ 			if (ip.Length == 0 || ip [0] == ' ')
+ 				return new IPAddress (0);
+ 				
+@@ -121,14 +164,15 @@
+ 			if (pos != -1)
+ 				ip = ip.Substring (0, pos);				
+ 			else if (ip [ip.Length - 1] == '.')
+-				throw new FormatException ("An invalid IP address was specified");
++				return null;
+ 
+ 			string [] ips = ip.Split (new char [] {'.'});
+ 			if (ips.Length > 4)
+-				throw new FormatException ("An invalid IP address was specified");
++				return null;
+ 			
+ 			// Make the number in network order
+-			try {
++			try 
++			{
+ 				long a = 0;
+ 				byte val = 0;
+ 				for (int i = 0; i < ips.Length; i++) {
+@@ -153,12 +197,28 @@
+ 
+ 				return (new IPAddress (a));
+ 			} catch (Exception) {
+-				throw new FormatException ("An invalid IP address was specified");
+-			}
++				return null;
++			}
+ 		}
+ 		
++		private static IPAddress ParseIPV6 (string ip)
++		{
++			try 
++			{
++				IPv6Address newIPv6Address = IPv6Address.Parse(ip);
++				return new IPAddress(newIPv6Address.Address, newIPv6Address.ScopeId);
++			}
++			catch(Exception e) {
++				return null;
++			}
++		}
++
++		[Obsolete]
+ 		public long Address {
+ 			get {
++				if(_family != AddressFamily.InterNetwork)
++					throw new Exception("The attempted operation is not supported for the type of object referenced");
++
+ 				return address;
+ 			}
+ 			set {
+@@ -168,13 +228,48 @@
+ 						"the address must be between 0 and 0xFFFFFFFF");
+ 				*/
+ 
++				if(_family != AddressFamily.InterNetwork)
++					throw new Exception("The attempted operation is not supported for the type of object referenced");
++
+ 				address = value;
+ 			}
+ 		}
+ 
++		public long ScopeId {
++			get {
++				if(_family != AddressFamily.InterNetworkV6)
++					throw new Exception("The attempted operation is not supported for the type of object referenced");
++
++				return _scopeId;
++			}
++			set {
++				if(_family != AddressFamily.InterNetworkV6)
++					throw new Exception("The attempted operation is not supported for the type of object referenced");
++
++				_scopeId = value;
++			}
++		}
++
++		public byte[] GetAddressBytes() {
++
++			if(_family == AddressFamily.InterNetworkV6)
++			{
++				byte[] addressBytes = new byte[16];
++				Buffer.BlockCopy(_numbers, 0, addressBytes, 0, 16);
++				return addressBytes;
++			}
++			else
++			{
++				return new byte[4] { (byte)(address & 0xFF),
++									   (byte)((address >> 8) & 0xFF),
++									   (byte)((address >> 16) & 0xFF),
++									   (byte)(address >> 24) }; 
++			}
++		}
++
+ 		public AddressFamily AddressFamily {
+ 			get {
+-				return(AddressFamily.InterNetwork);
++				return _family;
+ 			}
+ 		}
+ 		
+@@ -188,7 +283,16 @@
+ 		/// <returns></returns>
+ 		public static bool IsLoopback (IPAddress addr)
+ 		{
+-			return (addr.address & 0xFF) == 127;
++			if(addr._family == AddressFamily.InterNetwork)
++				return (addr.address & 0xFF) == 127;
++			else {
++				for(int i=0; i<6; i++) {
++					if(addr._numbers[i] != 0)
++						return false;
++				}
++
++				return NetworkToHostOrder((short)addr._numbers[7]) == 1;
++			}
+ 		}
+ 
+ 		/// <summary>
+@@ -197,7 +301,17 @@
+ 		/// </summary>
+ 		public override string ToString ()
+ 		{
+-			return ToString (address);
++			if(_family == AddressFamily.InterNetwork)
++				return ToString (address);
++			else
++			{
++				ushort[] numbers = _numbers.Clone() as ushort[];
++
++				for(int i=0; i<numbers.Length; i++)
++					numbers[i] = (ushort)NetworkToHostOrder((short)numbers[i]);
++
++				return new IPv6Address(numbers).ToString();
++			}
+ 		}
+ 
+ 		/// <summary>
+@@ -218,14 +332,41 @@
+ 		public override bool Equals (object other)
+ 		{
+ 			if (other is System.Net.IPAddress){
+-				return Address == ((System.Net.IPAddress) other).Address;
++				IPAddress otherAddr = other as IPAddress;
++
++				if(AddressFamily != otherAddr.AddressFamily)
++					return false;
++
++				if(AddressFamily == AddressFamily.InterNetwork)
++					return Address == otherAddr.Address;
++				else
++				{
++					ushort[] vals = otherAddr._numbers;
++
++					for(int i=0; i<8; i++)
++						if(_numbers[i] != vals[i])
++							return false;
++
++					return true;
++				}
+ 			}
+ 			return false;
+ 		}
+ 
+ 		public override int GetHashCode ()
+ 		{
+-			return (int)Address;
++			if(_family == AddressFamily.InterNetwork)
++				return (int)Address;
++			else
++				return Hash (((((int) _numbers[0]) << 16) + _numbers [1]), 
++					((((int) _numbers [2]) << 16) + _numbers [3]),
++					((((int) _numbers [4]) << 16) + _numbers [5]),
++					((((int) _numbers [6]) << 16) + _numbers [7]));
+ 		}
++
++		private static int Hash (int i, int j, int k, int l) 
++		{
++			return i ^ (j << 13 | j >> 19) ^ (k << 26 | k >> 6) ^ (l << 7 | l >> 25);
++		}
+ 	}
+ }
+Index: class/System/System.Net/IPEndPoint.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net/IPEndPoint.cs,v
+retrieving revision 1.8
+diff -u -r1.8 IPEndPoint.cs
+--- class/System/System.Net/IPEndPoint.cs	18 May 2002 22:10:39 -0000	1.8
++++ class/System/System.Net/IPEndPoint.cs	28 Jun 2003 13:37:37 -0000
+@@ -43,7 +43,7 @@
+ 
+ 		public override AddressFamily AddressFamily {
+ 			get {
+-				return AddressFamily.InterNetwork;
++				return address.AddressFamily;
+ 			}
+ 		}
+ 
+@@ -74,38 +74,88 @@
+ 				// port and address
+ 				return(null);
+ 			}
++
+ 			AddressFamily family=(AddressFamily)sockaddr[0];
+-			if(family!=AddressFamily.InterNetwork) {
+-				return(null);
++			int port;
++
++			IPEndPoint ipe = null;
++			switch(family)
++			{
++				case AddressFamily.InterNetwork:
++					port = (((int)sockaddr[2])<<8) + (int)sockaddr[3];
++					long address=(((long)sockaddr[7])<<24) +
++						(((long)sockaddr[6])<<16) +
++						(((long)sockaddr[5])<<8) +
++						(long)sockaddr[4];
++
++					ipe = new IPEndPoint(address, port);
++					break;
++				case AddressFamily.InterNetworkV6:
++					port	= (((int)sockaddr[2])<<8) + (int)sockaddr[3];
++
++					/// maybe flowid ?
++					int unknown	= (int)sockaddr[4] +
++						(((int)sockaddr[5])<<8) +
++						(((int)sockaddr[6])<<16) +
++						(((int)sockaddr[7])<<24);
++
++					int scopeId	= (int)sockaddr[24] +
++						(((int)sockaddr[25])<<8) +
++						(((int)sockaddr[26])<<16) +
++						(((int)sockaddr[27])<<24);
++
++					ushort[] addressData = new ushort[8];
++					for(int i=0; i<8; i++)
++						addressData[i] = (ushort)((sockaddr[8+i*2] << 8) + sockaddr[8+i*2+1]);
++
++					ipe = new IPEndPoint (new IPAddress(addressData, scopeId), port);
++					break;
++				default:
++					return null;
+ 			}
+-			
+-			int port=(((int)sockaddr[2])<<8) + (int)sockaddr[3];
+-			long address=(((long)sockaddr[7])<<24) +
+-				(((long)sockaddr[6])<<16) +
+-				(((long)sockaddr[5])<<8) +
+-				(long)sockaddr[4];
+ 
+-			IPEndPoint ipe = new IPEndPoint(address, port);
+-			
+ 			return(ipe);
+ 		}
+ 
+ 		public override SocketAddress Serialize() {
+-			// .net produces a 16 byte buffer, even though
+-			// only 8 bytes are used. I guess its just a
+-			// holdover from struct sockaddr padding.
+-			SocketAddress sockaddr = new SocketAddress(AddressFamily.InterNetwork, 16);
+-
+-			// bytes 2 and 3 store the port, the rest
+-			// stores the address
+-			sockaddr [2] = (byte) ((port>>8) & 0xff);
+-			sockaddr [3] = (byte) (port & 0xff);
+-
+-			sockaddr [4] = (byte) (address.Address & 0xff);
+-			sockaddr [5] = (byte) ((address.Address >> 8) & 0xff);
+-			sockaddr [6] = (byte) ((address.Address >> 16) & 0xff);
+-			sockaddr [7] = (byte) ((address.Address >> 24) & 0xff);
+-			
++			SocketAddress sockaddr;
++
++			switch (address.AddressFamily)
++			{
++				case AddressFamily.InterNetwork:
++					// .net produces a 16 byte buffer, even though
++					// only 8 bytes are used. I guess its just a
++					// holdover from struct sockaddr padding.
++					sockaddr = new SocketAddress(AddressFamily.InterNetwork, 16);
++
++					// bytes 2 and 3 store the port, the rest
++					// stores the address
++					sockaddr [2] = (byte) ((port>>8) & 0xff);
++					sockaddr [3] = (byte) (port & 0xff);
++
++					sockaddr [4] = (byte) (address.Address & 0xff);
++					sockaddr [5] = (byte) ((address.Address >> 8) & 0xff);
++					sockaddr [6] = (byte) ((address.Address >> 16) & 0xff);
++					sockaddr [7] = (byte) ((address.Address >> 24) & 0xff);
++					break;
++
++				case AddressFamily.InterNetworkV6:
++					sockaddr = new SocketAddress(AddressFamily.InterNetworkV6, 28);
++
++					sockaddr [2] = (byte) ((port>>8) & 0xff);
++					sockaddr [3] = (byte) (port & 0xff);
++
++					byte[] addressBytes = address.GetAddressBytes();
++					for(int i=0; i<16; i++)
++						sockaddr[8+i] = addressBytes[i];
++					
++					sockaddr [24] = (byte) (address.ScopeId & 0xff);
++					sockaddr [25] = (byte) ((address.ScopeId >> 8) & 0xff);
++					sockaddr [26] = (byte) ((address.ScopeId >> 16) & 0xff);
++					sockaddr [27] = (byte) ((address.ScopeId >> 24) & 0xff);
++					break;
++			}
++
+ 			return(sockaddr);
+ 		}
+ 
+Index: class/System/System.Net/IPv6Address.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net/IPv6Address.cs,v
+retrieving revision 1.1
+diff -u -r1.1 IPv6Address.cs
+--- class/System/System.Net/IPv6Address.cs	5 May 2002 06:51:38 -0000	1.1
++++ class/System/System.Net/IPv6Address.cs	28 Jun 2003 13:37:37 -0000
+@@ -27,6 +27,7 @@
+ 	public class IPv6Address {
+ 		private ushort [] address;
+ 		private int prefixLength;
++		private long scopeId = 0;
+ 
+ 		public static readonly IPv6Address Loopback = IPv6Address.Parse ("::1");
+ 		public static readonly IPv6Address Unspecified = IPv6Address.Parse ("::");
+@@ -49,6 +50,11 @@
+ 			if (prefixLength < 0 || prefixLength > 128)
+ 				throw new ArgumentException ("prefixLength");
+ 			this.prefixLength = prefixLength;
++		}	
++	
++		public IPv6Address (ushort [] addr, int prefixLength, int scopeId) : this (addr, prefixLength)
++		{
++            this.scopeId = scopeId;
+ 		}		
+ 		
+ 		public static IPv6Address Parse (string ipString)
+@@ -65,6 +71,7 @@
+ 				throw new FormatException ("Not a valid IPv6 address");
+ 
+ 			int prefixLen = 0;
++			int scopeId = 0;
+ 			int pos = ipString.LastIndexOf ('/');
+ 			if (pos != -1) {
+ 				string prefix = ipString.Substring (pos + 1);
+@@ -74,8 +81,20 @@
+ 					prefixLen = -1;
+ 				}
+ 				if (prefixLen < 0 || prefixLen > 128)
+-					throw new FormatException ("Not a valid prefix length");;
++					throw new FormatException ("Not a valid prefix length");
+ 				ipString = ipString.Substring (0, pos);
++			} else {
++				pos = ipString.LastIndexOf ('%');
++				if (pos != -1) {
++					string prefix = ipString.Substring (pos + 1);
++					try  {
++						scopeId = Int32.Parse (prefix);
++					} 
++					catch (Exception) {
++						scopeId = 0;
++					}
++					ipString = ipString.Substring (0, pos);
++				}			
+ 			}
+ 			
+ 			ushort [] addr = new ushort [8];			
+@@ -164,7 +183,7 @@
+ 					throw new FormatException ("Not a valid IPv6 address");
+ 			}
+ 			
+-			return new IPv6Address (addr, prefixLen);
++			return new IPv6Address (addr, prefixLen, scopeId);
+ 		}
+ 		
+ 		public ushort [] Address {
+@@ -175,6 +194,15 @@
+ 			get { return this.prefixLength; }
+ 		}
+ 		
++		public long ScopeId {
++			get {
++				return scopeId;
++			}
++			set {
++				scopeId = value;
++			}
++		}
++
+ 		public ushort this [int index] {
+ 			get { return address [index]; }
+ 		}		
+@@ -204,8 +232,8 @@
+ 		{
+ 			for (int i = 0; i < 6; i++) 
+ 				if (address [i] != 0)
+-					return false;			
+-			return true;
++					return false;
++			return ( (IPAddress.NetworkToHostOrder(address[7]) << 16) | IPAddress.NetworkToHostOrder(address[6])) > 1;
+ 		}
+ 		
+ 		public bool IsIPv4Mapped ()
+@@ -222,10 +250,42 @@
+ 		/// </summary>
+ 		public override string ToString ()
+ 		{
++			bool bZeroUsed = false;
+ 			StringBuilder s = new StringBuilder ();
+-			for (int i = 0; i < 7; i++)
+-				s.Append (String.Format ("{0:X4}", address [i])).Append (':');
+-			s.Append (String.Format ("{0:X4}", address [7]));
++
++
++			if(IsIPv4Compatible() || IsIPv4Mapped())
++			{
++				s.Append("::");
++
++				if(IsIPv4Mapped())
++					s.Append("ffff:");
++
++                s.Append(new IPAddress( IPAddress.NetworkToHostOrder(address[6]<<16) + IPAddress.NetworkToHostOrder(address[7])).ToString());
++
++				return s.ToString ();
++			}
++			else
++			{
++				if(address[0] == 0) 
++					s.Append (":");
++
++				for (int i = 0;i < 8; i++)
++				{
++					if(address[i] == 0 && !bZeroUsed) {
++						bZeroUsed = true;
++						while(i < 8 && address[i] == 0) i++;
++						s.Append (":");
++					}
++
++					if(i < 8) {
++						s.AppendFormat("{0:x}", address [i]);
++						if(i < 7) s.Append (':');
++					}
++				}
++			}
++
++
+ 			return s.ToString ();
+ 		}
+ 
+Index: class/System/System.Net.Sockets/ProtocolType.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net.Sockets/ProtocolType.cs,v
+retrieving revision 1.3
+diff -u -r1.3 ProtocolType.cs
+--- class/System/System.Net.Sockets/ProtocolType.cs	7 Sep 2001 15:27:34 -0000	1.3
++++ class/System/System.Net.Sockets/ProtocolType.cs	28 Jun 2003 13:37:37 -0000
+@@ -51,6 +51,10 @@
+ 
+ 		/// <summary>
+ 		/// </summary>
++		IPv6 = 41,
++
++		/// <summary>
++		/// </summary>
+ 		ND = 77,
+ 
+ 		/// <summary>
+Index: class/System/System.Net.Sockets/Socket.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net.Sockets/Socket.cs,v
+retrieving revision 1.15
+diff -u -r1.15 Socket.cs
+--- class/System/System.Net.Sockets/Socket.cs	16 May 2003 12:03:57 -0000	1.15
++++ class/System/System.Net.Sockets/Socket.cs	28 Jun 2003 13:37:38 -0000
+@@ -258,6 +258,7 @@
+ 		private SocketType socket_type;
+ 		private ProtocolType protocol_type;
+ 		private bool blocking=true;
++		private static int ipv4Supported = -1, ipv6Supported = -1;
+ 
+ 		/* When true, the socket was connected at the time of
+ 		 * the last IO operation
+@@ -463,7 +464,7 @@
+ 				
+ 				sa=LocalEndPoint_internal(socket);
+ 
+-				if(sa.Family==AddressFamily.InterNetwork) {
++				if(sa.Family==AddressFamily.InterNetwork || sa.Family==AddressFamily.InterNetworkV6) {
+ 					// Stupidly, EndPoint.Create() is an
+ 					// instance method
+ 					return new IPEndPoint(0, 0).Create(sa);
+@@ -493,7 +494,7 @@
+ 				
+ 				sa=RemoteEndPoint_internal(socket);
+ 
+-				if(sa.Family==AddressFamily.InterNetwork) {
++				if(sa.Family==AddressFamily.InterNetwork || sa.Family==AddressFamily.InterNetworkV6 ) {
+ 					// Stupidly, EndPoint.Create() is an
+ 					// instance method
+ 					return new IPEndPoint(0, 0).Create(sa);
+@@ -512,6 +513,42 @@
+ 			}
+ 		}
+ 
++		public static bool SupportsIPv4 {
++			get {
++				if(ipv4Supported == -1) {
++					try {
++						Socket tmp = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
++						tmp.Close();
++
++						ipv4Supported = 1;
++					}
++					catch {
++						ipv4Supported = 0;
++					}
++				}
++
++				return ipv4Supported == 1;
++			}
++		}
++
++		public static bool SupportsIPv6 {
++			get {
++				if(ipv6Supported == -1 ){
++					try {
++						Socket tmp = new Socket(AddressFamily.InterNetworkV6, SocketType.Stream, ProtocolType.Tcp);
++						tmp.Close();
++
++						ipv6Supported = 1;
++					}
++					catch {
++						ipv6Supported = 0;
++					}
++				}
++
++				return ipv6Supported == 1;
++			}
++		}
++		
+ 		// Creates a new system socket, returning the handle
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+ 		private extern static IntPtr Accept_internal(IntPtr sock);
+@@ -635,7 +672,7 @@
+ 			if(remote_end==null) {
+ 				throw new ArgumentNullException();
+ 			}
+-			
++
+ 			Connect_internal(socket, remote_end.Serialize());
+ 			connected=true;
+ 		}
+Index: class/System/System.Net.Sockets/SocketOptionLevel.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net.Sockets/SocketOptionLevel.cs,v
+retrieving revision 1.3
+diff -u -r1.3 SocketOptionLevel.cs
+--- class/System/System.Net.Sockets/SocketOptionLevel.cs	7 Sep 2001 15:27:34 -0000	1.3
++++ class/System/System.Net.Sockets/SocketOptionLevel.cs	28 Jun 2003 13:37:39 -0000
+@@ -27,6 +27,10 @@
+ 
+ 		/// <summary>
+ 		/// </summary>
++		IPv6 = 41,
++
++		/// <summary>
++		/// </summary>
+ 		Tcp = 6,
+ 
+ 		/// <summary>
+Index: class/System/System.Net.Sockets/TcpClient.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net.Sockets/TcpClient.cs,v
+retrieving revision 1.7
+diff -u -r1.7 TcpClient.cs
+--- class/System/System.Net.Sockets/TcpClient.cs	2 Nov 2002 12:33:08 -0000	1.7
++++ class/System/System.Net.Sockets/TcpClient.cs	28 Jun 2003 13:37:39 -0000
+@@ -32,11 +32,16 @@
+ 		/// <summary>
+ 		/// Some code that is shared between the constructors.
+ 		/// </summary>
+-		private void Init ()
++		private void Init (AddressFamily family)
+ 		{
+ 			active = false;
+-			client = new Socket(AddressFamily.InterNetwork,
+-				SocketType.Stream, ProtocolType.Tcp);
++
++			if(client != null) {
++				client.Close();
++				client = null;
++			}
++
++			client = new Socket(family, SocketType.Stream, ProtocolType.Tcp);
+ 		}
+ 
+ 		/// <summary>
+@@ -44,7 +49,7 @@
+ 		/// </summary>
+ 		public TcpClient ()
+ 		{
+-			Init();
++			Init(AddressFamily.InterNetwork);
+ 			client.Bind(new IPEndPoint(IPAddress.Any, 0));
+ 		}
+ 	
+@@ -57,7 +62,7 @@
+ 		/// <param name="local_end_point">The aforementioned local endpoint</param>
+ 		public TcpClient (IPEndPoint local_end_point)
+ 		{
+-			Init();
++			Init(local_end_point.AddressFamily);
+ 			client.Bind(local_end_point);
+ 		}
+ 		
+@@ -71,8 +76,6 @@
+ 		/// <param name="port">The port to connect to, e.g. 80 for HTTP</param>
+ 		public TcpClient (string hostname, int port)
+ 		{
+-			Init();
+-			client.Bind(new IPEndPoint(IPAddress.Any, 0));
+ 			Connect(hostname, port);
+ 		}
+ 				
+@@ -276,10 +279,33 @@
+ 		public void Connect (string hostname, int port)
+ 		{
+ 			CheckDisposed ();
++
+ 			IPHostEntry host = Dns.GetHostByName(hostname);
+-			/* TODO: This will connect to the first IP address returned
+-			from GetHostByName.  Is that right? */
+-			Connect(new IPEndPoint(host.AddressList[0], port));
++
++			for(int i=0; i<host.AddressList.Length; i++)
++			{
++				try {
++					Init(host.AddressList[i].AddressFamily);
++
++					if(host.AddressList[i].AddressFamily == AddressFamily.InterNetwork)
++						client.Bind(new IPEndPoint(IPAddress.Any, 0));
++					else if(host.AddressList[i].AddressFamily == AddressFamily.InterNetworkV6)
++						client.Bind(new IPEndPoint(IPAddress.IPv6Any, 0));
++
++					Connect(new IPEndPoint(host.AddressList[i], port));
++					break;
++				}
++				catch(Exception e) {
++					if(client != null) {
++						client.Close();
++						client = null;
++					}
++
++					/// This is the last known address, re-throw the exception
++					if(i == host.AddressList.Length-1)
++						throw e;
++				}
++			}
+ 		}
+ 		
+ 		/// <summary>
+Index: class/System/System.Net.Sockets/TcpListener.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net.Sockets/TcpListener.cs,v
+retrieving revision 1.5
+diff -u -r1.5 TcpListener.cs
+--- class/System/System.Net.Sockets/TcpListener.cs	17 May 2002 15:53:05 -0000	1.5
++++ class/System/System.Net.Sockets/TcpListener.cs	28 Jun 2003 13:37:39 -0000
+@@ -30,11 +30,10 @@
+ 		/// <summary>
+ 		/// Some code that is shared between the constructors.
+ 		/// </summary>
+-		private void Init ()
++		private void Init (AddressFamily family)
+ 		{
+ 			active = false;
+-			server = new Socket(AddressFamily.InterNetwork,
+-				SocketType.Stream, ProtocolType.Tcp);
++			server = new Socket(family, SocketType.Stream, ProtocolType.Tcp);
+ 		}
+ 		
+ 		/// <summary>
+@@ -44,7 +43,7 @@
+ 		/// are a web server</param>
+ 		public TcpListener (int port)
+ 		{
+-			Init();
++			Init(AddressFamily.InterNetwork);
+ 			server.Bind(new IPEndPoint(IPAddress.Any, port));
+ 		}
+ 
+@@ -54,7 +53,7 @@
+ 		/// <param name="local_end_point">The endpoint</param>
+ 		public TcpListener (IPEndPoint local_end_point)
+ 		{
+-			Init();
++			Init(local_end_point.AddressFamily);
+ 			server.Bind(local_end_point);
+ 		}
+ 		
+@@ -66,7 +65,7 @@
+ 		/// <param name="port">The port to listen on</param>
+ 		public TcpListener (IPAddress listen_ip, int port)
+ 		{
+-			Init();
++			Init(listen_ip.AddressFamily);
+ 			server.Bind(new IPEndPoint(listen_ip, port));
+ 		}
+ 
+Index: class/System/System.Net.Sockets/UdpClient.cs
+===================================================================
+RCS file: /mono/mcs/class/System/System.Net.Sockets/UdpClient.cs,v
+retrieving revision 1.6
+diff -u -r1.6 UdpClient.cs
+--- class/System/System.Net.Sockets/UdpClient.cs	25 Mar 2003 00:16:59 -0000	1.6
++++ class/System/System.Net.Sockets/UdpClient.cs	28 Jun 2003 13:37:39 -0000
+@@ -17,10 +17,19 @@
+ 		private bool disposed = false;
+ 		private bool active = false;
+ 		private Socket socket;
++		private AddressFamily family = AddressFamily.InterNetwork;
+ 		
+ #region Constructors
+-		public UdpClient ()
++		public UdpClient () : this(AddressFamily.InterNetwork)
+ 		{
++		}
++
++		public UdpClient(AddressFamily family)
++		{
++			if(family != AddressFamily.InterNetwork && family != AddressFamily.InterNetwork)
++				throw new ArgumentException("family");
++
++			this.family = family;
+ 			InitSocket (null);
+ 		}
+ 
+@@ -29,6 +38,8 @@
+ 			if (port < IPEndPoint.MinPort || port > IPEndPoint.MaxPort)
+ 				throw new ArgumentOutOfRangeException ("port");
+ 
++			this.family = AddressFamily.InterNetwork;
++
+ 			IPEndPoint localEP = new IPEndPoint (IPAddress.Any, port);
+ 			InitSocket (localEP);
+ 		}
+@@ -38,6 +49,8 @@
+ 			if (localEP == null)
+ 				throw new ArgumentNullException ("localEP");
+ 
++			this.family = localEP.AddressFamily;
++
+ 			InitSocket (localEP);
+ 		}
+ 
+@@ -55,7 +68,13 @@
+ 
+ 		private void InitSocket (EndPoint localEP)
+ 		{
+-			socket = new Socket (AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
++			if(socket != null) {
++				socket.Close();
++				socket = null;
++			}
++
++			socket = new Socket (family, SocketType.Dgram, ProtocolType.Udp);
++
+ 			if (localEP != null)
+ 				socket.Bind (localEP);
+ 		}
+@@ -95,25 +114,57 @@
+ 			if (port < IPEndPoint.MinPort || port > IPEndPoint.MaxPort)
+ 				throw new ArgumentOutOfRangeException ("port");
+ 
+-			Connect (new IPEndPoint (Dns.Resolve (hostname).AddressList [0], port));
++			IPAddress[] addresses = Dns.Resolve (hostname).AddressList;
++			for(int i=0; i<addresses.Length; i++) {
++				try {
++					Console.WriteLine("Trying: {0}, Family: {1}", addresses[i], addresses[i].AddressFamily);
++
++					this.family = addresses[i].AddressFamily;
++					Connect (new IPEndPoint (addresses[i], port));
++
++					Console.WriteLine("Connected: {0}, Family: {1}", addresses[i], family);
++					break;
++				}
++				catch(Exception e) {
++					if(i == addresses.Length - 1){
++						if(socket != null) {
++							socket.Close();
++							socket = null;
++						}
++
++						/// This is the last entry, re-throw the exception
++						throw e;
++					}
++				}
++			}
++
+ 		}
+ #endregion
+-#region Multicast methods
++		#region Multicast methods
+ 		public void DropMulticastGroup (IPAddress multicastAddr)
+ 		{
+ 			CheckDisposed ();
+ 			if (multicastAddr == null)
+ 				throw new ArgumentNullException ("multicastAddr");
+ 
+-			socket.SetSocketOption (SocketOptionLevel.IP, SocketOptionName.DropMembership,
+-						new MulticastOption (multicastAddr));
++			if(family == AddressFamily.InterNetwork)
++				socket.SetSocketOption (SocketOptionLevel.IP, SocketOptionName.DropMembership,
++					new MulticastOption (multicastAddr));
++			else
++				socket.SetSocketOption (SocketOptionLevel.IPv6, SocketOptionName.DropMembership,
++					new IPv6MulticastOption (multicastAddr));
+ 		}
+ 
+ 		public void JoinMulticastGroup (IPAddress multicastAddr)
+ 		{
+ 			CheckDisposed ();
+-			socket.SetSocketOption (SocketOptionLevel.IP, SocketOptionName.AddMembership,
+-						new MulticastOption (multicastAddr));
++
++			if(family == AddressFamily.InterNetwork)
++				socket.SetSocketOption (SocketOptionLevel.IP, SocketOptionName.AddMembership,
++					new MulticastOption (multicastAddr));
++			else
++				socket.SetSocketOption (SocketOptionLevel.IPv6, SocketOptionName.AddMembership,
++					new IPv6MulticastOption (multicastAddr));
+ 		}
+ 
+ 		public void JoinMulticastGroup (IPAddress multicastAddr, int timeToLive)
+@@ -123,10 +174,14 @@
+ 			if (timeToLive < 0 || timeToLive > 255)
+ 				throw new ArgumentOutOfRangeException ("timeToLive");
+ 
+-			socket.SetSocketOption (SocketOptionLevel.IP, SocketOptionName.MulticastTimeToLive,
+-						timeToLive);
++			if(family == AddressFamily.InterNetwork)
++				socket.SetSocketOption (SocketOptionLevel.IP, SocketOptionName.MulticastTimeToLive,
++					timeToLive);
++			else
++				socket.SetSocketOption (SocketOptionLevel.IPv6, SocketOptionName.MulticastTimeToLive,
++					timeToLive);
+ 		}
+-#endregion
++		#endregion
+ #region Data I/O
+ 		public byte [] Receive (ref IPEndPoint remoteEP)
+ 		{
+Index: class/System/Test/System.Net/DnsTest.cs
+===================================================================
+RCS file: /mono/mcs/class/System/Test/System.Net/DnsTest.cs,v
+retrieving revision 1.9
+diff -u -r1.9 DnsTest.cs
+--- class/System/Test/System.Net/DnsTest.cs	18 Mar 2003 21:45:40 -0000	1.9
++++ class/System/Test/System.Net/DnsTest.cs	28 Jun 2003 13:37:39 -0000
+@@ -120,6 +120,7 @@
+         }
+         
+         private void SubTestGetHostByAddressIPAddress(IPAddress addr) {
++				Console.WriteLine("Resolving: {0}", addr);
+                 IPHostEntry h = Dns.GetHostByAddress(addr);
+                 SubTestValidIPHostEntry(h);
+                 Assertion.Assert(h.AddressList[0].ToString() == addr.ToString());
+Index: class/System/Test/System.Net.Sockets/TcpListenerTest.cs
+===================================================================
+RCS file: /mono/mcs/class/System/Test/System.Net.Sockets/TcpListenerTest.cs,v
+retrieving revision 1.2
+diff -u -r1.2 TcpListenerTest.cs
+--- class/System/Test/System.Net.Sockets/TcpListenerTest.cs	18 Mar 2003 21:45:40 -0000	1.2
++++ class/System/Test/System.Net.Sockets/TcpListenerTest.cs	28 Jun 2003 13:37:40 -0000
+@@ -28,23 +28,29 @@
+ 		[Test]
+ 		public void TcpListener()
+ 		{
+-			// listen with a new listener
++			// listen with a new listener (IPv4 is the default)
+ 			TcpListener inListener = new TcpListener(1234);
+ 			inListener.Start();
+ 			
+ 
+ 			// connect to it from a new socket
+-			Socket outSock = new Socket(AddressFamily.InterNetwork, SocketType.Stream,
+-				ProtocolType.IP);
+ 			IPHostEntry hostent = Dns.GetHostByAddress("127.0.0.1");
+-			IPEndPoint remote = new IPEndPoint(hostent.AddressList[0], 1234);
+-			outSock.Connect(remote);
++			Socket outSock;
+ 
++			foreach(IPAddress address in hostent.AddressList) {
++				if(address.AddressFamily == AddressFamily.InterNetwork) {
++					/// Only keep IPv4 addresses, our Server is in IPv4 only mode.
++					outSock = new Socket(address.AddressFamily, SocketType.Stream,
++						ProtocolType.IP);
++					IPEndPoint remote = new IPEndPoint(address, 1234);
++					outSock.Connect(remote);
++					break;
++				}
++			}
+ 			
+ 			// make sure the connection arrives
+ 			Assertion.Assert(inListener.Pending());
+ 			Socket inSock = inListener.AcceptSocket();
+-
+ 
+ 			// now send some data and see if it comes out the other end
+ 			const int len = 1024;

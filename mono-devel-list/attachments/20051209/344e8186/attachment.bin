@@ -1,0 +1,419 @@
+Index: mono/metadata/security.c
+===================================================================
+--- mono/metadata/security.c	(revision 54164)
++++ mono/metadata/security.c	(working copy)
+@@ -4,7 +4,7 @@
+  * Author:
+  *	Sebastien Pouliot  <sebastien@ximian.com>
+  *
+- * (C) 2004 Novell (http://www.novell.com)
++ * Copyright (C) 2004-2005 Novell, Inc (http://www.novell.com)
+  */
+ 
+ #ifdef HAVE_CONFIG_H
+@@ -16,6 +16,7 @@
+ #include <mono/metadata/exception.h>
+ #include <mono/metadata/object-internals.h>
+ #include <mono/metadata/metadata-internals.h>
++#include <mono/metadata/rand.h>
+ #include <mono/metadata/security.h>
+ #include <mono/io-layer/io-layer.h>
+ #include <mono/utils/strenc.h>
+@@ -38,6 +39,7 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <unistd.h>
++#include "mono/utils/rijndael-alg-fst.h"
+ 
+ /* Disclaimers */
+ 
+@@ -964,3 +966,191 @@
+ 	}
+ 	return FALSE;
+ }
++
++
++#ifdef PLATFORM_WIN32
++
++static MonoProtectMemoryFunc dapiProtectMemory = NULL;
++static MonoProtectMemoryFunc dapiUnprotectMemory = NULL;
++static guint32 success;
++
++#else
++
++static guchar* dpapiSameProcessKey = NULL;
++static guchar* dpapiSameProcessIV = NULL;
++
++#endif
++
++static gboolean
++InitializeProtectedMemory (void)
++{
++#ifdef PLATFORM_WIN32
++	/*
++	 * http://msdn.microsoft.com/library/en-us/dncode/html/secure06122003.asp
++	 * Summary: CryptProtectMemory and CryptUnprotectMemory exists only in Windows 2003 +
++	 * but they are available in advapi32.dll as RtlEncryptMemory (SystemFunction040) and
++	 * RtlDecryptMemory (SystemFunction041) since Windows 2000 SP 3. Sadly both can disappear
++	 * anytime with a newer OS so we include support for Crypt[Unp|P]rotectMemory too.
++	 *
++	 * Both function pair share the same parameters but the return value differs because 
++	 * SystemFunction[040|041] returns NTSTATUS (where 0 is a STATUS_SUCCESS) while
++	 * Crypt[Unp|P]rotectMemory returns BOOL (where 0 is a failure).
++	 */
++
++	/* 1st try to get address from crypt32.dll (windows 2003 and later) */
++	HMODULE crypt32 = LoadLibraryA ("crypt32.dll");
++	if (crypt32) {
++		dapiProtectMemory = GetProcAddress (crypt32, "CryptProtectMemory");
++		dapiUnprotectMemory = GetProcAddress (crypt32, "CryptUnprotectMemory");
++		FreeLibrary (crypt32);
++		success = 1;
++		/* don't return here as functions may not be present (e.g. Windows XP) */
++	}
++
++	if (!dapiProtectMemory || !dapiUnprotectMemory) {
++		/* second/last chance, try the older Rtl functions in advapi32.dll (windows 2000 sp3 and later) */
++		HMODULE advapi32 = LoadLibraryA ("advapi32.dll");
++		if (advapi32) {
++			dapiProtectMemory = GetProcAddress (advapi32, "SystemFunction040");
++			dapiUnprotectMemory = GetProcAddress (advapi32, "SystemFunction041");
++			FreeLibrary (advapi32);
++			success = 0;
++			/* don't return here as functions may not be present (e.g. early win2k) */
++		}
++	}
++
++	return (dapiProtectMemory && dapiUnprotectMemory);
++#else
++	/* initialize SameProcess key */
++	if (dpapiSameProcessKey)
++		return TRUE;
++
++	gpointer handle = ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngInitialize (NULL);
++	if (!handle)
++		return FALSE;
++
++	dpapiSameProcessKey = (guchar*) malloc (MONO_DPAPI_KEY_SIZE);
++	mono_random_get_bytes (handle, dpapiSameProcessKey, MONO_DPAPI_KEY_SIZE);
++
++	dpapiSameProcessIV = (guchar*) malloc (MONO_DPAPI_BLOCK_SIZE); /* IV is always equals to the block size */
++	mono_random_get_bytes (handle, dpapiSameProcessIV, MONO_DPAPI_BLOCK_SIZE);
++
++	ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngClose (handle);
++	return TRUE;
++#endif
++}
++
++MonoBoolean
++ves_icall_System_Security_Cryptography_ProtectedMemory_InternalProtectMemory (MonoArray *data, guint32 flags)
++{
++	guchar *buffer = mono_array_addr (data, guchar, 0);
++	guint32 length = mono_array_length (data);
++
++#ifdef PLATFORM_WIN32
++	if (!dapiProtectMemory) {
++		if (!InitializeProtectedMemory ())
++			return FALSE;
++	}
++
++	return (dapiProtectMemory (buffer, length, flags) == success);
++#else
++	guint32 rk [44]; /* 4 x (Nr + 1), where Nr always equals 10 for 128 bits keys */
++	int blocks = length >> 4; /* in multiple of 16 bytes */
++
++	/* Mono only supports protection inside the same process */
++	if (flags != CRYPTPROTECTMEMORY_SAME_PROCESS)
++		return FALSE;
++
++	if (!dpapiSameProcessKey) {
++		if (!InitializeProtectedMemory ())
++			return FALSE;
++	}
++
++	if (rijndaelKeySetupEnc (rk, dpapiSameProcessKey, (MONO_DPAPI_KEY_SIZE << 3)) != 10)
++		return FALSE;
++
++	/* source and destination must be different buffers */
++	guchar *input = (guchar*) g_new (guchar, length);
++	if (input) {
++		guchar block[MONO_DPAPI_BLOCK_SIZE];
++		int i;
++		guchar *original = input;
++		guchar *iv = dpapiSameProcessIV;
++		memcpy (input, buffer, length);
++		for (i = 0; i < blocks; i++) {
++			/* CBC mode */
++			((guint32*)block)[0] = ((guint32*)input)[0] ^ ((guint32*)iv)[0];
++			((guint32*)block)[1] = ((guint32*)input)[1] ^ ((guint32*)iv)[1];
++			((guint32*)block)[2] = ((guint32*)input)[2] ^ ((guint32*)iv)[2];
++			((guint32*)block)[3] = ((guint32*)input)[3] ^ ((guint32*)iv)[3];
++			rijndaelEncrypt (rk, 10, block, buffer);
++			iv = buffer;
++			input += MONO_DPAPI_BLOCK_SIZE;
++			buffer += MONO_DPAPI_BLOCK_SIZE;
++		}
++		memset (original, 0, length);
++		free (original);
++		return TRUE;
++	}
++	return FALSE;
++#endif
++}
++
++MonoBoolean
++ves_icall_System_Security_Cryptography_ProtectedMemory_InternalUnprotectMemory (MonoArray *data, guint32 flags)
++{
++	guchar *buffer = mono_array_addr (data, guchar, 0);
++	guint32 length = mono_array_length (data);
++
++#ifdef PLATFORM_WIN32
++	if (!dapiUnprotectMemory) {
++		if (!InitializeProtectedMemory ())
++			return FALSE;
++	}
++
++	return (dapiUnprotectMemory (buffer, length, flags) == success);
++#else
++	guint32 rk [44]; /* 4 x (Nr + 1), where Nr always equals 10 for 128 bits keys */
++	int blocks = length >> 4; /* in multiple of 16 bytes */
++
++	/* Mono only supports protection inside the same process */
++	if (flags != CRYPTPROTECTMEMORY_SAME_PROCESS)
++		return FALSE;
++
++	if (!dpapiSameProcessKey) {
++		if (!InitializeProtectedMemory ())
++			return FALSE;
++	}
++
++	/* Nr always equals 10 for 128 bits keys */
++	if (rijndaelKeySetupDec (rk, dpapiSameProcessKey, (MONO_DPAPI_KEY_SIZE << 3)) != 10)
++		return FALSE;
++
++	/* source and destination must be different buffers */
++	guchar *input = (guchar*) g_new (guchar, length);
++	if (input) {
++		guchar block[MONO_DPAPI_BLOCK_SIZE];
++		int i;
++		guchar *original = input;
++		guchar *iv = dpapiSameProcessIV;
++		memcpy (original, buffer, length);
++		for (i = 0; i < blocks; i++) {
++			rijndaelDecrypt (rk, 10, input, block);
++			/* CBC mode */
++			((guint32*)block)[0] ^= ((guint32*)iv)[0];
++			((guint32*)block)[1] ^= ((guint32*)iv)[1];
++			((guint32*)block)[2] ^= ((guint32*)iv)[2];
++			((guint32*)block)[3] ^= ((guint32*)iv)[3];
++			memcpy (iv, input, MONO_DPAPI_BLOCK_SIZE);
++			memcpy (buffer, block, MONO_DPAPI_BLOCK_SIZE);
++			input += MONO_DPAPI_BLOCK_SIZE;
++			buffer += MONO_DPAPI_BLOCK_SIZE;
++		}
++		memset (original, 0, length);
++		free (original);
++		return TRUE;
++	}
++	return FALSE;
++#endif
++}
++
+Index: mono/metadata/security.h
+===================================================================
+--- mono/metadata/security.h	(revision 54164)
++++ mono/metadata/security.h	(working copy)
+@@ -4,7 +4,7 @@
+  * Author:
+  *	Sebastien Pouliot  <sebastien@ximian.com>
+  *
+- * (C) 2004 Novell (http://www.novell.com)
++ * Copyright (C) 2004-2005 Novell, Inc (http://www.novell.com)
+  */
+ 
+ 
+@@ -13,6 +13,21 @@
+ 
+ #include <mono/metadata/object.h>
+ 
++#if defined (PLATFORM_WIN32)
++
++#include <windows.h>
++#include <wincrypt.h>
++
++#endif
++
++/* Data Protection API definitions */
++#define MONO_DPAPI_KEY_SIZE			16
++#define MONO_DPAPI_BLOCK_SIZE			16
++
++#ifndef CRYPTPROTECTMEMORY_SAME_PROCESS
++#define CRYPTPROTECTMEMORY_SAME_PROCESS		0
++#endif
++
+ G_BEGIN_DECLS
+ 
+ /* System.Environment */
+@@ -49,6 +64,13 @@
+ /* System.Security.Policy.Evidence */
+ MonoBoolean ves_icall_System_Security_Policy_Evidence_IsAuthenticodePresent (MonoReflectionAssembly *refass);
+ 
++
++/* System.Security.Cryptography.ProtectedMemory */
++typedef guint32 (*MonoProtectMemoryFunc)	(gpointer data, guint32 length, guint32 flags);
++MonoBoolean ves_icall_System_Security_Cryptography_ProtectedMemory_InternalProtectMemory (MonoArray *data, guint32 flags);
++MonoBoolean ves_icall_System_Security_Cryptography_ProtectedMemory_InternalUnprotectMemory (MonoArray *data, guint32 flags);
++
++
+ G_END_DECLS
+ 
+ #endif /* _MONO_METADATA_SECURITY_H_ */
+Index: mono/metadata/icall.c
+===================================================================
+--- mono/metadata/icall.c	(revision 54164)
++++ mono/metadata/icall.c	(working copy)
+@@ -6812,6 +6819,11 @@
+ 	{"IsTransparentProxy", ves_icall_IsTransparentProxy}
+ };
+ 
++static const IcallEntry dapi_icalls [] = {
++	{"InternalProtectMemory", ves_icall_System_Security_Cryptography_ProtectedMemory_InternalProtectMemory},
++	{"InternalUnprotectMemory", ves_icall_System_Security_Cryptography_ProtectedMemory_InternalUnprotectMemory},
++};
++
+ static const IcallEntry rng_icalls [] = {
+ 	{"RngClose", ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngClose},
+ 	{"RngGetBytes", ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngGetBytes},
+@@ -7140,6 +7152,7 @@
+ 	{"System.Runtime.Remoting.Proxies.RealProxy", realproxy_icalls, G_N_ELEMENTS (realproxy_icalls)},
+ 	{"System.Runtime.Remoting.RemotingServices", remotingservices_icalls, G_N_ELEMENTS (remotingservices_icalls)},
+ 	{"System.RuntimeMethodHandle", methodhandle_icalls, G_N_ELEMENTS (methodhandle_icalls)},
++	{"System.Security.Cryptography.ProtectedMemory", dapi_icalls, G_N_ELEMENTS (dapi_icalls)},
+ 	{"System.Security.Cryptography.RNGCryptoServiceProvider", rng_icalls, G_N_ELEMENTS (rng_icalls)},
+ 	{"System.Security.Policy.Evidence", evidence_icalls, G_N_ELEMENTS (evidence_icalls)},
+ 	{"System.Security.Principal.WindowsIdentity", identity_icalls, G_N_ELEMENTS (identity_icalls)},
+Index: mono/metadata/rand.c
+===================================================================
+--- mono/metadata/rand.c	(revision 54164)
++++ mono/metadata/rand.c	(working copy)
+@@ -92,6 +92,16 @@
+ }
+ #endif
+ 
++/* Common to both WIN32 and other OS */
++gpointer 
++ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngGetBytes (gpointer handle, MonoArray *arry)
++{
++	guint32 len = mono_array_length (arry);
++	guchar *buf = mono_array_addr (arry, guchar, 0);
++	return mono_random_get_bytes (handle, buf, len);
++}
++
++
+ #if defined (PLATFORM_WIN32)
+ 
+ #include <windows.h>
+@@ -150,17 +160,15 @@
+ }
+ 
+ gpointer
+-ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngGetBytes (gpointer handle, MonoArray *arry)
++mono_random_get_bytes (gpointer handle, guchar *buffer, int length)
+ {
+ 	HCRYPTPROV provider = (HCRYPTPROV) handle;
+-	guint32 len = mono_array_length (arry);
+-	guchar *buf = mono_array_addr (arry, guchar, 0);
+ 
+-	if (!CryptGenRandom (provider, len, buf)) {
++	if (!CryptGenRandom (provider, length, buffer)) {
+ 		CryptReleaseContext (provider, 0);
+ 		/* we may have lost our context with CryptoAPI, but all hope isn't lost yet! */
+ 		provider = (HCRYPTPROV) ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngInitialize (NULL);
+-		if (!CryptGenRandom (provider, len, buf)) {
++		if (!CryptGenRandom (provider, length, buffer)) {
+ 			CryptReleaseContext (provider, 0);
+ 			provider = 0;
+ 			/* exception will be thrown in managed code */
+@@ -215,19 +223,17 @@
+ 	return ((!egd && (file < 0)) ? NULL : GINT_TO_POINTER (file));
+ }
+ 
+-gpointer 
+-ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngGetBytes (gpointer handle, MonoArray *arry)
++gpointer
++mono_random_get_bytes (gpointer handle, guchar *buffer, int length)
+ {
+ 	gint file = GPOINTER_TO_INT (handle);
+-	guint32 len = mono_array_length (arry);
+-	guchar *buf = mono_array_addr (arry, guchar, 0);
+ 
+ 	if (egd) {
+ 		const char *socket_path = g_getenv ("MONO_EGD_SOCKET");
+ 		/* exception will be thrown in managed code */
+ 		if (socket_path == NULL)
+ 			return NULL; 
+-		get_entropy_from_server (socket_path, mono_array_addr (arry, guchar, 0), mono_array_length (arry));
++		get_entropy_from_server (socket_path, buffer, length);
+ 		return (gpointer) -1;
+ 	}
+ 	else {
+@@ -236,9 +242,9 @@
+ 		gint err;
+ 
+ 		do {
+-			err = read (file, buf + count, len - count);
++			err = read (file, buffer + count, length - count);
+ 			count += err;
+-		} while (err >= 0 && count < len);
++		} while (err >= 0 && count < length);
+ 
+ 		if (err < 0) {
+ 			g_warning("Entropy error! Error in read (%s).", strerror (errno));
+@@ -247,8 +253,7 @@
+ 		}
+ 	}
+ 
+-	/* We do not support PRNG seeding right now but the class library is this */
+-
++	/* We do not support PRNG seeding right now (but the class library can accept it) */
+ 	return handle;	
+ }
+ 
+Index: mono/metadata/rand.h
+===================================================================
+--- mono/metadata/rand.h	(revision 54164)
++++ mono/metadata/rand.h	(working copy)
+@@ -19,4 +19,5 @@
+ gpointer ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngGetBytes (gpointer handle, MonoArray *arry);
+ void ves_icall_System_Security_Cryptography_RNGCryptoServiceProvider_RngClose (gpointer handle);
+ 
++gpointer mono_random_get_bytes (gpointer handle, guchar *buffer, int length);
+ #endif
+Index: mono/utils/Makefile.am
+===================================================================
+--- mono/utils/Makefile.am	(revision 54164)
++++ mono/utils/Makefile.am	(working copy)
+@@ -2,7 +2,14 @@
+ 
+ INCLUDES = -I$(top_srcdir) -I$(top_srcdir)/mono $(LIBGC_CFLAGS) $(GLIB_CFLAGS) $(GMODULE_CFLAGS)
+ 
++# AES support isn't required on Windows as we use DPAPI (Data Protection API)
++if ! PLATFORM_WIN32
++dpapi_source = rijndael-alg-fst.c
++dpapi_include = rijndael-alg-fst.h
++endif
++
+ libmonoutils_la_SOURCES = \
++	$(dpapi_source)	\
+ 	mono-hash.c	\
+ 	mono-md5.c	\
+ 	mono-sha1.c	\
+@@ -21,6 +28,7 @@
+ libmonoutilsincludedir = $(includedir)/mono/utils
+ 
+ libmonoutilsinclude_HEADERS = \
++	$(dpapi_include)	\
+ 	monobitset.h	\
+ 	mono-codeman.h	\
+ 	mono-digest.h	\
+

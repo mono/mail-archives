@@ -1,0 +1,652 @@
+Index: typemanager.cs
+===================================================================
+--- typemanager.cs	(revisión: 50567)
++++ typemanager.cs	(copia de trabajo)
+@@ -215,6 +215,8 @@
+ 	// </remarks>
+ 	static Assembly [] assemblies;
+ 
++	static Hashtable external_aliases;
++
+ 	// <remarks>
+ 	//  Keeps a list of modules. We used this to do lookups
+ 	//  on the module using GetType -- needed for arrays
+@@ -278,6 +280,7 @@
+ 		// Lets get everything clean so that we can collect before generating code
+ 		assemblies = null;
+ 		modules = null;
++		external_aliases = null;
+ 		builder_to_declspace = null;
+ 		builder_to_member_cache = null;
+ 		builder_to_ifaces = null;
+@@ -379,6 +382,7 @@
+ 		assemblies = new Assembly [0];
+ 		modules = null;
+ 		
++		external_aliases = new Hashtable ();
+ 		builder_to_declspace = new PtrHashtable ();
+ 		builder_to_member_cache = new PtrHashtable ();
+ 		builder_to_method = new PtrHashtable ();
+@@ -504,11 +508,22 @@
+ 		assemblies = n;
+ 	}
+ 
++	public static void AddExternAlias (string alias, Assembly a)
++	{
++		// Keep the new as the chosen one
++		external_aliases [alias] = a;
++	}
++
+         public static Assembly [] GetAssemblies ()
+         {
+                 return assemblies;
+         }
+ 
++	public static Assembly GetExternAlias (string alias)
++	{
++		return (Assembly) external_aliases [alias];
++	}
++
+ 	/// <summary>
+ 	///  Registers a module builder to lookup types from
+ 	/// </summary>
+@@ -625,12 +640,63 @@
+ 		return found_type;
+ 	}
+ 
++	public static Type LookupTypeInExternAlias (string ns, string name, Location loc)
++	{
++		Type found_type = null;
++		
++		int idx = ns.IndexOf ('.');
++		string first = idx != -1 ? ns.Substring (0, idx) : ns;
++		Assembly assembly = (Assembly) external_aliases [first];
++		if (assembly == null)
++			throw new InternalErrorException ("External alias `" + first + "' hasn't been registered.");
++		
++		string nspace = ns != first ? ns.Substring (idx + 1) : "";
++		string fullname = nspace.Length > 0 ? nspace + "." + name : name;
++		Type t = assembly.GetType (fullname);
++		if (t != null) {
++			if (t.IsPointer)
++				throw new InternalErrorException ("Use GetPointerType() to get a pointer");
++			
++			TypeAttributes ta = t.Attributes & TypeAttributes.VisibilityMask;
++			if (ta != TypeAttributes.NotPublic && ta != TypeAttributes.NestedPrivate &&
++					ta != TypeAttributes.NestedAssembly && ta != TypeAttributes.NestedFamANDAssem)
++				found_type = t;
++		}
++		
++		// Look for the type in the code
++		fullname = ns.Length > 0 ? ns + "." + name : name;
++		foreach (Module mb in modules) {
++			t = mb.GetType (fullname);
++			if (t == null)
++				continue;
++			
++			if (found_type == null) {
++				found_type = t;
++				continue;
++			}
++
++			Report.SymbolRelatedToPreviousError (t);
++			Report.SymbolRelatedToPreviousError (found_type);
++			Report.Warning (436, 2, loc, "Ignoring imported type `{0}' since the current assembly already has a declaration with the same name",
++				TypeManager.CSharpName (t));
++			return t;
++		}
++
++		return found_type;
++	}
++
++	//
++	// We use this for retrieving GetNamespaces method if avalaible
++	//
++	static MethodInfo assembly_get_namespaces;
++
+ 	/// <summary>
+ 	///   Computes the namespaces that we import from the assemblies we reference.
+ 	/// </summary>
+ 	public static void ComputeNamespaces ()
+ 	{
+-		MethodInfo assembly_get_namespaces = typeof (Assembly).GetMethod ("GetNamespaces", BindingFlags.Instance|BindingFlags.NonPublic);
++		if (assembly_get_namespaces == null)
++			assembly_get_namespaces = typeof (Assembly).GetMethod ("GetNamespaces", BindingFlags.Instance|BindingFlags.NonPublic);
+ 
+ 		Hashtable cache = null;
+ 
+@@ -682,8 +748,43 @@
+ 				cache.Add (ns, null);
+ 			}
+ 		}
++
+ 	}
+ 
++	public static Namespace ComputeNamespacesForAlias (string name)
++	{
++		Assembly assembly = (Assembly) external_aliases [name];
++		if (assembly == null)
++			return null;
++		
++		if (assembly_get_namespaces == null)
++			assembly_get_namespaces = typeof (Assembly).GetMethod ("GetNamespaces", BindingFlags.Instance|BindingFlags.NonPublic);
++		
++		Namespace retval = Namespace.LookupNamespace (name, true, true);
++		if (assembly_get_namespaces != null) {
++			string [] namespaces = (string []) assembly_get_namespaces.Invoke (assembly, null);
++			foreach (string ns in namespaces) {
++				if (ns.Length == 0)
++					continue;
++				
++				retval.GetNamespace (ns, true, true);
++			}
++		} else {
++			Hashtable alias_cache = new Hashtable ();
++			alias_cache.Add ("", null);
++			foreach (Type t in assembly.GetExportedTypes ()) {
++				string ns = t.Namespace;
++				if (ns == null || alias_cache.Contains (ns))
++					continue;
++
++				retval.GetNamespace (ns, true, true);
++				alias_cache.Add (ns, null);
++			}
++		}
++
++		return retval;
++	}
++
+ 	/// <summary>
+ 	/// Fills static table with exported types from all referenced assemblies.
+ 	/// This information is required for CLS Compliance tests.
+Index: namespace.cs
+===================================================================
+--- namespace.cs	(revisión: 50567)
++++ namespace.cs	(copia de trabajo)
+@@ -28,6 +28,7 @@
+ 		Hashtable namespaces;
+ 		IDictionary declspaces;
+ 		Hashtable cached_types;
++		bool is_extern_alias;
+ 
+ 		public readonly MemberName MemberName;
+ 
+@@ -51,14 +52,19 @@
+ 		///   name.  This is bootstrapped with parent == null
+ 		///   and name = ""
+ 		/// </summary>
+-		public Namespace (Namespace parent, string name)
++		public Namespace (Namespace parent, string name) : this (parent, name, false)
+ 		{
++		}
++		
++		public Namespace (Namespace parent, string name, bool is_extern_alias)
++		{
+ 			// Expression members.
+ 			this.eclass = ExprClass.Namespace;
+ 			this.Type = null;
+ 			this.loc = Location.Null;
+ 
+ 			this.parent = parent;
++			this.is_extern_alias = is_extern_alias;
+ 
+ 			string pname = parent != null ? parent.Name : "";
+ 				
+@@ -109,6 +115,11 @@
+ 		
+ 		public Namespace GetNamespace (string name, bool create)
+ 		{
++			return GetNamespace (name, create, false);
++		}
++		
++		public Namespace GetNamespace (string name, bool create, bool is_extern_alias)
++		{
+ 			int pos = name.IndexOf ('.');
+ 
+ 			Namespace ns;
+@@ -123,20 +134,28 @@
+ 				if (!create)
+ 					return null;
+ 
+-				ns = new Namespace (this, first);
++				ns = new Namespace (this, first, is_extern_alias);
+ 				namespaces.Add (first, ns);
++			} else if (is_extern_alias) {
++				// Update ns information
++				ns.IsExternAlias = is_extern_alias;
+ 			}
+ 
+ 			if (pos >= 0)
+-				ns = ns.GetNamespace (name.Substring (pos + 1), create);
++				ns = ns.GetNamespace (name.Substring (pos + 1), create, is_extern_alias);
+ 
+ 			return ns;
+ 		}
+ 
+ 		public static Namespace LookupNamespace (string name, bool create)
+ 		{
+-			return Root.GetNamespace (name, create);
++			return LookupNamespace (name, create, false);
+ 		}
++		
++		public static Namespace LookupNamespace (string name, bool create, bool is_extern_alias)
++		{
++			return Root.GetNamespace (name, create, is_extern_alias);
++		}
+ 
+ 		TypeExpr LookupType (string name, Location loc)
+ 		{
+@@ -160,8 +179,14 @@
+ 					t = tdecl.TypeBuilder;
+ 				}
+ 			}
+-			string lookup = t != null ? t.FullName : (fullname == "" ? name : fullname + "." + name);
+-			Type rt = TypeManager.LookupTypeReflection (lookup, loc);
++			Type rt = null;
++			if (IsExternAlias)
++				rt = TypeManager.LookupTypeInExternAlias (fullname, name, loc);
++			else {
++				string lookup = t != null ? t.FullName : (fullname == "" ? name : fullname + "." + name);
++				rt = TypeManager.LookupTypeReflection (lookup, loc);
++			}
++			
+ 			if (t == null)
+ 				t = rt;
+ 
+@@ -218,6 +243,11 @@
+ 			get { return parent; }
+ 		}
+ 
++		public bool IsExternAlias {
++			get { return is_extern_alias; }
++			set { is_extern_alias = value; }
++		}
++
+ 		public static void DefineNamespaces (SymbolWriter symwriter)
+ 		{
+ 			foreach (Namespace ns in all_namespaces) {
+@@ -256,6 +286,7 @@
+ 		Hashtable aliases;
+ 		ArrayList using_clauses;
+ 		public bool DeclarationFound = false;
++		bool UsingFound = false;
+ 
+ 		//
+ 		// This class holds the location where a using definition is
+@@ -304,23 +335,32 @@
+ 			}
+ 		}
+ 
+-		public class AliasEntry {
++		public abstract class AliasDef {
+ 			public readonly string Name;
+-			public readonly Expression Alias;
+ 			public readonly NamespaceEntry NamespaceEntry;
+ 			public readonly Location Location;
+-			
+-			public AliasEntry (NamespaceEntry entry, string name, MemberName alias, Location loc)
++			protected FullNamedExpression resolved;
++
++			protected AliasDef (NamespaceEntry entry, string name, Location loc)
+ 			{
+ 				Name = name;
+-				Alias = alias.GetTypeExpression ();
+ 				NamespaceEntry = entry;
+ 				Location = loc;
+ 			}
++			
++			public abstract FullNamedExpression Resolve ();
++		}
+ 
+-			FullNamedExpression resolved;
++		public class AliasEntry : AliasDef {
++			public readonly Expression Alias;
++			
++			public AliasEntry (NamespaceEntry entry, string name, MemberName alias, Location loc)
++				: base (entry, name, loc)
++			{
++				Alias = alias.GetTypeExpression ();
++			}
+ 
+-			public FullNamedExpression Resolve ()
++			public override FullNamedExpression Resolve ()
+ 			{
+ 				if (resolved != null)
+ 					return resolved;
+@@ -333,7 +373,23 @@
+ 				return resolved;
+ 			}
+ 		}
++		
++		public class ExternalAliasEntry : AliasDef {
++			public ExternalAliasEntry (NamespaceEntry entry, string name, Location loc)
++				: base (entry, name, loc)
++			{
++			}
+ 
++			public override FullNamedExpression Resolve ()
++			{
++				if (resolved != null)
++					return resolved;
++
++				FullNamedExpression ns = TypeManager.ComputeNamespacesForAlias (Name);
++				return resolved = ns;
++			}
++		}
++
+ 		public NamespaceEntry (NamespaceEntry parent, SourceFile file, string name, Location loc)
+ 		{
+ 			this.parent = parent;
+@@ -431,6 +487,8 @@
+ 
+ 			UsingEntry ue = new UsingEntry (Doppelganger, name, loc);
+ 			using_clauses.Add (ue);
++			
++			UsingFound = true;
+ 		}
+ 
+ 		public void UsingAlias (string name, MemberName alias, Location loc)
+@@ -440,23 +498,45 @@
+ 				return;
+ 			}
+ 
++			if (RootContext.Version == LanguageVersion.Default &&
++			    name == "global" && RootContext.WarningLevel >= 2)
++				Report.Warning (440, loc, "An alias named `global' will not be used when resolving 'global::';" +
++					" the global namespace will be used instead");
++
++			AddAlias (name, new AliasEntry (Doppelganger, name, alias, loc));
++			
++			UsingFound = true;
++		}
++
++		public void UsingExternalAlias (string alias, Location loc)
++		{
++			if (DeclarationFound || UsingFound) {
++				Report.Error (439, loc, "An extern alias declaration must precede all other elements");
++				return;
++			}
++
++			if (alias == "global") {
++				Report.Error (1681, loc, "You cannot redefine the global extern alias");
++				return;
++			}
++
++			AddAlias (alias, new ExternalAliasEntry (Doppelganger, alias, loc));
++		}
++
++		void AddAlias (string name, AliasDef alias)
++		{
+ 			if (aliases == null)
+ 				aliases = new Hashtable ();
+ 
+ 			if (aliases.Contains (name)) {
+-				AliasEntry ae = (AliasEntry)aliases [name];
++				AliasDef ae = (AliasDef) aliases [name];
+ 				Report.SymbolRelatedToPreviousError (ae.Location, ae.Name);
+-				Report.Error (1537, loc, "The using alias `" + name +
++				Report.Error (1537, alias.Location, "The using alias `" + name +
+ 					      "' appeared previously in this namespace");
+ 				return;
+ 			}
+ 
+-			if (RootContext.Version == LanguageVersion.Default &&
+-			    name == "global" && RootContext.WarningLevel >= 2)
+-				Report.Warning (440, loc, "An alias named `global' will not be used when resolving 'global::';" +
+-					" the global namespace will be used instead");
+-
+-			aliases [name] = new AliasEntry (Doppelganger, name, alias, loc);
++			aliases [name] = alias;
+ 		}
+ 
+ 		public FullNamedExpression LookupNamespaceOrType (DeclSpace ds, string name, Location loc, bool ignore_cs0104)
+@@ -479,13 +559,13 @@
+ 		// Looks-up a alias named @name in this and surrounding namespace declarations
+ 		public FullNamedExpression LookupAlias (string name)
+ 		{
+-			AliasEntry entry = null;
++			AliasDef entry = null;
+ 			// We use Parent rather than ImplicitParent since we know implicit namespace declarations
+ 			// cannot have using entries.
+ 			for (NamespaceEntry n = this; n != null; n = n.Parent) {
+ 				if (n.aliases == null)
+ 					continue;
+-				entry = n.aliases [name] as AliasEntry;
++				entry = n.aliases [name] as AliasDef;
+ 				if (entry != null)
+ 					return entry.Resolve ();
+ 			}
+@@ -639,9 +719,18 @@
+ 
+ 			if (aliases != null) {
+ 				foreach (DictionaryEntry de in aliases) {
+-					AliasEntry alias = (AliasEntry) de.Value;
+-					if (alias.Resolve () == null)
+-						Error_NamespaceNotFound (alias.Location, alias.Alias.ToString ());
++					if (de.Value is AliasEntry) {
++						AliasEntry alias = (AliasEntry) de.Value;
++						if (alias.Resolve () == null)
++							Error_NamespaceNotFound (alias.Location, alias.Alias.ToString ());
++					} else {
++						ExternalAliasEntry alias = (ExternalAliasEntry) de.Value;
++						// We don't resolve by now, since it would imply
++						// modify the namespace tree
++						if (TypeManager.GetExternAlias (alias.Name) == null)
++							Report.Error (430, alias.Location, "The extern alias `" + alias.Name +
++									"` was not specified in a /reference option");
++					}
+ 				}
+ 			}
+ 		}
+Index: cs-parser.jay
+===================================================================
+--- cs-parser.jay	(revisión: 50567)
++++ cs-parser.jay	(copia de trabajo)
+@@ -309,10 +309,31 @@
+         ;
+  
+ outer_declaration
+-        : using_directive
++	: extern_alias_directive
++        | using_directive 
+         | namespace_member_declaration
+         ;
+-  
++
++extern_alias_directives
++	: extern_alias_directive
++	| extern_alias_directives extern_alias_directive;
++
++extern_alias_directive
++	: EXTERN IDENTIFIER IDENTIFIER SEMICOLON
++	  {
++		LocatedToken lt = (LocatedToken) $2;
++		string s = lt.Value;
++		if (s != "alias"){
++			Report.Error (1003, lt.Location, "'alias' expected");
++		} else if (RootContext.Version == LanguageVersion.ISO_1) {
++			Report.FeatureIsNotStandardized (lt.Location, "external alias");
++		} else {
++			lt = (LocatedToken) $3; 
++			current_namespace.UsingExternalAlias (lt.Value, lt.Location);
++		}
++	  }
++	;
++ 
+ using_directives
+ 	: using_directive 
+ 	| using_directives using_directive
+@@ -393,6 +414,7 @@
+ 		if (RootContext.Documentation != null)
+ 			Lexer.doc_state = XmlCommentState.Allowed;
+ 	  }
++	  opt_extern_alias_directives
+ 	  opt_using_directives
+ 	  opt_namespace_member_declarations
+ 	  CLOSE_BRACE
+@@ -403,6 +425,11 @@
+ 	| using_directives
+ 	;
+ 
++opt_extern_alias_directives
++	: /* empty */
++	| extern_alias_directives
++	;
++
+ opt_namespace_member_declarations
+ 	: /* empty */
+ 	| namespace_member_declarations
+Index: driver.cs
+===================================================================
+--- driver.cs	(revisión: 50567)
++++ driver.cs	(copia de trabajo)
+@@ -42,7 +42,12 @@
+ 		//
+ 		static ArrayList soft_references;
+ 
++		// 
++		// External aliases for assemblies.
+ 		//
++		static Hashtable external_aliases;
++
++		//
+ 		// Modules to be linked
+ 		//
+ 		static ArrayList modules;
+@@ -305,6 +310,11 @@
+ 
+ 		static public void LoadAssembly (string assembly, bool soft)
+ 		{
++			LoadAssembly (assembly, null, soft);
++		}
++
++		static public void LoadAssembly (string assembly, string alias, bool soft)
++		{
+ 			Assembly a;
+ 			string total_log = "";
+ 
+@@ -319,7 +329,11 @@
+ 						ass = assembly.Substring (0, assembly.Length - 4);
+ 					a = Assembly.Load (ass);
+ 				}
+-				TypeManager.AddAssembly (a);
++				// Extern aliased refs require special handling
++				if (alias == null)
++					TypeManager.AddAssembly (a);
++				else
++					TypeManager.AddExternAlias (alias, a);
+ 
+ 			} catch (FileNotFoundException){
+ 				foreach (string dir in link_paths){
+@@ -329,7 +343,10 @@
+ 
+ 					try {
+ 						a = Assembly.LoadFrom (full_path);
+-						TypeManager.AddAssembly (a);
++						if (alias == null)
++							TypeManager.AddAssembly (a);
++						else
++							TypeManager.AddExternAlias (alias, a);
+ 						return;
+ 					} catch (FileNotFoundException ff) {
+ 						total_log += ff.FusionLog;
+@@ -405,6 +422,9 @@
+ 
+ 			foreach (string r in soft_references)
+ 				LoadAssembly (r, true);
++
++			foreach (DictionaryEntry entry in external_aliases)
++				LoadAssembly ((string) entry.Value, (string) entry.Key, false);
+ 			
+ 			return;
+ 		}
+@@ -800,7 +820,25 @@
+ 					Environment.Exit (1);
+ 				}
+ 				
+-				references.Add (args [++i]);
++				string val = args [++i];
++				int idx = val.IndexOf ('=');
++				if (idx > -1) {
++					string alias = val.Substring (0, idx);
++					string assembly = val.Substring (idx + 1);
++					if (assembly.Length == 0) {
++						Report.Error (1680, "Invalid reference alias '" + alias + "='. Missing filename");
++						Environment.Exit (1);
++					}
++					if (!IsExternAliasValid (alias)) {
++						Report.Error (1679, "Invalid extern alias for /reference. Alias '" + alias + "' is not a valid identifier");
++						Environment.Exit (1);
++					}
++					external_aliases [alias] = assembly;
++					val = assembly;
++					return true;
++				}
++
++				references.Add (val);
+ 				return true;
+ 				
+ 			case "-L":
+@@ -1092,7 +1130,24 @@
+ 
+ 				string [] refs = value.Split (new char [] { ';', ',' });
+ 				foreach (string r in refs){
+-					references.Add (r);
++					string val = r;
++					int index = val.IndexOf ("=");
++					if (index > -1) {
++						string alias = r.Substring (0, index);
++						string assembly = r.Substring (index + 1);
++						if (assembly.Length == 0) {
++							Report.Error (1680, "Invalid reference alias '" + alias + "='. Missing filename");
++							Environment.Exit (1);
++						}
++						if (!IsExternAliasValid (alias)) {
++							Report.Error (1679, "Invalid extern alias for /reference. Alias '" + alias + "' is not a valid identifier");
++							Environment.Exit (1);
++						}
++						external_aliases [alias] = assembly;
++						val = assembly;
++						return true;
++					}
++					references.Add (val);
+ 				}
+ 				return true;
+ 			}
+@@ -1348,6 +1403,28 @@
+ 
+ 			return new_args;
+ 		}
++
++		static bool IsExternAliasValid (string identifier)
++		{
++			if (identifier.Length == 0)
++				return false;
++			if (identifier [0] != '_' && !Char.IsLetter (identifier [0]))
++				return false;
++
++			for (int i = 1; i < identifier.Length; i++) {
++				char c = identifier [i];
++				if (Char.IsLetter (c) || Char.IsDigit (c))
++					continue;
++
++				UnicodeCategory category = Char.GetUnicodeCategory (c);
++				if (category != UnicodeCategory.Format || category != UnicodeCategory.NonSpacingMark ||
++						category != UnicodeCategory.SpacingCombiningMark ||
++						category != UnicodeCategory.ConnectorPunctuation)
++					return false;
++			}
++			
++			return true;
++		}
+ 		
+ 		/// <summary>
+ 		///    Parses the arguments, and drives the compilation
+@@ -1374,6 +1451,7 @@
+ 			encoding = defaultEncoding;
+ 
+ 			references = new ArrayList ();
++			external_aliases = new Hashtable ();
+ 			soft_references = new ArrayList ();
+ 			modules = new ArrayList ();
+ 			link_paths = new ArrayList ();

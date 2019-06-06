@@ -1,0 +1,288 @@
+#include <mono/metadata/profiler.h>
+#include <mono/metadata/debug-helpers.h>
+#include <string.h>
+
+/*
+ * Trace profiler.
+ */
+
+void mono_profiler_startup (const char *desc);
+
+typedef enum {
+	MONO_TRACEOP_ALL,
+	MONO_TRACEOP_PROGRAM,
+	MONO_TRACEOP_METHOD,
+	MONO_TRACEOP_ASSEMBLY,
+	MONO_TRACEOP_CLASS,
+	MONO_TRACEOP_NAMESPACE
+} MonoTraceOpcode;
+
+typedef struct {
+	MonoTraceOpcode op;
+	int   exclude;
+	void *data, *data2;
+} MonoTraceOperation;
+
+typedef struct {
+	int len;
+	MonoTraceOperation *ops;
+
+	MonoAssembly *assembly;
+} MonoTraceSpec;
+
+struct _MonoProfiler {
+	MonoTraceSpec trace_spec;
+};
+
+/* called at the end of the program */
+static void
+trace_shutdown (MonoProfiler *prof)
+{
+	g_free(prof);
+}
+
+static gboolean
+trace_method_filter (MonoProfiler *prof, MonoMethod *method)
+{
+	int include = 0;
+	int i;
+
+	for (i = 0; i < prof->trace_spec.len; i++){
+		MonoTraceOperation *op = &prof->trace_spec.ops [i];
+		int inc = 0;
+		
+		switch (op->op){
+		case MONO_TRACEOP_ALL:
+			inc = 1; break;
+		case MONO_TRACEOP_PROGRAM:
+			//if (method->klass->image == trace_spec.assembly->image) //FIXME
+				inc = 1; break;
+		case MONO_TRACEOP_METHOD:
+			if (mono_method_desc_match ((MonoMethodDesc *) op->data, method))
+				inc = 1; break;
+		case MONO_TRACEOP_CLASS:
+			if (strcmp (method->klass->name_space, op->data) == 0)
+				if (strcmp (method->klass->name, op->data2) == 0)
+					inc = 1;
+			break;
+		case MONO_TRACEOP_ASSEMBLY:
+			if (strcmp (method->klass->image->assembly_name, op->data) == 0)
+				inc = 1; break;
+		case MONO_TRACEOP_NAMESPACE:
+			if (strcmp (method->klass->name_space, op->data) == 0)
+				inc = 1;
+		}
+		if (op->exclude){
+			if (inc)
+				include = 0;
+		} else if (inc)
+			include = 1;
+	}
+	return include;
+
+	return strcmp(method->klass->name, "String") == 0;
+}
+
+static void
+trace_method_enter (MonoProfiler *prof, MonoMethod *method)
+{
+	g_print ("enter %s::%s, %p\n", method->klass->name, method->name, method);
+}
+
+static void
+trace_method_leave (MonoProfiler *prof, MonoMethod *method)
+{
+	g_print ("leave %s::%s, %p\n", method->klass->name, method->name, method);
+}
+
+static int is_filenamechar (char p)
+{
+	if (p >= 'A' && p <= 'Z')
+		return TRUE;
+	if (p >= 'a' && p <= 'z')
+		return TRUE;
+	if (p == '.' || p == ':')
+		return TRUE;
+	return FALSE;
+}
+
+static const char *input;
+static char *value;
+
+static void get_string (void)
+{
+	const char *start = input;
+	while (is_filenamechar (*input)){
+		input++;
+	}
+	if (value != NULL)
+		g_free (value);
+	value = g_malloc (input - start + 1);
+	strncpy (value, start, input-start);
+	value [input-start] = 0;
+}
+
+enum Token {
+	TOKEN_METHOD,
+	TOKEN_CLASS,
+	TOKEN_ALL,
+	TOKEN_PROGRAM,
+	TOKEN_NAMESPACE,
+	TOKEN_STRING,
+	TOKEN_EXCLUDE,
+	TOKEN_SEPARATOR,
+	TOKEN_END,
+	TOKEN_ERROR
+};
+
+static int
+get_token (void)
+{
+	while (*input != 0){
+		if (input [0] == 'M' && input [1] == ':'){
+			input += 2;
+			get_string ();
+			return TOKEN_METHOD;
+		}
+		if (input [0] == 'N' && input [1] == ':'){
+			input += 2;
+			get_string ();
+			return TOKEN_NAMESPACE;
+		}
+		if (input [0] == 'T' && input [1] == ':'){
+			input += 2;
+			get_string ();
+			return TOKEN_CLASS;
+		}
+		if (is_filenamechar (*input)){
+			get_string ();
+			if (strcmp (value, "all") == 0)
+				return TOKEN_ALL;
+			if (strcmp (value, "program") == 0)
+				return TOKEN_PROGRAM;
+			return TOKEN_STRING;
+		}
+		if (*input == '-'){
+			input++;
+			return TOKEN_EXCLUDE;
+		}
+		if (*input == ','){
+			input++;
+			return TOKEN_SEPARATOR;
+		}
+		input++;
+			
+	}
+	return TOKEN_END;
+}
+
+static void
+cleanup (void)
+{
+	if (value != NULL)
+		g_free (value);
+}
+
+static int
+get_spec (MonoTraceOperation *ops, int *last)
+{
+	int token = get_token ();
+	if (token == TOKEN_EXCLUDE){
+		token = get_spec (ops, last);
+		if (token == TOKEN_EXCLUDE){
+			fprintf (stderr, "Expecting an expression");
+			return TOKEN_ERROR;
+		}
+		if (token == TOKEN_ERROR)
+			return token;
+		ops [(*last)-1].exclude = 1;
+		return TOKEN_SEPARATOR;
+	}
+	if (token == TOKEN_END || token == TOKEN_SEPARATOR || token == TOKEN_ERROR)
+		return token;
+	
+	if (token == TOKEN_METHOD){
+		MonoMethodDesc *desc = mono_method_desc_new (value, TRUE);
+		if (desc == NULL){
+			fprintf (stderr, "Invalid method name: %s\n", value);
+			return TOKEN_ERROR;
+		}
+		ops [*last].op = MONO_TRACEOP_METHOD;
+		ops [*last].data = desc;
+	} else if (token == TOKEN_ALL)
+		ops [*last].op = MONO_TRACEOP_ALL;
+	else if (token == TOKEN_PROGRAM)
+		ops [*last].op = MONO_TRACEOP_PROGRAM;
+	else if (token == TOKEN_NAMESPACE){
+		ops [*last].op = MONO_TRACEOP_NAMESPACE;
+		ops [*last].data = g_strdup (value);
+		g_print("namespace: %s.", value);
+	} else if (token == TOKEN_CLASS){
+		char *p = strrchr (value, '.');
+		*p++ = 0;
+		ops [*last].op = MONO_TRACEOP_CLASS;
+		ops [*last].data = g_strdup (value);
+		ops [*last].data2 = g_strdup (p);
+	} else if (token == TOKEN_STRING){
+		ops [*last].op = MONO_TRACEOP_ASSEMBLY;
+		ops [*last].data = g_strdup (value);
+	}
+	else {
+		fprintf (stderr, "Syntax error in trace option specification\n");
+		return TOKEN_ERROR;
+	}
+	(*last)++;
+	return TOKEN_SEPARATOR;
+}
+
+static gboolean
+mono_trace_parse_options (MonoTraceSpec *trace_spec, const char *options)
+{
+	const char *p = options;
+	int size = 1;
+	int last_used;
+	int token;
+
+	g_print("Parsing: '%s'\n", p);
+	
+	if (!p){
+		trace_spec->len = 1;
+		trace_spec->ops = g_new0 (MonoTraceOperation, 1);
+		trace_spec->ops [0].op = MONO_TRACEOP_ALL;
+		return TRUE;
+	}
+		
+	for (; *p; p++)
+		if (*p == ',')
+			size++;
+
+	trace_spec->ops = g_new0 (MonoTraceOperation, size);
+
+	input = options;
+	last_used = 0;
+	
+	while ((token = (get_spec (trace_spec->ops, &last_used))) != TOKEN_END){
+		if (token == TOKEN_ERROR)
+			return FALSE;
+		if (token == TOKEN_SEPARATOR)
+			continue;
+	}
+	trace_spec->len = last_used;
+	cleanup ();
+	return TRUE;
+}
+
+/* the entry point */
+void
+mono_profiler_startup (const char *desc)
+{
+	MonoProfiler *prof = g_new0 (MonoProfiler, 1);
+
+	//prof.trace_spec.assembly = assembly; //FIXME
+	mono_trace_parse_options(&prof->trace_spec, desc);
+
+	mono_profiler_install (prof, trace_shutdown);
+	mono_profiler_install_method_filter (trace_method_filter);
+	mono_profiler_install_enter_leave (trace_method_enter, trace_method_leave);
+	mono_profiler_set_events (MONO_PROFILE_ENTER_LEAVE | MONO_PROFILE_COVERAGE);
+}

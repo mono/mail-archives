@@ -1,0 +1,926 @@
+Index: mono/mono/mini/mini.c
+===================================================================
+--- mono/mono/mini/mini.c	(revision 74366)
++++ mono/mono/mini/mini.c	(working copy)
+@@ -11524,8 +11524,13 @@
+ 	CONTEXT context;
+ 
+ 	context.ContextFlags = CONTEXT_CONTROL;
+-	if (GetThreadContext (win32_main_thread, &context))
++	if (GetThreadContext (win32_main_thread, &context)) {
++#ifdef _WIN64
++		mono_profiler_stat_hit ((guchar *) context.Rip, &context);
++#else
+ 		mono_profiler_stat_hit ((guchar *) context.Eip, &context);
++#endif
++	}
+ }
+ #endif
+ 
+Index: mono/mono/mini/mini-amd64.c
+===================================================================
+--- mono/mono/mini/mini-amd64.c	(revision 74366)
++++ mono/mono/mini/mini-amd64.c	(working copy)
+@@ -717,6 +717,7 @@
+ void
+ mono_arch_cpu_init (void)
+ {
++#ifndef _MSC_VER
+ 	guint16 fpcw;
+ 
+ 	/* spec compliance requires running with double precision */
+@@ -725,6 +726,9 @@
+ 	fpcw |= X86_FPCW_PREC_DOUBLE;
+ 	__asm__  __volatile__ ("fldcw %0\n": : "m" (fpcw));
+ 	__asm__  __volatile__ ("fnstcw %0\n": "=m" (fpcw));
++#else
++	_control87 (_PC_53, MCW_PC);
++#endif
+ }
+ 
+ /*
+Index: mono/mono/mini/ChangeLog
+===================================================================
+--- mono/mono/mini/ChangeLog	(revision 74366)
++++ mono/mono/mini/ChangeLog	(working copy)
+@@ -1,4 +1,14 @@
++2007-03-15  Jonathan Chambers  <joncham@gmail.com>
+ 
++	* *.c: Begin WIN64 port.
++	* mini.c:  Use correct register in profiler.
++	* mini-amd64.c: No inline assembly on Win64.
++	* mini-amd64.h: Implement MONO_INIT_CONTEXT_FROM_FUNC for Win64.
++	Only define MONO_ARCH_USE_SIGACTION on non-windows platforms.
++	* exceptions-amd64.c: Only need gregs_from_ucontext if MONO_ARCH_USE_SIGACTION
++	is defined. Implement mono_arch_sigctx_to_monoctx, mono_arch_monoctx_to_sigctx, and
++	mono_arch_ip_from_context for Win64.
++	
+ Thu Mar 15 13:47:59 CET 2007 Paolo Molaro <lupus@ximian.com>
+ 
+ 	* mini-arm.c, mini-mips.c, mini-ppc.c, mini-s390.c,
+Index: mono/mono/mini/mini-amd64.h
+===================================================================
+--- mono/mono/mini/mini-amd64.h	(revision 74366)
++++ mono/mono/mini/mini-amd64.h	(working copy)
+@@ -161,14 +161,27 @@
+ 	guint64 r15;
+ } MonoContext;
+ 
+-#define MONO_CONTEXT_SET_IP(ctx,ip) do { (ctx)->rip = (long)(ip); } while (0); 
+-#define MONO_CONTEXT_SET_BP(ctx,bp) do { (ctx)->rbp = (long)(bp); } while (0); 
+-#define MONO_CONTEXT_SET_SP(ctx,esp) do { (ctx)->rsp = (long)(esp); } while (0); 
++#define MONO_CONTEXT_SET_IP(ctx,ip) do { (ctx)->rip = (guint64)(ip); } while (0); 
++#define MONO_CONTEXT_SET_BP(ctx,bp) do { (ctx)->rbp = (guint64)(bp); } while (0); 
++#define MONO_CONTEXT_SET_SP(ctx,esp) do { (ctx)->rsp = (guint64)(esp); } while (0); 
+ 
+ #define MONO_CONTEXT_GET_IP(ctx) ((gpointer)((ctx)->rip))
+ #define MONO_CONTEXT_GET_BP(ctx) ((gpointer)((ctx)->rbp))
+ #define MONO_CONTEXT_GET_SP(ctx) ((gpointer)((ctx)->rsp))
+ 
++#ifdef _MSC_VER
++
++#define MONO_INIT_CONTEXT_FROM_FUNC(ctx, start_func) do { \
++    guint64 stackptr; \
++	mono_arch_flush_register_windows (); \
++	stackptr = ((guint64)_GetAddressOfReturnAddress () - sizeof (void*));\
++	MONO_CONTEXT_SET_IP ((ctx), (start_func)); \
++	MONO_CONTEXT_SET_BP ((ctx), stackptr); \
++	MONO_CONTEXT_SET_SP ((ctx), stackptr); \
++} while (0)
++
++#else
++
+ #define MONO_INIT_CONTEXT_FROM_FUNC(ctx,start_func) do {	\
+ 		mono_arch_flush_register_windows ();	\
+ 		MONO_CONTEXT_SET_IP ((ctx), (start_func));	\
+@@ -176,7 +189,7 @@
+ 		MONO_CONTEXT_SET_SP ((ctx), __builtin_frame_address (0));	\
+ 	} while (0)
+ 
+-#define MONO_ARCH_USE_SIGACTION 1
++#endif
+ 
+ /*
+  * some icalls like mono_array_new_va needs to be called using a different 
+@@ -189,6 +202,7 @@
+ #ifdef HAVE_WORKING_SIGALTSTACK
+ 
+ #define MONO_ARCH_SIGSEGV_ON_ALTSTACK
++#define MONO_ARCH_USE_SIGACTION 1
+ 
+ #endif
+ 
+Index: mono/mono/mini/exceptions-amd64.c
+===================================================================
+--- mono/mono/mini/exceptions-amd64.c	(revision 74366)
++++ mono/mono/mini/exceptions-amd64.c	(working copy)
+@@ -11,7 +11,9 @@
+ #include <glib.h>
+ #include <signal.h>
+ #include <string.h>
++#ifndef PLATFORM_WIN32
+ #include <sys/ucontext.h>
++#endif
+ 
+ #include <mono/arch/amd64/amd64-codegen.h>
+ #include <mono/metadata/appdomain.h>
+@@ -55,15 +57,19 @@
+ 	sctx = g_malloc(sizeof(MonoContext));
+ 
+ 	/* Copy Win32 context to UNIX style context */
+-	sctx->eax = ctx->Eax;
+-	sctx->ebx = ctx->Ebx;
+-	sctx->ecx = ctx->Ecx;
+-	sctx->edx = ctx->Edx;
+-	sctx->ebp = ctx->Ebp;
+-	sctx->esp = ctx->Esp;
+-	sctx->esi = ctx->Esi;
+-	sctx->edi = ctx->Edi;
+-	sctx->eip = ctx->Eip;
++	sctx->rax = ctx->Rax;
++	sctx->rbx = ctx->Rbx;
++	sctx->rcx = ctx->Rcx;
++	sctx->rdx = ctx->Rdx;
++	sctx->rbp = ctx->Rbp;
++	sctx->rsp = ctx->Rsp;
++	sctx->rsi = ctx->Rsi;
++	sctx->rdi = ctx->Rdi;
++	sctx->rip = ctx->Rip;
++	sctx->r12 = ctx->R12;
++	sctx->r13 = ctx->R13;
++	sctx->r14 = ctx->R14;
++	sctx->r15 = ctx->R15;
+ 
+ 	switch (er->ExceptionCode) {
+ 	case EXCEPTION_ACCESS_VIOLATION:
+@@ -85,15 +91,15 @@
+ 	}
+ 
+ 	/* Copy context back */
+-	ctx->Eax = sctx->eax;
+-	ctx->Ebx = sctx->ebx;
+-	ctx->Ecx = sctx->ecx;
+-	ctx->Edx = sctx->edx;
+-	ctx->Ebp = sctx->ebp;
+-	ctx->Esp = sctx->esp;
+-	ctx->Esi = sctx->esi;
+-	ctx->Edi = sctx->edi;
+-	ctx->Eip = sctx->eip;
++	ctx->Rax = sctx->rax;
++	ctx->Rbx = sctx->rbx;
++	ctx->Rcx = sctx->rcx;
++	ctx->Rdx = sctx->rdx;
++	ctx->Rbp = sctx->rbp;
++	ctx->Rsp = sctx->rsp;
++	ctx->Rsi = sctx->rsi;
++	ctx->Rdi = sctx->rdi;
++	ctx->Rip = sctx->rip;
+ 
+ 	return res;
+ }
+@@ -631,6 +637,7 @@
+ 	return TRUE;
+ }
+ 
++#ifdef MONO_ARCH_USE_SIGACTION
+ static inline guint64*
+ gregs_from_ucontext (ucontext_t *ctx)
+ {
+@@ -642,10 +649,11 @@
+ 
+ 	return gregs;
+ }
+-
++#endif
+ void
+ mono_arch_sigctx_to_monoctx (void *sigctx, MonoContext *mctx)
+ {
++#ifdef MONO_ARCH_USE_SIGACTION
+ 	ucontext_t *ctx = (ucontext_t*)sigctx;
+ 
+     guint64 *gregs = gregs_from_ucontext (ctx);
+@@ -663,11 +671,29 @@
+ 	mctx->r13 = gregs [REG_R13];
+ 	mctx->r14 = gregs [REG_R14];
+ 	mctx->r15 = gregs [REG_R15];
++#else
++	MonoContext *ctx = (MonoContext *)sigctx;
++
++	mctx->rax = ctx->rax;
++	mctx->rbx = ctx->rbx;
++	mctx->rcx = ctx->rcx;
++	mctx->rdx = ctx->rdx;
++	mctx->rbp = ctx->rbp;
++	mctx->rsp = ctx->rsp;
++	mctx->rsi = ctx->rsi;
++	mctx->rdi = ctx->rdi;
++	mctx->rip = ctx->rip;
++	mctx->r12 = ctx->r12;
++	mctx->r13 = ctx->r13;
++	mctx->r14 = ctx->r14;
++	mctx->r15 = ctx->r15;
++#endif
+ }
+ 
+ void
+ mono_arch_monoctx_to_sigctx (MonoContext *mctx, void *sigctx)
+ {
++#ifdef MONO_ARCH_USE_SIGACTION
+ 	ucontext_t *ctx = (ucontext_t*)sigctx;
+ 
+     guint64 *gregs = gregs_from_ucontext (ctx);
+@@ -685,15 +711,39 @@
+ 	gregs [REG_R13] = mctx->r13;
+ 	gregs [REG_R14] = mctx->r14;
+ 	gregs [REG_R15] = mctx->r15;
++#else
++	MonoContext *ctx = (MonoContext *)sigctx;
++
++	ctx->rax = mctx->rax;
++	ctx->rbx = mctx->rbx;
++	ctx->rcx = mctx->rcx;
++	ctx->rdx = mctx->rdx;
++	ctx->rbp = mctx->rbp;
++	ctx->rsp = mctx->rsp;
++	ctx->rsi = mctx->rsi;
++	ctx->rdi = mctx->rdi;
++	ctx->rip = mctx->rip;
++	ctx->r12 = mctx->r12;
++	ctx->r13 = mctx->r13;
++	ctx->r14 = mctx->r14;
++	ctx->r15 = mctx->r15;
++#endif
+ }
+ 
+ gpointer
+ mono_arch_ip_from_context (void *sigctx)
+ {
++	
++#ifdef MONO_ARCH_USE_SIGACTION
++
+ 	ucontext_t *ctx = (ucontext_t*)sigctx;
+ 
+     guint64 *gregs = gregs_from_ucontext (ctx);
+ 
+ 	return (gpointer)gregs [REG_RIP];
++#else
++	MonoContext *ctx = sigctx;
++	return (gpointer)ctx->rip;
++#endif	
+ }
+ 
+Index: mono/msvc/runmdesc.bat
+===================================================================
+--- mono/msvc/runmdesc.bat	(revision 74366)
++++ mono/msvc/runmdesc.bat	(working copy)
+@@ -1,8 +1,22 @@
+ @echo off
+ rem This runs genmdesc on the x86 files when called on Visual Studio
+-echo Running genmdesc on the x86 files...
++echo Running genmdesc
+ cd ..\mono\mini
+ set PATH=%PATH%;..\..\VSDependancies\lib
++if "%2" == "Win32" goto x86
++if "%2" == "x64" goto x64
++goto error
++:x86
++echo Platform detected is x86...
+ %1 cpu-x86.md cpu-x86.h x86_desc
++goto end
++:x64
++echo Platform detected is x64...
++%1 cpu-amd64.md cpu-amd64.h amd64_desc
++goto end
++:error
++echo Error: unsupported platform
++exit /b 100
++:end
+ echo done
+ 
+Index: mono/msvc/genmdesc.vcproj
+===================================================================
+--- mono/msvc/genmdesc.vcproj	(revision 74366)
++++ mono/msvc/genmdesc.vcproj	(working copy)
+@@ -106,7 +106,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCPostBuildEventTool"
+-				CommandLine="runmdesc.bat $(TargetPath)"
++				CommandLine="runmdesc.bat $(TargetPath) $(PlatformName)"
+ 			/>
+ 		</Configuration>
+ 		<Configuration
+@@ -199,7 +199,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCPostBuildEventTool"
+-				CommandLine="runmdesc.bat $(TargetPath)"
++				CommandLine="runmdesc.bat $(TargetPath) $(PlatformName)"
+ 			/>
+ 		</Configuration>
+ 		<Configuration
+@@ -290,7 +290,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCPostBuildEventTool"
+-				CommandLine="runmdesc.bat $(TargetPath)"
++				CommandLine="runmdesc.bat $(TargetPath) $(PlatformName)"
+ 			/>
+ 		</Configuration>
+ 		<Configuration
+@@ -382,7 +382,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCPostBuildEventTool"
+-				CommandLine="runmdesc.bat $(TargetPath)"
++				CommandLine="runmdesc.bat $(TargetPath) $(PlatformName)"
+ 			/>
+ 		</Configuration>
+ 	</Configurations>
+Index: mono/msvc/ChangeLog
+===================================================================
+--- mono/msvc/ChangeLog	(revision 0)
++++ mono/msvc/ChangeLog	(revision 0)
+@@ -0,0 +1,5 @@
++2007-03-15  Jonathan Chambers  <joncham@gmail.com>
++
++	* *.vcproj: Begin Win64 port. Run bat files with $(Platform) argument.
++	* *.bat: Begin Win64 port. Run bat files with $(Platform) argument.
++	
+\ No newline at end of file
+
+Property changes on: mono/msvc/ChangeLog
+___________________________________________________________________
+Name: svn:executable
+   + *
+
+Index: mono/msvc/runburg.bat
+===================================================================
+--- mono/msvc/runburg.bat	(revision 74366)
++++ mono/msvc/runburg.bat	(working copy)
+@@ -1,8 +1,23 @@
+ @echo off
+ rem This runs Monoburg on the various x86 files when called on Visual Studio
+-echo Running Monoburg on the x86 inssel.brg files...
++echo Running Monoburg on the inssel.brg files...
+ cd ..\mono\mini
+ set PATH=%PATH%;..\..\VSDependancies\lib
++
++if "%2" == "Win32" goto x86
++if "%2" == "x64" goto x64
++goto error
++:x86
++echo Platform detected is x86...
+ %1 -c 1 -p -e inssel.brg inssel-float.brg inssel-long32.brg inssel-x86.brg -d inssel.h -s inssel.c
++goto end
++:x64
++echo Platform detected is x64...
++%1 -c 1 -p -e inssel.brg inssel-float.brg inssel-long.brg inssel-amd64.brg -d inssel.h -s inssel.c
++goto end
++:error
++echo Error: unsupported platform
++exit /b 100
++:end
+ echo done
+ 
+Index: mono/msvc/monoburg.vcproj
+===================================================================
+--- mono/msvc/monoburg.vcproj	(revision 74366)
++++ mono/msvc/monoburg.vcproj	(working copy)
+@@ -27,7 +27,7 @@
+ 			>
+ 			<Tool
+ 				Name="VCPreBuildEventTool"
+-				CommandLine="cd ..\mono\monoburg&#x0D;&#x0A;copy wparser.c parser.c"
++				CommandLine="cd ..\mono\monoburg&#x0D;&#x0A;copy wparser.c parser.c&#x0D;&#x0A;"
+ 			/>
+ 			<Tool
+ 				Name="VCCustomBuildTool"
+@@ -98,7 +98,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCPostBuildEventTool"
+-				CommandLine="runburg.bat $(TargetPath)"
++				CommandLine="runburg.bat $(TargetPath) $(PlatformName)"
+ 			/>
+ 		</Configuration>
+ 		<Configuration
+@@ -110,7 +110,7 @@
+ 			>
+ 			<Tool
+ 				Name="VCPreBuildEventTool"
+-				CommandLine="cd ..\mono\monoburg&#x0D;&#x0A;copy wparser.c parser.c"
++				CommandLine="cd ..\mono\monoburg&#x0D;&#x0A;copy wparser.c parser.c&#x0D;&#x0A;"
+ 			/>
+ 			<Tool
+ 				Name="VCCustomBuildTool"
+@@ -182,7 +182,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCPostBuildEventTool"
+-				CommandLine="runburg.bat $(TargetPath)"
++				CommandLine="runburg.bat $(TargetPath) $(PlatformName)"
+ 			/>
+ 		</Configuration>
+ 		<Configuration
+@@ -194,7 +194,7 @@
+ 			>
+ 			<Tool
+ 				Name="VCPreBuildEventTool"
+-				CommandLine="cd ..\mono\monoburg&#x0D;&#x0A;copy wparser.c parser.c"
++				CommandLine="cd ..\mono\monoburg&#x0D;&#x0A;copy wparser.c parser.c&#x0D;&#x0A;"
+ 			/>
+ 			<Tool
+ 				Name="VCCustomBuildTool"
+@@ -264,7 +264,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCPostBuildEventTool"
+-				CommandLine="runburg.bat $(TargetPath)"
++				CommandLine="runburg.bat $(TargetPath) $(PlatformName)"
+ 			/>
+ 		</Configuration>
+ 		<Configuration
+@@ -276,7 +276,7 @@
+ 			>
+ 			<Tool
+ 				Name="VCPreBuildEventTool"
+-				CommandLine="cd ..\mono\monoburg&#x0D;&#x0A;copy wparser.c parser.c"
++				CommandLine="cd ..\mono\monoburg&#x0D;&#x0A;copy wparser.c parser.c&#x0D;&#x0A;"
+ 			/>
+ 			<Tool
+ 				Name="VCCustomBuildTool"
+@@ -347,7 +347,7 @@
+ 			/>
+ 			<Tool
+ 				Name="VCPostBuildEventTool"
+-				CommandLine="runburg.bat $(TargetPath)"
++				CommandLine="runburg.bat $(TargetPath) $(PlatformName)"
+ 			/>
+ 		</Configuration>
+ 	</Configurations>
+Index: mono/msvc/libmono.vcproj
+===================================================================
+--- mono/msvc/libmono.vcproj	(revision 74366)
++++ mono/msvc/libmono.vcproj	(working copy)
+@@ -132,7 +132,7 @@
+ 				Optimization="2"
+ 				InlineFunctionExpansion="1"
+ 				AdditionalIncludeDirectories="..\libgc\include;..\;&quot;..\VSDependancies\include\glib-2.0&quot;;&quot;..\VSDependancies\include\glib-2.0\glib&quot;;..\VSDependancies\include;&quot;..\VSDependancies\lib\glib-2.0\include&quot;;..\mono\;..\mono\jit"
+-				PreprocessorDefinitions="NDEBUG;WIN32;_WINDOWS;__WIN32__;HAVE_CONFIG_H;__i386__;PLATFORM_WIN32;GC_NOT_DLL;GC_GCJ_SUPPORT;GC_WIN32_THREADS;_CRT_SECURE_NO_DEPRECATE"
++				PreprocessorDefinitions="NDEBUG;WIN32;_WINDOWS;__WIN32__;HAVE_CONFIG_H;PLATFORM_WIN32;GC_NOT_DLL;GC_GCJ_SUPPORT;GC_WIN32_THREADS;_CRT_SECURE_NO_DEPRECATE"
+ 				StringPooling="true"
+ 				RuntimeLibrary="2"
+ 				EnableFunctionLevelLinking="true"
+@@ -306,7 +306,7 @@
+ 				Optimization="0"
+ 				InlineFunctionExpansion="0"
+ 				AdditionalIncludeDirectories="..\libgc\include;..\;&quot;..\VSDependancies\include\glib-2.0&quot;;&quot;..\VSDependancies\include\glib-2.0\glib&quot;;..\VSDependancies\include;&quot;..\VSDependancies\lib\glib-2.0\include&quot;;..\mono\;..\mono\jit"
+-				PreprocessorDefinitions="WIN64;_WIN64;_DEBUG;WIN32;_WINDOWS;__WIN32__;HAVE_CONFIG_H;__i386__;PLATFORM_WIN32;GC_NOT_DLL;GC_GCJ_SUPPORT;GC_WIN32_THREADS;_CRT_SECURE_NO_DEPRECATE"
++				PreprocessorDefinitions="WIN64;_WIN64;_DEBUG;WIN32;_WINDOWS;__WIN32__;HAVE_CONFIG_H;PLATFORM_WIN32;GC_NOT_DLL;GC_GCJ_SUPPORT;GC_WIN32_THREADS;_CRT_SECURE_NO_DEPRECATE;__x86_64__"
+ 				MinimalRebuild="true"
+ 				BasicRuntimeChecks="3"
+ 				RuntimeLibrary="3"
+@@ -3322,52 +3322,6 @@
+ 				</FileConfiguration>
+ 			</File>
+ 			<File
+-				RelativePath="..\mono\mini\exceptions-x86.c"
+-				>
+-				<FileConfiguration
+-					Name="Release|Win32"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-					/>
+-				</FileConfiguration>
+-				<FileConfiguration
+-					Name="Release|x64"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-					/>
+-				</FileConfiguration>
+-				<FileConfiguration
+-					Name="Debug|Win32"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-						BrowseInformation="1"
+-					/>
+-				</FileConfiguration>
+-				<FileConfiguration
+-					Name="Debug|x64"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-						BrowseInformation="1"
+-					/>
+-				</FileConfiguration>
+-			</File>
+-			<File
+ 				RelativePath="..\mono\mini\graph.c"
+ 				>
+ 				<FileConfiguration
+@@ -3718,56 +3672,6 @@
+ 				>
+ 			</File>
+ 			<File
+-				RelativePath="..\mono\mini\mini-x86.c"
+-				>
+-				<FileConfiguration
+-					Name="Release|Win32"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-					/>
+-				</FileConfiguration>
+-				<FileConfiguration
+-					Name="Release|x64"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-					/>
+-				</FileConfiguration>
+-				<FileConfiguration
+-					Name="Debug|Win32"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-						BrowseInformation="1"
+-					/>
+-				</FileConfiguration>
+-				<FileConfiguration
+-					Name="Debug|x64"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-						BrowseInformation="1"
+-					/>
+-				</FileConfiguration>
+-			</File>
+-			<File
+-				RelativePath="..\mono\mini\mini-x86.h"
+-				>
+-			</File>
+-			<File
+ 				RelativePath="..\mono\mini\mini.c"
+ 				>
+ 				<FileConfiguration
+@@ -3980,62 +3884,260 @@
+ 				>
+ 			</File>
+ 			<File
+-				RelativePath="..\mono\mini\tramp-x86.c"
+-				>
+-				<FileConfiguration
+-					Name="Release|Win32"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-					/>
+-				</FileConfiguration>
+-				<FileConfiguration
+-					Name="Release|x64"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-					/>
+-				</FileConfiguration>
+-				<FileConfiguration
+-					Name="Debug|Win32"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-						BrowseInformation="1"
+-					/>
+-				</FileConfiguration>
+-				<FileConfiguration
+-					Name="Debug|x64"
+-					>
+-					<Tool
+-						Name="VCCLCompilerTool"
+-						AdditionalIncludeDirectories=""
+-						PreprocessorDefinitions=""
+-						UsePrecompiledHeader="0"
+-						BrowseInformation="1"
+-					/>
+-				</FileConfiguration>
+-			</File>
+-			<File
+ 				RelativePath="..\mono\mini\wapihandles.c"
+ 				>
+ 			</File>
+ 			<Filter
+ 				Name="x86"
+ 				>
++				<File
++					RelativePath="..\mono\mini\exceptions-x86.c"
++					>
++					<FileConfiguration
++						Name="Release|Win32"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Release|x64"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|Win32"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++							BrowseInformation="1"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|x64"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++							BrowseInformation="1"
++						/>
++					</FileConfiguration>
++				</File>
++				<File
++					RelativePath="..\mono\mini\mini-x86.c"
++					>
++					<FileConfiguration
++						Name="Release|Win32"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Release|x64"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|Win32"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++							BrowseInformation="1"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|x64"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++							BrowseInformation="1"
++						/>
++					</FileConfiguration>
++				</File>
++				<File
++					RelativePath="..\mono\mini\mini-x86.h"
++					>
++					<FileConfiguration
++						Name="Release|x64"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCustomBuildTool"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|x64"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCustomBuildTool"
++						/>
++					</FileConfiguration>
++				</File>
++				<File
++					RelativePath="..\mono\mini\tramp-x86.c"
++					>
++					<FileConfiguration
++						Name="Release|Win32"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Release|x64"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|Win32"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++							BrowseInformation="1"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|x64"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++							AdditionalIncludeDirectories=""
++							PreprocessorDefinitions=""
++							UsePrecompiledHeader="0"
++							BrowseInformation="1"
++						/>
++					</FileConfiguration>
++				</File>
+ 			</Filter>
+ 			<Filter
+-				Name="x64"
++				Name="amd64"
+ 				>
++				<File
++					RelativePath="..\mono\mini\exceptions-amd64.c"
++					>
++					<FileConfiguration
++						Name="Release|Win32"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|Win32"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++						/>
++					</FileConfiguration>
++				</File>
++				<File
++					RelativePath="..\mono\mini\mini-amd64.c"
++					>
++					<FileConfiguration
++						Name="Release|Win32"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|Win32"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++						/>
++					</FileConfiguration>
++				</File>
++				<File
++					RelativePath="..\mono\mini\mini-amd64.h"
++					>
++					<FileConfiguration
++						Name="Release|Win32"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCustomBuildTool"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|Win32"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCustomBuildTool"
++						/>
++					</FileConfiguration>
++				</File>
++				<File
++					RelativePath="..\mono\mini\tramp-amd64.c"
++					>
++					<FileConfiguration
++						Name="Release|Win32"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++						/>
++					</FileConfiguration>
++					<FileConfiguration
++						Name="Debug|Win32"
++						ExcludedFromBuild="true"
++						>
++						<Tool
++							Name="VCCLCompilerTool"
++						/>
++					</FileConfiguration>
++				</File>
+ 			</Filter>
+ 		</Filter>
+ 	</Files>
+Index: mono/ChangeLog
+===================================================================
+--- mono/ChangeLog	(revision 74366)
++++ mono/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2007-03-15  Jonathan Chambers  <joncham@gmail.com>
++
++	* winconfig.h: Don't use MONO_XEN_OPT on windows.
++	
+ 2007-03-14  Marek Habersack  <mhabersack@novell.com>
+ 
+ 	* data/net_2_0/machine.config: add two missing section handlers.
+Index: mono/winconfig.h
+===================================================================
+--- mono/winconfig.h	(revision 74366)
++++ mono/winconfig.h	(working copy)
+@@ -394,7 +394,7 @@
+ /* #undef MONO_DEBUGGER_SUPPORTED */
+ 
+ /* Xen-specific behaviour */
+-#define MONO_XEN_OPT 1
++/* #undef MONO_XEN_OPT */
+ 
+ /* Define if Unix sockets cannot be created in an anonymous namespace */
+ /* #undef NEED_LINK_UNLINK */

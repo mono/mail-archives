@@ -1,0 +1,290 @@
+Index: System.Data/DataSet.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataSet.cs,v
+retrieving revision 1.59
+diff -u -r1.59 DataSet.cs
+--- System.Data/DataSet.cs	8 Jan 2004 12:22:51 -0000	1.59
++++ System.Data/DataSet.cs	14 Jan 2004 14:22:13 -0000
+@@ -495,6 +495,41 @@
+ 		[MonoTODO]
+ 		public void InferXmlSchema (XmlReader reader, string[] nsArray)
+ 		{
++			if (reader.LocalName == "xml")
++				reader.MoveToContent();
++			
++			//Assuming namespace dont come into picture with diffgram
++			if (reader.LocalName == "diffgram"){
++				XmlReadMode mode = ReadXml (reader, XmlReadMode.DiffGram);
++				return;
++			}
++			
++			// Get the DataSet name.
++			string dataSetName = XmlConvert.DecodeName (reader.LocalName);
++			if (dataSetName != null && dataSetName.Length != 0)
++				DataSetName = dataSetName;
++			
++			reader.ReadStartElement ();
++			reader.MoveToContent();
++			
++			// Check if the current element is the schema, assuming namespace dont come
++			//into picture with schema
++			if (reader.LocalName == "schema") {
++				ReadXmlSchema (reader);
++				reader.MoveToContent();
++				return;
++			}
++			
++			if (reader.LocalName == "diffgram") {
++				XmlReadMode mode = ReadXml (reader, XmlReadMode.DiffGram);
++				return;
++			}
++			
++			// There was no schema element or diffgram present, so infer schema from
++			// rest of the document
++			ReadXml (reader, nsArray);
++			return ;
++																
+ 		}
+ 
+ 		public void InferXmlSchema (Stream stream, string[] nsArray)
+@@ -516,6 +551,7 @@
+ 				reader.Close ();
+ 			}
+ 		}
++		
+ 
+ #if NET_1_2
+ 		[MonoTODO]
+@@ -765,7 +801,8 @@
+ 			
+ 			// Get the DataSet name.
+ 			string dataSetName = XmlConvert.DecodeName (r.LocalName);
+-			DataSetName = dataSetName;
++			if (dataSetName != null && dataSetName.Length != 0)
++				DataSetName = dataSetName;
+ 			
+ 			r.ReadStartElement ();
+ 			r.MoveToContent();
+@@ -859,6 +896,12 @@
+ 
+ 			XmlDataLoader Loader = new XmlDataLoader (this);
+ 			return Loader.LoadData (r, mode);
++		}
++
++		private XmlReadMode ReadXml (XmlReader r, string[] nsArray)
++		{
++			XmlDataLoader Loader = new XmlDataLoader (this);
++			return Loader.LoadData (r, nsArray);
+ 		}
+ 
+ 		#endregion // Public Methods
+Index: System.Data/XmlDataLoader.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/XmlDataLoader.cs,v
+retrieving revision 1.11
+diff -u -r1.11 XmlDataLoader.cs
+--- System.Data/XmlDataLoader.cs	8 Jan 2004 12:22:51 -0000	1.11
++++ System.Data/XmlDataLoader.cs	14 Jan 2004 14:22:18 -0000
+@@ -29,6 +29,7 @@
+ 	{
+ 	
+ 		private DataSet DSet;
++		private string[] nameSpaceArray = null;
+ 		Hashtable DiffGrRows = new Hashtable ();
+ 
+ 		public XmlDataLoader (DataSet set) 
+@@ -57,6 +58,13 @@
+ 			return Result;
+ 		}
+ 
++		public XmlReadMode LoadData (XmlReader reader, string[] nsArray)
++		{
++			nameSpaceArray = nsArray;
++			ReadModeSchema (reader);
++			return XmlReadMode.InferSchema;
++		}
++
+ 		#region reading
+ 
+ 		// Read information from the reader.
+@@ -91,7 +99,31 @@
+ 			// set the EnforceConstraints to original value;
+ 			DSet.EnforceConstraints = origEnforceConstraint;
+ 		}
++		
++		private void ReadModeSchema (XmlReader reader)
++		{
++			//if the current element is schema, then skip. We would have already read it.
++			if (String.Compare (reader.LocalName, "schema", true) == 0)
++				reader.MoveToContent();
+ 
++			// load an XmlDocument from the reader.
++			XmlDocument doc = BuildXmlDocument(reader);
++
++			// set EnforceConstraint to false - we do not want any validation during 
++			// load time.
++			bool origEnforceConstraint = DSet.EnforceConstraints;
++			DSet.EnforceConstraints = false;
++
++			// The childs are tables.
++			XmlNodeList nList = doc.DocumentElement.ChildNodes;
++
++			for (int i = 0; i < nList.Count; i++) {
++				XmlNode node = nList[i];
++				AddRowToTable(node, null);
++			}
++			// set the EnforceConstraints to original value;
++			DSet.EnforceConstraints = origEnforceConstraint;
++		}
+ 		#endregion // reading
+ 
+ 		#region Private helper methods
+@@ -235,6 +267,148 @@
+ 			
+ 		}
+ 		
++		
++		private void AddRowToTable(XmlNode tableNode, DataColumn relationColumn)
++		{
++			Hashtable rowValue = new Hashtable();
++			DataTable table;
++			
++			// Check if the table exists in the DataSet. If not create one.
++			if (DSet.Tables.Contains(tableNode.LocalName))
++				table = DSet.Tables[tableNode.LocalName];
++			else {
++				table = new DataTable(tableNode.LocalName);
++				DSet.Tables.Add(table);
++			}
++			
++			// Get the child nodes of the table. Any child can be one of the following tow:
++			// 1. DataTable - if there was a relation with another table..
++			// 2. DataColumn - column of the current table.
++			XmlNodeList childList = tableNode.ChildNodes;
++			for (int i = 0; i < childList.Count; i++) {
++				XmlNode childNode = childList[i];
++				
++				// The child node is a table if:
++				// 1. It has attributes that are not ignored from the namespace passed
++				// 2. It has more then one child nodes. Columns has only one child node
++				// which is a Text node type that has the column value.
++				
++				//Check if the following would be table, is a column, by ignoring the attributes from
++				//ignored namespaces
++				bool added = false;
++				if (nameSpaceArray != null && nameSpaceArray.Length > 0)
++					if (AddToSet(childNode, table))			
++						continue;	// child node is processed so take next node	
++				
++				//If Child node of childnodes are more than one, which suggests this nodes might be possible columns
++				// or tables so we call recursively
++				if (childNode.ChildNodes.Count > 1) {
++					// We need to create new column for the relation between the current
++					// table and the new table we found (the child table).
++					string newRelationColumnName = table.TableName + "_Id";
++					if (!table.Columns.Contains(newRelationColumnName)) {
++						DataColumn newRelationColumn = new DataColumn(newRelationColumnName, typeof(int));
++						newRelationColumn.AutoIncrement = true;
++						table.Columns.Add(newRelationColumn);
++					}
++					// Add a row to the new table we found.
++					AddRowToTable(childNode, table.Columns[newRelationColumnName]);
++					
++				}
++				else { //Child node is a column.
++					if (table.Columns.Contains(childNode.LocalName))
++						rowValue.Add(childNode.LocalName, childNode.FirstChild.Value);
++					else {
++						table.Columns.Add(childNode.LocalName);
++						rowValue.Add(childNode.LocalName, childNode.FirstChild.Value);
++					}
++				}
++			}
++
++			// Column can be attribute of the table element.
++			XmlAttributeCollection aCollection = tableNode.Attributes;
++			for (int i = 0; i < aCollection.Count; i++) {
++				XmlAttribute attr = aCollection[i];
++				//the atrribute can be the namespace.
++				if (attr.Prefix.Equals("xmlns"))
++					table.Namespace = attr.Value;
++				else { // the attribute is a column.
++					if (!table.Columns.Contains(attr.LocalName))
++						table.Columns.Add(attr.LocalName);
++					table.Columns[attr.LocalName].Namespace = table.Namespace;
++
++					rowValue.Add(attr.LocalName, attr.Value);
++				}
++			}
++
++			// If the current table is a child table we need to add a new column for the relation
++			// and add a new relation to the DataSet.
++			if (relationColumn != null) {
++				if (!table.Columns.Contains(relationColumn.ColumnName)) {
++					DataColumn dc = new DataColumn(relationColumn.ColumnName, typeof(int));
++					dc.AutoIncrement = true;
++					table.Columns.Add(dc);
++					DSet.Relations.Add(relationColumn, dc);
++				}
++			}
++
++			// Create new row and add all values to the row.
++			// then add it to the table.
++			DataRow row = table.NewRow ();
++					
++			IDictionaryEnumerator enumerator = rowValue.GetEnumerator ();
++			while (enumerator.MoveNext ()) {
++				row [enumerator.Key.ToString ()] = enumerator.Value.ToString ();
++			}
++
++			table.Rows.Add (row);
++			
++		}
++
++		private bool AddToSet(XmlNode childNode, DataTable table)
++		{
++			Hashtable rowValue = new Hashtable();
++			if (childNode.Attributes != null){
++				int nsLength = nameSpaceArray.Length;
++				for (int j=0; j< nsLength; j++){
++					string names = nameSpaceArray[j].ToLower();
++					XmlAttributeCollection attributes = childNode.Attributes;
++					IEnumerator ienum = attributes.GetEnumerator();
++					while (ienum.MoveNext()){
++						XmlAttribute attr = (XmlAttribute)ienum.Current;
++						if (attr.NamespaceURI.ToLower().Equals(names))
++							childNode.Attributes.Remove(attr);	
++					}
++				}
++				if(childNode.Attributes.Count == 0){
++					// we have ignored all the attributes thereby its a column so
++					//we add it to the table.
++					if (table.Columns.Contains(childNode.LocalName))
++						rowValue.Add(childNode.LocalName, childNode.FirstChild.Value);
++					else {
++						table.Columns.Add(childNode.LocalName);
++						rowValue.Add(childNode.LocalName, childNode.FirstChild.Value);
++					}
++				}
++				else {
++					//attributes are still present so its a table. We add the relation column and the table
++					//to the parent table and data set respectively
++					string newRelationColumnName = table.TableName + "_Id";
++					if (!table.Columns.Contains(newRelationColumnName)) {
++						DataColumn newRelationColumn = new DataColumn(newRelationColumnName, typeof(int));
++						newRelationColumn.AutoIncrement = true;
++						table.Columns.Add(newRelationColumn);
++					}
++					// Add a row to the new table we found.
++					AddRowToTable(childNode, table.Columns[newRelationColumnName]);
++				}	
++				return true;
++			}		
++			else
++				return false;
++		}
++
++
+ 		// bulid the document from the reader.
+ 		private XmlDocument BuildXmlDocument(XmlReader reader)
+ 		{

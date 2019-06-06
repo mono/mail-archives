@@ -1,0 +1,790 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] embedding mono with threads
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20embedding%20mono%20with%20threads&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001442.html">
+   <LINK REL="Next"  HREF="001597.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] embedding mono with threads</H1>
+    <B>eric lindvall</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20embedding%20mono%20with%20threads&In-Reply-To="
+       TITLE="[Mono-devel-list] embedding mono with threads">eric at 5stops.com
+       </A><BR>
+    <I>Wed Jul  9 04:17:20 EDT 2003</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001442.html">[Mono-devel-list] PEToolkit from current CVS crashing mcs?
+</A></li>
+        <LI>Next message: <A HREF="001597.html">[Mono-devel-list] embedding mono with threads
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1440">[ date ]</a>
+              <a href="thread.html#1440">[ thread ]</a>
+              <a href="subject.html#1440">[ subject ]</a>
+              <a href="author.html#1440">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I've had all sorts of troubles embedding mono in a world of pthreads.
+
+The biggest problems i've found are that:
+
+- I can't seem to run mono_jit_init() from a thread other than the &quot;main
+  thread&quot; (see oxide-3)
+- odd things start to happen when i use pthread_create() and then use
+  mono_thread_attach() (see oxide-2)
+- if mono_runtime_exec_managed_code() isn't used, nothing works right --
+  I'm not quite sure how much and what I'm supposed to do with that call
+  though.. once I call it, can I run everything else in a different
+  thread?
+
+I've found other smaller odd issues, like when i try to use
+mono_runtime_invoke() on a MonoObject that is a TransparentProxy, it seems
+to run in the default app domain, instead of the app domain of the object
+that is being proxied.. but that's a story for another email. (using
+mono_object_get_virtual_method() seemed to give me the correct object, but
+i am not sure if it's the right answer).
+
+I have included both a tarball of my source as well as included the main
+.c files for reference.
+
+I also included a managed parity of the unmanaged code: oxide-bin.exe.
+
+The differences between the three unmaraged versions:
+
+oxide-1: nothing is using pthreads
+
+         result:
+	   everything works.
+
+oxide-2: initialization happens in the main thread, but the &quot;request&quot;
+         happens in a pthread
+
+         result:
+	   Unhandled Exception: System.NullReferenceException: A null value was found where an object instance was required 
+	   in [0x000e6] (at /home/eric/src/mono/mcs/class/System.Web/System.Web.Hosting/ApplicationHost.cs:62) 00 System.Web.Hosting.ApplicationHost:CreateApplicationHost (System.Type,string,string) 
+	   in [0x0000c] (at /home/eric/src/oxide_test/managed/OxideApplicationHost.cs:46) 00 Fivestops.Oxide.OxideApplicationHost:CreateApplicationHost (string,string)
+
+oxide-3: initialization attempts to happen in a pthread (and segfaults)
+
+         result:
+	   Segmentation fault
+
+e.
+
+
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: oxide_test.tar.gz
+Type: application/x-tar-gz
+Size: 3037 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20030709/bfea4da4/attachment.bin">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20030709/bfea4da4/attachment.bin</A> 
+-------------- next part --------------
+
+#include &lt;sys/select.h&gt;
+
+#include &lt;mono/jit/jit.h&gt;
+#include &lt;mono/metadata/environment.h&gt;
+#include &lt;mono/metadata/debug-helpers.h&gt;
+#include &lt;mono/metadata/mono-debug.h&gt;
+#include &lt;mono/metadata/threads.h&gt;
+
+#define DOCROOT &quot;/home/eric/xsp/test&quot;
+#define DLL_LOCATION &quot;oxide.dll&quot;
+
+static MonoDomain *g_domain;
+static MonoAssembly *g_assembly;
+
+static MonoObject *g_appHost;
+
+void oxideHandler (void *p);
+
+static char *
+GetVariable (char *key)
+{
+    if (strcmp (key, &quot;ntrans-base&quot;) == 0)
+    {
+        return (DOCROOT);
+    }
+    else if (strcmp (key, &quot;HasInittedMono&quot;) == 0)
+    {
+        return (NULL); // nope
+    }
+    else if (strcmp (key, &quot;uri&quot;) == 0)
+    {
+        return (&quot;index.aspx&quot;);
+    }
+    else if (strcmp (key, &quot;query&quot;) == 0)
+    {
+        return (&quot;&quot;);
+    }
+
+    return (NULL);
+}
+
+static void
+oxideSetupMono (gpointer userData)
+{
+    char *assemblyLocation = DLL_LOCATION;
+
+    g_assembly = mono_domain_assembly_open (g_domain, assemblyLocation);
+
+    if (g_assembly == NULL)
+    {
+        printf (&quot;OXIDE: could not load assembly: %s\n&quot;, assemblyLocation);
+
+        mono_environment_exitcode_set (-1);
+    }
+    else
+    {
+        printf (&quot;OXIDE: loaded assembly: %s\n&quot;, assemblyLocation);
+
+        mono_debug_init_2 (g_assembly);
+        g_domain-&gt;entry_assembly = g_assembly;
+
+        mono_environment_exitcode_set (0);
+    }
+}
+
+void
+oxideInit (void *p)
+{
+    int ret = 0;
+
+    g_domain = mono_jit_init (&quot;oxide-domain&quot;);
+
+    if (g_domain == NULL)
+    {
+        printf (&quot;OXIDE: could not initialize application domain.\n&quot;);
+        
+        return;
+    }
+
+    mono_debug_init (MONO_DEBUG_FORMAT_MONO);
+
+    mono_runtime_exec_managed_code (g_domain, oxideSetupMono, NULL);
+    
+    ret = mono_environment_exitcode_get();
+
+    printf (&quot;OXIDE: exit code: %d\n&quot;, ret);
+
+    if (ret == 0)
+    {
+        printf (&quot;OXIDE: successfully started.\n&quot;);
+    }
+    else
+    {
+        mono_jit_cleanup (g_domain);
+
+        printf (&quot;OXIDE: error, could not start.\n&quot;);
+    }
+}
+
+static MonoObject *
+oxideAppHostSetup (char *virtualDir, char *baseDir)
+{
+    MonoMethodDesc *methodDesc;
+    MonoMethod *method;
+    MonoObject *appHost;
+    gpointer params[2];
+
+    methodDesc = mono_method_desc_new (&quot;Fivestops.Oxide.OxideApplicationHost:CreateApplicationHost&quot;, TRUE);
+    method = mono_method_desc_search_in_image (methodDesc, g_assembly-&gt;image);
+
+    if (virtualDir != NULL &amp;&amp; *virtualDir != 0)
+        params[0] = mono_string_new (g_domain, virtualDir);
+    else
+        params[0] = NULL;
+
+    if (baseDir != NULL &amp;&amp; *baseDir != 0)
+        params[1] = mono_string_new (g_domain, baseDir);
+    else
+        params[1] = NULL;
+
+    appHost = mono_runtime_invoke (method, NULL, params, NULL);
+
+    return (appHost);
+}
+
+static MonoObject *
+oxideGetAppHost (char *virtualDir, char *baseDir)
+{
+    if (g_appHost == NULL)
+    {
+        g_appHost = oxideAppHostSetup (virtualDir, baseDir);
+    }
+
+    return (g_appHost);
+}
+
+static char *
+oxideGetVirtualDir ()
+{
+    return (&quot;/&quot;);
+}
+
+static char *
+oxideProcessRequest (MonoObject *appHost, char *page, char *query)
+{
+    MonoMethodDesc *methodDesc;
+    MonoMethod *method;
+    MonoString *response;
+    gpointer params[2];
+
+    methodDesc = mono_method_desc_new (&quot;Fivestops.Oxide.OxideApplicationHost:HandleRequest&quot;, TRUE);
+    method = mono_method_desc_search_in_image (methodDesc, g_assembly-&gt;image);
+    method = mono_object_get_virtual_method (appHost, method);
+
+    printf (&quot;OXIDE: HandleRequest: %p\n&quot;, method);
+
+    if (method == NULL)
+    {
+        return (&quot;(error)&quot;);
+    }
+
+    if (page != NULL &amp;&amp; *page != 0)
+        params[0] = mono_string_new (g_domain, page);
+    else
+        params[0] = NULL;
+
+    if (query != NULL &amp;&amp; *query != 0)
+        params[1] = mono_string_new (g_domain, query);
+    else
+        params[1] = NULL;
+
+    response = (MonoString *) mono_runtime_invoke (method, appHost, params, NULL);
+
+    return (mono_string_to_utf8 (response));
+}
+
+
+void
+oxideHandler (void *p)
+{
+    MonoObject *appHost;
+    char *docRoot;
+    char *response;
+    void *hasInitted;
+
+    docRoot = GetVariable (&quot;ntrans-base&quot;);
+
+    if (docRoot == NULL)
+    {
+        printf (&quot;OXIDE: no docRoot defined\n&quot;);
+
+        return;
+    }
+
+    hasInitted = GetVariable (&quot;HasInittedMono&quot;);
+
+    if (hasInitted == NULL)
+    {
+        printf (&quot;OXIDE: calling mono_thread_attach (%p)\n&quot;, g_domain);
+
+        mono_thread_attach (g_domain);
+    }
+
+    // appHost = oxideGetAppHost (oxideGetVirtualDir(), docRoot);
+    appHost = oxideAppHostSetup (oxideGetVirtualDir(), docRoot);
+
+    response = oxideProcessRequest (appHost, GetVariable (&quot;uri&quot;),
+            GetVariable (&quot;query&quot;));
+
+    printf (&quot;response = \n%s\n&quot;, response);
+}
+
+int
+main (int argc, char **argv)
+{
+    oxideInit (NULL);
+
+    oxideHandler (NULL);
+
+    return (0);
+}
+-------------- next part --------------
+
+#include &lt;sys/select.h&gt;
+
+#include &lt;mono/jit/jit.h&gt;
+#include &lt;mono/metadata/environment.h&gt;
+#include &lt;mono/metadata/debug-helpers.h&gt;
+#include &lt;mono/metadata/mono-debug.h&gt;
+#include &lt;mono/metadata/threads.h&gt;
+
+#define DOCROOT &quot;/home/eric/xsp/test&quot;
+#define DLL_LOCATION &quot;oxide.dll&quot;
+
+static MonoDomain *g_domain;
+static MonoAssembly *g_assembly;
+
+static MonoObject *g_appHost;
+
+void oxideHandler (void *p);
+
+static char *
+GetVariable (char *key)
+{
+    if (strcmp (key, &quot;ntrans-base&quot;) == 0)
+    {
+        return (DOCROOT);
+    }
+    else if (strcmp (key, &quot;HasInittedMono&quot;) == 0)
+    {
+        return (NULL); // nope
+    }
+    else if (strcmp (key, &quot;uri&quot;) == 0)
+    {
+        return (&quot;index.aspx&quot;);
+    }
+    else if (strcmp (key, &quot;query&quot;) == 0)
+    {
+        return (&quot;&quot;);
+    }
+
+    return (NULL);
+}
+
+static void
+oxideSetupMono (gpointer userData)
+{
+    char *assemblyLocation = DLL_LOCATION;
+
+    g_assembly = mono_domain_assembly_open (g_domain, assemblyLocation);
+
+    if (g_assembly == NULL)
+    {
+        printf (&quot;OXIDE: could not load assembly: %s\n&quot;, assemblyLocation);
+
+        mono_environment_exitcode_set (-1);
+    }
+    else
+    {
+        printf (&quot;OXIDE: loaded assembly: %s\n&quot;, assemblyLocation);
+
+        mono_debug_init_2 (g_assembly);
+        g_domain-&gt;entry_assembly = g_assembly;
+
+        mono_environment_exitcode_set (0);
+    }
+}
+
+void
+oxideInit (void *p)
+{
+    int ret = 0;
+
+    g_domain = mono_jit_init (&quot;oxide-domain&quot;);
+
+    if (g_domain == NULL)
+    {
+        printf (&quot;OXIDE: could not initialize application domain.\n&quot;);
+        
+        return;
+    }
+
+    mono_debug_init (MONO_DEBUG_FORMAT_MONO);
+
+    mono_runtime_exec_managed_code (g_domain, oxideSetupMono, NULL);
+    
+    ret = mono_environment_exitcode_get();
+
+    printf (&quot;OXIDE: exit code: %d\n&quot;, ret);
+
+    if (ret == 0)
+    {
+        printf (&quot;OXIDE: successfully started.\n&quot;);
+    }
+    else
+    {
+        mono_jit_cleanup (g_domain);
+
+        printf (&quot;OXIDE: error, could not start.\n&quot;);
+    }
+}
+
+static MonoObject *
+oxideAppHostSetup (char *virtualDir, char *baseDir)
+{
+    MonoMethodDesc *methodDesc;
+    MonoMethod *method;
+    MonoObject *appHost;
+    gpointer params[2];
+
+    methodDesc = mono_method_desc_new (&quot;Fivestops.Oxide.OxideApplicationHost:CreateApplicationHost&quot;, TRUE);
+    method = mono_method_desc_search_in_image (methodDesc, g_assembly-&gt;image);
+
+    if (virtualDir != NULL &amp;&amp; *virtualDir != 0)
+        params[0] = mono_string_new (g_domain, virtualDir);
+    else
+        params[0] = NULL;
+
+    if (baseDir != NULL &amp;&amp; *baseDir != 0)
+        params[1] = mono_string_new (g_domain, baseDir);
+    else
+        params[1] = NULL;
+
+    appHost = mono_runtime_invoke (method, NULL, params, NULL);
+
+    return (appHost);
+}
+
+static MonoObject *
+oxideGetAppHost (char *virtualDir, char *baseDir)
+{
+    if (g_appHost == NULL)
+    {
+        g_appHost = oxideAppHostSetup (virtualDir, baseDir);
+    }
+
+    return (g_appHost);
+}
+
+static char *
+oxideGetVirtualDir ()
+{
+    return (&quot;/&quot;);
+}
+
+static char *
+oxideProcessRequest (MonoObject *appHost, char *page, char *query)
+{
+    MonoMethodDesc *methodDesc;
+    MonoMethod *method;
+    MonoString *response;
+    gpointer params[2];
+
+    methodDesc = mono_method_desc_new (&quot;Fivestops.Oxide.OxideApplicationHost:HandleRequest&quot;, TRUE);
+    method = mono_method_desc_search_in_image (methodDesc, g_assembly-&gt;image);
+    method = mono_object_get_virtual_method (appHost, method);
+
+    printf (&quot;OXIDE: HandleRequest: %p\n&quot;, method);
+
+    if (method == NULL)
+    {
+        return (&quot;(error)&quot;);
+    }
+
+    if (page != NULL &amp;&amp; *page != 0)
+        params[0] = mono_string_new (g_domain, page);
+    else
+        params[0] = NULL;
+
+    if (query != NULL &amp;&amp; *query != 0)
+        params[1] = mono_string_new (g_domain, query);
+    else
+        params[1] = NULL;
+
+    response = (MonoString *) mono_runtime_invoke (method, appHost, params, NULL);
+
+    return (mono_string_to_utf8 (response));
+}
+
+
+void
+oxideHandler (void *p)
+{
+    MonoObject *appHost;
+    char *docRoot;
+    char *response;
+    void *hasInitted;
+
+    docRoot = GetVariable (&quot;ntrans-base&quot;);
+
+    if (docRoot == NULL)
+    {
+        printf (&quot;OXIDE: no docRoot defined\n&quot;);
+
+        return;
+    }
+
+    hasInitted = GetVariable (&quot;HasInittedMono&quot;);
+
+    if (hasInitted == NULL)
+    {
+        printf (&quot;OXIDE: calling mono_thread_attach (%p)\n&quot;, g_domain);
+
+        mono_thread_attach (g_domain);
+    }
+
+    // appHost = oxideGetAppHost (oxideGetVirtualDir(), docRoot);
+    appHost = oxideAppHostSetup (oxideGetVirtualDir(), docRoot);
+
+    response = oxideProcessRequest (appHost, GetVariable (&quot;uri&quot;),
+            GetVariable (&quot;query&quot;));
+
+    printf (&quot;response = \n%s\n&quot;, response);
+}
+
+int
+main (int argc, char **argv)
+{
+    pthread_t thread2;
+
+    oxideInit (NULL);
+
+    pthread_create (&amp;thread2, NULL, (void *(*)(void *)) oxideHandler, NULL);
+
+    pthread_join (thread2, NULL);
+
+    return (0);
+}
+-------------- next part --------------
+
+#include &lt;sys/select.h&gt;
+
+#include &lt;mono/jit/jit.h&gt;
+#include &lt;mono/metadata/environment.h&gt;
+#include &lt;mono/metadata/debug-helpers.h&gt;
+#include &lt;mono/metadata/mono-debug.h&gt;
+#include &lt;mono/metadata/threads.h&gt;
+
+#define DOCROOT &quot;/home/eric/xsp/test&quot;
+#define DLL_LOCATION &quot;oxide.dll&quot;
+
+static MonoDomain *g_domain;
+static MonoAssembly *g_assembly;
+
+static MonoObject *g_appHost;
+
+void oxideHandler (void *p);
+
+static char *
+GetVariable (char *key)
+{
+    if (strcmp (key, &quot;ntrans-base&quot;) == 0)
+    {
+        return (DOCROOT);
+    }
+    else if (strcmp (key, &quot;HasInittedMono&quot;) == 0)
+    {
+        return (NULL); // nope
+    }
+    else if (strcmp (key, &quot;uri&quot;) == 0)
+    {
+        return (&quot;index.aspx&quot;);
+    }
+    else if (strcmp (key, &quot;query&quot;) == 0)
+    {
+        return (&quot;&quot;);
+    }
+
+    return (NULL);
+}
+
+static void
+oxideSetupMono (gpointer userData)
+{
+    char *assemblyLocation = DLL_LOCATION;
+
+    g_assembly = mono_domain_assembly_open (g_domain, assemblyLocation);
+
+    if (g_assembly == NULL)
+    {
+        printf (&quot;OXIDE: could not load assembly: %s\n&quot;, assemblyLocation);
+
+        mono_environment_exitcode_set (-1);
+    }
+    else
+    {
+        printf (&quot;OXIDE: loaded assembly: %s\n&quot;, assemblyLocation);
+
+        mono_debug_init_2 (g_assembly);
+        g_domain-&gt;entry_assembly = g_assembly;
+
+        mono_environment_exitcode_set (0);
+    }
+}
+
+void
+oxideInit (void *p)
+{
+    int ret = 0;
+
+    g_domain = mono_jit_init (&quot;oxide-domain&quot;);
+
+    if (g_domain == NULL)
+    {
+        printf (&quot;OXIDE: could not initialize application domain.\n&quot;);
+        
+        return;
+    }
+
+    mono_debug_init (MONO_DEBUG_FORMAT_MONO);
+
+    mono_runtime_exec_managed_code (g_domain, oxideSetupMono, NULL);
+    
+    ret = mono_environment_exitcode_get();
+
+    printf (&quot;OXIDE: exit code: %d\n&quot;, ret);
+
+    if (ret == 0)
+    {
+        printf (&quot;OXIDE: successfully started.\n&quot;);
+    }
+    else
+    {
+        mono_jit_cleanup (g_domain);
+
+        printf (&quot;OXIDE: error, could not start.\n&quot;);
+    }
+}
+
+static MonoObject *
+oxideAppHostSetup (char *virtualDir, char *baseDir)
+{
+    MonoMethodDesc *methodDesc;
+    MonoMethod *method;
+    MonoObject *appHost;
+    gpointer params[2];
+
+    methodDesc = mono_method_desc_new (&quot;Fivestops.Oxide.OxideApplicationHost:CreateApplicationHost&quot;, TRUE);
+    method = mono_method_desc_search_in_image (methodDesc, g_assembly-&gt;image);
+
+    if (virtualDir != NULL &amp;&amp; *virtualDir != 0)
+        params[0] = mono_string_new (g_domain, virtualDir);
+    else
+        params[0] = NULL;
+
+    if (baseDir != NULL &amp;&amp; *baseDir != 0)
+        params[1] = mono_string_new (g_domain, baseDir);
+    else
+        params[1] = NULL;
+
+    appHost = mono_runtime_invoke (method, NULL, params, NULL);
+
+    return (appHost);
+}
+
+static MonoObject *
+oxideGetAppHost (char *virtualDir, char *baseDir)
+{
+    if (g_appHost == NULL)
+    {
+        g_appHost = oxideAppHostSetup (virtualDir, baseDir);
+    }
+
+    return (g_appHost);
+}
+
+static char *
+oxideGetVirtualDir ()
+{
+    return (&quot;/&quot;);
+}
+
+static char *
+oxideProcessRequest (MonoObject *appHost, char *page, char *query)
+{
+    MonoMethodDesc *methodDesc;
+    MonoMethod *method;
+    MonoString *response;
+    gpointer params[2];
+
+    methodDesc = mono_method_desc_new (&quot;Fivestops.Oxide.OxideApplicationHost:HandleRequest&quot;, TRUE);
+    method = mono_method_desc_search_in_image (methodDesc, g_assembly-&gt;image);
+    method = mono_object_get_virtual_method (appHost, method);
+
+    printf (&quot;OXIDE: HandleRequest: %p\n&quot;, method);
+
+    if (method == NULL)
+    {
+        return (&quot;(error)&quot;);
+    }
+
+    if (page != NULL &amp;&amp; *page != 0)
+        params[0] = mono_string_new (g_domain, page);
+    else
+        params[0] = NULL;
+
+    if (query != NULL &amp;&amp; *query != 0)
+        params[1] = mono_string_new (g_domain, query);
+    else
+        params[1] = NULL;
+
+    response = (MonoString *) mono_runtime_invoke (method, appHost, params, NULL);
+
+    return (mono_string_to_utf8 (response));
+}
+
+
+void
+oxideHandler (void *p)
+{
+    MonoObject *appHost;
+    char *docRoot;
+    char *response;
+    void *hasInitted;
+
+    docRoot = GetVariable (&quot;ntrans-base&quot;);
+
+    if (docRoot == NULL)
+    {
+        printf (&quot;OXIDE: no docRoot defined\n&quot;);
+
+        return;
+    }
+
+    hasInitted = GetVariable (&quot;HasInittedMono&quot;);
+
+    if (hasInitted == NULL)
+    {
+        printf (&quot;OXIDE: calling mono_thread_attach (%p)\n&quot;, g_domain);
+
+        mono_thread_attach (g_domain);
+    }
+
+    // appHost = oxideGetAppHost (oxideGetVirtualDir(), docRoot);
+    appHost = oxideAppHostSetup (oxideGetVirtualDir(), docRoot);
+
+    response = oxideProcessRequest (appHost, GetVariable (&quot;uri&quot;),
+            GetVariable (&quot;query&quot;));
+
+    printf (&quot;response = \n%s\n&quot;, response);
+}
+
+int
+main (int argc, char **argv)
+{
+    pthread_t thread1;
+    pthread_t thread2;
+
+    pthread_create (&amp;thread1, NULL, (void *(*)(void *)) oxideInit, NULL);
+
+    pthread_join (thread1, NULL);
+
+    pthread_create (&amp;thread2, NULL, (void *(*)(void *)) oxideHandler, NULL);
+
+    pthread_join (thread2, NULL);
+
+    return (0);
+}
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001442.html">[Mono-devel-list] PEToolkit from current CVS crashing mcs?
+</A></li>
+	<LI>Next message: <A HREF="001597.html">[Mono-devel-list] embedding mono with threads
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1440">[ date ]</a>
+              <a href="thread.html#1440">[ thread ]</a>
+              <a href="subject.html#1440">[ subject ]</a>
+              <a href="author.html#1440">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

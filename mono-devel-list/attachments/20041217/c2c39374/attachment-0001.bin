@@ -1,0 +1,417 @@
+Index: mini.c
+===================================================================
+--- mini.c	(revision 37879)
++++ mini.c	(working copy)
+@@ -8148,6 +8148,7 @@
+ 	jinfo->code_size = cfg->code_len;
+ 	jinfo->used_regs = cfg->used_int_regs;
+ 	jinfo->domain_neutral = (cfg->opt & MONO_OPT_SHARED) != 0;
++	jinfo->cas_inited = FALSE; /* initialization delayed at the first stalk walk using this method */
+ 
+ 	if (header->num_clauses) {
+ 		int i;
+@@ -8736,6 +8737,10 @@
+ 				ves_icall_get_frame_info);
+ 	mono_add_internal_call ("System.Diagnostics.StackTrace::get_trace", 
+ 				ves_icall_get_trace);
++	mono_add_internal_call ("System.Security.SecurityFrame::_GetSecurityFrame",
++				ves_icall_System_Security_SecurityFrame_GetSecurityFrame);
++	mono_add_internal_call ("System.Security.SecurityFrame::_GetSecurityStack",
++				ves_icall_System_Security_SecurityFrame_GetSecurityStack);
+ 	mono_add_internal_call ("Mono.Runtime::mono_runtime_install_handlers", 
+ 				mono_runtime_install_handlers);
+ 
+Index: mini.h
+===================================================================
+--- mini.h	(revision 37879)
++++ mini.h	(working copy)
+@@ -818,6 +818,11 @@
+ gboolean mono_handle_exception                  (MonoContext *ctx, gpointer obj,
+ 						 gpointer original_ip, gboolean test_only);
+ void      mono_jit_walk_stack                   (MonoStackWalk func, gboolean do_il_offset, gpointer user_data);
++
++/* the new function to do stack walks */
++typedef gboolean (*MonoStackFrameWalk)          (MonoDomain *domain, MonoContext *ctx, MonoJitInfo *ji, gpointer data);
++void      mono_walk_stack                       (MonoDomain *domain, MonoJitTlsData *jit_tls, MonoContext *start_ctx, MonoStackFrameWalk func, gpointer user_data);
++
+ MonoArray *ves_icall_get_trace                  (MonoException *exc, gint32 skip, MonoBoolean need_file_info);
+ MonoBoolean ves_icall_get_frame_info            (gint32 skip, MonoBoolean need_file_info, 
+ 						 MonoReflectionMethod **method, 
+@@ -859,4 +864,9 @@
+ extern void
+ mono_perform_ssapre (MonoCompile *cfg);
+ 
++/* CAS - stack walk */
++//MonoBoolean ves_icall_System_Security_SecurityFrame_GetSecurityFrameInformation (gint32 skip, MonoReflectionMethod **method, gint32 *flags);
++MonoSecurityFrame* ves_icall_System_Security_SecurityFrame_GetSecurityFrame (gint32 skip);
++MonoArray* ves_icall_System_Security_SecurityFrame_GetSecurityStack (gint32 skip);
++
+ #endif /* __MONO_MINI_H__ */
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 37879)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,19 @@
++2004-12-17  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* declsec.c|h: Added functions to cache the declarative stack modifiers
++	in MonoJitInfo and to create a security frame from a MonoJitInfo 
++	structure.
++	* mini.c: Initialize jinfo->cas_inited to FALSE when MonoJitInfo is
++	created. Register internal calls for System.Security.SecurityFrame::
++	_GetSecurityFrame and _GetSecurityStack.
++	* mini.h: Added definition for new icalls (in mini-exceptions.c) and
++	the definitions for the new stack walk/callback mechanism.
++	* mini-exceptions.c: Added internal call GetSecurityFrame (to get the 
++	first security frame for LinkDemands and InheritanceDemands) and
++	GetSecurityStack for Demands. Both use the new mono_walk_stack code
++	from lupus.
++	* mini-x86.h: Architecture specific stack walk initialization (lupus).
++
+ 2004-12-16  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* mini-x86.c (mono_arch_emit_epilog): Optimize the corlib exception
+Index: mini-exceptions.c
+===================================================================
+--- mini-exceptions.c	(revision 37879)
++++ mini-exceptions.c	(working copy)
+@@ -154,7 +154,50 @@
+ 	return res;
+ }
+ 
++
++/**
++ * mono_walk_stack:
++ * @domain: starting appdomain
++ * @jit_tls: JIT data for the thread
++ * @start_ctx: starting state of the stack frame
++ * @func: callback to call for each stack frame
++ * @user_data: data passed to the callback
++ *
++ * This function walks the stack of a thread, starting from the state
++ * represented by jit_tls and start_ctx. For each frame the callback
++ * function is called with the relevant info. The walk ends when no more
++ * managed stack frames are found or when the callback returns a TRUE value.
++ * Note that the function can be used to walk the stack of a thread 
++ * different from the current.
++ */
+ void
++mono_walk_stack (MonoDomain *domain, MonoJitTlsData *jit_tls, MonoContext *start_ctx, MonoStackFrameWalk func, gpointer user_data)
++{
++	MonoLMF *lmf = jit_tls->lmf;
++	MonoJitInfo *ji, rji;
++	gint native_offset;
++	gboolean managed;
++	MonoContext ctx, new_ctx;
++
++	ctx = *start_ctx;
++
++	while (MONO_CONTEXT_GET_BP (&ctx) < jit_tls->end_of_stack) {
++		/* 
++		 * FIXME: mono_find_jit_info () will need to be able to return a different
++		 * MonoDomain when apddomain transitions are found on the stack.
++		 */
++		ji = mono_find_jit_info (domain, jit_tls, &rji, NULL, &ctx, &new_ctx, NULL, &lmf, &native_offset, &managed);
++		if (!ji || ji == (gpointer)-1)
++			return;
++
++		if (func (domain, &new_ctx, ji, user_data))
++			return;
++
++		ctx = new_ctx;
++	}
++}
++
++void
+ mono_jit_walk_stack (MonoStackWalk func, gboolean do_il_offset, gpointer user_data) {
+ 	MonoDomain *domain = mono_domain_get ();
+ 	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+@@ -243,8 +286,95 @@
+ 	return TRUE;
+ }
+ 
++typedef struct {
++	guint32 skips;
++	MonoSecurityFrame *frame;
++} MonoFrameSecurityInfo;
++
++static gboolean
++callback_get_first_frame_security_info (MonoDomain *domain, MonoContext *ctx, MonoJitInfo *ji, gpointer data)
++{
++	MonoFrameSecurityInfo *si = (MonoFrameSecurityInfo*) data;
++
++	/* FIXME: skip all wrappers ?? probably not - case by case testing is required */
++	if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
++	    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++	    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
++	    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
++	    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE) {
++		return FALSE;
++	}
++
++	if (si->skips > 0) {
++		si->skips--;
++		return FALSE;
++	}
++
++	si->frame = mono_declsec_create_frame (domain, ji);
++
++	/* Stop - we only want the first frame (e.g. LinkDemand and InheritanceDemand) */
++	return TRUE;
++}
++
++/**
++ * ves_icall_System_Security_SecurityFrame_GetSecurityFrame:
++ * @skip: the number of stack frames to skip
++ *
++ * This function returns a the security informations of a single stack frame 
++ * (after the skipped ones). This is required for [NonCas]LinkDemand[Choice]
++ * and [NonCas]InheritanceDemand[Choice] as only the caller security is 
++ * evaluated.
++ */
++MonoSecurityFrame*
++ves_icall_System_Security_SecurityFrame_GetSecurityFrame (gint32 skip)
++{
++	MonoDomain *domain = mono_domain_get ();
++	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
++	MonoFrameSecurityInfo si;
++	MonoContext ctx;
++
++	MONO_INIT_CONTEXT_FROM_FUNC (&ctx, ves_icall_System_Security_SecurityFrame_GetSecurityFrame);
++
++	si.skips = skip;
++	si.frame = NULL;
++	mono_walk_stack (domain, jit_tls, &ctx, callback_get_first_frame_security_info, (gpointer)&si);
++
++	return (si.skips == 0) ? si.frame : NULL;
++}
++
++
++typedef struct {
++	guint32 skips;
++	GList *stack;
++} MonoSecurityStack;
++
++static gboolean
++callback_get_stack_frames_security_info (MonoDomain *domain, MonoContext *ctx, MonoJitInfo *ji, gpointer data)
++{
++	MonoSecurityStack *ss = (MonoSecurityStack*) data;
++
++	/* FIXME: skip all wrappers ?? probably not - case by case testing is required */
++	if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
++	    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++	    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
++	    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
++	    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE) {
++		return FALSE;
++	}
++
++	if (ss->skips > 0) {
++		ss->skips--;
++		return FALSE;
++	}
++
++	ss->stack = g_list_prepend (ss->stack, mono_declsec_create_frame (domain, ji));
++
++	/* continue down the stack */
++	return FALSE;
++}
++
+ static MonoArray *
+-glist_to_array (GList *list) 
++glist_to_array (GList *list, MonoClass *eclass) 
+ {
+ 	MonoDomain *domain = mono_domain_get ();
+ 	MonoArray *res;
+@@ -254,7 +384,7 @@
+ 		return NULL;
+ 
+ 	len = g_list_length (list);
+-	res = mono_array_new (domain, mono_defaults.int_class, len);
++	res = mono_array_new (domain, eclass, len);
+ 
+ 	for (i = 0; list; list = list->next, i++)
+ 		mono_array_set (res, gpointer, i, list->data);
+@@ -263,6 +393,37 @@
+ }
+ 
+ /**
++ * ves_icall_System_Security_SecurityFrame_GetSecurityStack:
++ * @skip: the number of stack frames to skip
++ *
++ * This function returns an managed array of containing the security
++ * informations for each frame (after the skipped ones). This is used for
++ * [NonCas]Demand[Choice] where the complete evaluation of the stack is 
++ * required.
++ */
++MonoArray*
++ves_icall_System_Security_SecurityFrame_GetSecurityStack (gint32 skip)
++{
++	MonoDomain *domain = mono_domain_get ();
++	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
++	MonoSecurityStack ss;
++	MonoContext ctx;
++	MonoArray *stack;
++
++	MONO_INIT_CONTEXT_FROM_FUNC (&ctx, ves_icall_System_Security_SecurityFrame_GetSecurityStack);
++
++	ss.skips = skip;
++	ss.stack = NULL;
++	mono_walk_stack (domain, jit_tls, &ctx, callback_get_stack_frames_security_info, (gpointer)&ss);
++
++	stack = glist_to_array (ss.stack, mono_defaults.runtimesecurityframe_class);
++	if (ss.stack)
++		g_list_free (ss.stack);
++
++	return stack;
++}
++
++/**
+  * mono_handle_exception:
+  * @ctx: saved processor state
+  * @obj: the exception object
+@@ -446,7 +607,7 @@
+ 							if (test_only) {
+ 								if (mono_ex) {
+ 									trace_ips = g_list_reverse (trace_ips);
+-									mono_ex->trace_ips = glist_to_array (trace_ips);
++									mono_ex->trace_ips = glist_to_array (trace_ips, mono_defaults.int_class);
+ 								}
+ 								g_list_free (trace_ips);
+ 								g_free (trace);
+@@ -509,7 +670,7 @@
+ 			} else {
+ 				if (mono_ex) {
+ 					trace_ips = g_list_reverse (trace_ips);
+-					mono_ex->trace_ips = glist_to_array (trace_ips);
++					mono_ex->trace_ips = glist_to_array (trace_ips, mono_defaults.int_class);
+ 				}
+ 				g_list_free (trace_ips);
+ 				if (trace_str)
+Index: mini-x86.h
+===================================================================
+--- mini-x86.h	(revision 37879)
++++ mini-x86.h	(working copy)
+@@ -142,6 +142,12 @@
+ #define MONO_CONTEXT_GET_BP(ctx) ((gpointer)((ctx)->SC_EBP))
+ #define MONO_CONTEXT_GET_SP(ctx) ((gpointer)((ctx)->SC_ESP))
+ 
++#define MONO_INIT_CONTEXT_FROM_FUNC(ctx,start_func) do {	\
++		mono_arch_flush_register_windows ();	\
++		MONO_CONTEXT_SET_IP ((ctx), (start_func));	\
++		MONO_CONTEXT_SET_BP ((ctx), __builtin_frame_address (0));	\
++	} while (0)
++
+ #ifndef PLATFORM_WIN32
+ #ifdef HAVE_WORKING_SIGALTSTACK
+ #define MONO_ARCH_SIGSEGV_ON_ALTSTACK
+Index: declsec.c
+===================================================================
+--- declsec.c	(revision 37879)
++++ declsec.c	(working copy)
+@@ -26,3 +26,68 @@
+ 	}
+ 	return FALSE;
+ }
++
++
++/*
++ * Fill actions for the specific index (which may either be an encoded class token or
++ * an encoded method token) from the metadata image.
++ * Returns TRUE if some actions requiring code generation are present, FALSE otherwise.
++ */
++void
++mono_declsec_cache_stack_modifiers (MonoJitInfo *jinfo)
++{
++	/* first find the stack modifiers applied to the method */
++	guint32 flags = mono_declsec_flags_from_method (jinfo->method);
++	jinfo->cas_method_assert = (flags & MONO_DECLSEC_FLAG_ASSERT) != 0;
++	jinfo->cas_method_deny = (flags & MONO_DECLSEC_FLAG_DENY) != 0;
++	jinfo->cas_method_permitonly = (flags & MONO_DECLSEC_FLAG_PERMITONLY) != 0;
++
++	/* then find the stack modifiers applied to the class */
++	flags = mono_declsec_flags_from_class (jinfo->method->klass);
++	jinfo->cas_class_assert = (flags & MONO_DECLSEC_FLAG_ASSERT) != 0;
++	jinfo->cas_class_deny = (flags & MONO_DECLSEC_FLAG_DENY) != 0;
++	jinfo->cas_class_permitonly = (flags & MONO_DECLSEC_FLAG_PERMITONLY) != 0;
++}
++
++
++MonoSecurityFrame*
++mono_declsec_create_frame (MonoDomain *domain, MonoJitInfo *jinfo)
++{
++	MonoDeclSecurityEntry entry;
++	MonoSecurityFrame *frame = (MonoSecurityFrame*) mono_object_new (domain, mono_defaults.runtimesecurityframe_class);
++
++	if (!jinfo->cas_inited) {
++		if (mono_method_has_declsec (jinfo->method)) {
++			/* Cache the stack modifiers into the MonoJitInfo structure to speed up future stack walks */
++			mono_declsec_cache_stack_modifiers (jinfo);
++		}
++		jinfo->cas_inited = TRUE;
++	}
++
++	frame->method = mono_method_get_object (domain, jinfo->method, NULL);
++
++	/* stack modifiers on methods have priority on (i.e. replaces) modifiers on class */
++
++	if (jinfo->cas_method_assert) {
++		mono_declsec_get_method_action (jinfo->method, SECURITY_ACTION_ASSERT, &frame->assert);
++	} else if (jinfo->cas_class_assert) {
++		mono_declsec_get_class_action (jinfo->method->klass, SECURITY_ACTION_ASSERT, &frame->assert);
++	}
++
++	if (jinfo->cas_method_deny) {
++		mono_declsec_get_method_action (jinfo->method, SECURITY_ACTION_DENY, &frame->deny);
++	} else if (jinfo->cas_class_deny) {
++		mono_declsec_get_class_action (jinfo->method->klass, SECURITY_ACTION_DENY, &frame->deny);
++	}
++
++	if (jinfo->cas_method_permitonly) {
++		mono_declsec_get_method_action (jinfo->method, SECURITY_ACTION_PERMITONLY, &frame->permitonly);
++	} else if (jinfo->cas_class_permitonly) {
++		mono_declsec_get_class_action (jinfo->method->klass, SECURITY_ACTION_PERMITONLY, &frame->permitonly);
++	}
++
++	/* g_warning ("FRAME %s A(%p,%d) D(%p,%d) PO(%p,%d)", 
++	jinfo->method->name, frame->assert.blob, frame->assert.size, frame->deny.blob, frame->deny.size, frame->permitonly.blob,frame->permitonly.size); */
++
++	return frame;
++}
+Index: declsec.h
+===================================================================
+--- declsec.h	(revision 37879)
++++ declsec.h	(working copy)
+@@ -13,9 +13,32 @@
+ #include <string.h>
+ 
+ #include "mono/metadata/class-internals.h"
++#include "mono/metadata/domain-internals.h"
+ #include "mono/metadata/object.h"
+ #include "mono/metadata/tabledefs.h"
+ 
++
++/* Definitions */
++
++typedef struct {
++	MonoObject obj;
++	MonoReflectionMethod *method;
++	MonoDeclSecurityEntry assert;
++	MonoDeclSecurityEntry deny;
++	MonoDeclSecurityEntry permitonly;
++} MonoSecurityFrame;
++
++
++/* limited flags used in MonoJitInfo for stack modifiers */
++enum {
++	MONO_JITINFO_STACKMOD_ASSERT		= 0x01,
++	MONO_JITINFO_STACKMOD_DENY		= 0x02,
++	MONO_JITINFO_STACKMOD_PERMITONLY	= 0x04
++};
++
++/* Prototypes */
+ MonoBoolean mono_method_has_declsec (MonoMethod *method);
++void mono_declsec_cache_stack_modifiers (MonoJitInfo *jinfo);
++MonoSecurityFrame* mono_declsec_create_frame (MonoDomain *domain, MonoJitInfo *jinfo);
+ 
+ #endif /* _MONO_MINI_DECLSEC_H_ */

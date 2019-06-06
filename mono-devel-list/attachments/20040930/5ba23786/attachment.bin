@@ -1,0 +1,372 @@
+Index: mcs/ChangeLog
+from  Raja R Harinath  <rharinath@novell.com>
+
+	Fix #65833, test-300.cs, cs0122-5.cs, cs0122-6.cs.
+	* class.c (TypeContainer.DefineType): Flag error if
+	base types aren't accessible due to access permissions.
+	* decl.cs (DeclSpace.ResolveType): Move logic to 
+	Expression.ResolveAsTypeTerminal.
+	(DeclSpace.ResolveTypeExpr): Thin layer over 
+	Expression.ResolveAsTypeTerminal.
+	(DeclSpace.CheckAccessLevel, DeclSpace.FamilyAccess):
+	Refactor code into NestedAccess.  Use it.
+	(DeclSpace.NestedAccess): New.
+	* ecore.cs (Expression.ResolveAsTypeTerminal): Add new 
+	argument to silence errors.  Check access permissions.
+	(TypeExpr.DoResolve, TypeExpr.ResolveType): Update.
+	* expression.cs (ProbeExpr.DoResolve): Use ResolveAsTypeTerminal.
+	(Cast.DoResolve): Likewise.
+	(New.DoResolve): Likewise.
+	(InvocationOrCast.DoResolve,ResolveStatement): Likewise.
+	(TypeOf.DoResolve): Likewise.
+
+Index: mcs/class.cs
+--- mcs/class.cs	23 Sep 2004 11:29:25 -0000	1.516
++++ mcs/class.cs	30 Sep 2004 12:10:58 -0000
+@@ -1164,8 +1164,13 @@
+ 
+ 			TypeAttributes type_attributes = TypeAttr;
+ 
+-			if (parent != null)
++			if (parent != null) {
+ 				base_class_type = parent.ResolveType (ec);
++				if (base_class_type == null) {
++					error = true;
++					return null;
++				}
++			}
+ 
+ 			try {
+ 				if (IsTopLevel){
+@@ -1209,9 +1214,16 @@
+ 				base_inteface_types = new Type[ifaces.Length];
+ 				for (int i = 0; i < ifaces.Length; ++i) {
+ 					Type itype = ifaces [i].ResolveType (ec);
++					if (itype == null) {
++						error = true;
++						continue;
++					}
+ 					TypeBuilder.AddInterfaceImplementation (itype);
+ 					base_inteface_types [i] = itype;
+ 				}
++
++				if (error)
++					return null;
+ 			}
+ 
+ 			//
+Index: mcs/decl.cs
+--- mcs/decl.cs	23 Sep 2004 20:30:17 -0000	1.145
++++ mcs/decl.cs	30 Sep 2004 12:10:59 -0000
+@@ -544,27 +544,8 @@
+ 		// </summary>
+ 		public Type ResolveType (Expression e, bool silent, Location loc)
+ 		{
+-			if (type_resolve_ec == null)
+-				type_resolve_ec = GetTypeResolveEmitContext (Parent, loc);
+-			type_resolve_ec.loc = loc;
+-			type_resolve_ec.ContainerType = TypeBuilder;
+-
+-			int errors = Report.Errors;
+-			TypeExpr d = e.ResolveAsTypeTerminal (type_resolve_ec);
+-			
+-			if (d == null || d.eclass != ExprClass.Type){
+-				if (!silent && errors == Report.Errors){
+-					Report.Error (246, loc, "Cannot find type `"+ e.ToString () +"'");
+-				}
+-				return null;
+-			}
+-
+-			if (!d.CheckAccessLevel (this)) {
+-				Report.Error (122, loc, "'{0}' is inaccessible due to its protection level", d.Name);
+-				return null;
+-			}
+-
+-			return d.Type;
++			TypeExpr d = ResolveTypeExpr (e, silent, loc);
++			return d == null ? null : d.Type;
+ 		}
+ 
+ 		// <summary>
+@@ -578,25 +559,16 @@
+ 			type_resolve_ec.loc = loc;
+ 			type_resolve_ec.ContainerType = TypeBuilder;
+ 
+-			TypeExpr d = e.ResolveAsTypeTerminal (type_resolve_ec);
+-			 
+-			if (d == null || d.eclass != ExprClass.Type){
+-				if (!silent){
+-					Report.Error (246, loc, "Cannot find type `"+ e +"'");
+-				}
+-				return null;
+-			}
+-
+-			return d;
++			return e.ResolveAsTypeTerminal (type_resolve_ec, silent);
+ 		}
+ 		
+-		public bool CheckAccessLevel (Type check_type) 
++		public bool CheckAccessLevel (Type check_type)
+ 		{
+ 			if (check_type == TypeBuilder)
+ 				return true;
+ 			
+ 			TypeAttributes check_attr = check_type.Attributes & TypeAttributes.VisibilityMask;
+-			
++
+ 			//
+ 			// Broken Microsoft runtime, return public for arrays, no matter what 
+ 			// the accessibility is for their underlying class, and they return 
+@@ -605,16 +577,17 @@
+ 			if (check_type.IsArray || check_type.IsPointer)
+ 				return CheckAccessLevel (TypeManager.GetElementType (check_type));
+ 
++			if (TypeBuilder == null)
++				// FIXME: TypeBuilder will be null when invoked by Class.GetNormalBases().
++				//        However, this is invoked again later -- so safe to return true.
++				//        May also be null when resolving top-level attributes.
++				return true;
++
+ 			switch (check_attr){
+ 			case TypeAttributes.Public:
+ 				return true;
+ 
+ 			case TypeAttributes.NotPublic:
+-
+-				// In same cases is null.
+-				if (TypeBuilder == null)
+-					return true;
+-
+ 				//
+ 				// This test should probably use the declaringtype.
+ 				//
+@@ -624,29 +597,9 @@
+ 				return true;
+ 
+ 			case TypeAttributes.NestedPrivate:
+-				string check_type_name = check_type.FullName;
+-				string type_name = TypeBuilder.FullName;
+-				
+-				int cio = check_type_name.LastIndexOf ('+');
+-				string container = check_type_name.Substring (0, cio);
+-
+-				//
+-				// Check if the check_type is a nested class of the current type
+-				//
+-				if (check_type_name.StartsWith (type_name + "+")){
+-					return true;
+-				}
+-				
+-				if (type_name.StartsWith (container)){
+-					return true;
+-				}
+-
+-				return false;
++				return NestedAccessible (check_type);
+ 
+ 			case TypeAttributes.NestedFamily:
+-				//
+-				// Only accessible to methods in current type or any subtypes
+-				//
+ 				return FamilyAccessible (check_type);
+ 
+ 			case TypeAttributes.NestedFamANDAssem:
+@@ -666,24 +619,32 @@
+ 
+ 		}
+ 
+-		protected bool FamilyAccessible (Type check_type)
++		protected bool NestedAccessible (Type check_type)
+ 		{
+-			Type declaring = check_type.DeclaringType;
+-			if (TypeBuilder.IsSubclassOf (declaring))
+-				return true;
+-
+ 			string check_type_name = check_type.FullName;
+-			
++
++			// At this point, we already know check_type is a nested class.
+ 			int cio = check_type_name.LastIndexOf ('+');
+-			string container = check_type_name.Substring (0, cio);
+-			
+-			//
+-			// Check if the check_type is a nested class of the current type
+-			//
+-			if (check_type_name.StartsWith (container + "+"))
++
++			// Ensure that the string 'container' has a '+' in it to avoid false matches
++			string container = check_type_name.Substring (0, cio + 1);
++
++			// Ensure that type_name ends with a '+' so that it can match 'container', if necessary
++			string type_name = TypeBuilder.FullName + "+";
++
++			// If the current class is nested inside the container of check_type,
++			// we can access check_type even if it is private or protected.
++			return type_name.StartsWith (container);
++		}
++
++		protected bool FamilyAccessible (Type check_type)
++		{
++			Type declaring = check_type.DeclaringType;
++			if (TypeBuilder == declaring ||
++			    TypeBuilder.IsSubclassOf (declaring))
+ 				return true;
+ 
+-			return false;
++			return NestedAccessible (check_type);
+ 		}
+ 
+ 		// Access level of a type.
+Index: mcs/ecore.cs
+--- mcs/ecore.cs	22 Sep 2004 13:56:41 -0000	1.306
++++ mcs/ecore.cs	30 Sep 2004 12:10:59 -0000
+@@ -253,9 +253,24 @@
+ 		// value will be returned if the expression is not a type
+ 		// reference
+ 		//
+-		public TypeExpr ResolveAsTypeTerminal (EmitContext ec)
++		public TypeExpr ResolveAsTypeTerminal (EmitContext ec, bool silent)
+ 		{
+-			return ResolveAsTypeStep (ec) as TypeExpr;
++			int errors = Report.Errors;
++
++			TypeExpr te = ResolveAsTypeStep (ec) as TypeExpr;
++
++			if (te == null || te.eclass != ExprClass.Type) {
++				if (!silent && errors == Report.Errors)
++					Report.Error (246, Location, "Cannot find type '{0}'", ToString ());
++				return null;
++			}
++
++			if (!te.CheckAccessLevel (ec.DeclSpace)) {
++				Report.Error (122, Location, "'{0}' is inaccessible due to its protection level", te.Name);
++				return null;
++			}
++
++			return te;
+ 		}
+ 	       
+ 		/// <summary>
+@@ -2239,7 +2254,7 @@
+ 
+ 		override public Expression DoResolve (EmitContext ec)
+ 		{
+-			return ResolveAsTypeTerminal (ec);
++			return ResolveAsTypeTerminal (ec, true);
+ 		}
+ 
+ 		override public void Emit (EmitContext ec)
+@@ -2301,7 +2316,7 @@
+ 
+ 		public virtual Type ResolveType (EmitContext ec)
+ 		{
+-			TypeExpr t = ResolveAsTypeTerminal (ec);
++			TypeExpr t = ResolveAsTypeTerminal (ec, false);
+ 			if (t == null)
+ 				return null;
+ 
+Index: mcs/expression.cs
+--- mcs/expression.cs	23 Sep 2004 19:47:46 -0000	1.617
++++ mcs/expression.cs	30 Sep 2004 12:11:01 -0000
+@@ -1012,7 +1012,7 @@
+ 	///   size. 
+ 	/// </remarks>
+ 	public abstract class Probe : Expression {
+-		public readonly Expression ProbeType;
++		public Expression ProbeType;
+ 		protected Expression expr;
+ 		protected Type probe_type;
+ 		
+@@ -1031,10 +1031,10 @@
+ 
+ 		public override Expression DoResolve (EmitContext ec)
+ 		{
+-			probe_type = ec.DeclSpace.ResolveType (ProbeType, false, loc);
+-
+-			if (probe_type == null)
++			ProbeType = ProbeType.ResolveAsTypeTerminal (ec, false);
++			if (ProbeType == null)
+ 				return null;
++			probe_type = ProbeType.Type;
+ 
+ 			CheckObsoleteAttribute (probe_type);
+ 
+@@ -1768,11 +1768,12 @@
+ 			if (expr == null)
+ 				return null;
+ 
+-			type = ec.DeclSpace.ResolveType (target_type, false, Location);
+-			
+-			if (type == null)
++			TypeExpr target = target_type.ResolveAsTypeTerminal (ec, false);
++			if (target == null)
+ 				return null;
+ 
++			type = target.Type;
++
+ 			CheckObsoleteAttribute (type);
+ 
+ 			if (type.IsAbstract && type.IsSealed) {
+@@ -5384,9 +5389,9 @@
+ 			//
+ 			// First try to resolve it as a cast.
+ 			//
+-			type = ec.DeclSpace.ResolveType (expr, true, loc);
+-			if (type != null) {
+-				Cast cast = new Cast (new TypeExpression (type, loc), argument, loc);
++			TypeExpr te = expr.ResolveAsTypeTerminal (ec, true);
++			if (te != null) {
++				Cast cast = new Cast (te, argument, loc);
+ 				return cast.Resolve (ec);
+ 			}
+ 
+@@ -5431,8 +5436,8 @@
+ 			//
+ 			// First try to resolve it as a cast.
+ 			//
+-			type = ec.DeclSpace.ResolveType (expr, true, loc);
+-			if (type != null) {
++			TypeExpr te = expr.ResolveAsTypeTerminal (ec, true);
++			if (te != null) {
+ 				error201 ();
+ 				return null;
+ 			}
+@@ -5566,10 +5571,11 @@
+ 				return this;
+ 			}
+ 			
+-			type = ec.DeclSpace.ResolveType (RequestedType, false, loc);
+-			
+-			if (type == null)
++			RequestedType = RequestedType.ResolveAsTypeTerminal (ec, false);
++			if (RequestedType == null)
+ 				return null;
++
++			type = RequestedType.Type;
+ 			
+ 			CheckObsoleteAttribute (type);
+ 
+@@ -6756,7 +6762,7 @@
+ 	///   Implements the typeof operator
+ 	/// </summary>
+ 	public class TypeOf : Expression {
+-		public readonly Expression QueriedType;
++		public Expression QueriedType;
+ 		protected Type typearg;
+ 		
+ 		public TypeOf (Expression queried_type, Location l)
+@@ -6767,10 +6773,11 @@
+ 
+ 		public override Expression DoResolve (EmitContext ec)
+ 		{
+-			typearg = ec.DeclSpace.ResolveType (QueriedType, false, loc);
+-
+-			if (typearg == null)
++			QueriedType = QueriedType.ResolveAsTypeTerminal (ec, false);
++			if (QueriedType == null)
+ 				return null;
++
++			typearg = QueriedType.Type;
+ 
+ 			if (typearg == TypeManager.void_type) {
+ 				Error (673, "System.Void cannot be used from C# - " +

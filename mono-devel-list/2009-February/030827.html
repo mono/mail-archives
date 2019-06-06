@@ -1,0 +1,300 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] signal.c cross-thread access
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20signal.c%20cross-thread%20access&In-Reply-To=E961123C01E7E94AA29163941172913E0775C17A%40mail1.dundee.realtimeworlds.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="030758.html">
+   <LINK REL="Next"  HREF="030764.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] signal.c cross-thread access</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20signal.c%20cross-thread%20access&In-Reply-To=E961123C01E7E94AA29163941172913E0775C17A%40mail1.dundee.realtimeworlds.com"
+       TITLE="[Mono-dev] signal.c cross-thread access">jonpryor at vt.edu
+       </A><BR>
+    <I>Wed Feb  4 13:42:24 EST 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="030758.html">[Mono-dev] signal.c cross-thread access
+</A></li>
+        <LI>Next message: <A HREF="030764.html">[Mono-dev] [PATCH] Enable TLS for PPC32/64
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30827">[ date ]</a>
+              <a href="thread.html#30827">[ thread ]</a>
+              <a href="subject.html#30827">[ subject ]</a>
+              <a href="author.html#30827">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Before I forget, you should also write additional tests for this
+behavior in mcs/class/Mono.Posix/Test/Mono.Unix/UnixSignalTest.cs.
+
+An example test would be e.g.
+
+	[Test]
+	public void TestNestedInvocations ()
+	{
+		UnixSignal s = new UnixSignal (Signum.SIGINT);
+		Thread a = CreateWaitSignalThread (s, 1000)
+		Thread b = CreateWaitSignalThread (s, 500);
+		a.Start (); b.Start ();
+		a.Join ();  b.Join ();
+	}
+
+i.e. &quot;nest&quot; the WaitOne() calls, thus ensuring that WaitOne() doesn't
+block other invocations of WaitOne() on the same UnixSignal instance.
+
+On Mon, 2009-02-02 at 08:46 +0000, <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">tim.jenks at realtimeworlds.com</A> wrote:
+&gt;<i> Couple of questions though:
+</I>&gt;<i> 
+</I>&gt;<i> &gt; 1. Somehow find out which is preferable for &quot;normal&quot; UnixSignal
+</I>&gt;<i> usage:
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt;   a. One pipe/UnixSignal instance for the lifetime of the
+</I>&gt;<i> UnixSignal.
+</I>&gt;<i> &gt;   b. One pipe/UnixSignal instance for the lifetime of a WaitAny()
+</I>&gt;<i> call.
+</I>&gt;<i> &gt; 
+</I>&gt;<i> &gt; I'm assuming &quot;normal&quot; is that a UnixSignal will last for the life of
+</I>&gt;<i> &gt; the application; that is, UnixSignal instances won't be short lived.
+</I>&gt;<i> &gt; Meanwhile, I'd expect WaitAny() to be comparatively infrequent, but
+</I>&gt;<i> &gt; have less clues about how it's used in practice.
+</I>&gt;<i> 
+</I>&gt;<i> We're using SIGRT* raised a bunch of times a second for the update
+</I>&gt;<i> tick of a game server, I'm talking 20-30Hz. For our use case I think
+</I>&gt;<i> a) is preferable, though I've implemented this as b) as suggested just
+</I>&gt;<i> now. 
+</I>&gt;<i> 
+</I>&gt;<i> What are your thoughts?
+</I>
+How much free time do you have? :-)
+
+In an ideal world, we would write it both ways, then profile your app to
+see how much of a performance impact (1.b) makes over (1.a).  If it's a
+negligible change, then (1.b) should be used.
+
+If necessary, we could add flags to UnixSignal to select between these
+two behaviors, but before doing that I'd like to know if it's necessary.
+
+&gt;<i> &gt; You might need to change wait_for_any() to actually perform error
+</I>&gt;<i> &gt; checking on the read(h-&gt;read_fd, &amp;c, 1) call, as this could now
+</I>&gt;<i> &gt; error if multiple threads are calling WaitAny().
+</I>&gt;<i> 
+</I>&gt;<i> What kind of error conditions are you expecting in this instance?
+</I>
+EINTR, for one. :-)
+
+(Which, come to think of it, I should have handled in the first
+place...)
+
+&gt;<i> And finally, here's some comments on mph_int*:
+</I>&gt;<i> 
+</I>&gt;<i> Obviously the signal handler can be executing concurrently with the
+</I>&gt;<i> other functions in signal.c that are guarded by the mutex; to keep a
+</I>&gt;<i> consistent view of pipecnt in the signal handler I have used atomics:
+</I>
+Which is why pipecnt is incremented *after* the pipe(2) call completes
+and h-&gt;read_fd &amp; h-&gt;write_fd are set (as you do).  This way, if a signal
+occurs while default_handler() is executing, it doesn't matter -- the
+&quot;new&quot; pipe won't be used during that default_handler() invocation.
+
+Though there could be a race if
+Mono_Unix_UnixSignal_WaitAny()/setup_pipes() and default_handler() run
+concurrently with each other, and _somehow_ (1) default_handler() read
+pipecnt before setup_pipes() added the pipe, and (2) the same
+default_handler() invocation was being processed when setup_pipes()
+returned to _WaitAny() and wait_for_any() was invoked.  In this case
+we'd have (from default_handler()'s perspective) pipecnt+1 threads
+blocking on the pipe, and thus we'd send out one too few write(2) calls.
+
+This seems _highly_ improbable to me, though.
+
+The other solution is to increment pipecnt *before* the pipe(2) call,
+and check in default_handler() that write_fd is valid before writing to
+it (which is also currently done).  This is still subject to a race,
+though, resulting in &quot;too many&quot; writes to write_fd, which will cause the
+next call to WaitOne() to exit prematurely.
+
+I think the current behavior is preferable -- better to signal too few
+than too many (as the next default_handler() invocation for that signal
+should wake up the right number next time).
+
+&gt;<i> 1. There does not appear to be an equivalent to InterlockedIncrement
+</I>&gt;<i> in the glib functions (returning the value after atomic inc), so there
+</I>&gt;<i> is code in setup_pipes that would race if it were re-entrant. It isn't
+</I>&gt;<i> re-entrant due to the global mutex being held but this needs tidying
+</I>&gt;<i> to avoid confusion. Effectively, I need to: if
+</I>&gt;<i> (InterlockedIncrement(pipecnt) == 1) { setup pipes }. 
+</I>&gt;<i> 
+</I>&gt;<i> 2. Conversely, I needed an atomic decrement. Having looked at the glib
+</I>&gt;<i> functions I could only find g_atomic_int_dec_and_test in 2.4. Is this
+</I>&gt;<i> OK, or is there an a g_atomic_int_dec ? This is to achieve: if
+</I>&gt;<i> (InterlockedDecrement(pipecnt) == 0) { teardown pipes }.
+</I>&gt;<i> g_atomic_int_dec_and_test clearly does the job, but it's a little
+</I>&gt;<i> inconsistent with InterlockedDecrement with respect to the mph_int*
+</I>&gt;<i> macros.
+</I>
+It looks like you already went with (2), which seems fine to me as I
+don't see an equivalent to InterlockedIncrement in glib either.
+
+I'm also not sure what you mean by &quot;[setup_pipes] needs tidying up to
+avoid confusion.&quot;  Which confusion?
+
+&gt;<i> Index: signal.c
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- signal.c    (revision 123183)
+</I>&gt;<i> +++ signal.c    (working copy)
+</I>&gt;<i> @@ -101,16 +101,19 @@
+</I>&gt;<i>  #ifdef WAPI_ATOMIC_ASM
+</I>&gt;<i>         #define mph_int_get(p)     InterlockedExchangeAdd ((p), 0)
+</I>&gt;<i>         #define mph_int_inc(p)     InterlockedIncrement ((p))
+</I>&gt;<i> +       #define mph_int_dec_test(p)     InterlockedDecrement ((p)) == 0
+</I>
+This should be wrapped in parens: (InterlockedDecrement ((p)) == 0)
+ 
+&gt;<i> @@ -128,7 +131,8 @@
+</I>&gt;<i>  static void
+</I>&gt;<i>  default_handler (int signum)
+</I>&gt;<i>  {
+</I>&gt;<i> -       int i;
+</I>&gt;<i> +       int i,j;
+</I>&gt;<i> +       int pipecounter;
+</I>
+Please narrow down variable declarations to their minimum scope.  In
+this case, instead of declaring `j' and `pipecounter' here...
+
+&gt;<i>         for (i = 0; i &lt; NUM_SIGNALS; ++i) {
+</I>&gt;<i>                 int fd;
+</I>&gt;<i>                 signal_info* h = &amp;signals [i];
+</I>&gt;<i> @@ -138,7 +142,9 @@
+</I>&gt;<i>                 fd = mph_int_get (&amp;h-&gt;write_fd);
+</I>&gt;<i>                 if (fd &gt; 0) {
+</I>
+...declare them here.
+
+&gt;<i>                         char c = signum;
+</I>&gt;<i> -                       write (fd, &amp;c, 1);
+</I>&gt;<i> +                       pipecounter = mph_int_get (&amp;h-&gt;pipecnt);
+</I>&gt;<i> +                       for (j = 0; j &lt; pipecounter; ++j)
+</I>&gt;<i> +                               write (fd, &amp;c, 1);
+</I>
+We should check for EINTR, thus:
+
+	int r;
+	do { r = write (fd, &amp;c, 1); } while (r == -1 &amp;&amp; errno == EINTR);
+
+&gt;<i> @@ -182,7 +188,7 @@
+</I>&gt;<i>                                 break;
+</I>&gt;<i>                         }
+</I>&gt;<i>                         else {
+</I>&gt;<i> -                               h-&gt;have_handler = 1;
+</I>&gt;<i> +                               h-&gt;state = 1;
+</I>
+We should either stick with have_handler (annoying, I know, as I first
+suggested `state'), or use a HAVE_HANDLER #define.  'have_handler'
+implies a boolean value, so 1/0 are fine, but `state' makes no such
+implications, so HAVE_HANDLER would be better.
+
+If we do follow HAVE_HANDLER, we should state that `state' is a
+bitfield, and behave appropriately.
+
+&gt;<i> @@ -195,13 +201,14 @@
+</I>&gt;<i>         }
+</I>&gt;<i>  
+</I>&gt;<i>         if (h &amp;&amp; have_handler) {
+</I>&gt;<i> -               h-&gt;have_handler = 1;
+</I>&gt;<i> +               h-&gt;state = 1;
+</I>&gt;<i>                 h-&gt;handler      = handler;
+</I>&gt;<i>         }
+</I>&gt;<i>  
+</I>&gt;<i>         if (h) {
+</I>&gt;<i>                 mph_int_set (&amp;h-&gt;count, h-&gt;count, 0);
+</I>&gt;<i>                 mph_int_set (&amp;h-&gt;signum, h-&gt;signum, sig);
+</I>&gt;<i> +               mph_int_set (&amp;h-&gt;pipecnt, h-&gt;pipecnt, 0);
+</I>&gt;<i>         }
+</I>&gt;<i>  
+</I>&gt;<i>         pthread_mutex_unlock (&amp;signals_mutex);
+</I>&gt;<i> @@ -239,12 +246,12 @@
+</I>&gt;<i>                 errno = EINVAL;
+</I>&gt;<i>         else {
+</I>&gt;<i>                 /* last UnixSignal -- we can unregister */
+</I>&gt;<i> -               if (h-&gt;have_handler &amp;&amp; count_handlers (h-&gt;signum) == 1) {
+</I>&gt;<i> +               if (h-&gt;state &amp;&amp; count_handlers (h-&gt;signum) == 1) {
+</I>
+so `if ((h-&gt;state &amp; HAVE_HANDLER) &amp;&amp; count_handlers (h-&gt;signum) == 1)'
+if state were a bitfield...
+ 
+&gt;<i> @@ -348,9 +362,19 @@
+</I>&gt;<i>         FD_ZERO (&amp;read_fds);
+</I>&gt;<i>  
+</I>&gt;<i>         r = setup_pipes (signals, count, &amp;read_fds, &amp;max_fd);
+</I>&gt;<i> +
+</I>&gt;<i> +       pthread_mutex_unlock (&amp;signals_mutex);
+</I>
+We should check for errors here; pthread_mutex_unlock(3p) documents
+EAGAIN as an error that we could handle:
+
+	if( r == 0 ) {
+		while ((r = pthread_mutex_unlock (&amp;signals_mutex)) == EAGAIN) {
+			/* keep trying */
+		}
+	}
+
+The other uses of pthread_mutex_unlock() in this file should be fixed
+for this as well.
+
+&gt;<i>         if (r == 0) {
+</I>&gt;<i>                 r = wait_for_any (signals, count, max_fd, &amp;read_fds, timeout);
+</I>&gt;<i>         }
+</I>&gt;<i> +
+</I>&gt;<i> +       mr = pthread_mutex_lock (&amp;signals_mutex);
+</I>&gt;<i> +       if (mr != 0) {
+</I>&gt;<i> +               errno = mr;
+</I>&gt;<i> +               return -1;
+</I>&gt;<i> +       }
+</I>
+Similarly here, pthread_mutex_lock() could return EAGAIN, so we may want
+to try again.  Or it could return EDEADLK, which means that we already
+own the thread, and thus can continue anyway.
+
+Overall, it looks good.
+
+If you make the above changes, add some tests, and explicitly state that
+this contribution is under MIT/X11 this should be good to check in.
+
+Thanks,
+ - Jon
+
+
+</PRE>
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="030758.html">[Mono-dev] signal.c cross-thread access
+</A></li>
+	<LI>Next message: <A HREF="030764.html">[Mono-dev] [PATCH] Enable TLS for PPC32/64
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#30827">[ date ]</a>
+              <a href="thread.html#30827">[ thread ]</a>
+              <a href="subject.html#30827">[ subject ]</a>
+              <a href="author.html#30827">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,373 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] streamwriter fixes
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20streamwriter%20fixes&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001802.html">
+   <LINK REL="Next"  HREF="001807.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] streamwriter fixes</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20streamwriter%20fixes&In-Reply-To="
+       TITLE="[Mono-devel-list] streamwriter fixes">lupus at ximian.com
+       </A><BR>
+    <I>Mon Aug 18 12:39:00 EDT 2003</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001802.html">[Mono-devel-list] X86 interpreter patch + struct layout patch
+</A></li>
+        <LI>Next message: <A HREF="001807.html">[Mono-devel-list] streamwriter fixes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1800">[ date ]</a>
+              <a href="thread.html#1800">[ thread ]</a>
+              <a href="subject.html#1800">[ subject ]</a>
+              <a href="author.html#1800">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I had these fixes in my tree for a few months, but I can't say
+I have tested them much. This should get the writer classes closer to
+the documentation (which says only Write(char) must be implemented by a
+subclass, previous code had Wrute(char[]) as the required method to
+implement in a derived class) and it may give a small speedup, since
+decoding is done in largers buffers at a time.
+Please test and review.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+Index: StreamWriter.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.IO/StreamWriter.cs,v
+retrieving revision 1.19
+diff -u -p -r1.19 StreamWriter.cs
+--- StreamWriter.cs	19 Nov 2002 12:05:09 -0000	1.19
++++ StreamWriter.cs	18 Aug 2003 16:41:36 -0000
+@@ -1,8 +1,9 @@
+ //
+ // System.IO.StreamWriter.cs
+ //
+-// Author:
++// Authors:
+ //   Dietmar Maurer (<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">dietmar at ximian.com</A>)
++//   Paolo Molaro (<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>)
+ //
+ // (C) Ximian, Inc.  <A HREF="http://www.ximian.com">http://www.ximian.com</A>
+ //
+@@ -24,11 +25,12 @@ namespace System.IO {
+ 		
+ 		private const int DefaultBufferSize = 1024;
+ 		private const int DefaultFileBufferSize = 4096;
+-		private const int MinimumBufferSize = 2;
++		private const int MinimumBufferSize = 256;
+ 
+-		private int pos;
+-		private int BufferSize;
+-		private byte[] TheBuffer;
++		private byte[] byte_buf;
++		private int byte_pos;
++		private char[] decode_buf;
++		private int decode_pos;
+ 
+ 		private bool DisposedAlready = false;
+ 		private bool preamble_done = false;
+@@ -43,9 +45,10 @@ namespace System.IO {
+ 
+ 		internal void Initialize(Encoding encoding, int bufferSize) {
+ 			internalEncoding = encoding;
+-			pos = 0;
+-			BufferSize = Math.Max(bufferSize, MinimumBufferSize);
+-			TheBuffer = new byte[BufferSize];
++			decode_pos = byte_pos = 0;
++			int BufferSize = Math.Max(bufferSize, MinimumBufferSize);
++			decode_buf = new char [BufferSize];
++			byte_buf = new byte [encoding.GetMaxByteCount (BufferSize)];
+ 		}
+ 
+ 		//[MonoTODO(&quot;Nothing is done with bufferSize&quot;)]
+@@ -136,75 +139,119 @@ namespace System.IO {
+ 			}
+ 
+ 			internalStream = null;
+-			TheBuffer = null;
++			byte_buf = null;
+ 			internalEncoding = null;
++			decode_buf = null;
+ 		}
+ 
+ 		public override void Flush () {
+ 			if (DisposedAlready)
+ 				throw new ObjectDisposedException(&quot;StreamWriter&quot;);
+ 
+-			if (pos &gt; 0) {
+-				internalStream.Write (TheBuffer, 0, pos);
++			Decode ();
++			if (byte_pos &gt; 0) {
++				FlushBytes ();
+ 				internalStream.Flush ();
+-				pos = 0;
+ 			}
+ 		}
+-		
+-		public override void Write (char[] buffer, int index, int count) {
+-			if (DisposedAlready)
+-				throw new ObjectDisposedException(&quot;StreamWriter&quot;);
+-
+-			byte[] res = new byte [internalEncoding.GetByteCount (buffer)];
+-			int len;
+-			int BytesToBuffer;
+-			int resPos = 0;
+ 
+-			len = internalEncoding.GetBytes (buffer, index, count, res, 0);
++		// how the speedup works:
++		// the Write () methods simply copy the characters in a buffer of chars (decode_buf)
++		// Decode () is called when the buffer is full or we need to flash.
++		// Decode () will use the encoding to get the bytes and but them inside
++		// byte_buf. From byte_buf the data is finally outputted to the stream.
++		void FlushBytes () {
+ 			// write the encoding preamble only at the start of the stream
+-			if (!preamble_done &amp;&amp; len &gt; 0) {
++			if (!preamble_done &amp;&amp; byte_pos &gt; 0) {
+ 				byte[] preamble = internalEncoding.GetPreamble ();
+ 				if (preamble.Length &gt; 0)
+ 					internalStream.Write (preamble, 0, preamble.Length);
+ 				preamble_done = true;
+ 			}
++			internalStream.Write (byte_buf, 0, byte_pos);
++			byte_pos = 0;
++		}
++		
++		void Decode () {
++			if (byte_pos &gt; 0)
++				FlushBytes ();
++			if (decode_pos &gt; 0) {
++				int len = internalEncoding.GetBytes (decode_buf, 0, decode_pos, byte_buf, byte_pos);
++				byte_pos += len;
++				decode_pos = 0;
++			}
++		}
++		
++		public override void Write (char[] buffer, int index, int count) {
++			if (DisposedAlready)
++				throw new ObjectDisposedException(&quot;StreamWriter&quot;);
++
++			if (buffer == null)
++				throw new ArgumentNullException (&quot;buffer&quot;);
++			if (index &lt; 0 || index &gt; buffer.Length)
++				throw new ArgumentOutOfRangeException (&quot;index&quot;);
++			if (count &lt; 0 || (index + count) &gt; buffer.Length)
++				throw new ArgumentOutOfRangeException (&quot;count&quot;);
+ 
+-			// if they want AutoFlush, don't bother buffering
+-			if (iflush) {
++			LowLevelWrite (buffer, index, count);
++			if (iflush)
+ 				Flush();
+-				internalStream.Write (res, 0, len);
+-				internalStream.Flush ();
+-			} else {
+-				// otherwise use the buffer.
+-				// NOTE: this logic is not optimized for performance.
+-				while (resPos &lt; len) {
+-					// fill the buffer if we've got more bytes than will fit
+-					BytesToBuffer = Math.Min(BufferSize - pos, len - resPos);
+-					Array.Copy(res, resPos, TheBuffer, pos, BytesToBuffer);
+-					resPos += BytesToBuffer;
+-					pos += BytesToBuffer;
+-					// if the buffer is full, flush it out.
+-					if (pos == BufferSize) Flush();
++		}
++		
++		void LowLevelWrite (char[] buffer, int index, int count) {
++			while (count &gt; 0) {
++				int todo = decode_buf.Length - decode_pos;
++				if (todo == 0) {
++					Decode ();
++					todo = decode_buf.Length;
+ 				}
++				if (todo &gt; count)
++					todo = count;
++				Buffer.BlockCopy (buffer, index * 2, decode_buf, decode_pos * 2, todo * 2);
++				count -= todo;
++				index += todo;
++				decode_pos += todo;
+ 			}
+ 		}
+ 
+ 		public override void Write (char value)
+ 		{
+-			Write (new char [] {value}, 0, 1);
++			// the size of decode_buf is always &gt; 0 and
++			// we check for overflow right away
++			if (decode_pos &gt;= decode_buf.Length)
++				Decode ();
++			decode_buf [decode_pos++] = value;
++			if (iflush)
++				Flush ();
+ 		}
+ 
+ 		public override void Write (char [] value)
+ 		{
+-			Write (value, 0, value.Length);
++			LowLevelWrite (value, 0, value.Length);
++			if (iflush)
++				Flush ();
++		}
++
++		public override void Write (string value) {
++			if (DisposedAlready)
++				throw new ObjectDisposedException(&quot;StreamWriter&quot;);
++
++			if (value != null)
++				LowLevelWrite (value.ToCharArray (), 0, value.Length);
++			if (iflush)
++				Flush ();
+ 		}
+ 
+-		public override void Write(string value) {
++		public override void WriteLine (string value) {
+ 			if (DisposedAlready)
+ 				throw new ObjectDisposedException(&quot;StreamWriter&quot;);
+ 
+ 			if (value != null)
+-				Write (value.ToCharArray (), 0, value.Length);
++				LowLevelWrite (value.ToCharArray (), 0, value.Length);
++			string nl = NewLine;
++				LowLevelWrite (nl.ToCharArray (), 0, nl.Length);
++			if (iflush)
++				Flush ();
+ 		}
+ 
+ 		public override void Close()
+Index: TextWriter.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/corlib/System.IO/TextWriter.cs,v
+retrieving revision 1.12
+diff -u -p -r1.12 TextWriter.cs
+--- TextWriter.cs	5 Apr 2003 19:00:53 -0000	1.12
++++ TextWriter.cs	18 Aug 2003 16:41:36 -0000
+@@ -4,6 +4,7 @@
+ // Authors:
+ //   Marcin Szczepanski (<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">marcins at zipworld.com.au</A>)
+ //   Miguel de Icaza (<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">miguel at gnome.org</A>)
++//   Paolo Molaro (<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>)
+ //
+ 
+ using System.Text;
+@@ -14,14 +15,14 @@ namespace System.IO {
+ 	public abstract class TextWriter : MarshalByRefObject, IDisposable {
+                 
+                 protected TextWriter() {
+-			CoreNewLine = &quot;\n&quot;.ToCharArray ();
++			CoreNewLine = System.Environment.NewLine;
+ 		}
+                 
+                 protected TextWriter( IFormatProvider formatProvider ) {
+                         internalFormatProvider = formatProvider;
+                 }
+ 
+-                protected char[] CoreNewLine;
++                protected string CoreNewLine;
+ 
+                 internal IFormatProvider internalFormatProvider;
+ 
+@@ -37,11 +38,11 @@ namespace System.IO {
+ 
+                 public virtual string NewLine { 
+                         get {
+-                                return new String(CoreNewLine);
++                                return CoreNewLine;
+                         }
+                         
+                         set {
+-                                CoreNewLine = value.ToCharArray();
++                                CoreNewLine = value;
+                         }
+                 }
+ 
+@@ -84,8 +85,10 @@ namespace System.IO {
+ 
+                 public virtual void Write (char[] value)
+ 		{
+-			if (value != null)
+-				Write (new String (value));
++			if (value != null) {
++				for (int i = 0; i &lt; value.Length; ++i)
++					Write (value [i]);
++			}
+ 		}
+ 		
+                 public virtual void Write (decimal value)
+@@ -121,7 +124,8 @@ namespace System.IO {
+ 		
+                 public virtual void Write (string value)
+ 		{
+-			// do nothing
++			if (value != null)
++				Write (value.ToCharArray ());
+ 		}
+ 		
+ 		[CLSCompliant(false)]
+@@ -148,7 +152,15 @@ namespace System.IO {
+ 		
+                 public virtual void Write (char[] buffer, int index, int count)
+ 		{
+-			Write (new String (buffer, index, count));
++			if (buffer == null)
++				throw new ArgumentNullException (&quot;buffer&quot;);
++			if (index &lt; 0 || index &gt; buffer.Length)
++				throw new ArgumentOutOfRangeException (&quot;index&quot;);
++			if (count &lt; 0 || (index + count) &gt; buffer.Length)
++				throw new ArgumentOutOfRangeException (&quot;count&quot;);
++			for (; count &gt; 0; --count, ++index) {
++				Write (buffer [index]);
++			}
+ 		}
+ 		
+                 public virtual void Write (string format, object arg0, object arg1)
+@@ -281,6 +293,12 @@ namespace System.IO {
+ 			}
+ 			
+ 			public override void Write (string s)
++			{
++			}
++			public override void Write (char value)
++			{
++			}
++			public override void Write (char[] value, int index, int count)
+ 			{
+ 			}
+ 		}
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001802.html">[Mono-devel-list] X86 interpreter patch + struct layout patch
+</A></li>
+	<LI>Next message: <A HREF="001807.html">[Mono-devel-list] streamwriter fixes
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1800">[ date ]</a>
+              <a href="thread.html#1800">[ thread ]</a>
+              <a href="subject.html#1800">[ subject ]</a>
+              <a href="author.html#1800">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

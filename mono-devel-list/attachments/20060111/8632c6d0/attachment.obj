@@ -1,0 +1,280 @@
+Index: Mono.Data.SqlExpressions/ColumnReference.cs
+===================================================================
+--- Mono.Data.SqlExpressions/ColumnReference.cs	(revision 55373)
++++ Mono.Data.SqlExpressions/ColumnReference.cs	(working copy)
+@@ -44,6 +44,8 @@
+ 	internal class ColumnReference : BaseExpression {
+ 		ReferencedTable refTable;
+ 		string relationName, columnName;
++		DataColumn _cachedColumn;
++		DataRelation _cachedRelation;
+ 
+ 		public ColumnReference (string columnName) : this (ReferencedTable.Self, null, columnName) {}
+ 
+@@ -88,24 +90,24 @@
+ 			get { return refTable; }
+ 		}
+ 
+-		protected DataRelation GetRelation (DataRow row)
++		DataRelation GetRelation (DataTable table)
+ 		{
+ 			DataRelationCollection relations;
+ 			if (relationName != null) {
+-				relations = row.Table.DataSet.Relations;
++				relations = table.DataSet.Relations;
+ 				return relations[relations.IndexOf(relationName)];
+ 			}
+ 
+ 			if (refTable == ReferencedTable.Parent)
+-				relations = row.Table.ParentRelations;
++				relations = table.ParentRelations;
+ 			else
+-				relations = row.Table.ChildRelations;
++				relations = table.ChildRelations;
+ 				
+ 			if (relations.Count > 1)
+ 				throw new EvaluateException (String.Format (
+ 					"The table [{0}] is involved in more than one relation." +
+ 					"You must explicitly mention a relation name.",
+-					row.Table.TableName));
++					table.TableName));
+ 			else
+ 				return relations[0];
+ 		}
+@@ -118,10 +120,10 @@
+ 				return row;
+ 
+ 			case ReferencedTable.Parent:
+-				return row.GetParentRow (GetRelation (row));
++				return row.GetParentRow (_cachedRelation);
+ 
+ 			case ReferencedTable.Child:
+-				return row.GetChildRows (GetRelation (row)) [0];
++				return row.GetChildRows (_cachedRelation) [0];
+ 			}
+ 		}
+ 		
+@@ -135,10 +137,10 @@
+ 				return rows;
+ 				
+ 			case ReferencedTable.Parent:
+-				return row.GetParentRows (GetRelation (row));
++				return row.GetParentRows (_cachedRelation);
+ 
+ 			case ReferencedTable.Child:
+-				return row.GetChildRows (GetRelation (row));
++				return row.GetChildRows (_cachedRelation);
+ 			}
+ 		}
+ 		
+@@ -146,7 +148,7 @@
+ 		{
+ 			object[] values = new object [rows.Length];
+ 			for (int i = 0; i < rows.Length; i++)
+-				values [i] = Unify (rows [i][columnName]);
++				values [i] = Unify (rows [i][_cachedColumn]);
+ 				
+ 			return values;
+ 		}
+@@ -176,7 +178,7 @@
+ 			object val;
+ 			try {
+ 				referencedRow._inExpressionEvaluation = true;
+-				val = referencedRow [columnName];
++				val = referencedRow [_cachedColumn];
+ 				referencedRow._inExpressionEvaluation = false;
+ 			} catch (IndexOutOfRangeException) {
+ 				throw new EvaluateException (String.Format ("Cannot find column [{0}].", columnName));
+@@ -188,5 +190,23 @@
+ 		{
+ 			return refTable == ReferencedTable.Self && columnName == other.ColumnName;
+ 		}
++
++		public override void Initialize(DataTable table) {
++			switch (refTable) {
++				case ReferencedTable.Parent:
++					_cachedRelation = GetRelation(table);
++					table = _cachedRelation.ParentTable;
++					break;
++				case ReferencedTable.Child:
++					_cachedRelation = GetRelation(table);
++					table = _cachedRelation.ChildTable;
++					break;
++			}
++
++			_cachedColumn = table.Columns[columnName];
++			if (_cachedColumn == null)
++				throw new EvaluateException (String.Format ("Cannot find column [{0}].", columnName));
++		}
++
+ 	}
+ }
+Index: Mono.Data.SqlExpressions/Expressions.cs
+===================================================================
+--- Mono.Data.SqlExpressions/Expressions.cs	(revision 55373)
++++ Mono.Data.SqlExpressions/Expressions.cs	(working copy)
+@@ -40,12 +40,14 @@
+ 		bool DependsOn(DataColumn other);
+ 
+ 		bool EvalBoolean (DataRow row);
+-		void ResetExpression ();
++		void ResetExpression();
++		void Initialize(DataTable table);
+ 	}
+ 
+ 	internal abstract class BaseExpression : IExpression {
+ 		public abstract object Eval (DataRow row);
+ 		public abstract bool DependsOn(DataColumn other);
++		public abstract void Initialize(DataTable table);
+ 
+ 		public virtual bool EvalBoolean (DataRow row)
+ 		{
+@@ -65,7 +67,7 @@
+ 			return 0;
+ 		}
+ 
+-		public virtual void ResetExpression ()
++		public virtual void ResetExpression()
+ 		{
+ 		}
+ 	}
+@@ -102,6 +104,11 @@
+ 		override public bool DependsOn(DataColumn other) {
+ 			return expr.DependsOn(other);
+ 		}
++
++		public override void Initialize(DataTable table) {
++			expr.Initialize(table);
++		}
++
+ 	}
+ 	
+ 	internal abstract class BinaryExpression : BaseExpression {
+@@ -140,6 +147,12 @@
+ 			return expr1.DependsOn(other) || expr2.DependsOn(other);
+ 		}
+ 
++		public override void Initialize(DataTable table) {
++			expr1.Initialize(table);
++			expr2.Initialize(table);
++		}
++
++
+ 		override public void ResetExpression ()
+ 		{
+ 			expr1.ResetExpression ();
+Index: Mono.Data.SqlExpressions/Aggregation.cs
+===================================================================
+--- Mono.Data.SqlExpressions/Aggregation.cs	(revision 55373)
++++ Mono.Data.SqlExpressions/Aggregation.cs	(working copy)
+@@ -152,6 +152,11 @@
+ 		{
+ 			return column.DependsOn(other);
+ 		}
++
++		public override void Initialize(DataTable table) {
++			column.Initialize(table);
++		}
++
+ 		
+ 		private void Aggregate (IConvertible val)
+ 		{
+Index: Mono.Data.SqlExpressions/Literal.cs
+===================================================================
+--- Mono.Data.SqlExpressions/Literal.cs	(revision 55373)
++++ Mono.Data.SqlExpressions/Literal.cs	(working copy)
+@@ -75,5 +75,10 @@
+ 		{
+ 			return false;
+ 		}
++
++		public override void Initialize(DataTable table) {
++			
++		}
++
+ 	}
+ }
+Index: System.Data/DataView.cs
+===================================================================
+--- System.Data/DataView.cs	(revision 55373)
++++ System.Data/DataView.cs	(working copy)
+@@ -233,6 +233,7 @@
+ 				else {
+ 					Parser parser = new Parser ();
+ 					rowFilterExpr = parser.Compile (value);
++					rowFilterExpr.Initialize(Table);
+ 				}
+ 				rowFilter = value;
+ 				if (!inEndInit)
+Index: System.Data/DataColumn.cs
+===================================================================
+--- System.Data/DataColumn.cs	(revision 55373)
++++ System.Data/DataColumn.cs	(working copy)
+@@ -504,6 +504,7 @@
+ 					{
+ 						if (compiledExpression.DependsOn(this))
+ 							throw new ArgumentException("Cannot set Expression property due to circular reference in the expression.");
++						compiledExpression.Initialize(Table);
+ 					}
+ 					
+ 					ReadOnly = true;
+@@ -820,6 +821,9 @@
+ 				// it's cheaper that raise event on each row.
+ 				DataContainer.FillValues(defaultValuesRowIndex);
+ 			}
++
++			if (_compiledExpression != null)
++				_compiledExpression.Initialize(Table);
+ 		}
+ 		
+ 		// Returns true if all the same collumns are in columnSet and compareSet
+Index: System.Data/DataTable.cs
+===================================================================
+--- System.Data/DataTable.cs	(revision 55373)
++++ System.Data/DataTable.cs	(working copy)
+@@ -755,6 +755,7 @@
+ 			
+ 			Parser parser = new Parser (rows);
+ 			IExpression expr = parser.Compile (expression);
++			expr.Initialize(this);
+ 			object obj = expr.Eval (rows[0]);
+ 			
+ 			return obj;
+@@ -1485,6 +1486,7 @@
+ 			if (filterExpression != String.Empty) {
+ 				Parser parser = new Parser ();
+ 				filter = parser.Compile (filterExpression);
++				filter.Initialize(this);
+ 			}
+ 
+ 			Index index = GetIndex(columns, sorts, recordStates, filter, false);
+Index: System.Data/RelatedDataView.cs
+===================================================================
+--- System.Data/RelatedDataView.cs	(revision 55373)
++++ System.Data/RelatedDataView.cs	(working copy)
+@@ -100,6 +100,14 @@
+ 			return filter != null ? filter.EvalBoolean(row) : true;
+ 		}
+ 
++		public void Initialize(DataTable table) {
++			IExpression filter = base.FilterExpression;
++			if (filter == null)
++				return;
++
++			filter.Initialize(table);
++		}
++
+ 		public bool DependsOn(DataColumn other) {
+ 			for (int i = 0; i < _columns.Length; i++)
+ 				if (_columns[i] == other)
+@@ -109,8 +117,8 @@
+ 			return filter != null ? filter.DependsOn(other) : false;
+ 		}
+ 		
+-		void IExpression.ResetExpression()
+-		{
++		void IExpression.ResetExpression()
++		{
+ 		}
+ 
+ 		#endregion

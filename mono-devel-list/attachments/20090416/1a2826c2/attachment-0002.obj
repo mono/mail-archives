@@ -1,0 +1,1700 @@
+Index: frontend/libedit/vis.c
+===================================================================
+--- frontend/libedit/vis.c	(revision 131900)
++++ frontend/libedit/vis.c	(working copy)
+@@ -81,6 +81,9 @@
+ #include <sys/types.h>
+ 
+ #include <assert.h>
++#ifndef _DIAGASSERT
++#define _DIAGASSERT(x) assert(x)
++#endif
+ #include <vis.h>
+ #include <stdlib.h>
+ 
+Index: frontend/libedit/unvis.c
+===================================================================
+--- frontend/libedit/unvis.c	(revision 131900)
++++ frontend/libedit/unvis.c	(working copy)
+@@ -34,6 +34,9 @@
+ #include <sys/types.h>
+ 
+ #include <assert.h>
++#ifndef _DIAGASSERT
++#define _DIAGASSERT(x) assert(x)
++#endif
+ #include <ctype.h>
+ #include <stdio.h>
+ #include <vis.h>
+Index: frontend/libedit/Makefile.am
+===================================================================
+--- frontend/libedit/Makefile.am	(revision 131900)
++++ frontend/libedit/Makefile.am	(working copy)
+@@ -9,7 +9,11 @@
+ 	vi.h vis.h el_term.h filecomplete.h tokenizer.c filecomplete.c
+ 
+ libmonodebuggerreadline_la_LIBADD = @BASE_DEPENDENCIES_LIBS@ @READLINE_DEPLIBS@
++if PLATFORM_X86_DARWIN
++libmonodebuggerreadline_la_LDFLAGS = -no-undefined -shared -Wl
++else
+ libmonodebuggerreadline_la_LDFLAGS = -no-undefined -shared -Wl,-version-script=$(srcdir)/ldscript
++endif
+ 
+ EXTRA_DIST = ldscript
+ 
+Index: configure.in
+===================================================================
+--- configure.in	(revision 131900)
++++ configure.in	(working copy)
+@@ -51,6 +51,13 @@
+ 		bfd_target=powerpc
+ 		platform=powerpc
+ 		;;
++	*86-apple-darwin*)
++		glue_flags=
++		server_cflags=
++		server_only=yes
++		bfd_target=i386darwin
++		platform=i386darwin
++		;;
+ 	*)
+ 		AC_MSG_ERROR([*** This platform is not yet supported.])
+ 		;;
+@@ -64,10 +71,12 @@
+ 	fi
+ )
+ 
++AM_CONDITIONAL(BFD_TARGET_X86_MACH, test x$bfd_target = xi386darwin)
+ AM_CONDITIONAL(BFD_TARGET_POWERPC, test x$bfd_target = xpowerpc)
+ AM_CONDITIONAL(BFD_TARGET_X86_64, test x$bfd_target = xx86_64)
++AM_CONDITIONAL(PLATFORM_X86_DARWIN, test x$platform = xi386darwin)
++AM_CONDITIONAL(PLATFORM_POWERPC, test x$platform = xpowerpc)
+ AM_CONDITIONAL(PLATFORM_X86_64, test x$platform = xx86_64)
+-AM_CONDITIONAL(PLATFORM_POWERPC, test x$platform = xpowerpc)
+ 
+ AC_SUBST(glue_cflags)
+ AC_SUBST(server_cflags)
+@@ -261,7 +270,7 @@
+ AC_HEADER_TIME
+ AC_HEADER_DIRENT
+ AC_CHECK_FUNCS(fcntl getpagesize setitimer sysconf fdopen getuid getgid)
+-AC_CHECK_FUNCS(strlcpy strlcat)
++AC_CHECK_FUNCS(strlcpy strlcat fgetln)
+ 
+ CHECK_READLINE
+ 
+@@ -286,6 +295,8 @@
+ AC_SUBST(XSP_LIBS)
+ AM_CONDITIONAL(HAVE_XSP, test "x$with_xsp" = "xyes")
+ 
++#not sure why, but I cannot get this test to pass on OS X.
++if test x$PLATFORM_X86_DARWIN = "xno" ; then
+ AC_MSG_CHECKING([Whether your Mono is working])
+ old_CFLAGS=$cflags
+ CFLAGS=$WRAPPER_CFLAGS
+@@ -307,6 +318,7 @@
+ if test x$mono_working != xyes; then
+    AC_MSG_ERROR([*** Your Mono is too old for this version of the debugger.])
+ fi
++fi
+ 
+ martin_private=no
+ if test "x$from_svn" = "xyes"; then
+Index: backend/MonoThreadManager.cs
+===================================================================
+--- backend/MonoThreadManager.cs	(revision 131900)
++++ backend/MonoThreadManager.cs	(working copy)
+@@ -282,7 +282,7 @@
+ 					Report.Debug (DebugFlags.Threads,
+ 						      "{0} created gc thread: {1:x} {2}",
+ 						      engine, tid, data);
+-
++					
+ 					engine = engine.ProcessServant.GetEngineByTID (inferior, tid);
+ 					if (engine == null)
+ 						throw new InternalError ();
+Index: backend/server/thread-db.h
+===================================================================
+--- backend/server/thread-db.h	(revision 131900)
++++ backend/server/thread-db.h	(working copy)
+@@ -3,9 +3,28 @@
+ 
+ #include <server.h>
+ #include <pthread.h>
++
++#ifdef __linux__
+ #include <thread_db.h>
+ #include "linux-proc-service.h"
++#else
++typedef enum
++{
++  PS_OK,		/* Generic "call succeeded".  */
++  PS_ERR,		/* Generic error. */
++  PS_BADPID,		/* Bad process handle.  */
++  PS_BADLID,		/* Bad LWP identifier.  */
++  PS_BADADDR,		/* Bad address.  */
++  PS_NOSYM,		/* Could not find given symbol.  */
++  PS_NOFREGS		/* FPU register set not available for given LWP.  */
++} ps_err_e;
+ 
++typedef struct{
++	thread_t tid;
++	void *handle;
++} td_thrhandle_t;
++#endif
++
+ G_BEGIN_DECLS
+ 
+ /* C# delegates. */
+@@ -17,7 +36,11 @@
+ 
+ typedef struct ps_prochandle {
+ 	pid_t pid;
++#ifdef __MACH__
++	mach_port_t port;
++#else
+ 	td_thragent_t *thread_agent;
++#endif
+ 	GlobalLookupFunc global_lookup;
+ 	ReadMemoryFunc read_memory;
+ 	WriteMemoryFunc write_memory;
+Index: backend/server/darwin-ptrace.c
+===================================================================
+--- backend/server/darwin-ptrace.c	(revision 0)
++++ backend/server/darwin-ptrace.c	(revision 0)
+@@ -0,0 +1,896 @@
++#include <mach/mach.h>
++#include <sys/sysctl.h>
++
++static ServerCommandError
++_server_ptrace_check_errno (InferiorHandle *inferior)
++{
++	gchar *filename;
++
++	if (!errno)
++		return COMMAND_ERROR_NONE;
++	else if (errno != ESRCH) {
++		g_message (G_STRLOC ": %d - %s", inferior->pid, g_strerror (errno));
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++
++	filename = g_strdup_printf ("/proc/%d/stat", inferior->pid);
++	if (g_file_test (filename, G_FILE_TEST_EXISTS)) {
++		g_free (filename);
++		return COMMAND_ERROR_NOT_STOPPED;
++	}
++
++	g_warning (G_STRLOC ": %d - %s - %d (%s)", inferior->pid, filename,
++		   errno, g_strerror (errno));
++	g_free (filename);
++	return COMMAND_ERROR_NO_TARGET;
++}
++
++static ServerCommandError
++_server_ptrace_get_registers (InferiorHandle *inferior, INFERIOR_REGS_TYPE *regs)
++{
++	thread_array_t threads;
++	mach_msg_type_number_t count;
++	kern_return_t err;
++	mach_msg_type_number_t state_size = sizeof(x86_thread_state32_t)/sizeof(int);
++	
++	err = task_threads(inferior->port, &threads, &count);
++	if (err)
++	{
++		g_message (G_STRLOC ": task_threads failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++
++	//@todo get current thread.
++
++	err = thread_get_state(threads[0], x86_THREAD_STATE32, (thread_state_t)regs, &state_size);
++	if (err)
++	{
++		g_message (G_STRLOC ": thread_get_state failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	
++//	g_message (G_STRLOC ": threads: %d eip: %x eax: %x ebx: %x ecx: %x edx: %x.", count, state.__eip, state.__eax, state.__ebx, state.__ecx, state.__edx);
++		
++	err = vm_deallocate (mach_task_self(), (vm_address_t) threads, (count * sizeof (int)));
++	if (err)
++	{
++		g_message (G_STRLOC ": vm_deallocate failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	  
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++_server_ptrace_set_registers (InferiorHandle *inferior, INFERIOR_REGS_TYPE *regs)
++{
++	thread_array_t threads;
++	mach_msg_type_number_t count;
++	kern_return_t err;
++	
++	err = task_threads(inferior->port, &threads, &count);
++	if (err)
++	{
++		g_message (G_STRLOC ": task_threads failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++
++	//@todo get current thread.
++
++	err = thread_set_state(threads[0], x86_THREAD_STATE32, (thread_state_t)regs, sizeof(x86_thread_state32_t)/sizeof(int));
++	if (err)
++	{
++		g_message (G_STRLOC ": thread_set_state failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++			
++	err = vm_deallocate (mach_task_self(), (vm_address_t) threads, (count * sizeof (int)));
++	if (err)
++	{
++		g_message (G_STRLOC ": vm_deallocate failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	  
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++_server_ptrace_get_fp_registers (InferiorHandle *inferior, INFERIOR_FPREGS_TYPE *regs)
++{
++	thread_array_t threads;
++	mach_msg_type_number_t count;
++	kern_return_t err;
++	mach_msg_type_number_t state_size = sizeof(x86_float_state32_t)/sizeof(int);
++	
++	err = task_threads(inferior->port, &threads, &count);
++	if (err)
++	{
++		g_message (G_STRLOC ": task_threads failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++
++	//@todo get current thread.
++
++	err = thread_get_state(threads[0], x86_FLOAT_STATE32, (thread_state_t)regs, &state_size);
++	if (err)
++	{
++		g_message (G_STRLOC ": thread_get_state failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++			
++	err = vm_deallocate (mach_task_self(), (vm_address_t) threads, (count * sizeof (int)));
++	if (err)
++	{
++		g_message (G_STRLOC ": vm_deallocate failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	  
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++_server_ptrace_set_fp_registers (InferiorHandle *inferior, INFERIOR_FPREGS_TYPE *regs)
++{
++	thread_array_t threads;
++	mach_msg_type_number_t count;
++	kern_return_t err;
++	
++	err = task_threads(inferior->port, &threads, &count);
++	if (err)
++	{
++		g_message (G_STRLOC ": task_threads failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++
++	//@todo get current thread.
++
++	err = thread_set_state(threads[0], x86_FLOAT_STATE32, (thread_state_t)regs, sizeof(x86_float_state32_t)/sizeof(int));
++	if (err)
++	{
++		g_message (G_STRLOC ": thread_set_state failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++			
++	err = vm_deallocate (mach_task_self(), (vm_address_t) threads, (count * sizeof (int)));
++	if (err)
++	{
++		g_message (G_STRLOC ": vm_deallocate failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	  
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++_server_ptrace_read_memory (ServerHandle *handle, guint64 start, guint32 size, gpointer buffer)
++{
++	kern_return_t err;
++	vm_address_t low_address = (vm_address_t) trunc_page (start);
++	vm_size_t aligned_length = (vm_size_t) round_page (start + size) - low_address;
++	pointer_t copied;
++	mach_msg_type_number_t copy_count;
++
++	/* Get memory from inferior with page aligned addresses */
++	err = vm_read (handle->inferior->port, low_address, aligned_length, &copied, &copy_count);
++	if (err)
++	{
++		g_warning (G_STRLOC ": vm_read failed: %s", mach_error_string(err));
++		return COMMAND_ERROR_MEMORY_ACCESS;
++	}
++	
++	memcpy (buffer, (void *) start - low_address + copied, size);
++
++	err = vm_deallocate (mach_task_self (), copied, copy_count);
++	if (err)
++		g_warning (G_STRLOC ": vm_deallocate failed: %s", mach_error_string(err));
++	
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++server_ptrace_read_memory (ServerHandle *handle, guint64 start, guint32 size, gpointer buffer)
++{
++	ServerCommandError result = _server_ptrace_read_memory (handle, start, size, buffer);
++	if (result != COMMAND_ERROR_NONE)
++		return result;
++	x86_arch_remove_breakpoints_from_target_memory (handle, start, size, buffer);
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++server_ptrace_make_memory_executable (ServerHandle *handle, guint64 start, guint32 size)
++{
++	kern_return_t err;
++	vm_address_t low_address = (vm_address_t) trunc_page (start);
++	vm_size_t aligned_length = (vm_size_t) round_page (start + size) - low_address;
++	int fail = FALSE;
++	vm_size_t remaining_length = aligned_length;
++	vm_address_t region_address = low_address;
++	struct vm_region_list *region_element;
++	struct vm_region_list *region_head = (struct vm_region_list *) NULL;
++		
++	while (region_address < low_address + aligned_length)
++	{
++		mach_port_t object_name;
++		vm_size_t region_length = remaining_length;
++		vm_address_t old_address = region_address;
++		
++		vm_region_basic_info_data_64_t info;
++		mach_msg_type_number_t info_cnt = VM_REGION_BASIC_INFO_COUNT_64;
++		
++		err = vm_region (handle->inferior->port, &region_address, &region_length, VM_REGION_BASIC_INFO_64, (vm_region_info_t) & info, &info_cnt, &object_name);
++		if (err)
++		{
++			g_warning (G_STRLOC "vm_region failed: %d", err);
++			return COMMAND_ERROR_MEMORY_ACCESS;
++		}
++
++		if (!(info.protection & VM_PROT_EXECUTE))
++		{
++			err = vm_protect (handle->inferior->port, region_address, region_length, FALSE, info.protection | VM_PROT_EXECUTE);
++			if (err)
++			{
++				g_warning (G_STRLOC "vm_protect: restore protection failed", err);
++				return COMMAND_ERROR_MEMORY_ACCESS;
++			}
++		}
++						
++		region_address += region_length;
++		remaining_length = remaining_length - region_length;
++	}
++	
++	return COMMAND_ERROR_NONE;	
++}
++
++struct vm_region_list
++{
++  struct vm_region_list *next;
++  vm_prot_t protection;
++  vm_address_t start;
++  vm_size_t length;
++};
++
++static ServerCommandError
++server_ptrace_write_memory (ServerHandle *handle, guint64 start,
++			    guint32 size, gconstpointer buffer)
++{
++	kern_return_t err;
++	vm_address_t low_address = (vm_address_t) trunc_page (start);
++	vm_size_t aligned_length = (vm_size_t) round_page (start + size) - low_address;
++	pointer_t copied;
++	mach_msg_type_number_t copy_count;
++	int fail = FALSE;
++
++	err = vm_read (handle->inferior->port, low_address, aligned_length, &copied, &copy_count);
++	if (err)
++	{
++		g_warning (G_STRLOC "vm_read failed: %d", err);
++		return COMMAND_ERROR_MEMORY_ACCESS;
++	}
++	
++	memcpy ( (void *) start - low_address + copied, buffer, size);
++
++	{
++		vm_size_t remaining_length = aligned_length;
++		vm_address_t region_address = low_address;
++		struct vm_region_list *region_element;
++		struct vm_region_list *region_head = (struct vm_region_list *) NULL;
++		
++		struct vm_region_list *scan;
++		
++		while (region_address < low_address + aligned_length)
++		{
++			mach_port_t object_name;
++			vm_size_t region_length = remaining_length;
++			vm_address_t old_address = region_address;
++			
++			vm_region_basic_info_data_64_t info;
++			mach_msg_type_number_t info_cnt = VM_REGION_BASIC_INFO_COUNT_64;
++			
++			err = vm_region (handle->inferior->port, &region_address, &region_length, VM_REGION_BASIC_INFO_64, (vm_region_info_t) & info, &info_cnt, &object_name);
++			if (err)
++			{
++				g_warning (G_STRLOC "vm_region failed: %d", err);
++				fail = TRUE;
++				break;
++			}
++			
++			region_element = (struct vm_region_list *) malloc (sizeof (struct vm_region_list));
++			
++			region_element->protection = info.protection;
++			region_element->start = region_address;
++			region_element->length = region_length;
++			region_element->next = region_head;
++			
++			region_head = region_element;
++			region_address += region_length;
++			remaining_length = remaining_length - region_length;
++		}
++		
++		if (!fail)
++		{
++			for (scan = region_head; scan; scan = scan->next)
++			{
++				if (!(scan->protection & VM_PROT_WRITE))
++				{
++					err = vm_protect (handle->inferior->port, scan->start, scan->length, FALSE, scan->protection | VM_PROT_WRITE);
++					if(err)
++					{
++						g_warning (G_STRLOC "vm_protect: enable write failed", err);
++						fail = TRUE;
++					}
++				}
++			}
++			
++			err = vm_write (handle->inferior->port, low_address, copied, aligned_length);
++			if (err)
++			{
++				g_warning (G_STRLOC "vm_write failed: %d", err);
++				fail = TRUE;
++			}
++			
++			for (scan = region_head; scan; scan = scan->next)
++			{
++				if (!(scan->protection & VM_PROT_WRITE))
++				{
++					err = vm_protect (handle->inferior->port, scan->start, scan->length, FALSE, scan->protection);
++					if (err)
++					{
++						g_warning (G_STRLOC "vm_protect: restore protection failed", err);
++						fail = TRUE;
++					}
++				}
++			}
++		}
++	}
++
++out:	
++	err = vm_deallocate (mach_task_self (), copied, copy_count);
++	if (err)
++	{
++		g_warning (G_STRLOC "vm_deallocate failed: %d", err);
++		fail = TRUE;
++	}
++
++	return fail ? COMMAND_ERROR_MEMORY_ACCESS : COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++server_ptrace_poke_word (ServerHandle *handle, guint64 addr, gsize value)
++{
++	return server_ptrace_write_memory (handle, addr, sizeof(value), &value);
++}
++
++static ServerCommandError
++_server_ptrace_set_dr (InferiorHandle *inferior, int regnum, guint64 value)
++{
++	thread_array_t threads;
++	mach_msg_type_number_t count;
++	kern_return_t err;
++	mach_msg_type_number_t state_size = sizeof(x86_debug_state32_t)/sizeof(int);
++	x86_debug_state32_t state;
++	
++	err = task_threads(inferior->port, &threads, &count);
++	if (err)
++	{
++		g_message (G_STRLOC ": task_threads failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++
++	//@todo get current thread.
++
++	err = thread_get_state(threads[0], x86_DEBUG_STATE32, (thread_state_t)&state, &state_size);
++	if (err)
++	{
++		g_message (G_STRLOC ": thread_get_state failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++		
++	(&state.__dr0)[regnum] = value;
++
++	err = thread_set_state(threads[0], x86_DEBUG_STATE32, (thread_state_t)&state, state_size);
++	if (err)
++	{
++		g_message (G_STRLOC ": thread_set_state failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	
++	err = vm_deallocate (mach_task_self(), (vm_address_t) threads, (count * sizeof (int)));
++	if (err)
++	{
++		g_message (G_STRLOC ": vm_deallocate failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	  
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++_server_ptrace_get_dr (InferiorHandle *inferior, int regnum, guint64 *value)
++{
++	thread_array_t threads;
++	mach_msg_type_number_t count;
++	kern_return_t err;
++	mach_msg_type_number_t state_size = sizeof(x86_debug_state32_t)/sizeof(int);
++	x86_debug_state32_t state;
++	
++	err = task_threads(inferior->port, &threads, &count);
++	if (err)
++	{
++		g_message (G_STRLOC ": task_threads failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++
++	//@todo get current thread.
++
++	err = thread_get_state(threads[0], x86_DEBUG_STATE32, (thread_state_t)&state, &state_size);
++	if (err)
++	{
++		g_message (G_STRLOC ": thread_get_state failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++		
++	*value = (&state.__dr0)[regnum];
++	
++	err = vm_deallocate (mach_task_self(), (vm_address_t) threads, (count * sizeof (int)));
++	if (err)
++	{
++		g_message (G_STRLOC ": vm_deallocate failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	  
++	return COMMAND_ERROR_NONE;
++}
++
++GStaticMutex wait_mutex = G_STATIC_MUTEX_INIT;
++GStaticMutex wait_mutex_2 = G_STATIC_MUTEX_INIT;
++GStaticMutex wait_mutex_3 = G_STATIC_MUTEX_INIT;
++
++static int
++do_wait (int pid, int *status)
++{
++	int ret;
++
++#if DEBUG_WAIT
++	g_message (G_STRLOC ": do_wait (%d)", pid);
++#endif
++	ret = waitpid (pid, status, WUNTRACED /*| __WALL | __WCLONE*/);
++#if DEBUG_WAIT
++	g_message (G_STRLOC ": do_wait (%d) finished: %d - %x", pid, ret, *status);
++#endif
++	if (ret < 0) {
++		if (errno == EINTR)
++			return 0;
++		else if (errno == ECHILD)
++			return -1;
++		g_warning (G_STRLOC ": Can't waitpid for %d: %s", pid, g_strerror (errno));
++		return -1;
++	}
++
++	return ret;
++	return 0;
++}
++
++static int stop_requested = 0;
++static int stop_status = 0;
++
++static guint32
++server_ptrace_global_wait (guint32 *status_ret)
++{
++	int ret, status;
++
++ again:
++	g_static_mutex_lock (&wait_mutex);
++	ret = do_wait (-1, &status);
++	if (ret <= 0)
++		goto out;
++
++#if DEBUG_WAIT
++	g_message (G_STRLOC ": global wait finished: %d - %x", ret, status);
++#endif
++
++	g_static_mutex_lock (&wait_mutex_2);
++
++#if DEBUG_WAIT
++	g_message (G_STRLOC ": global wait finished #1: %d - %x - %d",
++		   ret, status, stop_requested);
++#endif
++
++	if (ret == stop_requested) {
++		*status_ret = 0;
++		stop_status = status;
++		g_static_mutex_unlock (&wait_mutex_2);
++		g_static_mutex_unlock (&wait_mutex);
++
++		g_static_mutex_lock (&wait_mutex_3);
++		g_static_mutex_unlock (&wait_mutex_3);
++		goto again;
++	}
++	g_static_mutex_unlock (&wait_mutex_2);
++
++	*status_ret = status;
++ out:
++	g_static_mutex_unlock (&wait_mutex);
++	return ret;
++}
++
++static gboolean
++_server_ptrace_wait_for_new_thread (ServerHandle *handle)
++{
++	guint32 ret;
++	int status = 0;
++
++	/*
++	 * There is a race condition in the Linux kernel which shows up on >= 2.6.27:
++	 *
++	 * When creating a new thread, the initial stopping event of that thread is sometimes
++	 * sent before sending the `PTRACE_EVENT_CLONE' for it.
++	 *
++	 * Because of this, we wait here until the new thread has been stopped and ignore
++	 * any "early" stopping events.
++	 *
++	 * See also bugs #423518 and #466012.
++.	 *
++	 */
++
++	if (!g_static_mutex_trylock (&wait_mutex)) {
++		/* This should never happen, but let's not deadlock here. */
++		g_warning (G_STRLOC ": Can't lock mutex: %d", handle->inferior->pid);
++		return FALSE;
++	}
++
++	/*
++	 * If the call succeeds, then we're already stopped.
++	 */
++
++	if (x86_arch_get_registers (handle) == COMMAND_ERROR_NONE) {
++		g_static_mutex_unlock (&wait_mutex);
++		return TRUE;
++	}
++
++	/*
++	 * We own the `wait_mutex', so no other thread is currently waiting for the target
++	 * and we can safely wait for it here.
++	 */
++
++	ret = waitpid (handle->inferior->pid, &status, WUNTRACED /*| __WALL | __WCLONE*/);
++
++	/*
++	 * Safety check: make sure we got the correct event.
++	 */
++
++	if ((ret != handle->inferior->pid) || !WIFSTOPPED (status) || (WSTOPSIG (status) != SIGSTOP)) {
++		g_warning (G_STRLOC ": Wait failed: %d", handle->inferior->pid);
++		g_static_mutex_unlock (&wait_mutex);
++		return FALSE;
++	}
++
++	/*
++	 * Just as an extra safety check.
++	 */
++
++	if (x86_arch_get_registers (handle) != COMMAND_ERROR_NONE) {
++		g_static_mutex_unlock (&wait_mutex);
++		g_warning (G_STRLOC ": Failed to get registers: %d", handle->inferior->pid);
++		return FALSE;
++	}
++
++	g_static_mutex_unlock (&wait_mutex);
++	return TRUE;
++}
++
++static ServerCommandError
++server_ptrace_stop (ServerHandle *handle)
++{
++	ServerCommandError result;
++
++	/*
++	 * Try to get the thread's registers.  If we suceed, then it's already stopped
++	 * and still alive.
++	 */
++	result = x86_arch_get_registers (handle);
++	if (result == COMMAND_ERROR_NONE)
++		return COMMAND_ERROR_ALREADY_STOPPED;
++//thread group? tkill? wtf?
++	if (syscall (/*__NR_tkill*/ SYS_kill, handle->inferior->pid, SIGSTOP)) {
++		/*
++		 * It's already dead.
++		 */
++		if (errno == ESRCH)
++			return COMMAND_ERROR_NO_TARGET;
++		else
++			return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++server_ptrace_stop_and_wait (ServerHandle *handle, guint32 *status)
++{
++	ServerCommandError result;
++	int ret;
++
++	/*
++	 * Try to get the thread's registers.  If we suceed, then it's already stopped
++	 * and still alive.
++	 */
++#if DEBUG_WAIT
++	g_message (G_STRLOC ": stop and wait %d", handle->inferior->pid);
++#endif
++	g_static_mutex_lock (&wait_mutex_2);
++	result = server_ptrace_stop (handle);
++	if (result != COMMAND_ERROR_NONE) {
++#if DEBUG_WAIT
++		g_message (G_STRLOC ": %d - cannot stop %d", handle->inferior->pid, result);
++#endif
++		g_static_mutex_unlock (&wait_mutex_2);
++		return result;
++	}
++
++	g_static_mutex_lock (&wait_mutex_3);
++
++	stop_requested = handle->inferior->pid;
++	g_static_mutex_unlock (&wait_mutex_2);
++
++#if DEBUG_WAIT
++	g_message (G_STRLOC ": %d - sent SIGSTOP", handle->inferior->pid);
++#endif
++
++	g_static_mutex_lock (&wait_mutex);
++#if DEBUG_WAIT
++	g_message (G_STRLOC ": %d - got stop status %x", handle->inferior->pid, stop_status);
++#endif
++	if (stop_status) {
++		*status = stop_status;
++		stop_requested = stop_status = 0;
++		g_static_mutex_unlock (&wait_mutex);
++		g_static_mutex_unlock (&wait_mutex_3);
++		return COMMAND_ERROR_NONE;
++	}
++
++	stop_requested = stop_status = 0;
++
++	do {
++#if DEBUG_WAIT
++		g_message (G_STRLOC ": %d - waiting", handle->inferior->pid);
++#endif
++		ret = do_wait (handle->inferior->pid, (int*)status);
++#if DEBUG_WAIT
++		g_message (G_STRLOC ": %d - done waiting %d, %x",
++			   handle->inferior->pid, ret, status);
++#endif
++	} while (ret == 0);
++	g_static_mutex_unlock (&wait_mutex);
++	g_static_mutex_unlock (&wait_mutex_3);
++
++	/*
++	 * Should never happen.
++	 */
++	if (ret < 0)
++		return COMMAND_ERROR_NO_TARGET;
++
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++_server_ptrace_setup_inferior (ServerHandle *handle)
++{
++	if(task_for_pid(mach_task_self(), handle->inferior->pid, &handle->inferior->port) != KERN_SUCCESS)
++	{
++		g_warning (G_STRLOC ": Can't get Mach port for pid %d", handle->inferior->pid);
++		return COMMAND_ERROR_UNKNOWN_ERROR;		
++	}
++
++	return COMMAND_ERROR_NONE;
++}
++
++static void
++_server_ptrace_finalize_inferior (ServerHandle *handle)
++{
++}
++
++static ServerCommandError
++server_ptrace_initialize_process (ServerHandle *handle)
++{
++	//Darwin/Mach hasn't implemented the extended ptrace events (PTRACE_O_TRACECLONE at al). So, nothing to do here
++
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++server_ptrace_get_signal_info (ServerHandle *handle, SignalInfo **sinfo_out)
++{
++	SignalInfo *sinfo = g_new0 (SignalInfo, 1);
++
++	sinfo->sigkill = SIGKILL;
++	sinfo->sigstop = SIGSTOP;
++	sinfo->sigint = SIGINT;
++	sinfo->sigchld = SIGCHLD;
++
++	sinfo->sigfpe = SIGFPE;
++	sinfo->sigquit = SIGQUIT;
++	sinfo->sigabrt = SIGABRT;
++	sinfo->sigsegv = SIGSEGV;
++	sinfo->sigill = SIGILL;
++	sinfo->sigbus = SIGBUS;
++
++	/* __SIGRTMIN is the hard limit from the kernel, SIGRTMIN is the first
++	 * user-visible real-time signal.  __SIGRTMIN and __SIGRTMIN+1 are used
++	 * internally by glibc. */
++//	sinfo->kernel_sigrtmin = __SIGRTMIN;
++	sinfo->kernel_sigrtmin = SIGUSR1;
++	sinfo->mono_thread_abort = mono_thread_get_abort_signal ();
++
++	*sinfo_out = sinfo;
++
++	return COMMAND_ERROR_NONE;
++}
++
++static void
++server_ptrace_global_init (void)
++{
++	stop_requested = 0;
++	stop_status = 0;
++}
++
++static ServerCommandError
++server_ptrace_get_threads (ServerHandle *handle, guint32 *count, guint32 **threads)
++{
++	gchar *dirname = g_strdup_printf ("/proc/%d/task", handle->inferior->pid);
++	const gchar *filename;
++	GPtrArray *array;
++	GDir *dir;
++	int i;
++
++	dir = g_dir_open (dirname, 0, NULL);
++	if (!dir) {
++		g_warning (G_STRLOC ": Can't get threads of %d", handle->inferior->pid);
++		g_free (dirname);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++
++	array = g_ptr_array_new ();
++
++	while ((filename = g_dir_read_name (dir)) != NULL) {
++		gchar *endptr;
++		guint32 pid;
++
++		pid = (guint32) strtol (filename, &endptr, 10);
++		if (*endptr)
++			goto out_error;
++
++		g_ptr_array_add (array, GUINT_TO_POINTER (pid));
++	}
++
++	*count = array->len;
++	*threads = g_new0 (guint32, array->len);
++
++	for (i = 0; i < array->len; i++)
++		(*threads) [i] = GPOINTER_TO_UINT (g_ptr_array_index (array, i));
++
++	g_free (dirname);
++	g_dir_close (dir);
++	g_ptr_array_free (array, FALSE);
++	return COMMAND_ERROR_NONE;
++
++ out_error:
++	g_free (dirname);
++	g_dir_close (dir);
++	g_ptr_array_free (array, FALSE);
++	g_warning (G_STRLOC ": Can't get threads of %d", handle->inferior->pid);
++	return COMMAND_ERROR_UNKNOWN_ERROR;
++}
++
++static ServerCommandError
++server_ptrace_get_application (ServerHandle *handle, gchar **exe_file, gchar **cwd,
++			       guint32 *nargs, gchar ***cmdline_args)
++{
++    int                 err;
++    int					done = FALSE;
++    int					mib[4];
++	GPtrArray *array;
++	gchar **ptr;	
++	int maxarg = 0, numArgs = 0, i;
++	size_t size = 0;
++	char *args = NULL, *cp = NULL, *arg = NULL;
++	    
++    mib[0] = CTL_KERN;
++    mib[1] = KERN_ARGMAX;
++    
++    size = sizeof(maxarg);
++    if ( sysctl(mib, 2, &maxarg, &size, NULL, 0) == -1 ) {
++		g_warning (G_STRLOC ": sysctl failed.");
++		return COMMAND_ERROR_UNKNOWN_ERROR;		
++    }
++    
++    args = (char *)malloc( maxarg );
++    if ( args == NULL ) {
++		g_warning (G_STRLOC ": sysctl failed.");
++		return COMMAND_ERROR_UNKNOWN_ERROR;		
++    }
++    
++    mib[0] = CTL_KERN;
++    mib[1] = KERN_PROCARGS2;
++    mib[2] = handle->inferior->pid;
++    
++    size = (size_t)maxarg;
++    if ( sysctl(mib, 3, args, &size, NULL, 0) == -1 ) {
++	free( args );
++		g_warning (G_STRLOC ": sysctl failed.");
++		return COMMAND_ERROR_UNKNOWN_ERROR;		
++     }
++    
++    memcpy( &numArgs, args, sizeof(numArgs) );
++    cp = args + sizeof(numArgs);
++    
++    arg = cp;
++ 	array = g_ptr_array_new ();
++   
++	for ( i = 0; cp < &args[size]; *cp++ ) {
++		if ( *cp == '\0' ) {
++			if ( (arg != NULL) && (*arg != '\0') ) {
++				if(i == 0)
++					*exe_file = g_strdup (arg);
++				else if(i <= numArgs)
++					g_ptr_array_add (array, arg);
++				else
++					break;
++				while ( ((*cp == '\0') && (cp < &args[size])) )
++					*cp++;
++				arg = cp;
++				i++;
++			}
++		}
++    }
++
++	//@todo: implement!
++	*cwd = g_strdup("/");
++
++	*nargs = array->len;
++	*cmdline_args = ptr = g_new0 (gchar *, array->len + 1);
++
++	for (i = 0; i < array->len; i++)
++		ptr  [i] = g_ptr_array_index (array, i);
++	
++	return COMMAND_ERROR_NONE;
++}
++
++static ServerCommandError
++server_ptrace_detach_after_fork (ServerHandle *handle)
++{
++	ServerCommandError result;
++	GPtrArray *breakpoints;
++	int status;
++	int ret, i;
++
++	ret = waitpid (handle->inferior->pid, &status, WUNTRACED | WNOHANG /*| __WALL | __WCLONE*/);
++	if (ret < 0)
++		g_warning (G_STRLOC ": Can't waitpid for %d: %s", handle->inferior->pid, g_strerror (errno));
++
++	/*
++	 * Make sure we're stopped.
++	 */
++	if (x86_arch_get_registers (handle) != COMMAND_ERROR_NONE)
++		do_wait (handle->inferior->pid, &status);
++
++	result = x86_arch_get_registers (handle);
++	if (result != COMMAND_ERROR_NONE)
++		return result;
++
++	mono_debugger_breakpoint_manager_lock ();
++
++	breakpoints = mono_debugger_breakpoint_manager_get_breakpoints (handle->bpm);
++	for (i = 0; i < breakpoints->len; i++) {
++		BreakpointInfo *info = g_ptr_array_index (breakpoints, i);
++
++		x86_arch_disable_breakpoint (handle, info);
++	}
++
++	mono_debugger_breakpoint_manager_unlock ();
++
++	if (ptrace (PT_DETACH, handle->inferior->pid, NULL, 0) != 0)
++		return _server_ptrace_check_errno (handle->inferior);
++
++	return COMMAND_ERROR_NONE;
++}
+Index: backend/server/x86-ptrace.c
+===================================================================
+--- backend/server/x86-ptrace.c	(revision 131900)
++++ backend/server/x86-ptrace.c	(working copy)
+@@ -43,6 +43,10 @@
+ #include "x86-freebsd-ptrace.h"
+ #endif
+ 
++#ifdef __MACH__
++#include "darwin-ptrace.h"
++#endif
++
+ #include "x86-arch.h"
+ 
+ struct IOThreadData
+@@ -56,6 +60,12 @@
+ #ifdef __linux__
+ 	int mem_fd;
+ #endif
++
++#ifdef __MACH__
++	mach_port_t port;
++	int is_execd;
++#endif
++
+ 	int stepping;
+ 	int last_signal;
+ 	int redirect_fds;
+@@ -185,6 +195,8 @@
+ 	return server_ptrace_read_memory (handle, start, sizeof (gsize), retval);
+ }
+ 
++//PT_WRITE_D presumed to be broken in mach. use vm_write instead.
++#ifndef __MACH__
+ static ServerCommandError
+ server_ptrace_write_memory (ServerHandle *handle, guint64 start,
+ 			    guint32 size, gconstpointer buffer)
+@@ -227,12 +239,14 @@
+ 
+ 	return COMMAND_ERROR_NONE;
+ }
++#endif
+ 
+ static ServerStatusMessageType
+ server_ptrace_dispatch_event (ServerHandle *handle, guint32 status, guint64 *arg,
+ 			      guint64 *data1, guint64 *data2, guint32 *opt_data_size,
+ 			      gpointer *opt_data)
+ {
++	#ifdef PTRACE_EVENT_CLONE
+ 	if (status >> 16) {
+ 		switch (status >> 16) {
+ 		case PTRACE_EVENT_CLONE: {
+@@ -283,7 +297,7 @@
+ 			return MESSAGE_UNKNOWN_ERROR;
+ 		}
+ 	}
+-
++	#endif
+ 	if (WIFSTOPPED (status)) {
+ 		guint64 callback_arg, retval, retval2;
+ 		ChildStoppedAction action;
+@@ -629,6 +643,10 @@
+ #include "x86-freebsd-ptrace.c"
+ #endif
+ 
++#ifdef __MACH__
++#include "darwin-ptrace.c"
++#endif
++
+ #if defined(__i386__)
+ #include "i386-arch.c"
+ #elif defined(__x86_64__)
+Index: backend/server/i386-arch.c
+===================================================================
+--- backend/server/i386-arch.c	(revision 131900)
++++ backend/server/i386-arch.c	(working copy)
+@@ -10,7 +10,10 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ 
++#ifdef __linux__
+ #include "x86-linux-ptrace.h"
++#endif
++
+ #include "x86-arch.h"
+ 
+ typedef struct
+@@ -166,6 +169,12 @@
+ 	if (result != COMMAND_ERROR_NONE)
+ 		return result;
+ 
++#ifdef __MACH__
++	result = server_ptrace_make_memory_executable (handle, (guint32) new_esp, size);
++	if (result != COMMAND_ERROR_NONE)
++		return result;
++#endif
++
+ 	INFERIOR_REG_ORIG_EAX (arch->current_regs) = -1;
+ 	INFERIOR_REG_ESP (arch->current_regs) = INFERIOR_REG_EIP (arch->current_regs) = new_esp;
+ 
+@@ -233,6 +242,12 @@
+ 	if (result != COMMAND_ERROR_NONE)
+ 		return result;
+ 
++#ifdef __MACH__
++	result = server_ptrace_make_memory_executable (handle, (guint32) new_esp, size);
++	if (result != COMMAND_ERROR_NONE)
++		return result;
++#endif
++
+ 	INFERIOR_REG_ORIG_EAX (arch->current_regs) = -1;
+ 	INFERIOR_REG_ESP (arch->current_regs) = INFERIOR_REG_EIP (arch->current_regs) = new_esp;
+ 
+@@ -296,6 +311,12 @@
+ 	if (result != COMMAND_ERROR_NONE)
+ 		return result;
+ 
++#ifdef __MACH__
++	result = server_ptrace_make_memory_executable (handle, (guint32) new_esp, size);
++	if (result != COMMAND_ERROR_NONE)
++		return result;
++#endif
++
+ 	INFERIOR_REG_ORIG_EAX (arch->current_regs) = -1;
+ 	INFERIOR_REG_EIP (arch->current_regs) = method_address;
+ 	INFERIOR_REG_ESP (arch->current_regs) = new_esp;
+@@ -358,6 +379,12 @@
+ 	if (result != COMMAND_ERROR_NONE)
+ 		return result;
+ 
++#ifdef __MACH__
++	result = server_ptrace_make_memory_executable (handle, (guint32) new_esp, size);
++	if (result != COMMAND_ERROR_NONE)
++		return result;
++#endif
++
+ 	INFERIOR_REG_ORIG_EAX (arch->current_regs) = -1;
+ 	INFERIOR_REG_EIP (arch->current_regs) = method_address;
+ 	INFERIOR_REG_ESP (arch->current_regs) = new_esp;
+@@ -432,6 +459,12 @@
+ 	if (result != COMMAND_ERROR_NONE)
+ 		return result;
+ 
++#ifdef __MACH__
++	result = server_ptrace_make_memory_executable (handle, (guint32) new_esp, size);
++	if (result != COMMAND_ERROR_NONE)
++		return result;
++#endif
++
+ 	INFERIOR_REG_ORIG_EAX (arch->current_regs) = -1;
+ 	INFERIOR_REG_EIP (arch->current_regs) = invoke_method;
+ 	INFERIOR_REG_ESP (arch->current_regs) = new_esp;
+Index: backend/server/darwin-ptrace.h
+===================================================================
+--- backend/server/darwin-ptrace.h	(revision 0)
++++ backend/server/darwin-ptrace.h	(revision 0)
+@@ -0,0 +1,83 @@
++#ifndef __MONO_DEBUGGER_MACHO_PTRACE_H__
++#define __MONO_DEBUGGER_MACHO_PTRACE_H__
++
++#include <mach/mach.h>
++
++#define PTRACE_KILL PT_KILL
++
++struct user_regs_struct {
++	long eax, ebx, ecx, edx;
++	long edi, esi, ebp, esp;
++	unsigned short ss, xss;
++	long eflags;
++	long eip;
++	unsigned short cs, xcs;
++	unsigned short ds, xds, es, xes;
++	unsigned short fs, xfs, gs, xgs;
++	long orig_eax;
++/*
++	long ebx, ecx, edx, esi, edi, ebp, eax;
++	unsigned short ds, xds, es, xes;
++	unsigned short fs, xfs, gs, xgs;
++	long orig_eax, eip;
++	unsigned short cs, xcs;
++	long eflags, esp;
++	unsigned short ss, xss;*/
++};
++
++struct user_fpregs_struct {
++	i386_float_state_t regs;
++};
++
++#include "x86-arch.h"
++
++static ServerCommandError
++_server_ptrace_check_errno (InferiorHandle *);
++
++static ServerCommandError
++_server_ptrace_get_registers (InferiorHandle *inferior, INFERIOR_REGS_TYPE *regs);
++
++static ServerCommandError
++_server_ptrace_set_registers (InferiorHandle *inferior, INFERIOR_REGS_TYPE *regs);
++
++static ServerCommandError
++_server_ptrace_get_fp_registers (InferiorHandle *inferior, INFERIOR_FPREGS_TYPE *regs);
++
++static ServerCommandError
++_server_ptrace_set_fp_registers (InferiorHandle *inferior, INFERIOR_FPREGS_TYPE *regs);
++
++static ServerCommandError
++_server_ptrace_read_memory (ServerHandle *handle, guint64 start,
++			    guint32 size, gpointer buffer);
++
++static ServerCommandError
++server_ptrace_read_memory (ServerHandle *handle, guint64 start, guint32 size, gpointer buffer);
++
++static ServerCommandError
++_server_ptrace_set_dr (InferiorHandle *handle, int regnum, guint64 value);
++
++static ServerCommandError
++_server_ptrace_get_dr (InferiorHandle *handle, int regnum, guint64 *value);
++
++static ServerCommandError
++server_ptrace_stop (ServerHandle *handle);
++
++static ServerCommandError
++server_ptrace_stop_and_wait (ServerHandle *handle, guint32 *status);
++
++static ServerCommandError
++_server_ptrace_setup_inferior (ServerHandle *handle);
++
++static void
++_server_ptrace_finalize_inferior (ServerHandle *handle);
++
++static ServerCommandError
++server_ptrace_get_signal_info (ServerHandle *handle, SignalInfo **sinfo);
++
++static gboolean
++_server_ptrace_wait_for_new_thread (ServerHandle *handle);
++
++static ServerCommandError
++server_ptrace_make_memory_executable (ServerHandle *handle, guint64 start, guint32 size);
++
++#endif
+Index: backend/server/darwin-thread-db.c
+===================================================================
+--- backend/server/darwin-thread-db.c	(revision 0)
++++ backend/server/darwin-thread-db.c	(revision 0)
+@@ -0,0 +1,194 @@
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++
++#include <mach/mach.h>
++#include "thread-db.h"
++
++
++/*
++ps_err_e
++ps_pglobal_lookup (ThreadDbHandle *handle, const char *object_name,
++		   const char *sym_name, psaddr_t *sym_addr)
++{
++	guint64 address;
++	ps_err_e e;
++
++	e = (* handle->global_lookup) (object_name, sym_name, &address);
++	*sym_addr = GUINT_TO_POINTER ((gsize) address);
++	return e;
++}
++
++ps_err_e
++ps_pdread (ThreadDbHandle *handle, psaddr_t addr, void *buffer, size_t size)
++{
++	return (* handle->read_memory) ((guint64) (gsize) addr, buffer, size);
++}
++
++ps_err_e
++ps_pdwrite (ThreadDbHandle *handle, psaddr_t addr, const void *buffer, size_t size)
++{
++	return (* handle->write_memory) ((guint64) (gsize) addr, buffer, size);
++}
++
++ps_err_e
++ps_lgetregs (ThreadDbHandle *handle, lwpid_t lwp, prgregset_t regs)
++{
++	return PS_ERR;
++}
++
++ps_err_e
++ps_lsetregs (ThreadDbHandle *handle, lwpid_t lwp, const prgregset_t regs)
++{
++	return PS_ERR;
++}
++
++ps_err_e
++ps_lgetfpregs (ThreadDbHandle *handle, lwpid_t lwp, prfpregset_t *regs)
++{
++	return PS_ERR;
++}
++
++ps_err_e
++ps_lsetfpregs (ThreadDbHandle *handle, lwpid_t lwp, const prfpregset_t *regs)
++{
++	return PS_ERR;
++}
++
++pid_t
++ps_getpid (ThreadDbHandle *handle)
++{
++	return handle->pid;
++}
++*/
++ThreadDbHandle *
++mono_debugger_thread_db_init (guint32 pid, GlobalLookupFunc global_lookup,
++			      ReadMemoryFunc read_memory, WriteMemoryFunc write_memory)
++{
++	ThreadDbHandle *handle;
++
++	handle = g_new0 (ThreadDbHandle, 1);
++	handle->pid = pid;
++	handle->global_lookup = global_lookup;
++	handle->read_memory = read_memory;
++	handle->write_memory = write_memory;
++
++	if(task_for_pid(mach_task_self(), pid, &handle->port) != KERN_SUCCESS)
++		g_warning (G_STRLOC ": Can't get Mach port for pid %d", pid);
++	
++	return handle;
++}
++
++void
++mono_debugger_thread_db_destroy (ThreadDbHandle *handle)
++{
++	g_free (handle);
++}
++
++/* get_application_thread_port returns the thread port number in the
++   application's port namespace.  We get this so that we can present
++   the user with the same port number they would see if they store
++   away the thread id in their program.  It is for display purposes 
++   only.  */
++
++thread_t
++get_application_thread_port (ThreadDbHandle *handle, thread_t our_name)
++{
++  mach_msg_type_number_t i;
++  mach_port_name_array_t names;
++  mach_msg_type_number_t names_count;
++  mach_port_type_array_t types;
++  mach_msg_type_number_t types_count;
++  mach_port_t match = 0;
++  kern_return_t ret;
++
++  /* To get the application name, we have to iterate over all the ports
++     in the application and extract a right for them.  The right will include
++     the port name in our port namespace, so we can use that to find the
++     thread we are looking for.  Of course, we don't actually need another
++     right to each of these ports, so we deallocate it when we are done.  */
++
++  ret = mach_port_names (handle->port, &names, &names_count, &types, &types_count);
++  if (ret != KERN_SUCCESS)
++    {
++      g_warning (G_STRLOC ": Error %d getting port names from mach_port_names", ret);
++      return (thread_t) 0x0;
++    }
++
++  for (i = 0; i < names_count; i++)
++    {
++      mach_port_t local_name;
++      mach_msg_type_name_t local_type;
++
++      ret = mach_port_extract_right (handle->port, names[i], MACH_MSG_TYPE_COPY_SEND, &local_name, &local_type);
++	  
++      if (ret == KERN_SUCCESS)
++        {
++          mach_port_deallocate (mach_task_self (), local_name);
++          if (local_name == our_name)
++            {
++              match = names[i];
++              break;
++            }
++        }
++    }
++
++  vm_deallocate (mach_task_self (), (vm_address_t) names,
++                 names_count * sizeof (mach_port_t));
++
++  return (thread_t) match;
++}
++
++gboolean
++mono_debugger_thread_db_get_thread_info (const td_thrhandle_t *th, guint64 *tid, guint64 *tls,
++					 guint64 *lwp)
++{
++	*tid = get_application_thread_port(th->handle, th->tid);
++	*tls = NULL;
++	*lwp = th->tid;
++
++	return TRUE;
++}
++
++static int
++iterate_over_threads_cb (const td_thrhandle_t *th, void *user_data)
++{
++	IterateOverThreadsFunc func = (IterateOverThreadsFunc) user_data;
++
++	return (* func) (th) ? 0 : 1;
++}
++
++gboolean
++mono_debugger_thread_db_iterate_over_threads (ThreadDbHandle *handle, IterateOverThreadsFunc func)
++{
++	thread_array_t threads;
++	mach_msg_type_number_t count;
++	kern_return_t err;
++	int state_size = I386_THREAD_STATE_MAX;
++	int i;
++
++	err = task_threads(handle->port, &threads, &count);
++	if (err)
++	{
++		g_message (G_STRLOC ": task_threads failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	
++	for(i = 0; i<count; i++)
++	{
++		td_thrhandle_t th;
++		th.tid = threads[i];
++		th.handle = handle;
++		if(iterate_over_threads_cb(&th ,func))
++			break;
++	}
++	
++	err = vm_deallocate (mach_task_self(), (vm_address_t) threads, (count * sizeof (int)));
++	if (err)
++	{
++		g_message (G_STRLOC ": vm_deallocate failed: %d", err);
++		return COMMAND_ERROR_UNKNOWN_ERROR;
++	}
++	  
++	return COMMAND_ERROR_NONE;
++}
+Index: backend/server/Makefile.am
+===================================================================
+--- backend/server/Makefile.am	(revision 131900)
++++ backend/server/Makefile.am	(working copy)
+@@ -15,9 +15,25 @@
+ 
+ if PLATFORM_POWERPC
+ platform_sources =
++else 
++if PLATFORM_X86_DARWIN
++platform_sources = \
++	x86-ptrace.c \
++	darwin-thread-db.c \
++	thread-db.h		
++libmonodebuggerserver_la_LIBADD = \
++	@SERVER_DEPENDENCIES_LIBS@ \
++	../arch/libmonodebuggerbfdglue.la
+ else
+-platform_sources = x86-ptrace.c
++platform_sources = \
++	x86-ptrace.c \
++	thread-db.c	\
++	thread-db.h		
++libmonodebuggerserver_la_LIBADD = 
++	@SERVER_DEPENDENCIES_LIBS@ -lthread_db 
++	../arch/libmonodebuggerbfdglue.la
+ endif
++endif
+ 
+ libmonodebuggerserver_la_SOURCES = \
+ 	server.h		\
+@@ -27,15 +43,10 @@
+ 	breakpoints.h		\
+ 	mutex.c			\
+ 	mutex.h			\
+-	thread-db.c		\
+-	thread-db.h		\
+ 	libgtop-glue.c		\
+ 	libgtop-glue.h		\
+ 	linux-proc-service.h
+ 
+-libmonodebuggerserver_la_LIBADD = \
+-	@SERVER_DEPENDENCIES_LIBS@ -lthread_db \
+-	../arch/libmonodebuggerbfdglue.la
+ libmonodebuggerserver_la_LDFLAGS = \
+ 	 -no-undefined -export-dynamic -shared
+ 
+Index: backend/arch/bfdglue.c
+===================================================================
+--- backend/arch/bfdglue.c	(revision 131900)
++++ backend/arch/bfdglue.c	(working copy)
+@@ -88,6 +88,14 @@
+ 		*is_function = 0;
+ 		*address = symbol->section->vma + symbol->value;
+ 	}
++	else 
++	{
++		//Mach headers don't have a function flag. Mark everything as function for now.
++		//Possibly check address against text section to fix this properly?
++		*is_function = 1;
++		*address = symbol->section->vma + symbol->value;
++	}
++	
+ 
+ 	return g_strdup (symbol->name);
+ }
+Index: backend/arch/bfd/mach-o.c
+===================================================================
+--- backend/arch/bfd/mach-o.c	(revision 131900)
++++ backend/arch/bfd/mach-o.c	(working copy)
+@@ -1542,6 +1542,8 @@
+     case BFD_MACH_O_LC_SUB_LIBRARY:
+     case BFD_MACH_O_LC_TWOLEVEL_HINTS:
+     case BFD_MACH_O_LC_PREBIND_CKSUM:
++    case BFD_MACH_O_LC_UUID:
++    case BFD_MACH_O_LC_CODE_SIGNATURE:
+       break;
+     default:
+       fprintf (stderr, "unable to read unknown load command 0x%lx\n",
+Index: backend/arch/bfd/mach-o.h
+===================================================================
+--- backend/arch/bfd/mach-o.h	(revision 131900)
++++ backend/arch/bfd/mach-o.h	(working copy)
+@@ -88,7 +88,14 @@
+     BFD_MACH_O_LC_PREBIND_CKSUM = 0x17, /* Prebind checksum.  */
+     /* Load a dynamicly linked shared library that is allowed to be
+        missing (weak).  */
+-    BFD_MACH_O_LC_LOAD_WEAK_DYLIB = 0x18
++    BFD_MACH_O_LC_LOAD_WEAK_DYLIB = 0x18,
++    
++	/* APPLE LOCAL entries */
++	BFD_MACH_O_LC_UUID = 0x1b,             /* 128-bit UUID of the executable.  */
++	BFD_MACH_O_LC_RPATH = 0x1c | BFD_MACH_O_LC_REQ_DYLD,  
++	BFD_MACH_O_LC_CODE_SIGNATURE = 0x1d,   
++	BFD_MACH_O_LC_SEGMENT_SPLIT_INFO = 0x1e, 
++	BFD_MACH_O_LC_REEXPORT_DYLIB = 0x1f | BFD_MACH_O_LC_REQ_DYLD
+   }
+ bfd_mach_o_load_command_type;
+ 
+Index: backend/arch/bfd/Makefile.am
+===================================================================
+--- backend/arch/bfd/Makefile.am	(revision 131900)
++++ backend/arch/bfd/Makefile.am	(working copy)
+@@ -19,6 +19,9 @@
+ x86_64_linux_backend = elf64-x86-64.c elf64.c elf32-i386.c elf32.c elf.c elflink.c elf-strtab.c elf-eh-frame.c dwarf1.c i386linux.c aout32.c efi-app-ia32.c peigen.c cofflink.c elf64-gen.c elf32-gen.c cpu-i386.c pe-i386.c pei-i386.c trad-core.c archive64.c
+ x86_64_linux_vec_defines = -DHAVE_bfd_elf64_x86_64_vec -DHAVE_bfd_elf32_i386_vec -DHAVE_i386linux_vec -DHAVE_bfd_efi_app_ia32_vec -DHAVE_bfd_elf64_little_generic_vec -DHAVE_bfd_elf64_big_generic_vec -DHAVE_bfd_elf32_little_generic_vec -DHAVE_bfd_elf32_big_generic_vec
+ 
++i386_mach_backend = mach-o.c pef.c xsym.c cpu-i386.c
++i386_mach_vec_defines = -DHAVE_mach_o_be_vec -DHAVE_mach_o_le_vec -DHAVE_mach_o_fat_vec -DHAVE_pef_vec -DHAVE_pef_xlib_vec -DHAVE_sym_vec
++
+ if BFD_TARGET_POWERPC
+ BFD_BACKEND = $(powerpc_backend) $(i386_linux_backend)
+ TDEFAULTS =  -DDEFAULT_VECTOR=mach_o_be_vec -DSELECT_VECS='&mach_o_be_vec,&mach_o_le_vec,&mach_o_fat_vec,&pef_vec,&pef_xlib_vec,&sym_vec,&bfd_elf32_i386_vec,&i386linux_vec,&bfd_efi_app_ia32_vec,&bfd_elf32_little_generic_vec,&bfd_elf32_big_generic_vec,&i386pe_vec,&i386pei_vec' -DSELECT_ARCHITECTURES='&bfd_powerpc_arch,&bfd_rs6000_arch,&bfd_i386_arch' $(powerpc_vec_defines) $(i386_linux_vec_defines)
+@@ -29,11 +32,17 @@
+ TDEFAULTS =  -DDEFAULT_VECTOR=bfd_elf64_x86_64_vec -DSELECT_VECS='&bfd_elf64_x86_64_vec,&bfd_elf32_i386_vec,&i386linux_vec,&bfd_efi_app_ia32_vec,&bfd_elf64_little_generic_vec,&bfd_elf64_big_generic_vec,&bfd_elf32_little_generic_vec,&bfd_elf32_big_generic_vec' -DSELECT_ARCHITECTURES='&bfd_i386_arch' $(x86_64_linux_vec_defines)
+ bfd_cflags = -DTRAD_CORE -DBFD64
+ else
++if BFD_TARGET_X86_MACH
++BFD_BACKEND = $(i386_mach_backend)
++TDEFAULTS =  -DDEFAULT_VECTOR=mach_o_be_vec -DSELECT_VECS='&mach_o_be_vec,&mach_o_le_vec,&mach_o_fat_vec,&pef_vec,&pef_xlib_vec,&sym_vec' -DSELECT_ARCHITECTURES='&bfd_i386_arch' $(i386_mach_vec_defines)
++bfd_cflags =
++else
+ BFD_BACKEND = $(i386_linux_backend)
+ TDEFAULTS =  -DDEFAULT_VECTOR=bfd_elf32_i386_vec -DSELECT_VECS='&bfd_elf32_i386_vec,&i386linux_vec,&bfd_efi_app_ia32_vec,&bfd_elf32_little_generic_vec,&bfd_elf32_big_generic_vec,&i386pe_vec,&i386pei_vec' -DSELECT_ARCHITECTURES='&bfd_i386_arch' $(i386_linux_vec_defines)
+ bfd_cflags = -DTRAD_CORE
+ endif
+ endif
++endif
+ 
+ INCLUDES = -D_GNU_SOURCE $(bfd_cflags) $(CSEARCH) $(CSWITCHES)
+ 
+Index: backend/arch/Bfd.cs
+===================================================================
+--- backend/arch/Bfd.cs	(revision 131900)
++++ backend/arch/Bfd.cs	(working copy)
+@@ -232,6 +232,34 @@
+ 						base_address.Address + got_section.vma);
+ 					has_got = true;
+ 				}
++			} else if (target == "mach-o-le") {
++				if (!is_coredump) {
++					Section text = GetSectionByName ("LC_SEGMENT.__TEXT.__text", true);
++					Section bss = GetSectionByName ("LC_SEGMENT.__DATA.__bss", true);
++
++					if (!base_address.IsNull)
++						start_address = new TargetAddress (
++							info.AddressDomain,
++							base_address.Address + text.vma);
++					else
++						start_address = new TargetAddress (
++							info.AddressDomain, text.vma);
++
++					if (!base_address.IsNull)
++						end_address = new TargetAddress (
++							info.AddressDomain,
++							base_address.Address + bss.vma + bss.size);
++					else
++						end_address = new TargetAddress (
++							info.AddressDomain, bss.vma + bss.size);
++				}
++
++				read_bfd_symbols ();
++
++				if (DwarfReader.IsSupported (this))
++					has_debugging_info = true;
++					
++				has_got = false;
+ 			} else
+ 				throw new SymbolTableException (
+ 					"Symbol file {0} has unknown target architecture {1}",
+@@ -266,6 +294,8 @@
+ 			local_symbols = new Hashtable ();
+ 			simple_symbols = new ArrayList ();
+ 
++			bool is_Mach = (bfd_glue_get_target_name (bfd) == "mach-o-le");
++			
+ 			for (int i = 0; i < num_symbols; i++) {
+ 				string name;
+ 				long address;
+@@ -274,12 +304,18 @@
+ 				name = bfd_glue_get_symbol (bfd, symtab, i, out is_function, out address);
+ 				if (name == null)
+ 					continue;
++					
++				if(is_Mach)
++				{
++					if(name[0] == '_')
++						name = name.Substring(1);
++				}
+ 
+ 				TargetAddress relocated = new TargetAddress (
+ 					info.AddressDomain, base_address.Address + address);
+-				if (is_function != 0)
++				if (is_function != 0 && !symbols.Contains (name))
+ 					symbols.Add (name, relocated);
+-				else if ((main_bfd == null) && name.StartsWith ("MONO_DEBUGGER__"))
++				else if ((main_bfd == null) && name.StartsWith ("MONO_DEBUGGER__") && !symbols.Contains (name))
+ 					symbols.Add (name, relocated);
+ 				else if (!local_symbols.Contains (name))
+ 					local_symbols.Add (name, relocated);

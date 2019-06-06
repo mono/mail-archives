@@ -1,0 +1,568 @@
+Index: interpreter/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/interpreter/ChangeLog,v
+retrieving revision 1.217
+diff -u -r1.217 ChangeLog
+--- interpreter/ChangeLog	31 Oct 2003 13:06:28 -0000	1.217
++++ interpreter/ChangeLog	20 Nov 2003 15:37:20 -0000
+@@ -1,3 +1,7 @@
++2003-11-20  Lluis Sanchez Gual <lluis@ximian.com>
++
++	* interp.c: Added support for context static fields.
++
+ 2003-10-31  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* interp.c (mono_create_method_pointer): New function which contains
+Index: interpreter/interp.c
+===================================================================
+RCS file: /cvs/public/mono/mono/interpreter/interp.c,v
+retrieving revision 1.265
+diff -u -r1.265 interp.c
+--- interpreter/interp.c	31 Oct 2003 13:06:28 -0000	1.265
++++ interpreter/interp.c	20 Nov 2003 15:37:23 -0000
+@@ -3340,10 +3340,13 @@
+ 			vt = mono_class_vtable (domain, field->parent);
+ 			if (!vt->initialized)
+ 				mono_runtime_class_init (vt);
+-			if (!domain->thread_static_fields || !(addr = g_hash_table_lookup (domain->thread_static_fields, field)))
+-				addr = (char*)(vt->data) + field->offset;
+-			else
++			
++			if (domain->thread_static_fields && (addr = g_hash_table_lookup (domain->thread_static_fields, field)))
+ 				addr = mono_threads_get_static_data (GPOINTER_TO_UINT (addr));
++			else if (domain->context_static_fields && (addr = g_hash_table_lookup (domain->context_static_fields, field)))
++				addr = mono_contexts_get_static_data (GPOINTER_TO_UINT (addr));
++			else
++				addr = (char*)(vt->data) + field->offset;
+ 
+ 			if (load_addr) {
+ 				sp->type = VAL_MP;
+@@ -3370,10 +3373,13 @@
+ 			vt = mono_class_vtable (domain, field->parent);
+ 			if (!vt->initialized)
+ 				mono_runtime_class_init (vt);
+-			if (!domain->thread_static_fields || !(addr = g_hash_table_lookup (domain->thread_static_fields, field)))
+-				addr = (char*)(vt->data) + field->offset;
+-			else
++			
++			if (domain->thread_static_fields && (addr = g_hash_table_lookup (domain->thread_static_fields, field)))
+ 				addr = mono_threads_get_static_data (GPOINTER_TO_UINT (addr));
++			else if (domain->context_static_fields && (addr = g_hash_table_lookup (domain->context_static_fields, field)))
++				addr = mono_contexts_get_static_data (GPOINTER_TO_UINT (addr));
++			else
++				addr = (char*)(vt->data) + field->offset;
+ 
+ 			stackval_to_data (field->type, sp, addr, FALSE);
+ 			vt_free (sp);
+Index: metadata/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/ChangeLog,v
+retrieving revision 1.1237
+diff -u -r1.1237 ChangeLog
+--- metadata/ChangeLog	18 Nov 2003 18:02:26 -0000	1.1237
++++ metadata/ChangeLog	20 Nov 2003 15:37:28 -0000
+@@ -1,3 +1,17 @@
++2003-11-20  Lluis Sanchez Gual  <lluis@ximian.com>
++
++	* appdomain.h: Added support for context static fields. Added static_data
++	  field to MonoAppContext and the context_static_fields hastable in
++	  MonoAppDomain.
++	* domain.c: Destroy context_static_fields on domain unload.
++	* object.c: Replaced field_is_thread_static() for a more generic
++	  field_is_special_static() which also checks for context static attribute.
++	  In mono_class_vtable(), added support for static context fields.
++	* threads.c: Changed methods that manage thread static fields to more
++	  generic methods so they can be reused both for thread and context static
++	  data.
++	* threads.h: Declared some new methods.
++
+ 2003-11-18  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* reflection.h (MonoReflectionAssemblyName): Applied patch from Laurent Morichetti (l_m@pacbell.net). Fix type of 'flags' field.
+Index: metadata/appdomain.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/appdomain.h,v
+retrieving revision 1.61
+diff -u -r1.61 appdomain.h
+--- metadata/appdomain.h	18 Nov 2003 13:48:37 -0000	1.61
++++ metadata/appdomain.h	20 Nov 2003 15:37:28 -0000
+@@ -71,6 +71,7 @@
+ 	MonoObject obj;
+ 	gint32 domain_id;
+ 	gint32 context_id;
++	gpointer *static_data;
+ } MonoAppContext;
+ 
+ typedef enum {
+@@ -111,6 +112,7 @@
+ 	MonoAppContext     *default_context;
+ 	MonoException      *out_of_memory_ex;
+ 	GHashTable         *thread_static_fields;
++	GHashTable         *context_static_fields;
+ 	GHashTable         *jump_target_hash;
+ 	MonoGHashTable     *class_init_trampoline_hash;
+ 	/* 
+Index: metadata/domain.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/domain.c,v
+retrieving revision 1.41
+diff -u -r1.41 domain.c
+--- metadata/domain.c	12 Nov 2003 14:11:11 -0000	1.41
++++ metadata/domain.c	20 Nov 2003 15:37:29 -0000
+@@ -621,6 +621,8 @@
+ 	g_hash_table_destroy (domain->finalizable_objects_hash);
+ 	if (domain->thread_static_fields)
+ 		g_hash_table_destroy (domain->thread_static_fields);
++	if (domain->context_static_fields)
++		g_hash_table_destroy (domain->context_static_fields);
+ 	DeleteCriticalSection (&domain->lock);
+ 	domain->setup = NULL;
+ 
+Index: metadata/object.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/object.c,v
+retrieving revision 1.190
+diff -u -r1.190 object.c
+--- metadata/object.c	18 Nov 2003 13:48:37 -0000	1.190
++++ metadata/object.c	20 Nov 2003 15:37:31 -0000
+@@ -69,7 +69,7 @@
+ 	int i;
+ 	MonoException *exc;
+ 	MonoException *exc_to_throw;
+-	MonoMethod *method;
++	MonoMethod *method = NULL;
+ 	MonoClass *klass;
+ 	gchar *full_name;
+ 	gboolean found;
+@@ -323,8 +323,14 @@
+ }
+ #endif /* CREATION_SPEEDUP */
+ 
+-static gboolean
+-field_is_thread_static (MonoClass *fklass, MonoClassField *field)
++/**
++ * field_is_special_static:
++ *
++ * Returns 1 if the field is thread static, 2 if it is context static,
++ * 0 otherwise.
++ */
++static gint
++field_is_special_static (MonoClass *fklass, MonoClassField *field)
+ {
+ 	MonoCustomAttrInfo *ainfo;
+ 	int i;
+@@ -333,13 +339,19 @@
+ 		return FALSE;
+ 	for (i = 0; i < ainfo->num_attrs; ++i) {
+ 		MonoClass *klass = ainfo->attrs [i].ctor->klass;
+-		if (strcmp (klass->name, "ThreadStaticAttribute") == 0 && klass->image == mono_defaults.corlib) {
+-			mono_custom_attrs_free (ainfo);
+-			return TRUE;
++		if (klass->image == mono_defaults.corlib) {
++			if (strcmp (klass->name, "ThreadStaticAttribute") == 0) {
++				mono_custom_attrs_free (ainfo);
++				return 1;
++			}
++			else if (strcmp (klass->name, "ContextStaticAttribute") == 0) {
++				mono_custom_attrs_free (ainfo);
++				return 2;
++			}
+ 		}
+ 	}
+ 	mono_custom_attrs_free (ainfo);
+-	return FALSE;
++	return 0;
+ }
+ 
+ /**
+@@ -423,13 +435,21 @@
+ 		if (!(field->type->attrs & FIELD_ATTRIBUTE_STATIC))
+ 			continue;
+ 		if (!(field->type->attrs & FIELD_ATTRIBUTE_LITERAL)) {
+-			if (field_is_thread_static (class, field)) {
++			gint32 special_field = field_is_special_static (class, field);
++			if (special_field) {
+ 				guint32 size, align, offset;
+ 				size = mono_type_size (field->type, &align);
+-				offset = mono_threads_alloc_static_data (size, align);
+-				if (!domain->thread_static_fields)
+-					domain->thread_static_fields = g_hash_table_new (NULL, NULL);
+-				g_hash_table_insert (domain->thread_static_fields, field, GUINT_TO_POINTER (offset));
++				if (special_field==1) {
++					offset = mono_threads_alloc_static_data (size, align);
++					if (!domain->thread_static_fields)
++						domain->thread_static_fields = g_hash_table_new (NULL, NULL);
++					g_hash_table_insert (domain->thread_static_fields, field, GUINT_TO_POINTER (offset));
++				} else {
++					offset = mono_contexts_alloc_static_data (size, align);
++					if (!domain->context_static_fields)
++						domain->context_static_fields = g_hash_table_new (NULL, NULL);
++					g_hash_table_insert (domain->context_static_fields, field, GUINT_TO_POINTER (offset));
++				}
+ 				continue;
+ 			}
+ 		}
+Index: metadata/threads.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/threads.c,v
+retrieving revision 1.77
+diff -u -r1.77 threads.c
+--- metadata/threads.c	12 Nov 2003 17:22:22 -0000	1.77
++++ metadata/threads.c	20 Nov 2003 15:37:31 -0000
+@@ -42,6 +42,11 @@
+ 	gfloat fval;
+ } IntFloatUnion;
+  
++typedef struct {
++	int idx;
++	int offset;
++} StaticDataInfo;
++
+ /*
+  * The "os_handle" field of the WaitHandle class.
+  */
+@@ -50,6 +55,13 @@
+ /* Controls access to the 'threads' hash table */
+ static CRITICAL_SECTION threads_mutex;
+ 
++/* Controls access to context static data */
++static CRITICAL_SECTION contexts_mutex;
++
++/* Holds current status of static data heap */
++static StaticDataInfo thread_static_info;
++static StaticDataInfo context_static_info;
++
+ /* The hash of existing threads (key is thread ID) that need joining
+  * before exit
+  */
+@@ -77,6 +89,8 @@
+ static guint32 default_stacksize = 0;
+ 
+ static void thread_adjust_static_data (MonoThread *thread);
++static void mono_init_static_data_info (StaticDataInfo *static_data);
++static guint32 mono_alloc_static_data_slot (StaticDataInfo *static_data, guint32 size, guint32 align);
+ 
+ /* Spin lock for InterlockedXXX 64 bit functions */
+ static CRITICAL_SECTION interlocked_mutex;
+@@ -995,7 +1009,11 @@
+ {
+ 	InitializeCriticalSection(&threads_mutex);
+ 	InitializeCriticalSection(&interlocked_mutex);
++	InitializeCriticalSection(&contexts_mutex);
+ 	
++	mono_init_static_data_info (&thread_static_info);
++	mono_init_static_data_info (&context_static_info);
++
+ 	current_object_key=TlsAlloc();
+ #ifdef THREAD_DEBUG
+ 	g_message (G_GNUC_PRETTY_FUNCTION ": Allocated current_object_key %d",
+@@ -1309,37 +1327,94 @@
+ 	return NULL;
+ }
+ 
+-static int static_data_idx = 0;
+-static int static_data_offset = 0;
+ #define NUM_STATIC_DATA_IDX 8
+ static const int static_data_size [NUM_STATIC_DATA_IDX] = {
+ 	1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216
+ };
+ 
++
++/*
++ *  mono_alloc_static_data
++ *
++ *   Allocate memory blocks for storing threads or context static data
++ */
+ static void 
+-thread_alloc_static_data (MonoThread *thread, guint32 offset)
++mono_alloc_static_data (gpointer **static_data_ptr, guint32 offset)
+ {
+ 	guint idx = (offset >> 24) - 1;
+ 	int i;
+ 
+-	if (!thread->static_data) {
++	gpointer* static_data = *static_data_ptr;
++	if (!static_data) {
+ #if HAVE_BOEHM_GC
+-		thread->static_data = GC_MALLOC (static_data_size [0]);
++		static_data = GC_MALLOC (static_data_size [0]);
+ #else
+-		thread->static_data = g_malloc0 (static_data_size [0]);
++		static_data = g_malloc0 (static_data_size [0]);
+ #endif
+-		thread->static_data [0] = thread->static_data;
++		*static_data_ptr = static_data;
++		static_data [0] = static_data;
+ 	}
++	
+ 	for (i = 1; i < idx; ++i) {
+-		if (thread->static_data [i])
++		if (static_data [i])
+ 			continue;
+ #if HAVE_BOEHM_GC
+-		thread->static_data [i] = GC_MALLOC (static_data_size [i]);
++		static_data [i] = GC_MALLOC (static_data_size [i]);
+ #else
+-		thread->static_data [i] = g_malloc0 (static_data_size [i]);
++		static_data [i] = g_malloc0 (static_data_size [i]);
+ #endif
+ 	}
+-	
++}
++
++/*
++ *  mono_init_static_data_info
++ *
++ *   Initializes static data counters
++ */
++static void mono_init_static_data_info (StaticDataInfo *static_data)
++{
++	static_data->idx = 0;
++	static_data->offset = 0;
++}
++
++/*
++ *  mono_alloc_static_data_slot
++ *
++ *   Generates an offset for static data. static_data contains the counters
++ *  used to generate it.
++ */
++static guint32
++mono_alloc_static_data_slot (StaticDataInfo *static_data, guint32 size, guint32 align)
++{
++	guint32 offset;
++
++	if (!static_data->idx && !static_data->offset) {
++		/* 
++		 * we use the first chunk of the first allocation also as
++		 * an array for the rest of the data 
++		 */
++		static_data->offset = sizeof (gpointer) * NUM_STATIC_DATA_IDX;
++	}
++	static_data->offset += align - 1;
++	static_data->offset &= ~(align - 1);
++	if (static_data->offset + size >= static_data_size [static_data->idx]) {
++		static_data->idx ++;
++		g_assert (size <= static_data_size [static_data->idx]);
++		/* 
++		 * massive unloading and reloading of domains with thread-static
++		 * data may eventually exceed the allocated storage...
++		 * Need to check what the MS runtime does in that case.
++		 * Note that for each appdomain, we need to allocate a separate
++		 * thread data slot for security reasons. We could keep track
++		 * of the slots per-domain and when the domain is unloaded
++		 * out the slots on a sort of free list.
++		 */
++		g_assert (static_data->idx < NUM_STATIC_DATA_IDX);
++		static_data->offset = 0;
++	}
++	offset = static_data->offset | ((static_data->idx + 1) << 24);
++	static_data->offset += size;
++	return offset;
+ }
+ 
+ /* 
+@@ -1352,10 +1427,10 @@
+ 	guint32 offset;
+ 
+ 	EnterCriticalSection (&threads_mutex);
+-	if (static_data_offset || static_data_idx > 0) {
++	if (thread_static_info.offset || thread_static_info.idx > 0) {
+ 		/* get the current allocated size */
+-		offset = static_data_offset | ((static_data_idx + 1) << 24);
+-		thread_alloc_static_data (thread, offset);
++		offset = thread_static_info.offset | ((thread_static_info.idx + 1) << 24);
++		mono_alloc_static_data (&(thread->static_data), offset);
+ 	}
+ 	LeaveCriticalSection (&threads_mutex);
+ }
+@@ -1366,7 +1441,7 @@
+ 	MonoThread *thread = value;
+ 	guint32 offset = GPOINTER_TO_UINT (user);
+ 	
+-	thread_alloc_static_data (thread, offset);
++	mono_alloc_static_data (&(thread->static_data), offset);
+ }
+ 
+ /*
+@@ -1379,38 +1454,9 @@
+ mono_threads_alloc_static_data (guint32 size, guint32 align)
+ {
+ 	guint32 offset;
+-	
+ 	EnterCriticalSection (&threads_mutex);
+-
+-	if (!static_data_idx && !static_data_offset) {
+-		/* 
+-		 * we use the first chunk of the first allocation also as
+-		 * an array for the rest of the data 
+-		 */
+-		static_data_offset = sizeof (gpointer) * NUM_STATIC_DATA_IDX;
+-	}
+-	static_data_offset += align - 1;
+-	static_data_offset &= ~(align - 1);
+-	if (static_data_offset + size >= static_data_size [static_data_idx]) {
+-		static_data_idx ++;
+-		g_assert (size <= static_data_size [static_data_idx]);
+-		/* 
+-		 * massive unloading and reloading of domains with thread-static
+-		 * data may eventually exceed the allocated storage...
+-		 * Need to check what the MS runtime does in that case.
+-		 * Note that for each appdomain, we need to allocate a separate
+-		 * thread data slot for security reasons. We could keep track
+-		 * of the slots per-domain and when the domain is unloaded
+-		 * out the slots on a sort of free list.
+-		 */
+-		g_assert (static_data_idx < NUM_STATIC_DATA_IDX);
+-		static_data_offset = 0;
+-	}
+-	offset = static_data_offset | ((static_data_idx + 1) << 24);
+-	static_data_offset += size;
+-	
++	offset = mono_alloc_static_data_slot (&thread_static_info, size, align);
+ 	mono_g_hash_table_foreach (threads, alloc_thread_static_data_helper, GUINT_TO_POINTER (offset));
+-
+ 	LeaveCriticalSection (&threads_mutex);
+ 	return offset;
+ }
+@@ -1423,6 +1469,35 @@
+ 	
+ 	return ((char*) thread->static_data [idx - 1]) + (offset & 0xffffff);
+ }
++
++guint32
++mono_contexts_alloc_static_data (guint32 size, guint32 align)
++{
++	guint32 offset;
++	EnterCriticalSection (&contexts_mutex);
++	offset = mono_alloc_static_data_slot (&context_static_info, size, align);
++	LeaveCriticalSection (&contexts_mutex);
++	return offset;
++}
++
++gpointer
++mono_contexts_get_static_data (guint32 offset)
++{
++	MonoAppContext *context = mono_context_get ();
++	int idx = (offset >> 24)-1;
++
++	// Allocate static data block under demand, since we don't have a list
++	// of contexts
++
++	if (!context->static_data || !context->static_data [idx]) {
++		EnterCriticalSection (&contexts_mutex);
++		mono_alloc_static_data (&(context->static_data), offset);
++		LeaveCriticalSection (&contexts_mutex);
++	}
++
++	return ((char*) context->static_data [idx]) + (offset & 0xffffff);
++}
++
+ 
+ static void gc_stop_world (gpointer key, gpointer value, gpointer user)
+ {
+Index: metadata/threads.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/threads.h,v
+retrieving revision 1.40
+diff -u -r1.40 threads.h
+--- metadata/threads.h	12 Nov 2003 17:22:22 -0000	1.40
++++ metadata/threads.h	20 Nov 2003 15:37:31 -0000
+@@ -67,6 +67,8 @@
+ extern guint32 mono_threads_get_default_stacksize (void);
+ guint32  mono_threads_alloc_static_data (guint32 size, guint32 align);
+ gpointer mono_threads_get_static_data   (guint32 offset);
++guint32  mono_contexts_alloc_static_data (guint32 size, guint32 align);
++gpointer mono_contexts_get_static_data   (guint32 offset);
+ 
+ void mono_gc_stop_world (void);
+ 
+Index: mini/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/ChangeLog,v
+retrieving revision 1.246
+diff -u -r1.246 ChangeLog
+--- mini/ChangeLog	18 Nov 2003 17:14:12 -0000	1.246
++++ mini/ChangeLog	20 Nov 2003 15:37:34 -0000
+@@ -1,3 +1,7 @@
++2003-11-20  Lluis Sanchez Gual <lluis@ximian.com>
++
++	* jit-icalls.c, mini.c: Added support for context static fields.
++
+ 2003-11-18  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* mini.c (mono_method_blittable): Methods which set LastError are not 
+Index: mini/jit-icalls.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/jit-icalls.c,v
+retrieving revision 1.11
+diff -u -r1.11 jit-icalls.c
+--- mini/jit-icalls.c	8 Sep 2003 20:09:44 -0000	1.11
++++ mini/jit-icalls.c	20 Nov 2003 15:37:34 -0000
+@@ -363,10 +363,12 @@
+ 
+ 	//printf ("SFLDA1 %p\n", (char*)vtable->data + field->offset);
+ 
+-	if (!domain->thread_static_fields || !(addr = g_hash_table_lookup (domain->thread_static_fields, field)))
+-		addr = (char*)vtable->data + field->offset;
+-	else
++	if (domain->thread_static_fields && (addr = g_hash_table_lookup (domain->thread_static_fields, field)))
+ 		addr = mono_threads_get_static_data (GPOINTER_TO_UINT (addr));
++	else if (domain->context_static_fields && (addr = g_hash_table_lookup (domain->context_static_fields, field)))
++		addr = mono_contexts_get_static_data (GPOINTER_TO_UINT (addr));
++	else
++		addr = (char*)vtable->data + field->offset;
+ 	
+ 	return addr;
+ }
+Index: mini/mini.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/mini.c,v
+retrieving revision 1.139
+diff -u -r1.139 mini.c
+--- mini/mini.c	18 Nov 2003 17:14:12 -0000	1.139
++++ mini/mini.c	20 Nov 2003 15:37:36 -0000
+@@ -4119,6 +4119,7 @@
+ 		case CEE_STSFLD: {
+ 			MonoClassField *field;
+ 			gpointer addr = NULL;
++			gboolean ctx_static = FALSE;
+ 
+ 			token = read32 (ip + 1);
+ 
+@@ -4131,8 +4132,14 @@
+ 
+ 			handle_loaded_temps (cfg, bblock, stack_start, sp);
+ 
+-			if (cfg->domain->thread_static_fields)
++			if (cfg->domain->thread_static_fields) {
+ 				addr = g_hash_table_lookup (cfg->domain->thread_static_fields, field);
++				ctx_static = FALSE;
++			}
++			if (!addr && cfg->domain->context_static_fields) {
++				addr = g_hash_table_lookup (cfg->domain->context_static_fields, field);
++				ctx_static = TRUE;
++			}
+ 
+ 			if ((cfg->opt & MONO_OPT_SHARED) || (mono_compile_aot && addr)) {
+ 				int temp;
+@@ -4172,7 +4179,10 @@
+ 					int temp;
+ 					MonoInst *iargs [1];
+ 					NEW_ICONST (cfg, iargs [0], GPOINTER_TO_UINT (addr));
+-					temp = mono_emit_jit_icall (cfg, bblock, mono_threads_get_static_data, iargs, ip);
++					if (ctx_static)
++						temp = mono_emit_jit_icall (cfg, bblock, mono_contexts_get_static_data, iargs, ip);
++					else
++						temp = mono_emit_jit_icall (cfg, bblock, mono_threads_get_static_data, iargs, ip);
+ 					NEW_TEMPLOAD (cfg, ins, temp);
+ 				}
+ 			}
+@@ -7735,6 +7745,7 @@
+ 				 helper_sig_ptr_ptr_ptr, FALSE);
+ 	mono_register_jit_icall (mono_ldtoken_wrapper, "mono_ldtoken_wrapper", helper_sig_ptr_ptr_ptr, FALSE);
+ 	mono_register_jit_icall (mono_threads_get_static_data, "mono_threads_get_static_data", helper_sig_ptr_int, FALSE);
++	mono_register_jit_icall (mono_contexts_get_static_data, "mono_contexts_get_static_data", helper_sig_ptr_int, FALSE);
+ 	mono_register_jit_icall (mono_ldstr, "mono_ldstr", helper_sig_ldstr, FALSE);
+ 	mono_register_jit_icall (helper_memcpy, "helper_memcpy", helper_sig_memcpy, FALSE);
+ 	mono_register_jit_icall (helper_memset, "helper_memset", helper_sig_memset, FALSE);

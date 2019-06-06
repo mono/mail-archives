@@ -1,0 +1,259 @@
+Index: mcs/class/corlib/System/String.cs
+===================================================================
+--- mcs/class/corlib/System/String.cs	(revision 87020)
++++ mcs/class/corlib/System/String.cs	(working copy)
+@@ -216,12 +216,11 @@
+ 			if (count == 1) 
+ 				return new String[1] { ToString() };
+ 
+-			return InternalSplit (separator, count);
++			return InternalSplit (separator, count, 0);
+ 		}
+ 
+ #if NET_2_0
+ 		[ComVisible (false)]
+-		[MonoDocumentationNote ("optimization")]
+ 		public String[] Split (char[] separator, int count, StringSplitOptions options)
+ 		{
+ 			if (separator == null || separator.Length == 0)
+@@ -232,28 +231,9 @@
+ 			if ((options != StringSplitOptions.None) && (options != StringSplitOptions.RemoveEmptyEntries))
+ 				throw new ArgumentException ("options must be one of the values in the StringSplitOptions enumeration", "options");
+ 
+-			bool removeEmpty = (options & StringSplitOptions.RemoveEmptyEntries) == StringSplitOptions.RemoveEmptyEntries;
++			if (count==0) return new String[0];
+ 
+-			if (!removeEmpty)
+-				return Split (separator, count);
+-			else {
+-				/* FIXME: Optimize this */
+-				String[] res = Split (separator, count);
+-				int n = 0;
+-				for (int i = 0; i < res.Length; ++i)
+-					if (res [i] == String.Empty)
+-						n ++;
+-				if (n > 0) {
+-					String[] arr = new String [res.Length - n];
+-					int pos = 0;
+-					for (int i = 0; i < res.Length; ++i)
+-						if (res [i] != String.Empty)
+-							arr [pos ++] = res [i];
+-					return arr;
+-				}
+-				else
+-					return res;
+-			}
++			return InternalSplit (separator, count, (int) (options & StringSplitOptions.RemoveEmptyEntries) );
+ 		}
+ 
+ 		[ComVisible (false)]
+@@ -2461,7 +2441,7 @@
+ 		private extern void InternalCopyTo (int sIndex, char[] dest, int destIndex, int count);
+ 
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+-		private extern String[] InternalSplit (char[] separator, int count);
++		private extern String[] InternalSplit (char[] separator, int count, int options);
+ 
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+ 		private extern String InternalTrim (char[] chars, int typ);
+Index: mono/mono/metadata/string-icalls.c
+===================================================================
+--- mono/mono/metadata/string-icalls.c	(revision 87020)
++++ mono/mono/metadata/string-icalls.c	(working copy)
+@@ -98,7 +98,7 @@
+ }
+ 
+ MonoArray * 
+-ves_icall_System_String_InternalSplit (MonoString *me, MonoArray *separator, gint32 count)
++ves_icall_System_String_InternalSplit (MonoString *me, MonoArray *separator, gint32 count, gint32 options)
+ {
+ 	MonoString * tmpstr;
+ 	MonoArray * retarr;
+@@ -106,65 +106,141 @@
+ 	gint32 arrsize, srcsize, splitsize;
+ 	gint32 i, lastpos, arrpos;
+ 	gint32 tmpstrsize;
++	gint32 remempty;
++	gint32 flag;
+ 	gunichar2 *tmpstrptr;
+ 
+ 	gunichar2 cmpchar;
+ 
+ 	MONO_ARCH_SAVE_REGS;
+ 
++	remempty = options & 0x01;
+ 	src = mono_string_chars(me);
+ 	srcsize = mono_string_length(me);
+ 	arrsize = mono_array_length(separator);
+ 
+-	cmpchar = mono_array_get(separator, gunichar2, 0);
+-
+-	splitsize = 0;
+-	for (i = 0; i != srcsize && splitsize < count; i++) {
+-		if (string_icall_is_in_array(separator, arrsize, src[i]))
+-			splitsize++;
++	splitsize = 1;
++	/* Count the number of elements we will return. Note that this operation
++	 * guarantees that we will return exactly splitsize elements, and we will
++	 * have enough data to fill each. This allows us to skip some checks later on.
++	 */
++	if (remempty == 0) {
++		for (i = 0; i != srcsize && splitsize < count; i++) {
++			if (string_icall_is_in_array(separator, arrsize, src[i])) {
++				splitsize++;
++			}
++		}
+ 	}
++	else {
++		/* Require pattern "Nondelim + Delim + Nondelim" to increment counter.
++		 * Lastpos != 0 means first nondelim found.
++		 * Flag = 0 means last char was delim.
++		 * Efficient, though perhaps confusing.
++		 */
++		lastpos = 0;
++		flag = 0;
++		for (i = 0; i != srcsize && splitsize < count; i++) {
++			if (string_icall_is_in_array(separator, arrsize, src[i])) {
++				flag = 0;
++			}
++			else if (flag == 0) {
++				if (lastpos == 1)
++				{
++					splitsize++;
++				}
++				flag = 1;
++				lastpos = 1;
++			}
++		}
++	}
+ 
+-	lastpos = 0;
+-	arrpos = 0;
+-
+ 	/* if no split chars found return the string */
+-	if (splitsize == 0) {
+-		retarr = mono_array_new(mono_domain_get(), mono_get_string_class (), 1);
+-		mono_array_setref (retarr, 0, me);
++	if (splitsize == 1) {
++		if (remempty == 0 || count == 1)
++		{
++			/* Copy the whole string */
++			retarr = mono_array_new(mono_domain_get(), mono_get_string_class (), 1);
++			mono_array_setref (retarr, 0, me);
++		}
++		else 
++		{
++			/* otherwise we have to filter out leading & trailing delims */
+ 
++			/* find first non-delim char */
++			for ( ; srcsize != 0; srcsize--, src++)
++				if (!string_icall_is_in_array(separator, arrsize, src[0]))
++					break;
++
++			/* find last non-delim char */
++			for ( ; srcsize != 0; srcsize--)
++				if (!string_icall_is_in_array(separator, arrsize, src[srcsize - 1]))
++					break;
++				
++			tmpstr = mono_string_new_size( mono_domain_get (), srcsize);
++			tmpstrptr = mono_string_chars(tmpstr);
++
++			memcpy(tmpstrptr, src, srcsize * sizeof(gunichar2));
++			retarr = mono_array_new(mono_domain_get(), mono_get_string_class (), 1);
++			mono_array_setref (retarr, 0, tmpstr);
++		}
+ 		return retarr;
+ 	}
+ 
+-	if (splitsize != count)
+-		splitsize++;
++	lastpos = 0;
++	arrpos = 0;
++	
++	retarr = mono_array_new(mono_domain_get(), mono_get_string_class (), splitsize);
+ 
+-	retarr = mono_array_new(mono_domain_get(), mono_get_string_class (), splitsize);
+-	for (i = 0; i != srcsize && arrpos != count; i++) {
++	for (i = 0; i != srcsize && arrpos != splitsize; i++) {
+ 		if (string_icall_is_in_array(separator, arrsize, src[i])) {
+-			if (arrpos == count - 1)
+-				tmpstrsize = srcsize - lastpos;
+-			else
++			
++			if (lastpos != i || remempty == 0)
++			{
+ 				tmpstrsize = i - lastpos;
+ 
+-			tmpstr = mono_string_new_size( mono_domain_get (), tmpstrsize);
+-			tmpstrptr = mono_string_chars(tmpstr);
++				tmpstr = mono_string_new_size( mono_domain_get (), tmpstrsize);
++				tmpstrptr = mono_string_chars(tmpstr);
+ 
+-			memcpy(tmpstrptr, src + lastpos, tmpstrsize * sizeof(gunichar2));
+-			mono_array_setref (retarr, arrpos, tmpstr);
+-			arrpos++;
++				memcpy(tmpstrptr, src + lastpos, tmpstrsize * sizeof(gunichar2));
++				mono_array_setref (retarr, arrpos, tmpstr);
++				arrpos++;
++
++				if (arrpos == splitsize - 1)
++				{
++					/* Shortcut the last array element */
++
++					lastpos = i + 1;
++					if (remempty != 0)
++					{
++						/* Search for non-delim starting char (guaranteed to find one) */
++						for ( ; ; lastpos++)
++							if (!string_icall_is_in_array(separator, arrsize, src[lastpos])) 
++								break;
++						if (count > splitsize)
++						{
++						/* Since we have fewer results than our limit, we must remove
++						 * trailing delimiters as well. */
++							for ( ; srcsize != lastpos + 1 ; srcsize--)
++								if (!string_icall_is_in_array(separator, arrsize, src[srcsize - 1])) 
++									break;
++						}
++					}
++
++					tmpstrsize = srcsize - lastpos;
++					tmpstr = mono_string_new_size( mono_domain_get (), tmpstrsize);
++					tmpstrptr = mono_string_chars(tmpstr);
++
++					memcpy(tmpstrptr, src + lastpos, tmpstrsize * sizeof(gunichar2));
++					mono_array_setref (retarr, arrpos, tmpstr);
++
++					/* Loop will ALWAYS end here. Test criteria in the FOR loop is unnecessary. */
++					break;
++				}
++			}
+ 			lastpos = i + 1;
+ 		}
+ 	}
+ 
+-	if (arrpos < count) {
+-		tmpstrsize = srcsize - lastpos;
+-		tmpstr = mono_string_new_size( mono_domain_get (), tmpstrsize);
+-		tmpstrptr = mono_string_chars(tmpstr);
+-
+-		memcpy(tmpstrptr, src + lastpos, tmpstrsize * sizeof(gunichar2));
+-		mono_array_setref (retarr, arrpos, tmpstr);
+-	}
+-
+ 	return retarr;
+ }
+ 
+Index: mono/mono/metadata/string-icalls.h
+===================================================================
+--- mono/mono/metadata/string-icalls.h	(revision 87020)
++++ mono/mono/metadata/string-icalls.h	(working copy)
+@@ -24,7 +24,7 @@
+ ves_icall_System_String_InternalCopyTo (MonoString *me, gint32 sindex, MonoArray *dest, gint32 dindex, gint32 count) MONO_INTERNAL;
+ 
+ MonoArray * 
+-ves_icall_System_String_InternalSplit (MonoString *me, MonoArray *separator, gint32 count) MONO_INTERNAL;
++ves_icall_System_String_InternalSplit (MonoString *me, MonoArray *separator, gint32 count, gint32 options) MONO_INTERNAL;
+ 
+ MonoString * 
+ ves_icall_System_String_InternalTrim (MonoString *me, MonoArray *chars, gint32 typ) MONO_INTERNAL;

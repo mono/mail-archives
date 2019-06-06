@@ -1,0 +1,163 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Dictionary`2: optimized and	serialization-compatible	with MS.net
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Dictionary%602%3A%20optimized%20and%09serialization-compatible%0A%09with%20MS.net&In-Reply-To=1181594806.3231.92.camel%40leonardo.hotfeet.ch">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="023884.html">
+   <LINK REL="Next"  HREF="023824.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Dictionary`2: optimized and	serialization-compatible	with MS.net</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Dictionary%602%3A%20optimized%20and%09serialization-compatible%0A%09with%20MS.net&In-Reply-To=1181594806.3231.92.camel%40leonardo.hotfeet.ch"
+       TITLE="[Mono-dev] Dictionary`2: optimized and	serialization-compatible	with MS.net">lupus at ximian.com
+       </A><BR>
+    <I>Wed Jun 20 12:10:01 EDT 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="023884.html">[Mono-dev] Dictionary`2: optimized	and	serialization-compatible	with MS.net
+</A></li>
+        <LI>Next message: <A HREF="023824.html">[Mono-dev] Patch for SqlCommand
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23941">[ date ]</a>
+              <a href="thread.html#23941">[ thread ]</a>
+              <a href="subject.html#23941">[ subject ]</a>
+              <a href="author.html#23941">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 06/11/07 Juraj Skripsky wrote:
+&gt;<i> I've cleaned and packaged my different versions of Dictionary along with
+</I>&gt;<i> my test cases. Just extract the attached archive into an empty directory
+</I>&gt;<i> and run &quot;make&quot;. The test cases are in &quot;DictBench.cs&quot;.
+</I>
+Thanks for the code and the tests.
+Could you prepare Dictionary_Split_Hash.cs for commit, ensure there are
+no regressions in the test suite and commit it to svn?
+
+I think we eventually want to use the nohash variant, but first a few
+optimizations must be done in the JIT (see below). The hash-variant is
+currently a good compromise until the optimization issues are sorted
+out.
+
+&gt;<i> On Mon, 2007-06-11 at 19:34 +0200, Paolo Molaro wrote:
+</I>&gt;<i> &gt; As you pointed out, the Equals() methods will return at the first
+</I>&gt;<i> &gt; difference, so if we see lots of Equals calls it is again an indication
+</I>&gt;<i> &gt; of a poor hash function. I suspect some of the overhead is because of
+</I>&gt;<i> &gt; the way hashtable and dictionary eventually call Equals...
+</I>
+Having done a profile run this is indeed most of the slowdown, combined
+with a pattern in the test case that greatly favours checking the
+hashcode before calling hcp.Equals ().
+For JIT hackers the method to look for is
+System.Collections.Generic.IEquatableOfTEqualityComparer`1:Equals (int,int)
+there are several issue like:
+*) an unreachable basic block is not eliminated
+*) a residual null check from a callvirt call to int.Equals() is
+present even if we're dealing with a valuetype that can't be null
+*) excessive anding of 0xff
+
+When these issues are resolved the function should end up being prolog,
+3 instructions and epilog in place of the current kind-of-monster.
+
+Once that is done we can experiment with a change which should be able
+to get us the same performance of the current hash variant, but without
+the memory overhead. Consider that with Dictionary&lt;int,int&gt;
+the little loops over the hash chains do the following:
+
+	while (cur != NO_SLOT) {
+		if (linkSlots [cur].HashCode == hashCode &amp;&amp; hcp.Equals (keySlots [cur], key))
+			return valueSlots [cur];
+		cur = linkSlots [cur].Next;
+	}
+
+and the hashcode-less variant is:
+
+	while (cur != NO_SLOT) {
+		if (hcp.Equals (keySlots [cur], key))
+			return valueSlots [cur];
+		cur = linkSlots [cur].Next;
+	}
+
+if we always create a hcp object we'll need to always perform a virtual
+call (and we'll have the overhead of one more object allocated per
+hashtable in most cases). If hcp is the default comparer, the above
+could be written as:
+
+	while (cur != NO_SLOT) {
+		if (keySlots [cur].Equals (key))
+			return valueSlots [cur];
+		cur = linkSlots [cur].Next;
+	}
+
+which when inlined is:
+
+	while (cur != NO_SLOT) {
+		if (keySlots [cur] == key)
+			return valueSlots [cur];
+		cur = linkSlots [cur].Next;
+	}
+
+Note the implementation is now cheaper than the hash variant, the only
+addition is a check for a null hcp field, which could be done
+either inside or outside the loop (inside would mean less code
+duplication and the chains are supposed to be short anyway).
+It could look like:
+
+	while (cur != NO_SLOT) {
+		if (hcp != null) {
+			if (hcp.Equals (keySlots [cur], key))
+				return valueSlots [cur];
+		} else if (keySlots [cur].Equals (key)) {
+			return valueSlots [cur];
+		}
+		cur = linkSlots [cur].Next;
+	}
+
+The other possibility is (with the Dictionary code unchanged)
+to inline the default comparer Equals impl (which when optimized
+inlines itself the Tkey.Equals() impl) with a vtable check
+that the hcp object is indeed of the default comparer type
+(useful for valuetypes but going to be ineffective when we implement
+code sharing for generic code: it is also harder to implement than
+manually checking for a null hcp as above).
+
+Anyway, if Juraj or somebody else wants to try the above changes and
+report performance results it would be great.
+
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="023884.html">[Mono-dev] Dictionary`2: optimized	and	serialization-compatible	with MS.net
+</A></li>
+	<LI>Next message: <A HREF="023824.html">[Mono-dev] Patch for SqlCommand
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23941">[ date ]</a>
+              <a href="thread.html#23941">[ thread ]</a>
+              <a href="subject.html#23941">[ subject ]</a>
+              <a href="author.html#23941">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

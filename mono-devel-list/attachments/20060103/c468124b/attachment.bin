@@ -1,0 +1,528 @@
+Index: cs-tokenizer.cs
+===================================================================
+--- cs-tokenizer.cs	(revision 55012)
++++ cs-tokenizer.cs	(working copy)
+@@ -44,6 +44,7 @@
+ 		bool handle_assembly = false;
+ 		bool handle_constraints = false;
+ 		bool handle_typeof = false;
++		bool simple_name_deambiguation = false;
+ 		Location current_location;
+ 		Location current_comment_location = Location.Null;
+ 		ArrayList escapedIdentifiers = new ArrayList ();
+@@ -172,6 +173,29 @@
+ 			}
+ 		}
+ 
++		Stack state = new Stack ();
++
++		//
++		// Sets the new state for the simple-name-deambiguation.
++		//
++		public void PushSND (bool value)
++		{
++			state.Push (simple_name_deambiguation);
++			simple_name_deambiguation = value;
++			if (debug)
++				Console.WriteLine ("PUSH: ambiguation IS: {0}", simple_name_deambiguation);
++		}
++
++		//
++		// Restores the previous state for the simple-name-deambiguation.
++		//
++		public void PopSND ()
++		{
++			simple_name_deambiguation = (bool) state.Pop ();
++			if (debug)
++				Console.WriteLine ("POP: ambiguation is: {0}", simple_name_deambiguation);
++		}
++		
+ 		public XmlCommentState doc_state {
+ 			get { return xmlDocState; }
+ 			set {
+@@ -255,6 +279,59 @@
+ 			}
+ 		}
+ 
++		//
++		// This is used when the tokenizer needs to save
++		// the current position as it needs to do some parsing
++		// on its own to deamiguate a token in behalf of the
++		// parser.
++		//
++		Stack position_stack = new Stack ();
++		class Position {
++			public int position;
++			public int ref_line;
++			public int col;
++			public int putback_char;
++			public int previous_col;
++			public int parsing_generic_less_than;
++			
++			public Position (Tokenizer t)
++			{
++				position = t.reader.Position;
++				ref_line = t.ref_line;
++				col = t.col;
++				putback_char = t.putback_char;
++				previous_col = t.previous_col;
++				parsing_generic_less_than = t.parsing_generic_less_than;
++			}
++		}
++		
++		public void PushPosition ()
++		{
++			position_stack.Push (new Position (this));
++		}
++
++		public void PopPosition (bool restore_glt)
++		{
++			Position p = (Position) position_stack.Pop ();
++
++			reader.Position = p.position;
++			ref_line = p.ref_line;
++			col = p.col;
++			putback_char = p.putback_char;
++			previous_col = p.previous_col;
++
++			if (debug)
++				Console.WriteLine ("{3} PopPopsition with {0} {1}->{2}", restore_glt, parsing_generic_less_than, p.parsing_generic_less_than,Location);
++			if (restore_glt)
++				parsing_generic_less_than = p.parsing_generic_less_than;
++		}
++
++		// Do not reset the position, ignore it.
++		public void DiscardPosition ()
++		{
++			position_stack.Pop ();
++		}
++		
+ 		static void AddKeyword (string kw, int token) {
+ 			keywordStrings.Add (kw, kw);
+ 			if (keywords [kw.Length] == null) {
+@@ -354,6 +431,8 @@
+ 			AddKeyword ("partial", Token.PARTIAL);
+ 		}
+ 
++		static bool debug = false;
++		
+ 		//
+ 		// Class initializer
+ 		// 
+@@ -364,6 +443,9 @@
+ 			styles = NumberStyles.Float;
+ 			
+ 			string_builder = new System.Text.StringBuilder ();
++
++			if (Environment.GetEnvironmentVariable ("D") != null)
++				debug = true;
+ 		}
+ 
+ 		int GetKeyword (char[] id, int id_len)
+@@ -478,7 +560,12 @@
+ 			return false;
+ 		}
+ 
+-		bool parse_less_than ()
++		//
++		// The level indicates the nestedness level.  This is required
++		// to perform the extra check in case that simple_name_deambiguation
++		// is set to true
++		//
++		bool parse_less_than (int level)
+ 		{
+ 		start:
+ 			int the_token = token ();
+@@ -514,14 +601,27 @@
+ 		again:
+ 			the_token = token ();
+ 
+-			if (the_token == Token.OP_GENERICS_GT)
++			if (the_token == Token.OP_GENERICS_GT){
++				//
++				// Check for the 9.2.3 special cases
++				//
++				if (debug)
++					Console.WriteLine ("__GT {0}" + Environment.StackTrace, simple_name_deambiguation);
++				if (level == 0 && simple_name_deambiguation){
++					PushPosition ();
++					bool v = next_token_is_allowed_after_generic_closing ();
++					PopPosition (true);
++					return v;
++				}
+ 				return true;
++			}
++			
+ 			else if ((the_token == Token.COMMA) || (the_token == Token.DOT))
+ 				goto start;
+ 			else if (the_token == Token.INTERR)
+ 				goto again;
+ 			else if (the_token == Token.OP_GENERICS_LT) {
+-				if (!parse_less_than ())
++				if (!parse_less_than (level+1))
+ 					return false;
+ 				goto again;
+ 			} else if (the_token == Token.OPEN_BRACKET) {
+@@ -537,8 +637,52 @@
+ 			return false;
+ 		}
+ 
+-		int parsing_generic_less_than = 0;
++		//
++		// This method is used to deamiguate the meaning of '>'
++		// while parsing a '<'...'>' structure.  It implements the
++		// check specified in 9.2.3 "Grammar Ambiguities" on the C# 3rd
++		// edition
++		//
++		bool next_token_is_allowed_after_generic_closing ()
++		{
++			PushPosition ();
++			int next_token = token ();
++			bool ret;
+ 
++			//Console.WriteLine ("NextToken used for deambiguation is: " + next_token);
++			if (next_token == Token.OPEN_PARENS ||
++			    next_token == Token.CLOSE_PARENS ||
++			    next_token == Token.CLOSE_PARENS_OPEN_PARENS ||
++			    next_token == Token.CLOSE_PARENS_MINUS ||
++			    next_token == Token.CLOSE_PARENS_CAST ||
++			    next_token == Token.CLOSE_PARENS_NO_CAST ||
++			    next_token == Token.CLOSE_PARENS ||
++			    next_token == Token.CLOSE_BRACKET ||
++			    next_token == Token.COLON || next_token == Token.SEMICOLON ||
++			    next_token == Token.COMMA || next_token == Token.DOT ||
++			    next_token == Token.INTERR ||
++			    next_token == Token.OP_NE || next_token == Token.OP_EQ)
++				ret = true;
++			else
++				ret = false;
++
++			//
++			// The following line is a *hack*, it is here to parse:
++			// (Blah<a,b>[]) case.   but it is likely going to show
++			// up as another bug elsewhere.
++			//
++			if (next_token == Token.OPEN_BRACKET)
++				ret = true;
++
++			PopPosition (true);
++
++			if (debug)
++				Console.WriteLine ("DETERMINED: Token {0} allowed state: {1}", CSharpParser.yyname (next_token), ret);
++			return ret;
++		}
++		
++		public int parsing_generic_less_than = 0;
++
+ 		int is_punct (char c, ref bool doread)
+ 		{
+ 			int d;
+@@ -568,16 +712,9 @@
+ 
+ 				--deambiguate_close_parens;
+ 
+-				// Save current position and parse next token.
+-				int old = reader.Position;
+-				int old_ref_line = ref_line;
+-				int old_col = col;
+-
++				PushPosition ();
+ 				int new_token = token ();
+-				reader.Position = old;
+-				ref_line = old_ref_line;
+-				col = old_col;
+-				putback_char = -1;
++				PopPosition (true);
+ 
+ 				if (new_token == Token.OPEN_PARENS)
+ 					return Token.CLOSE_PARENS_OPEN_PARENS;
+@@ -605,22 +742,25 @@
+ 				if (parsing_generic_less_than++ > 0)
+ 					return Token.OP_GENERICS_LT;
+ 
+-				int old = reader.Position;
+ 				if (handle_typeof) {
+ 					int dimension;
++					PushPosition ();
+ 					if (parse_generic_dimension (out dimension)) {
+ 						val = dimension;
++						DiscardPosition ();
+ 						return Token.GENERIC_DIMENSION;
+ 					}
+-					reader.Position = old;
+-					putback_char = -1;
++					PopPosition (true);
+ 				}
+ 
+ 				// Save current position and parse next token.
+-				old = reader.Position;
+-				bool is_generic_lt = parse_less_than ();
+-				reader.Position = old;
+-				putback_char = -1;
++				PushPosition ();
++				if (debug)
++					Console.WriteLine ("Before parse_less_than: {0}", parsing_generic_less_than);
++				bool is_generic_lt = parse_less_than (0);
++				if (debug)
++					Console.WriteLine ("After parse_less_than: {0}", parsing_generic_less_than);
++				PopPosition (false);
+ 
+ 				if (is_generic_lt) {
+ 					parsing_generic_less_than++;
+@@ -1250,10 +1390,10 @@
+ 		{
+ 			int x;
+ 			if (putback_char != -1) {
++				//Console.WriteLine ("Using Putback_char: {0}", (char) putback_char);
+ 				x = putback_char;
+ 				putback_char = -1;
+-			}
+-			else
++			} else
+ 				x = reader.Read ();
+ 			if (x == '\n') {
+ 				line++;
+@@ -1263,6 +1403,7 @@
+ 			}
+ 			else
+ 				col++;
++			//Console.WriteLine ("getChar: {0}", (char) x);
+ 			return x;
+ 		}
+ 
+@@ -1362,12 +1503,25 @@
+ 			}
+ 		}
+ 
++		void r (int token)
++		{
++			if (debug)
++				Console.WriteLine ("{1}TOKEN: {0} {2}/{3}", CSharpParser.yyname (token), level, position_stack.Count, parsing_generic_less_than);
++		}
++		
++		int level = 0;
+ 		public int token ()
+                 {
++			level++;
++			//Console.WriteLine ("Starting read at {0}", reader.Position);
++			
+ 			current_token = xtoken ();
+ 
+-			if (current_token != Token.DEFAULT)
++			if (current_token != Token.DEFAULT){
++				r (current_token);
++				level--;
+ 				return current_token;
++			}
+ 
+ 			int c = consume_whitespace ();
+ 			if (c == -1)
+@@ -1377,6 +1531,10 @@
+ 			else
+ 				putback (c);
+ 
++			if (current_token == Token.FOR)
++				parsing_generic_less_than = 0;
++			r (current_token);
++			level--;
+ 			return current_token;
+                 }
+ 
+@@ -2015,23 +2173,15 @@
+ 
+ 			if (res == Token.PARTIAL) {
+ 				// Save current position and parse next token.
+-				int old = reader.Position;
+-				int old_putback = putback_char;
+-				int old_ref_line = ref_line;
+-				int old_col = col;
++				PushPosition ();
+ 
+-				putback_char = -1;
+-
+ 				int next_token = token ();
+ 				bool ok = (next_token == Token.CLASS) ||
+ 					(next_token == Token.STRUCT) ||
+ 					(next_token == Token.INTERFACE) ||
+ 					(next_token == Token.ENUM); // "partial" is a keyword in 'partial enum', even though it's not valid
+ 
+-				reader.Position = old;
+-				ref_line = old_ref_line;
+-				col = old_col;
+-				putback_char = old_putback;
++				PopPosition (true);
+ 
+ 				if (ok)
+ 					return res;
+Index: cs-parser.jay
+===================================================================
+--- cs-parser.jay	(revision 55012)
++++ cs-parser.jay	(working copy)
+@@ -104,6 +104,13 @@
+ 		bool global_attrs_enabled = true;
+ 		bool has_get, has_set;
+ 
++		//
++		// Used to pass information down to member-name that we are 
++		// parsing namespace_or_type_name and that it should not
++		// activate the grammar deambiguation.
++		//
++		bool in_namespace_or_typename;
++
+ %}
+ 
+ %token EOF
+@@ -2695,15 +2702,31 @@
+ 	;
+ 
+ namespace_or_type_name
+-	: member_name
++	: // 
++	  // inline member_name here
++	  //
++	  IDENTIFIER { 
++		lexer.PushSND (false);
++		oob_stack.Push (in_namespace_or_typename);
++		in_namespace_or_typename = true;
++	  } opt_type_argument_list {
++		lexer.PopSND ();
++		in_namespace_or_typename = (bool) oob_stack.Pop ();
++		LocatedToken lt = (LocatedToken) $1;
++		$$ = new MemberName (lt.Value, (TypeArguments) $3, lt.Location);
++	  }
+ 	| IDENTIFIER DOUBLE_COLON IDENTIFIER {
+ 		LocatedToken lt1 = (LocatedToken) $1;
+ 		LocatedToken lt2 = (LocatedToken) $3;
+ 		$$ = new MemberName (lt1.Value, lt2.Value, lt2.Location);
+ 	  }
+-	| namespace_or_type_name DOT IDENTIFIER opt_type_argument_list {
+-		LocatedToken lt = (LocatedToken) $3;
+-		$$ = new MemberName ((MemberName) $1, lt.Value, (TypeArguments) $4, lt.Location);
++	| namespace_or_type_name DOT {
++		lexer.PushSND (false);
++		//Console.WriteLine ("namespace_or_type_name: Setting deambiguation to {0}", lexer.SimpleNameDeambiguation);
++	  } IDENTIFIER opt_type_argument_list {
++		lexer.PopSND ();
++		LocatedToken lt = (LocatedToken) $4;
++		$$ = new MemberName ((MemberName) $1, lt.Value, (TypeArguments) $5, lt.Location);
+ 	  }
+ 	;
+ 
+@@ -2722,6 +2745,7 @@
+ 		if (RootContext.Version == LanguageVersion.ISO_1)
+ 			Report.FeatureIsNotStandardized (lexer.Location, "generics");
+ 	  }
++
+ 	| GENERIC_DIMENSION
+ 	  {
+ 		$$ = new TypeArguments ((int) $1, lexer.Location);
+@@ -2757,7 +2781,6 @@
+ 	  }
+ 	;
+ 
+-	
+ /* 
+  * Before you think of adding a return_type, notice that we have been
+  * using two rules in the places where it matters (one rule using type
+@@ -2892,7 +2915,51 @@
+ 	  }
+ 	;
+ 
++type_argument_list_or_qualified
++	: opt_type_argument_list
++	| DOUBLE_COLON IDENTIFIER { $$ = $2; }
++	;
++
+ //
++// This is used so we can push the SimpleNameDeambiguation state
++// before we parse a member-base (which might need the extra token
++// reading to deamiguate).
++//
++// To avoid a grammar conflict between a qualified-alias and a 
++// member-name, I merged both rules into this one and call
++// PushSND before.  It does not matter/hurt QualifiedAliasMember
++// and helps our cause
++//
++// This production merges two old productions in primary-expression:
++//  | member_name
++//  | IDENTIFIER DOUBLE_COLON IDENTIFIER
++//
++
++member_name_or_qualified_alias 
++	: IDENTIFIER 
++	  { 
++		lexer.PushSND (in_namespace_or_typename == false); 
++	  } 
++	  type_argument_list_or_qualified
++	  {
++		lexer.PopSND ();
++
++		//
++		// Its a member-name with or without type-arguments
++		//
++		if ($3 == null || $3 is TypeArguments){
++			LocatedToken lt = (LocatedToken) $1;
++			MemberName mn = new MemberName (lt.Value, (TypeArguments) $3, lt.Location);
++			$$ = mn.GetTypeExpression ();
++		} else {
++			LocatedToken lt1 = (LocatedToken) $1;
++			LocatedToken lt2 = (LocatedToken) $3;
++			$$ = new QualifiedAliasMember (lt1.Value, lt2.Value, lt2.Location);
++		}
++	  }
++	;
++
++//
+ // Expressions, section 7.5
+ //
+ primary_expression
+@@ -2900,17 +2967,7 @@
+ 	  {
+ 		// 7.5.1: Literals
+ 	  }
+- 	| member_name
+-	  {
+-		MemberName mn = (MemberName) $1;
+-		$$ = mn.GetTypeExpression ();
+-	  }
+-	| IDENTIFIER DOUBLE_COLON IDENTIFIER
+-	  {
+-		LocatedToken lt1 = (LocatedToken) $1;
+-		LocatedToken lt2 = (LocatedToken) $3;
+-		$$ = new QualifiedAliasMember (lt1.Value, lt2.Value, lt2.Location);
+-	  }
++	| member_name_or_qualified_alias 
+ 	| parenthesized_expression
+ 	| default_value_expression
+ 	| member_access
+@@ -4016,6 +4073,7 @@
+ block
+ 	: OPEN_BRACE 
+ 	  {
++		//lexer.parsing_generic_less_than = 0;
+ 		if (current_block == null){
+ 			current_block = new ToplevelBlock ((ToplevelBlock) top_current_block, current_local_parameters, (Location) $1);
+ 			top_current_block = current_block;
+@@ -4041,7 +4099,7 @@
+ 	;
+ 
+ statement_list
+-	: statement
++	: statement 
+ 	| statement_list statement
+ 	;
+ 
+@@ -4052,10 +4110,13 @@
+ 			current_block.AddStatement ((Statement) $1);
+ 			current_block = (Block) $1;
+ 		}
++		//lexer.parsing_generic_less_than = 0;
++
+ 	  }
+ 	| valid_declaration_statement
+ 	  {
+ 		current_block.AddStatement ((Statement) $1);
++		//lexer.parsing_generic_less_than = 0;
+ 	  }
+ 	| labeled_statement
+ 	;

@@ -1,0 +1,188 @@
+Index: mono/mini/mini.c
+===================================================================
+--- mono/mini/mini.c	(revision 36780)
++++ mono/mini/mini.c	(working copy)
+@@ -7852,6 +7852,7 @@
+ 	jinfo->code_size = cfg->code_len;
+ 	jinfo->used_regs = cfg->used_int_regs;
+ 	jinfo->domain_neutral = (cfg->opt & MONO_OPT_SHARED) != 0;
++	jinfo->cas_inited = FALSE; /* initialization delayed at the first stalk walk using this method */
+ 
+ 	if (header->num_clauses) {
+ 		int i;
+@@ -8440,6 +8441,8 @@
+ 				ves_icall_get_frame_info);
+ 	mono_add_internal_call ("System.Diagnostics.StackTrace::get_trace", 
+ 				ves_icall_get_trace);
++	mono_add_internal_call ("System.Security.SecurityFrame::_GetSecurityFrameInformation",
++				ves_icall_System_Security_SecurityFrame_GetSecurityFrameInformation);
+ 	mono_add_internal_call ("Mono.Runtime::mono_runtime_install_handlers", 
+ 				mono_runtime_install_handlers);
+ 
+Index: mono/mini/mini.h
+===================================================================
+--- mono/mini/mini.h	(revision 36773)
++++ mono/mini/mini.h	(working copy)
+@@ -844,4 +844,7 @@
+ extern void
+ mono_perform_abc_removal (MonoCompile *cfg);
+ 
++/* CAS - stack walk */
++MonoBoolean ves_icall_System_Security_SecurityFrame_GetSecurityFrameInformation (gint32 skip, MonoReflectionMethod **method, gint32 *flags);
++
+ #endif /* __MONO_MINI_H__ */  
+Index: mono/mini/ChangeLog
+===================================================================
+--- mono/mini/ChangeLog	(revision 36773)
++++ mono/mini/ChangeLog	(working copy)
+@@ -1,3 +1,15 @@
++2004-11-29  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* declsec.c|h: Added function to cache the declarative stack modifiers
++	in MonoJitInfo.
++	* mini.c: Initialize jinfo->cas_inited to FALSE when MonoJitInfo is
++	created. Register internal call for System.Security.SecurityFrame::
++	_GetSecurityFrameInformation.
++	* mini.h: Added definition for new icall (in mini-exceptions.c).
++	* mini-exceptions.c: Added internal call GetSecurityFrameInformation
++	to retrieve the methods and declarative security flags for (non-
++	wrappers) methods on the stack.
++
+ 2004-11-27  Ben Maurer  <bmaurer@ximian.com>
+ 
+ 	* inssel.brg (CEE_SWITCH): The AOT stuff Zoltan added is only for
+Index: mono/mini/mini-exceptions.c
+===================================================================
+--- mono/mini/mini-exceptions.c	(revision 36773)
++++ mono/mini/mini-exceptions.c	(working copy)
+@@ -243,6 +243,73 @@
+ 	return TRUE;
+ }
+ 
++MonoBoolean
++ves_icall_System_Security_SecurityFrame_GetSecurityFrameInformation (gint32 skip, MonoReflectionMethod **method, gint32 *flags)
++{
++	MonoDomain *domain = mono_domain_get ();
++	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
++	MonoLMF *lmf = jit_tls->lmf;
++	MonoJitInfo *ji, rji;
++	MonoContext ctx, new_ctx;
++
++	mono_arch_flush_register_windows ();
++
++	MONO_CONTEXT_SET_IP (&ctx, ves_icall_System_Security_SecurityFrame_GetSecurityFrameInformation);
++	MONO_CONTEXT_SET_BP (&ctx, __builtin_frame_address (0));
++
++	skip++;
++
++	do {
++		ji = mono_find_jit_info (domain, jit_tls, &rji, NULL, &ctx, &new_ctx, NULL, &lmf, NULL, NULL);
++
++		ctx = new_ctx;
++		
++		if (!ji || ji == (gpointer)-1 || MONO_CONTEXT_GET_BP (&ctx) >= jit_tls->end_of_stack)
++			return FALSE;
++
++		/* skip all wrappers */
++		if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
++		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
++		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE)
++			continue;
++
++		skip--;
++
++	} while (skip >= 0);
++
++	*method = mono_method_get_object (domain, ji->method, NULL);
++	if (flags) {
++		int f = 0;
++		if (!ji->cas_inited) {
++			if (mono_method_has_declsec (ji->method)) {
++				/* Cache the stack modifiers into the MonoJitInfo structure to speed up future stack walks */
++				mono_declsec_cache_stack_modifiers (ji);
++			}
++			ji->cas_inited = TRUE;
++		}
++
++		if (ji->cas_class_assert)
++			f |= MONO_JITINFO_STACKMOD_ASSERT;
++		if (ji->cas_class_deny)
++			f |= MONO_JITINFO_STACKMOD_DENY;
++		if (ji->cas_class_permitonly)
++			f |= MONO_JITINFO_STACKMOD_PERMITONLY;
++		f <<= 8;
++		if (ji->cas_method_assert)
++			f |= MONO_JITINFO_STACKMOD_ASSERT;
++		if (ji->cas_method_deny)
++			f |= MONO_JITINFO_STACKMOD_DENY;
++		if (ji->cas_method_permitonly)
++			f |= MONO_JITINFO_STACKMOD_PERMITONLY;
++
++		*flags = f;
++	}
++
++	return TRUE;
++}
++
+ static MonoArray *
+ glist_to_array (GList *list) 
+ {
+Index: mono/mini/declsec.c
+===================================================================
+--- mono/mini/declsec.c	(revision 36773)
++++ mono/mini/declsec.c	(working copy)
+@@ -26,3 +26,25 @@
+ 	}
+ 	return FALSE;
+ }
++
++
++/*
++ * Fill actions for the specific index (which may either be an encoded class token or
++ * an encoded method token) from the metadata image.
++ * Returns TRUE if some actions requiring code generation are present, FALSE otherwise.
++ */
++void
++mono_declsec_cache_stack_modifiers (MonoJitInfo *jinfo)
++{
++	/* first find the stack modifiers applied to the method */
++	guint32 flags = mono_declsec_flags_from_method (jinfo->method);
++	jinfo->cas_method_assert = (flags & MONO_DECLSEC_FLAG_ASSERT) != 0;
++	jinfo->cas_method_deny = (flags & MONO_DECLSEC_FLAG_DENY) != 0;
++	jinfo->cas_method_permitonly = (flags & MONO_DECLSEC_FLAG_PERMITONLY) != 0;
++
++	/* then find the stack modifiers applied to the class */
++	flags = mono_declsec_flags_from_class (jinfo->method->klass);
++	jinfo->cas_class_assert = (flags & MONO_DECLSEC_FLAG_ASSERT) != 0;
++	jinfo->cas_class_deny = (flags & MONO_DECLSEC_FLAG_DENY) != 0;
++	jinfo->cas_class_permitonly = (flags & MONO_DECLSEC_FLAG_PERMITONLY) != 0;
++}
+Index: mono/mini/declsec.h
+===================================================================
+--- mono/mini/declsec.h	(revision 36773)
++++ mono/mini/declsec.h	(working copy)
+@@ -13,9 +13,22 @@
+ #include <string.h>
+ 
+ #include "mono/metadata/class-internals.h"
++#include "mono/metadata/domain-internals.h"
+ #include "mono/metadata/object.h"
+ #include "mono/metadata/tabledefs.h"
+ 
++
++/* Definitions */
++
++/* limited flags used in MonoJitInfo for stack modifiers */
++#define MONO_JITINFO_STACKMOD_ASSERT		0x01
++#define MONO_JITINFO_STACKMOD_DENY		0x02
++#define MONO_JITINFO_STACKMOD_PERMITONLY	0x04
++
++
++/* Prototypes */
++
+ MonoBoolean mono_method_has_declsec (MonoMethod *method);
++void mono_declsec_cache_stack_modifiers (MonoJitInfo *jinfo);
+ 
+ #endif /* _MONO_MINI_DECLSEC_H_ */

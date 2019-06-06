@@ -1,0 +1,141 @@
+Index: MembershipProvider.cs
+===================================================================
+--- MembershipProvider.cs	(revision 68230)
++++ MembershipProvider.cs	(working copy)
+@@ -30,6 +30,7 @@
+ 
+ #if NET_2_0
+ using System.Configuration.Provider;
++using System.IO;
+ using System.Web.Configuration;
+ using System.Security.Cryptography;
+ using System.Text;
+@@ -70,14 +71,35 @@
+ 		public abstract MembershipPasswordFormat PasswordFormat { get; }
+ 		public abstract string PasswordStrengthRegularExpression { get; }
+ 		public abstract bool RequiresUniqueEmail { get; }
++
++		SymmetricAlgorithm algorithm;
++		Int64 algorithmIVSize;
+ 		
++		internal protected SymmetricAlgorithm Algorithm
++		{
++			get {
++				if (algorithm == null)
++					algorithm = GetAlg (null);
++				return algorithm;
++			}
++		}
++
++		internal protected Int64 AlgorithmIVSize
++		{
++			get {
++				if (algorithm == null)
++					algorithm = GetAlg (null);
++				return algorithmIVSize;
++			}
++		}
++		
+ 		protected virtual void OnValidatingPassword (ValidatePasswordEventArgs args)
+ 		{
+ 			if (ValidatingPassword != null)
+ 				ValidatingPassword (this, args);
+ 		}
+ 
+-		SymmetricAlgorithm GetAlg (out byte [] decryptionKey)
++		SymmetricAlgorithm GetAlg (byte [] iv)
+ 		{
+ 			MachineKeySection section = (MachineKeySection) WebConfigurationManager.GetSection ("system.web/machineKey");
+ 
+@@ -96,40 +118,56 @@
+ 			else
+ 				throw new ProviderException (String.Format ("Unsupported decryption attribute '{0}' in <machineKey> configuration section", alg_type));
+ 
+-			decryptionKey = section.DecryptionKey192Bits;
++			alg.Key = section.DecryptionKey192Bits;
++			algorithm = alg;
++			algorithmIVSize = alg.IV.Length;
++			if (iv != null)
++				alg.IV = iv;
++			
+ 			return alg;
+ 		}
+ 
+-		internal const int SALT_BYTES = 16;
++		byte [] EncryptDecryptPassword (byte [] data, ICryptoTransform transform)
++		{
++			MemoryStream ms = new MemoryStream ();
++			CryptoStream cs = new CryptoStream (ms, transform, CryptoStreamMode.Write);
++			cs.Write (data, 0, data.Length);
++			cs.FlushFinalBlock ();
++
++			byte [] ret = ms.ToArray ();
++			cs.Close ();
++			return ret;
++		}
++		
+ 		protected virtual byte [] DecryptPassword (byte [] encodedPassword)
+ 		{
+-			byte [] decryptionKey;
+-
+-			using (SymmetricAlgorithm alg = GetAlg (out decryptionKey)) {
+-				alg.Key = decryptionKey;
+-
++			byte [] iv = new byte [AlgorithmIVSize];
++			Array.Copy (encodedPassword, 0, iv, 0, algorithmIVSize);
++			byte [] password = new byte [encodedPassword.Length - algorithmIVSize];
++			Array.Copy (encodedPassword, algorithmIVSize, password, 0, encodedPassword.Length - algorithmIVSize);
++			
++			using (SymmetricAlgorithm alg = GetAlg (iv)) {
+ 				using (ICryptoTransform decryptor = alg.CreateDecryptor ()) {
+-
+-					byte [] buf = decryptor.TransformFinalBlock (encodedPassword, 0, encodedPassword.Length);
+-					byte [] rv = new byte [buf.Length - SALT_BYTES];
+-
+-					Array.Copy (buf, 16, rv, 0, buf.Length - 16);
+-					return rv;
++					byte [] buf = EncryptDecryptPassword (password, decryptor);
++					return buf;
+ 				}
+ 			}
+ 		}
+ 
+ 		protected virtual byte[] EncryptPassword (byte[] password)
+ 		{
+-			byte [] decryptionKey;
+-			byte [] iv = new byte [SALT_BYTES];
+-
+-			Array.Copy (password, 0, iv, 0, SALT_BYTES);
+-			Array.Clear (password, 0, SALT_BYTES);
+-
+-			using (SymmetricAlgorithm alg = GetAlg (out decryptionKey)) {
+-				using (ICryptoTransform encryptor = alg.CreateEncryptor (decryptionKey, iv)) {
+-					return encryptor.TransformFinalBlock (password, 0, password.Length);
++			byte [] iv = new byte [AlgorithmIVSize];
++			Array.Copy (password, 0, iv, 0, algorithmIVSize);
++			byte [] passwd = new byte [password.Length - algorithmIVSize];
++			Array.Copy (password, algorithmIVSize, passwd, 0, password.Length - algorithmIVSize);
++			
++			using (SymmetricAlgorithm alg = GetAlg (iv)) {
++				using (ICryptoTransform encryptor = alg.CreateEncryptor ()) {
++					byte [] buf = EncryptDecryptPassword (passwd, encryptor);
++					byte [] ret = new byte [algorithmIVSize + buf.Length];
++					Array.Copy (alg.IV, 0, ret, 0, algorithmIVSize);
++					Array.Copy (buf, 0, ret, algorithmIVSize, buf.Length);
++					return ret;
+ 				}
+ 			}
+ 		}
+Index: SqlMembershipProvider.cs
+===================================================================
+--- SqlMembershipProvider.cs	(revision 68230)
++++ SqlMembershipProvider.cs	(working copy)
+@@ -242,7 +242,7 @@
+ 			string passwordSalt = "";
+ 
+ 			RandomNumberGenerator rng = RandomNumberGenerator.Create ();
+-			byte [] salt = new byte [SALT_BYTES];
++			byte [] salt = new byte [base.AlgorithmIVSize];
+ 			rng.GetBytes (salt);
+ 			passwordSalt = Convert.ToBase64String (salt);
+ 

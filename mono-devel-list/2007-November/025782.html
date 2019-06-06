@@ -1,0 +1,492 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] ToString() performace in Mono
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20ToString%28%29%20performace%20in%20Mono&In-Reply-To=20071123130138.GP1289%40debian.org">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="025773.html">
+   <LINK REL="Next"  HREF="025776.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] ToString() performace in Mono</H1>
+    <B>Andreas Nahr</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20ToString%28%29%20performace%20in%20Mono&In-Reply-To=20071123130138.GP1289%40debian.org"
+       TITLE="[Mono-dev] ToString() performace in Mono">ClassDevelopment at A-SoftTech.com
+       </A><BR>
+    <I>Sun Nov 25 05:54:31 EST 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="025773.html">[Mono-dev] ToString() performace in Mono
+</A></li>
+        <LI>Next message: <A HREF="025776.html">[Mono-dev] ToString() performace in Mono
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25782">[ date ]</a>
+              <a href="thread.html#25782">[ thread ]</a>
+              <a href="subject.html#25782">[ subject ]</a>
+              <a href="author.html#25782">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>There seem to be some low-hanging fruit there. Actually I did some
+optimizations some years ago, but some were rejected because of possible
+&quot;code bloat&quot;.
+
+Here are some things in the current implementation that could likely be
+improved:
+1) ToString calls FormatGeneral, which is the most complex Formatting. Is
+that really needed for a parameterless call with the Default FormatProvider?
+2) 		internal static string FormatGeneral (NumberStore ns)
+		{
+			return FormatGeneral (ns, -1,
+NumberFormatInfo.CurrentInfo, true, false);
+		}
+Calls into a more specific FormatGeneral version with a lot of fixed
+parameters. It would be possible to drop quite a few of them with a specific
+implementation (or not call FormatGeneral at all (see 1))
+3) There seem to be some bad magic numbers (assumptions) in FormatGeneral:
+StringBuilder cb = new StringBuilder (ns.IntegerDigits + precision + 16);
+This means we overallocate for every number (seems like it might be some
+kind of max). The problem is that once StringBuilder.ToString() is called it
+will throw away and recreate the string if a string is less than half
+capacity. With the +16 this is basically guaranteed for any but the most
+complex formattings. It would be better to choose a realistic value and then
+let StringBuilder expand if neccessary (like ns.IntegerDigits + precision +
+1)
+4) FormatNumber has the same problem as in 3:
+StringBuilder sb = new StringBuilder(ns.IntegerDigits * 3 + precision);
+In fact the *3 is even more bogus...
+5) another huge CPU-sink is the following:  1062,500
+System.Globalization.NumberFormatInfo::get_CurrentInfo()
+One of the problems seems to be the following code in Thread:
+		public CultureInfo CurrentCulture {
+			get {
+				if (in_currentculture)
+					/* Bail out */
+					return CultureInfo.InvariantCulture;
+
+				CultureInfo culture =
+GetCachedCurrentCulture ();
+				if (culture != null)
+					return culture;
+This means we need a call to GetCachedCurrentCulture (an internalcall) once
+for retrieving anything up the chain. Perhaps it would be possible to find
+another mechanism to do it like adding a bool isChanged that gets modified
+by the runtime so we don't need to do that InternalCall every time
+				if (isChanged)
+					CultureInfo culture =
+GetCachedCurrentCulture ();
+				if (culture != null)
+					return culture;
+
+Attached is a profile on Windows/Mono 1.2.5:
+val is 599999 and time 9047
+Total time spent compiling 453 methods (sec): 0,07813
+Slowest method to compile (sec): 0,01563:
+System.Threading.Thread::GetCachedCurrentCulture()
+Time(ms) Count   P/call(ms) Method name
+########################
+ 9109,375       1  9109,375
+compareCompare.Class1::runtime_invoke_void_string[](object,intptr,intptr,int
+ptr)
+  Callers (with count) that contribute at least for 1%:
+########################
+ 9109,375       1  9109,375   compareCompare.Class1::Main(string[])
+  Callers (with count) that contribute at least for 1%:
+           1  100 %
+compareCompare.Class1::runtime_invoke_void_string[](object,intptr,intptr,int
+ptr)
+########################
+ 8906,250  600006    0,015   System.Int32::ToString()
+  Callers (with count) that contribute at least for 1%:
+      600000  99 % compareCompare.Class1::Main(string[])
+########################
+ 7531,250  600006    0,013
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore)
+  Callers (with count) that contribute at least for 1%:
+      600006  100 % System.Int32::ToString()
+########################
+ 5750,000  600006    0,010
+System.NumberFormatter::FormatGeneral(NumberFormd
+by the runtime int,Number
+FormatInfo,bool,bool)
+  Callers (with count) that contribute at least for 1%:
+      600006  100 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore)
+########################
+ 1609,375  600004    0,003
+.NumberStore::AppendIntegerString(int,StringBuilder)
+  Callers (with count) that contribute at least for 1%:
+      600003  99 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore,int,Number
+FormatInfo,bool,bool)
+########################
+ 1109,375  600006    0,002   System.Text.StringBuilder::ToString()
+  Callers (with count) that contribute at least for 1%:
+      600003  99 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore,int,Number
+FormatInfo,bool,bool)
+########################
+ 1062,500  600015    0,002
+System.Globalization.NumberFormatInfo::get_CurrentInfo()
+  Callers (with count) that contribute at least for 1%:
+      600006  99 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore)
+########################
+ 890,625  600176    0,001   System.String::Substring(int,int)
+  Callers (with count) that contribute at least for 1%:
+      600003  99 % System.Text.StringBuilder::ToString()
+########################
+ 703,125  600004    0,001   System.Text.StringBuilder::.ctor(int)
+  Callers (with count) that contribute at least for 1%:
+      600003  99 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore,int,Number
+FormatInfo,bool,bool)
+########################
+ 687,500  600007    0,001   .NumberStore::.ctor(int)
+  Callers (with count) that contribute at least for 1%:
+      600006  99 % System.Int32::ToString()
+########################
+ 671,875 1200384    0,001   System.String::memcpy(byte*,byte*,int)
+  Callers (with count) that contribute at least for 1%:
+      600176  49 % System.String::Substring(int,int)
+      600006  49 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore)
+########################
+ 484,375  600004    0,001
+System.Text.StringBuilder::.ctor(string,int,int,int)
+  Callers (with count) that contribute at least for 1%:
+      600004  100 % System.Text.StringBuilder::.ctor(int)
+########################
+ 468,750 3481%:
+      600015  100 % System.Globalization.CultureInfo::get_NumberFormat()
+########################
+ 234,375 1200023    0,000   System.String::memset(byte*,int,int)
+  Callers (with count) that contribu#####
+ 437,500  600015    0,001
+System.Globalization.CultureInfo::get_NumberFormat()
+  Callers (with count) that contribute at least for 1%:
+      600015  100 % System.Globalization.NumberFormatInfo::get_CurrentInfo()
+########################
+ 390,625 1200710    0,000   System.String::InternalAllocateStr(int)
+  Callers (with count) that contribute at least for 1%:
+      600176  49 % System.String::Substring(int,int)
+      600004  49 % System.Text.StringBuilder::.ctor(string,int,int,int)
+########################
+ 328,125 3000018    0,000   .NumberStore::get_IntegerDigits()
+  Callers (with count) that contribute at least for 1%:
+     2400012  79 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore,int,Number
+FormatInfo,bool,bool)
+      600004  20 % .NumberStore::AppendIntegerString(int,StringBuilder)
+########################
+ 312,500  600018    0,001   System.Threading.Thread::get_CurrentCulture()
+  Callers (with count) that contribute at least for 1%:
+      600015  99 % System.Globalization.NumberFormatInfo::get_CurrentInfo()
+########################
+ 296,875  600015    0,000   System.Globalization.CultureInfo::CheckNeutral()
+  Callers (with count) that contribute at least for 1%:
+      600015  100 % System.Globalization.CultureInfo::get_NumberFormat()
+########################
+ 234,375 1200023    0,000   System.String::memset(byte*,int,int)
+  Callers (with count) that contribute at least for 1%:
+      600007  49 % .NumberStore::.ctor(int)
+      600006  49 % System.Int32::ToString()
+########################
+ 234,375  600255    0,000
+System.Object::__icall_wrapper_mono_object_new_specific(intptr)
+  Callers (with count) that contribute at least for 1%:
+      600003  99 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore,int,Number
+FormatInfo,bool,bool)
+########################
+ 203,125 1200311    0,000   System.String::memcpy4(byte*,byte*,int)
+  Callers (with count) that contribute at least for 1%:
+     1200311  100 % System.String::memcpy(byte*,byte*,int)
+########################
+ 187,500  600219    0,000
+System.Object::__icall_wrapper_mono_array_new_specific(intptr,int)
+  Callers (with count) that contribute at least for 1%:
+      600007  99 % .NumberStore::.ctor(int)
+########################
+ 125,000  600003    0,000   .NumberStore::get_DecimalDigits()
+  Callers (with count) that contribute at least for 1%:
+      600003  100 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore,int,Number
+FormatInfo,bool,bool)
+########################
+  93,750      31    3,024
+System.String::runtime_invoke_void(object,intptr,intptr,intptr)
+  Callers (with count) that contribute at least for 1%:
+           3  10 % I18N.Common.Manager::.ctor()
+           2   6 % System.Int32::ToString()
+           2   6 %
+System.MonoType::InvokeMember(string,BindingFlags,Binder,object,object[],Par
+ameterModifier[],CultureInfo,string[])
+           2   6 %
+Mono.Globalization.Unicode.SimpleCollator::.ctor(CultureInfo)
+           1   3 % System.Globalization.NumberFormatInfo::get_CurrentInfo()
+           1   3 % System.Threading.Thread::get_CurrentCulture()
+           1   3 %
+System.Globalization.CultureInfo::ConstructInvariant(bool)
+           1   3 % compareCompare.Class1::Main(string[])
+           1   3 % System.Console::.cctor()
+           1   3 %
+System.Reflection.MonoMethodInfo::get_parameter_info(intptr)
+           1   3 %
+System.Reflection.MonoMethod::Invoke(object,BindingFlags,Binder,object[],Cul
+tureInfo)
+           1   3 % System.Collections.Hashtable::Add(object,object)
+           1   3 % System.Globalization.TextInfo::ToLower(char)
+           1   3 % System.Collections.Hashtable::KeyEquals(object,object)
+           1   3 % System.Globalization.CultureInfo::get_CompareInfo()
+           1   3 % System.Globalization.CompareInfo::.cctor()
+           1   3 % System.Globalization.CompareInfo::.ctor(CultureInfo)
+           1   3 %
+Mono.Globalization.Unicode.MSCompatUnicodeTable::FillCJK(string,CodePointInd
+exer&amp;,byte*&amp;,byte*&amp;,CodePointIndexer&amp;,byte*&amp;)
+           1   3 %
+Mono.Globalization.Unicode.MSCompatUnicodeTable::BuildTailoringTables(Cultur
+eInfo,TailoringInfo,Contraction[]&amp;,Level2Map[]&amp;)
+           1   3 % System.Console::OpenStandardError(int)
+           1   3 %
+System.IO.FileStream::.ctor(intptr,FileAccess,bool,int,bool,bool)
+           1   3 %
+System.IO.UnexceptionalStreamWriter::.ctor(Stream,Encoding)
+           1   3 % System.IO.StreamWriter::.ctor(Stream,Encoding,int)
+           1   3 %
+System.IO.UnexceptionalStreamReader::.ctor(Stream,Encoding)
+########################
+  78,125  600006    0,000   .NumberStore::get_ZeroOnly()
+  Callers (with count) that contribute at least for 1%:
+      600006  100 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore,int,Number
+FormatInfo,bool,bool)
+########################
+  78,125  600018    0,000
+System.Threading.Thread::GetCachedCurrentCulture()
+  Callers (with count) that contribute at least for 1%:
+      600018  100 % System.Threading.Thread::get_CurrentCulture()
+########################
+  62,500       1   62,500   System.Console::.cctor()
+  Callers (with count) that contribute at least for 1%:
+           1  100 %
+System.String::runtime_invoke_void(object,intptr,intptr,intptr)
+########################
+  46,875  600003    0,000   .NumberStore::RoundDecimal(int,bool,bool)
+  Callers (with count) that contribute at least for 1%:
+      600003  100 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore,int,Number
+FormatInfo,bool,bool)
+########################
+  31,250       4    7,813
+System.Reflection.MonoMethod::Invoke(object,BindingFlags,Binder,object[],Cul
+tureInfo)
+  Callers (with count) that contribute at least for 1%:
+           4  100 %
+System.MonoType::InvokeMember(string,BindingFlags,Binder,object,object[],Par
+ameterModifier[],CultureInfo,string[])
+########################
+  31,250       2   15,625
+System.Text.Encoding::InvokeI18N(string,object[])
+  Callers (with count) that contribute at least for 1%:
+           2  100 % System.Text.Encoding::GetEncoding(int)
+########################
+  31,250       2   15,625   System.Text.Encoding::GetEncoding(int)
+  Callers (with count) that contribute at least for 1%:
+           2  100 % System.Console::.cctor()
+########################
+  31,250       5    6,250
+System.MonoType::InvokeMember(string,BindingFlags,Binder,object,object[],Par
+ameterModifier[],CultureInfo,string[])
+  Callers (with count) that contribute at least for 1%:
+           4  80 % System.Text.Encoding::InvokeI18N(string,object[])
+           1  20 % I18N.Common.Manager::Instantiate(string)
+########################
+  31,250  600015    0,000
+System.Globalization.CultureInfo::get_IsNeutralCulture()
+  Callers (with count) that contribute at least for 1%:
+      600015  100 % System.Globalization.CultureInfo::CheckNeutral()
+########################
+  31,250       4    7,813
+System.Reflection.MonoMethod::InternalInvoke(object,object[])
+  Callers (with count) that contribute at least for 1%:
+           4  100 %
+System.Reflection.MonoMethod::Invoke(object,BindingFlags,Binder,object[],Cul
+tureInfo)
+########################
+  15,625       1   15,625
+System.IO.StreamWriter::.ctor(Stream,Encoding,int)
+  Callers (with count) that contribute at least for 1%:
+           1  100 % System.IO.StreamWriter::.cctor()
+########################
+  15,625       4    3,906   System.Collections.Hashtable::get_Item(object)
+  Callers (with count) that contribute at least for 1%:
+           4  100 % I18N.Common.Manager::Instantiate(string)
+########################
+  15,625       2    7,813
+I18N.Common.Manager::runtime_invoke_Manager(object,intptr,intptr,intptr)
+  Callers (with count) that contribute at least for 1%:
+           2  100 %
+System.Reflection.MonoMethod::InternalInvoke(object,object[])
+########################
+  15,625       1   15,625   I18N.Common.Manager::LoadInternalClasses()
+  Callers (with count) that contribute at least for 1%:
+           1  100 % I18N.Common.Manager::LoadClassList()
+########################
+  15,625       1   15,625   I18N.Common.Manager::LoadClassList()
+  Callers (with count) that contribute at least for 1%:
+           1  100 % I18N.Common.Manager::.ctor()
+########################
+  15,625       2    7,813   I18N.Common.Manager::Instantiate(string)
+  Callers (with count) that contribute at least for 1%:
+           2  100 % I18N.Common.Manager::GetEncoding(int)
+########################
+  15,625     347    0,045   System.Globalization.TextInfo::ToLower(string)
+  Callers (with count) that contribute at least for 1%:
+         347  100 %
+System.Collections.CaseInsensitiveHashCodeProvider::GetHashCode(object)
+########################
+  15,625       1   15,625   System.Collections.Comparer::.cctor()
+  Callers (with count) that contribute at least for 1%:
+           1  100 %
+System.String::runtime_invoke_void(object,intptr,intptr,intptr)
+########################
+  15,625       2    7,813   I18N.Common.Manager::GetEncoding(int)
+  Callers (with count) that contribute at least for 1%:
+           2  100 %
+I18N.Common.Manager::runtime_invoke_Encoding_int(object,intptr,intptr,intptr
+)
+########################
+  15,625       1   15,625   System.Collections.Comparer::.ctor(CultureInfo)
+  Callers (with count) that contribute at least for 1%:
+           1  100 % System.Collections.Comparer::.cctor()
+########################
+  15,625       2    7,813   I18N.Common.Manager::get_PrimaryManager()
+  Callers (with count) that contribute at least for 1%:
+           2  100 %
+I18N.Common.Manager::runtime_invoke_Manager(object,intptr,intptr,intptr)
+########################
+  15,625       2    7,813
+System.IO.UnexceptionalStreamWriter::.ctor(Stream,Encoding)
+  Callers (with count) that contribute at least for 1%:
+           2  100 % System.Console::.cctor()
+########################
+  15,625       1   15,625   I18N.Common.Manager::.ctor()
+  Callers (with count) that contribute at least for 1%:
+           1  100 % I18N.Common.Manager::get_PrimaryManager()
+########################
+  15,625       2    7,813
+I18N.Common.Manager::runtime_invoke_Encoding_int(object,intptr,intptr,intptr
+)
+  Callers (with count) that contribute at least for 1%:
+           2  100 %
+System.Reflection.MonoMethod::InternalInvoke(object,object[])
+########################
+  15,625       1   15,625   System.IO.StreamWriter::.cctor()
+  Callers (with count) that contribute at least for 1%:
+           1  100 %
+System.String::runtime_invoke_void(object,intptr,intptr,intptr)
+########################
+  15,625       2    7,813
+System.Globalization.CompareInfo::.ctor(CultureInfo)
+  Callers (with count) that contribute at least for 1%:
+           2  100 % System.Globalization.CultureInfo::get_CompareInfo()
+########################
+  15,625       2    7,813
+System.IO.UnexceptionalStreamWriter::.ctor(Stream,Encoding)
+  Callers (with count) that contribute at least for 1%:
+           2  100 %
+System.IO.UnexceptionalStreamWriter::.ctor(Stream,Encoding)
+########################
+  15,625     347    0,045
+System.Collections.CaseInsensitiveHashCodeProvider::GetHashCode(object)
+  Callers (with count) that contribute at least for 1%:
+         347  100 % System.Collections.Hashtable::GetHash(object)
+########################
+  15,625     173    0,090   System.Collections.Hashtable::Find(object)
+  Callers (with count) that contribute at least for 1%:
+         173  100 % System.Collections.Hashtable::Contains(object)
+########################
+  15,625       2    7,813
+System.Globalization.CultureInfo::get_CompareInfo()
+  Callers (with count) that contribute at least for 1%:
+           1  50 % System.Collections.Comparer::.ctor(CultureInfo)
+           1  50 %
+System.Collections.CaseInsensitiveComparer::Compare(object,object)
+########################
+  15,625       3    5,208
+System.IO.StreamWriter::.ctor(Stream,Encoding,int)
+  Callers (with count) that contribute at least for 1%:
+           2  66 % System.IO.StreamWriter::.ctor(Stream,Encoding)
+           1  33 % System.IO.StreamWriter::.ctor(Stream,Encoding,int)
+########################
+  15,625       2    7,813
+System.Collections.Hashtable::KeyEquals(object,object)
+  Callers (with count) that contribute at least for 1%:
+           2  100 % System.Collections.Hashtable::get_Item(object)
+########################
+  15,625     352    0,044   System.Collections.Hashtable::GetHash(object)
+  Callers (with count) that contribute at least for 1%:
+         175  49 % System.Collections.Hashtable::PutImpl(object,object,bool)
+         173  49 % System.Collections.Hashtable::Find(object)
+           4   1 % System.Collections.Hashtable::get_Item(object)
+########################
+  15,625     173    0,090   System.Collections.Hashtable::Contains(object)
+  Callers (with count) that contribute at least for 1%:
+         173  100 % I18N.Common.Manager::LoadInternalClasses()
+Total number of calls: 23301421
+
+Allocation profiler
+Total mem Method
+########################
+   45486 KB System.Text.StringBuilder::.ctor(string,int,int,int)
+       45486 KB   600004 System.String                                   
+  Callers (with count) that contribute at least for 1%:
+      600004  100 % System.Text.StringBuilder::.ctor(int)
+########################
+   15022 KB System.String::Substring(int,int)
+       15022 KB   600176 System.String                                   
+  Callers (with count) that contribute at least for 1%:
+      600003  99 % System.Text.StringBuilder::ToString()
+########################
+   14062 KB
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore,int,Number
+FormatInfo,bool,bool)
+       14062 KB   600003 System.Text.StringBuilder                       
+  Callers (with count) that contribute at least for 1%:
+      600006  100 %
+System.NumberFormatter::FormatGeneral(NumberFormatter/NumberStore)
+########################
+   12782 KB .NumberStore::.ctor(int)
+       12782 KB   600007 System.Byte[]                                   
+  Callers (with count) that contribute at least for 1%:
+      600006  99 % System.Int32::ToString()
+Total memory allocated: 87428 KB
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="025773.html">[Mono-dev] ToString() performace in Mono
+</A></li>
+	<LI>Next message: <A HREF="025776.html">[Mono-dev] ToString() performace in Mono
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25782">[ date ]</a>
+              <a href="thread.html#25782">[ thread ]</a>
+              <a href="subject.html#25782">[ subject ]</a>
+              <a href="author.html#25782">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

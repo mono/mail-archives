@@ -1,0 +1,140 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] Platform independence of mono assemblies
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Platform%20independence%20of%20mono%20assemblies&In-Reply-To=4DD43FE2.8030601%40fedoraproject.org">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="037579.html">
+   <LINK REL="Next"  HREF="037589.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] Platform independence of mono assemblies</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20Platform%20independence%20of%20mono%20assemblies&In-Reply-To=4DD43FE2.8030601%40fedoraproject.org"
+       TITLE="[Mono-dev] Platform independence of mono assemblies">jonpryor at vt.edu
+       </A><BR>
+    <I>Thu May 19 09:46:35 EDT 2011</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="037579.html">[Mono-dev] Platform independence of mono assemblies
+</A></li>
+        <LI>Next message: <A HREF="037589.html">[Mono-dev] Platform independence of mono assemblies
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#37584">[ date ]</a>
+              <a href="thread.html#37584">[ thread ]</a>
+              <a href="subject.html#37584">[ subject ]</a>
+              <a href="author.html#37584">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>&quot;The perfect is the enemy of the good&quot;
+	- Voltaire
+
+On May 18, 2011, at 5:53 PM, Christian Krause wrote:
+&gt;<i> In Fedora, the assemblies are treated as architecture-dependent and so
+</I>&gt;<i> they (including the GAC) are put into %{_libdir} which is /usr/lib64 on
+</I>&gt;<i> x86_64 systems.
+</I>&gt;<i> 
+</I>&gt;<i> However, it seems to be the standard for mono to place the assemblies
+</I>&gt;<i> under %{_prefix}/lib/, regardless of the architecture.
+</I>&gt;<i> 
+</I>&gt;<i> As far as I know this decision was based on a statement from the mono
+</I>&gt;<i> developers ([1]), that although the C# assemblies are currently
+</I>&gt;<i> architecture independent, it can not be guaranteed that they will be
+</I>&gt;<i> forever. That is why Fedora treats C# assemblies as arch-dependent files
+</I>&gt;<i> and so they are installed on multi-arch x86_64 systems into /usr/lib64.
+</I>
+Not exactly. As Miguel mentioned, mono at the time required that AOT-compiled shared libraries be placed next to the assembly, e.g. for mscorlib.dll the AOT-compiled mscorlib.dll.so must be in the same directory.
+
+However, no Linux distribution actually uses AOT-compiled assemblies (that I know of, anyway). Hence my quote: the feature is there, but it's rarely (never?) used, so using this as a reason to be different from openSUSE, Debian, Ubuntu, and the default build setup seems like chasing the perfect at the expense of the good.
+
+This is also somewhat moot as Mono no longer requires that the AOT-compiled .so be next to the assembly, as it can instead look for assemblies in ~/.mono/aot-cache if the MONO_AOT_CACHE environment variable is set; see mini/aot-runtime.c!load_aot_module_from_cache [0].
+
+A &quot;proper&quot; fix would likely involve altering the runtime so that other &quot;well defined&quot; platform-specific directories are checked for AOT .so's before JITing the assembly, but this apparently hasn't been important enough for anyone to actually implement (the above &quot;nobody uses AOT&quot; argument).
+
+&gt;<i> As far as I know, the C# assemblies are indeed architecture independent
+</I>&gt;<i> (as defined by the CIL standard). There may be some corner cases where
+</I>&gt;<i> it is possible to explicitly write arch-dependent code, but these may be
+</I>&gt;<i> treated as bugs in the projects.
+</I>
+It _is_ possible to have platform specific assemblies. Not because the IL is platform specific (as you note), but because of Platform Invoke [1], which allows ~direct invocation of native code. Managed code may thus embody platform specific assumptions. For example, consider nanosleep(2) [2]:
+
+	struct timespec {
+		time_t tv_sec;
+		long tv_nsec;
+	};
+	int nanosleep(const struct timespec* req, struct timespec *rem);
+
+What's `time_t`? That can vary amongst POSIX implementations. What's `long`? That can (and will!) vary between ILP32 (32-bit linux; 32-bits), LP64 (64-bit Linux; 64-bits), and P64 (Win64; 32-bits) platforms.
+
+A naive P/Invoke would be:
+
+	struct Timespec {
+		public int tv_sec;
+		public int tv_nsec;
+	}
+	class NativeMethods {
+		[DllImport (&quot;libc.so&quot;)]
+		public static extern int nanosleep (ref Timespec req, out Timespec rem);
+	}
+
+This is naive because it assumes that time_t is 32-bits in size, and `long` is also 32-bits in size; in short, this will only work on 32-bit platforms, and will fail in &quot;weird&quot; ways on 64-bit platforms.
+
+This can be fixed, and as such treating the declaration as a bug to be fixed is valid:
+
+	struct Timespec {
+		public IntPtr tv_spec;
+		public IntPtr tv_nsec;
+	}
+
+Using `IntPtr` instead of `int` results in the use of 32-bit values on 32-bit platforms, and 64-bit values on 64-bit platforms. This is thus portable between ILP32 and LP64 Linux platforms...and thus breaks on Win64. In this case we can declare that Windows is unsupported (which makes sense as Windows doesn't provide nanosleep(2) anyway, unless you use cygwin.dll).
+
+However, we're still assuming that `time_t` is an integral value, which is valid on Linux but is not required by the standard [3]:
+
+	&quot;time_t and clock_t shall be integer or real-floating types.&quot;
+
+In this case it still might not matter...as long as we have the size correct (a 32-bit float can still be read as a 32-bit int, it'll just look &quot;weird&quot;), but nothing stops some bizarre 32-bit POSIX platform from using a 64-bit double for time_t, which would invalidate the Timespec declaration.
+
+Again, we can declare that the perfect is the enemy of the good and leave it as is...or we can involve native code to do the type conversions for us, which is what Mono.Posix.dll and libMonoPosixHelper.so do.
+
+ - Jon
+
+[0] <A HREF="https://github.com/mono/mono/blob/master/mono/mini/aot-runtime.c#L843">https://github.com/mono/mono/blob/master/mono/mini/aot-runtime.c#L843</A>
+[1] <A HREF="http://mono-project.com/Dllimport">http://mono-project.com/Dllimport</A>
+[2] <A HREF="http://linux.die.net/man/2/nanosleep">http://linux.die.net/man/2/nanosleep</A>
+[2] <A HREF="http://pubs.opengroup.org/onlinepubs/009695399/basedefs/sys/types.h.html">http://pubs.opengroup.org/onlinepubs/009695399/basedefs/sys/types.h.html</A>
+</PRE>
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="037579.html">[Mono-dev] Platform independence of mono assemblies
+</A></li>
+	<LI>Next message: <A HREF="037589.html">[Mono-dev] Platform independence of mono assemblies
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#37584">[ date ]</a>
+              <a href="thread.html#37584">[ thread ]</a>
+              <a href="subject.html#37584">[ subject ]</a>
+              <a href="author.html#37584">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

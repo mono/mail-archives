@@ -1,0 +1,170 @@
+Index: mini.c
+===================================================================
+--- mini.c	(revision 36120)
++++ mini.c	(working copy)
+@@ -5946,6 +5946,7 @@
+ 		printf ("[%s] <- [%s + 0x%x]", mono_arch_regname (tree->dreg), mono_arch_regname (tree->inst_basereg), tree->inst_offset);
+ 		break;
+ 	case CEE_BR:
++	case OP_CALL_HANDLER:
+ 		printf ("[B%d]", tree->inst_target_bb->block_num);
+ 		break;
+ 	case CEE_SWITCH:
+@@ -7643,6 +7644,136 @@
+ 	}
+ }
+ 
++static void
++remove_critical_edges (MonoCompile *cfg) {
++	MonoBasicBlock *bb;
++	
++	if (cfg->verbose_level > 3) {
++		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
++			int i;
++			printf ("remove_critical_edges %s, BEFORE BB%d (in:", mono_method_full_name (cfg->method, TRUE), bb->block_num);
++			for (i = 0; i < bb->in_count; i++) {
++				printf (" %d", bb->in_bb [i]->block_num);
++			}
++			printf (") (out:");
++			for (i = 0; i < bb->out_count; i++) {
++				printf (" %d", bb->out_bb [i]->block_num);
++			}
++			printf (")");
++			if (bb->last_ins != NULL) {
++				printf (" ");
++				mono_print_tree (bb->last_ins);
++			}
++			printf ("\n");
++		}
++	}
++	
++	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
++		if (bb->out_count > 1) {
++			int out_bb_index;
++			for (out_bb_index = 0; out_bb_index < bb->out_count; out_bb_index++) {
++				MonoBasicBlock *out_bb = bb->out_bb [out_bb_index];
++				if (out_bb->in_count > 1) {
++					MonoInst *inst;
++					MonoBasicBlock *new_bb = mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoBasicBlock));
++					new_bb->block_num = cfg->num_bblocks++;
++					new_bb->next_bb = bb->next_bb;
++					bb->next_bb = new_bb;
++					new_bb->in_bb = mono_mempool_alloc ((cfg)->mempool, sizeof (MonoBasicBlock*));
++					new_bb->in_bb [0] = bb;
++					new_bb->in_count = 1;
++					new_bb->out_bb = mono_mempool_alloc ((cfg)->mempool, sizeof (MonoBasicBlock*));
++					new_bb->out_bb [0] = out_bb;
++					new_bb->out_count = 1;
++					replace_out_block (bb, out_bb, new_bb);
++					replace_in_block (out_bb, bb, new_bb);
++					for (inst = bb->code; inst != NULL; inst = inst->next) {
++						if (inst->opcode == OP_CALL_HANDLER) {
++							if (inst->inst_target_bb == out_bb) {
++								inst->inst_target_bb = new_bb;
++							}
++						}
++					}
++					if (bb->last_ins != NULL) {
++						switch (bb->last_ins->opcode) {
++						case CEE_BR:
++							if (bb->last_ins->inst_target_bb == out_bb) {
++								bb->last_ins->inst_target_bb = new_bb;
++							}
++							break;
++						case CEE_SWITCH: {
++							int i;
++							int n = GPOINTER_TO_INT (bb->last_ins->klass);
++							for (i = 0; i < n; i++ ) {
++								if (bb->last_ins->inst_many_bb [i] == out_bb) {
++									bb->last_ins->inst_many_bb [i] = new_bb;
++									break;
++								}
++							}
++							break;
++						}
++						case CEE_BNE_UN:
++						case CEE_BEQ:
++						case CEE_BLT:
++						case CEE_BLT_UN:
++						case CEE_BGT:
++						case CEE_BGT_UN:
++						case CEE_BGE:
++						case CEE_BGE_UN:
++						case CEE_BLE:
++						case CEE_BLE_UN:
++							if (bb->last_ins->inst_true_bb == out_bb) {
++								bb->last_ins->inst_true_bb = new_bb;
++							}
++							if (bb->last_ins->inst_false_bb == out_bb) {
++								bb->last_ins->inst_false_bb = new_bb;
++							}
++							break;
++						default:
++							break;
++						}
++					}
++//					new_bb->real_offset = bb->real_offset;
++					new_bb->region = bb->region;
++					
++					if (new_bb->next_bb != out_bb) {
++						MonoInst *jump;
++						MONO_INST_NEW (cfg, jump, CEE_BR);
++						MONO_ADD_INS (new_bb, jump);
++						jump->cil_code = bb->cil_code;
++						jump->inst_target_bb = out_bb;
++					}
++					
++					if (cfg->verbose_level > 2) {
++						printf ("remove_critical_edges %s, removed critical edge from BB%d to BB%d (added BB%d)\n", mono_method_full_name (cfg->method, TRUE), bb->block_num, out_bb->block_num, new_bb->block_num);
++					}
++				}
++			}
++		}
++	}
++	
++	if (cfg->verbose_level > 3) {
++		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
++			int i;
++			printf ("remove_critical_edges %s, AFTER BB%d (in:", mono_method_full_name (cfg->method, TRUE), bb->block_num);
++			for (i = 0; i < bb->in_count; i++) {
++				printf (" %d", bb->in_bb [i]->block_num);
++			}
++			printf (") (out:");
++			for (i = 0; i < bb->out_count; i++) {
++				printf (" %d", bb->out_bb [i]->block_num);
++			}
++			printf (")");
++			if (bb->last_ins != NULL) {
++				printf (" ");
++				mono_print_tree (bb->last_ins);
++			}
++			printf ("\n");
++		}
++	}
++}
++
++
+ MonoCompile*
+ mini_method_compile (MonoMethod *method, guint32 opts, MonoDomain *domain, gboolean run_cctors, int parts)
+ {
+@@ -7697,12 +7828,17 @@
+ 	}
+ 	/*g_print ("numblocks = %d\n", cfg->num_bblocks);*/
+ 
++	if (cfg->opt & MONO_OPT_BRANCH)
++		optimize_branches (cfg);
++
++//	if (0) {
++	if (! (cfg->disable_ssa)) {
++		remove_critical_edges (cfg);
++	}
++
+ 	/* Depth-first ordering on basic blocks */
+ 	cfg->bblocks = mono_mempool_alloc (cfg->mempool, sizeof (MonoBasicBlock*) * (cfg->num_bblocks + 1));
+ 
+-	if (cfg->opt & MONO_OPT_BRANCH)
+-		optimize_branches (cfg);
+-
+ 	df_visit (cfg->bb_entry, &dfn, cfg->bblocks);
+ 	if (cfg->num_bblocks != dfn + 1) {
+ 		MonoBasicBlock *bb;

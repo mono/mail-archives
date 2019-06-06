@@ -1,0 +1,205 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev]  [PATCH] mono-service bugs - please review
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%20%5BPATCH%5D%20mono-service%20bugs%20-%20please%20review&In-Reply-To=1202152368.15602.78.camel%40lina.magi.jprl.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="026808.html">
+   <LINK REL="Next"  HREF="026835.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev]  [PATCH] mono-service bugs - please review</H1>
+    <B>Avery Pennarun</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%20%5BPATCH%5D%20mono-service%20bugs%20-%20please%20review&In-Reply-To=1202152368.15602.78.camel%40lina.magi.jprl.com"
+       TITLE="[Mono-dev]  [PATCH] mono-service bugs - please review">apenwarr at gmail.com
+       </A><BR>
+    <I>Mon Feb  4 20:32:42 EST 2008</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="026808.html">[Mono-dev] mono-service bugs
+</A></li>
+        <LI>Next message: <A HREF="026835.html">[Mono-dev] [PATCH] mono-service bugs - please review
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26816">[ date ]</a>
+              <a href="thread.html#26816">[ thread ]</a>
+              <a href="subject.html#26816">[ subject ]</a>
+              <a href="author.html#26816">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Mon, Feb 04, 2008 at 02:12:48PM -0500, Jonathan Pryor wrote:
+
+&gt;<i> On Mon, 2008-02-04 at 12:14 -0500, Avery Pennarun wrote:
+</I>&gt;<i> &gt; 1. mono-service runner doesn't catch SIGINT (it should clean up like
+</I>&gt;<i> &gt; SIGTERM, and this is especially important when using the --debug
+</I>&gt;<i> &gt; option).
+</I>&gt;<i> 
+</I>&gt;<i> Not as easy as you'd think; check the archives with the &quot;Control-C
+</I>&gt;<i> handler&quot; subject.  To reliably catch SIGINT/SIGTERM/etc., you'll need to
+</I>&gt;<i> use UnixSignal, which was just added to svn-HEAD.  If I'm lucky, I'll
+</I>&gt;<i> get the tests written to permit it to go into 1.9 soon.
+</I>
+I read that thread.  Luckily or unluckily, mono-service already catches
+various signals; SIGINT should be treated identically to SIGTERM, so making
+it work &quot;better&quot; should be a one-liner.
+
+Note that it currently is implemented by polling every 500ms, which is lame
+on multiple levels (you don't want daemons waking up every 500ms on your
+laptop for no reason, as it wastes power).  I eagerly await your signal
+patch.
+
+&gt;<i> &gt;   Or maybe it should always be true except when
+</I>&gt;<i> &gt; mono-service explicitly makes it false somehow?
+</I>&gt;<i> 
+</I>&gt;<i> This makes more sense.
+</I>
+Implemented.
+
+&gt;<i> You can [DllImport(&quot;__Internal&quot;)] to obtain functions within the mono
+</I>&gt;<i> executable, or (better) you can add an internal call to Mono that
+</I>&gt;<i> mono-service would make use of.  Environment.UserInteractive could then
+</I>&gt;<i> use a different internal call to obtain the value of some variable,
+</I>&gt;<i> permitting communication (via internal calls) between mono-service and
+</I>&gt;<i> System.Environment.  This is likely the best solution.
+</I>
+I'm afraid I had a hard time deciding between the various methods here.  It
+didn't seem to me that an InternalCall was a very good choice, since we're
+just talking about a single bool and there's no reason that bool should be
+managed in native code.
+
+I did something else instead based on what was suggested elsewhere in this
+thread (private Environment.SetUserInteractive method that mono-service
+invokes via reflection).  I'm a little fuzzy on exactly what goes where for
+mono ABI compatibility, so please let me know if I've done it wrong.
+
+See the attached patch.  Changes:
+
+- mono-service makes Environment.UserInteractive false, otherwise defaults
+  to true.  (NOTE: this is the opposite of the old default!!)
+
+- mono-service can overwrite its lockfile if the lockfile isn't
+  lockf'ed.  This seems to be what was originally intended, but didn't
+  quite get implemented correctly.
+  
+- SIGINT is now trapped and treated the same as SIGTERM, which is nice when
+  using the --debug option.
+
+Any chance this can go into the mono-1-9 branch?
+
+Have fun,
+
+Avery
+-------------- next part --------------
+diff --git a/mcs/class/corlib/System/Environment.cs b/mcs/class/corlib/System/Environment.cs
+index 9e09405..ff6ca28 100644
+--- a/mcs/class/corlib/System/Environment.cs
++++ b/mcs/class/corlib/System/Environment.cs
+@@ -232,14 +232,21 @@ namespace System {
+ 				return MachineName;
+ 			}
+ 		}
+-
++		
++		private static bool IsInteractive = true;
++		
++		private static void SetUserInteractive(bool Value)
++		{
++			IsInteractive = Value;
++		}
++		
+ 		/// &lt;summary&gt;
+-		/// Gets a flag indicating whether the process is in interactive mode
++		/// Gets a flag indicating whether the process is in interactive mode.
++		/// Running under mono-service sets this to false.
+ 		/// &lt;/summary&gt;
+-		[MonoTODO (&quot;Currently always returns false, regardless of interactive state&quot;)]
+ 		public static bool UserInteractive {
+ 			get {
+-				return false;
++				return IsInteractive;
+ 			}
+ 		}
+ 
+diff --git a/mcs/tools/mono-service/mono-service.cs b/mcs/tools/mono-service/mono-service.cs
+index 41c4931..54379e4 100644
+--- a/mcs/tools/mono-service/mono-service.cs
++++ b/mcs/tools/mono-service/mono-service.cs
+@@ -100,10 +100,13 @@ class MonoServiceRunner : MarshalByRefObject
+ 		if (lockfile == null)
+ 			lockfile = String.Format (&quot;/tmp/{0}.lock&quot;, Path.GetFileName (assembly));
+ 
+-		int lfp = Syscall.open (lockfile, OpenFlags.O_RDWR|OpenFlags.O_CREAT|OpenFlags.O_EXCL, 
++		int lfp = Syscall.open (lockfile, OpenFlags.O_RDWR, 
+ 			FilePermissions.S_IRUSR|FilePermissions.S_IWUSR|FilePermissions.S_IRGRP);
++		if (lfp&lt;0)
++			lfp = Syscall.open (lockfile, OpenFlags.O_RDWR|OpenFlags.O_CREAT|OpenFlags.O_EXCL, 
++				FilePermissions.S_IRUSR|FilePermissions.S_IWUSR|FilePermissions.S_IRGRP);
+ 
+-		if (lfp&lt;0)  {
++		if (lfp&lt;0) {
+ 		        // Provide some useful info
+ 			if (File.Exists (lockfile))
+ 				error (logname, String.Format (&quot;Lock file already exists: {0}&quot;, lockfile));
+@@ -119,6 +122,7 @@ class MonoServiceRunner : MarshalByRefObject
+ 		
+ 		try {
+ 			// Write pid to lock file
++			Syscall.ftruncate (lfp, 0);
+ 			string pid = Syscall.getpid ().ToString () + Environment.NewLine;
+ 			IntPtr buf = Marshal.StringToCoTaskMemAnsi (pid);
+ 			Syscall.write (lfp, buf, (ulong)pid.Length);
+@@ -169,9 +173,18 @@ class MonoServiceRunner : MarshalByRefObject
+ 			
+ 			// Hook up 
+ 			Stdlib.signal (Signum.SIGTERM, new SignalHandler (my_handler));
++			Stdlib.signal (Signum.SIGINT,  new SignalHandler (my_handler));
+ 			Stdlib.signal (Signum.SIGUSR1, new SignalHandler (my_handler));
+ 			Stdlib.signal (Signum.SIGUSR2, new SignalHandler (my_handler));
+ 	
++			// Tell the application we're not interactive
++			// (ie. no GUI)
++			Type.GetType (&quot;System.Environment&quot;)
++				.GetMethod (&quot;SetUserInteractive&quot;,
++					    System.Reflection.BindingFlags.Static
++					  | System.Reflection.BindingFlags.NonPublic)
++				.Invoke (null, new object[] { false });
++			
+ 			// Load service assembly
+ 			Assembly a = null;
+ 			
+@@ -261,6 +274,7 @@ class MonoServiceRunner : MarshalByRefObject
+ 					
+ 					switch (v){
+ 					case Signum.SIGTERM:
++					case Signum.SIGINT:
+ 						if (service.CanStop) {
+ 							info (logname, &quot;Stopping service {0}&quot;, service.ServiceName);
+ 							call (service, &quot;OnStop&quot;, null);
+</PRE>
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="026808.html">[Mono-dev] mono-service bugs
+</A></li>
+	<LI>Next message: <A HREF="026835.html">[Mono-dev] [PATCH] mono-service bugs - please review
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#26816">[ date ]</a>
+              <a href="thread.html#26816">[ thread ]</a>
+              <a href="subject.html#26816">[ subject ]</a>
+              <a href="author.html#26816">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

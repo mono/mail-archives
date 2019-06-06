@@ -1,0 +1,149 @@
+diff --git a/mono/metadata/ChangeLog b/mono/metadata/ChangeLog
+index 50972b9..8226c9a 100644
+--- a/mono/metadata/ChangeLog
++++ b/mono/metadata/ChangeLog
+@@ -1,3 +1,10 @@
++2010-05-24 Rodrigo Kumpera  <rkumpera@novell.com>
++
++	* sgen-gc.c: Introduce two new kinds of memory holes for large objects.
++
++	* sgen-gc.c: Make LOSObject have a struct Block header. Change
++	code to use Block::next instead of LOSObject::next.
++
+ 2010-05-23  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* marshal.c (free_wrapper): New helper function to free dynamic wrappers.
+diff --git a/mono/metadata/sgen-gc.c b/mono/metadata/sgen-gc.c
+index 1852431..48b8f10 100644
+--- a/mono/metadata/sgen-gc.c
++++ b/mono/metadata/sgen-gc.c
+@@ -366,7 +366,9 @@ mono_gc_flush_info (void)
+ enum {
+ 	MEMORY_ROLE_GEN0,
+ 	MEMORY_ROLE_GEN1,
+-	MEMORY_ROLE_PINNED
++	MEMORY_ROLE_PINNED,
++	MEMORY_ROLE_LOS_GEN1,
++	MEMORY_ROLE_SINGLE_LOS
+ };
+ 
+ typedef struct _Block Block;
+@@ -413,9 +415,8 @@ struct _GCMemSection {
+  */
+ typedef struct _LOSObject LOSObject;
+ struct _LOSObject {
+-	LOSObject *next;
++	Block block;
+ 	mword size; /* this is the object size */
+-	guint16 role;
+ 	int dummy; /* to have a sizeof (LOSObject) a multiple of ALLOC_ALIGN  and data starting at same alignment */
+ 	char data [MONO_ZERO_LEN_ARRAY];
+ };
+@@ -1718,7 +1719,7 @@ mono_gc_scan_for_specific_ref (MonoObject *key)
+ 
+ 	major_iterate_objects (TRUE, TRUE, (IterateObjectCallbackFunc)scan_object_for_specific_ref_callback, key);
+ 
+-	for (bigobj = los_object_list; bigobj; bigobj = bigobj->next)
++	for (bigobj = los_object_list; bigobj; bigobj = bigobj->block.next)
+ 		scan_object_for_specific_ref (bigobj->data, key);
+ 
+ 	scan_roots_for_specific_ref (key, ROOT_TYPE_NORMAL);
+@@ -1864,7 +1865,7 @@ check_for_xdomain_refs (void)
+ 
+ 	major_iterate_objects (TRUE, TRUE, scan_pinned_object_for_xdomain_refs_callback, NULL);
+ 
+-	for (bigobj = los_object_list; bigobj; bigobj = bigobj->next)
++	for (bigobj = los_object_list; bigobj; bigobj = bigobj->block.next)
+ 		scan_object_for_xdomain_refs (bigobj->data);
+ }
+ 
+@@ -1955,7 +1956,7 @@ mono_gc_clear_domain (MonoDomain * domain)
+ 	   dereference a pointer from an object to another object if
+ 	   the first object is a proxy. */
+ 	major_iterate_objects (TRUE, TRUE, (IterateObjectCallbackFunc)clear_domain_process_major_object_callback, domain);
+-	for (bigobj = los_object_list; bigobj; bigobj = bigobj->next)
++	for (bigobj = los_object_list; bigobj; bigobj = bigobj->block.next)
+ 		clear_domain_process_object (bigobj->data, domain);
+ 
+ 	prev = NULL;
+@@ -1963,17 +1964,17 @@ mono_gc_clear_domain (MonoDomain * domain)
+ 		if (need_remove_object_for_domain (bigobj->data, domain)) {
+ 			LOSObject *to_free = bigobj;
+ 			if (prev)
+-				prev->next = bigobj->next;
++				prev->block.next = bigobj->block.next;
+ 			else
+-				los_object_list = bigobj->next;
+-			bigobj = bigobj->next;
++				los_object_list = bigobj->block.next;
++			bigobj = bigobj->block.next;
+ 			DEBUG (4, fprintf (gc_debug_file, "Freeing large object %p\n",
+ 					bigobj->data));
+ 			free_large_object (to_free);
+ 			continue;
+ 		}
+ 		prev = bigobj;
+-		bigobj = bigobj->next;
++		bigobj = bigobj->block.next;
+ 	}
+ 	major_iterate_objects (TRUE, FALSE, (IterateObjectCallbackFunc)clear_domain_free_major_non_pinned_object_callback, domain);
+ 	major_iterate_objects (FALSE, TRUE, (IterateObjectCallbackFunc)clear_domain_free_major_pinned_object_callback, domain);
+@@ -3142,7 +3143,7 @@ dump_heap (const char *type, int num, const char *reason)
+ 	major_dump_heap ();
+ 
+ 	fprintf (heap_dump_file, "<los>\n");
+-	for (bigobj = los_object_list; bigobj; bigobj = bigobj->next)
++	for (bigobj = los_object_list; bigobj; bigobj = bigobj->block.next)
+ 		dump_object ((MonoObject*)bigobj->data, FALSE);
+ 	fprintf (heap_dump_file, "</los>\n");
+ 
+@@ -3429,7 +3430,7 @@ major_do_collection (const char *reason)
+ 	major_find_pin_queue_start_ends ();
+ 	/* identify possible pointers to the insize of large objects */
+ 	DEBUG (6, fprintf (gc_debug_file, "Pinning from large objects\n"));
+-	for (bigobj = los_object_list; bigobj; bigobj = bigobj->next) {
++	for (bigobj = los_object_list; bigobj; bigobj = bigobj->block.next) {
+ 		int start, end;
+ 		find_optimized_pin_queue_area (bigobj->data, (char*)bigobj->data + bigobj->size, &start, &end);
+ 		if (start != end) {
+@@ -3497,16 +3498,16 @@ major_do_collection (const char *reason)
+ 			LOSObject *to_free;
+ 			/* not referenced anywhere, so we can free it */
+ 			if (prevbo)
+-				prevbo->next = bigobj->next;
++				prevbo->block.next = bigobj->block.next;
+ 			else
+-				los_object_list = bigobj->next;
++				los_object_list = bigobj->block.next;
+ 			to_free = bigobj;
+-			bigobj = bigobj->next;
++			bigobj = bigobj->block.next;
+ 			free_large_object (to_free);
+ 			continue;
+ 		}
+ 		prevbo = bigobj;
+-		bigobj = bigobj->next;
++		bigobj = bigobj->block.next;
+ 	}
+ 
+ 	major_sweep ();
+@@ -3965,7 +3966,9 @@ alloc_large_inner (MonoVTable *vtable, size_t size)
+ 	*vtslot = vtable;
+ 	total_alloc += alloc_size;
+ 	UPDATE_HEAP_BOUNDARIES (obj->data, (char*)obj->data + size);
+-	obj->next = los_object_list;
++	obj->block.role = MEMORY_ROLE_SINGLE_LOS;
++	obj->block.next = los_object_list;
++
+ 	los_object_list = obj;
+ 	los_memory_usage += size;
+ 	los_num_objects++;
+@@ -6397,7 +6400,7 @@ find_object_for_ptr (char *ptr)
+ 	if (ptr >= nursery_section->data && ptr < nursery_section->end_data)
+ 		return find_object_for_ptr_in_area (ptr, nursery_section->data, nursery_section->end_data);
+ 
+-	for (bigobj = los_object_list; bigobj; bigobj = bigobj->next) {
++	for (bigobj = los_object_list; bigobj; bigobj = bigobj->block.next) {
+ 		if (ptr >= bigobj->data && ptr < bigobj->data + bigobj->size)
+ 			return bigobj->data;
+ 	}

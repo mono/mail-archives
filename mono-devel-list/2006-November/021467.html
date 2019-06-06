@@ -1,0 +1,288 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH] Fix for Membership.{Encrypt, Decrypt}Password
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Fix%20for%20Membership.%7BEncrypt%2C%20Decrypt%7DPassword&In-Reply-To=20061121113735.0cc8bde4%40beowulf">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="021479.html">
+   <LINK REL="Next"  HREF="021469.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH] Fix for Membership.{Encrypt, Decrypt}Password</H1>
+    <B>Sebastien Pouliot</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Fix%20for%20Membership.%7BEncrypt%2C%20Decrypt%7DPassword&In-Reply-To=20061121113735.0cc8bde4%40beowulf"
+       TITLE="[Mono-dev] [PATCH] Fix for Membership.{Encrypt, Decrypt}Password">sebastien.pouliot at gmail.com
+       </A><BR>
+    <I>Tue Nov 21 08:20:38 EST 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="021479.html">[Mono-dev] [PATCH] Fix for Membership.{Encrypt, Decrypt}Password
+</A></li>
+        <LI>Next message: <A HREF="021469.html">[Mono-dev] [PATCH] Fix for Membership.{Encrypt, Decrypt}Password
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21467">[ date ]</a>
+              <a href="thread.html#21467">[ thread ]</a>
+              <a href="subject.html#21467">[ subject ]</a>
+              <a href="author.html#21467">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello Marek,
+
+On Tue, 2006-11-21 at 11:37 +0100, Marek Habersack wrote:
+&gt;<i> Hello,
+</I>&gt;<i> 
+</I>&gt;<i>   Attached is a diff which reimplements the two methods mentioned in
+</I>&gt;<i> the subject. The current implementation would break if the password
+</I>&gt;<i> passed was larger than the symmetric algorithm block size and it
+</I>&gt;<i> wouldn't take into account the IV embedded into the encrypted password
+</I>&gt;<i> when decrypting. Also, it assumet the IV (salt) size to be 16 bytes,
+</I>
+Note that a salt and an IV value are, often confused, but different
+things. The IV, when required by the cipher mode, must be equal to the
+symmetric algorithm cipher block. A salt doesn't have this restriction.
+
+Now the real question becomes &quot;is it a salt or an IV ?&quot;
+
+&gt;<i> which isn't forward-compatible. The reimplementation uses CryptoStream
+</I>&gt;<i> and the size of the algorithm's IV to fix both of the problems.
+</I>
+CryptoStream is nice as it does everything - but it comes at a high
+price (performance wise as it involves, by design, many object/memory
+allocations). I suggest people to avoid it unless they already deal with
+streams.
+
+&gt;<i>   At first I thought that embedding the IV in the password passed to
+</I>&gt;<i> {Encrypt,Decrypt}Password is incorrect according to the MS.NET
+</I>&gt;<i> documentation, but the tests show that it's the documentation that's
+</I>&gt;<i> wrong. 
+</I>
+Are the tests available somewhere ?
+
+&gt;<i>   The diff also touches SqlMembershipProvider to account for the
+</I>&gt;<i> salt size fix above. Please review,
+</I>&gt;<i> 
+</I>
+Index: MembershipProvider.cs
+===================================================================
+--- MembershipProvider.cs       (revision 68230)
++++ MembershipProvider.cs       (working copy)
+@@ -30,6 +30,7 @@
+ 
+ #if NET_2_0
+ using System.Configuration.Provider;
++using System.IO;
+ using System.Web.Configuration;
+ using System.Security.Cryptography;
+ using System.Text;
+@@ -70,14 +71,35 @@
+                public abstract MembershipPasswordFormat PasswordFormat
+{ get; }
+                public abstract string PasswordStrengthRegularExpression
+{ get; }
+                public abstract bool RequiresUniqueEmail { get; }
++
++               SymmetricAlgorithm algorithm;
++               Int64 algorithmIVSize;
+
+        There's no need for a 64-bit value.
+
++               internal protected SymmetricAlgorithm Algorithm
++               {
+
+        I don't think this is part of the public API so it should be
+        private or internal (if reused outside this class). Also the
+        { should be on the same line as the declaration for properties.
+
++                       get {
++                               if (algorithm == null)
++                                       algorithm = GetAlg (null);
++                               return algorithm;
++                       }
++               }
++
++               internal protected Int64 AlgorithmIVSize
++               {
++                       get {
++                               if (algorithm == null)
++                                       algorithm = GetAlg (null);
++                               return algorithmIVSize;
++                       }
++               }
+
+        same (visibility, } and return type)
+
++               
+                protected virtual void OnValidatingPassword
+(ValidatePasswordEventArgs args)
+                {
+                        if (ValidatingPassword != null)
+                                ValidatingPassword (this, args);
+                }
+ 
+-               SymmetricAlgorithm GetAlg (out byte [] decryptionKey)
++               SymmetricAlgorithm GetAlg (byte [] iv)
+                {
+                        MachineKeySection section = (MachineKeySection)
+WebConfigurationManager.GetSection (&quot;system.web/machineKey&quot;);
+ 
+@@ -96,40 +118,56 @@
+                        else
+                                throw new ProviderException
+(String.Format (&quot;Unsupported decryption attribute '{0}' in &lt;machineKey&gt;
+configuration section&quot;, alg_type));
+ 
+-                       decryptionKey = section.DecryptionKey192Bits;
++                       alg.Key = section.DecryptionKey192Bits;
++                       algorithm = alg;
++                       algorithmIVSize = alg.IV.Length;
++                       if (iv != null)
++                               alg.IV = iv;
++                       
+                        return alg;
+                }
+ 
+-               internal const int SALT_BYTES = 16;
++               byte [] EncryptDecryptPassword (byte [] data,
+ICryptoTransform transform)
++               {
++                       MemoryStream ms = new MemoryStream ();
++                       CryptoStream cs = new CryptoStream (ms,
+transform, CryptoStreamMode.Write);
++                       cs.Write (data, 0, data.Length);
++                       cs.FlushFinalBlock ();
++
++                       byte [] ret = ms.ToArray ();
++                       cs.Close ();
++                       return ret;
++               }
+
+        If you use streams you should dispose them (better yet use
+        &quot;using&quot; when creating them). This is important for ASP.NET code
+        as you can't know how many simultaneous instance could be
+        created (and how long the could be retained in memory).
+
+
+                protected virtual byte [] DecryptPassword (byte []
+encodedPassword)
+                {
+-                       byte [] decryptionKey;
+-
+-                       using (SymmetricAlgorithm alg = GetAlg (out
+decryptionKey)) {
+-                               alg.Key = decryptionKey;
+-
++                       byte [] iv = new byte [AlgorithmIVSize];
++                       Array.Copy (encodedPassword, 0, iv, 0,
+algorithmIVSize);
++                       byte [] password = new byte
+[encodedPassword.Length - algorithmIVSize];
++                       Array.Copy (encodedPassword, algorithmIVSize,
+password, 0, encodedPassword.Length - algorithmIVSize);
++                       
++                       using (SymmetricAlgorithm alg = GetAlg (iv)) {
+                                using (ICryptoTransform decryptor =
+alg.CreateDecryptor ()) {
+-
+-                                       byte [] buf =
+decryptor.TransformFinalBlock (encodedPassword, 0,
+encodedPassword.Length);
+-                                       byte [] rv = new byte
+[buf.Length - SALT_BYTES];
+-
+-                                       Array.Copy (buf, 16, rv, 0,
+buf.Length - 16);
+-                                       return rv;
++                                       byte [] buf =
+EncryptDecryptPassword (password, decryptor);
++                                       return buf;
+
+
+        Please call Array.Clear on arrays that contains &quot;secret&quot; data.
+
+                                }
+                        }
+                }
+ 
+                protected virtual byte[] EncryptPassword (byte[]
+password)
+                {
+-                       byte [] decryptionKey;
+-                       byte [] iv = new byte [SALT_BYTES];
+-
+-                       Array.Copy (password, 0, iv, 0, SALT_BYTES);
+-                       Array.Clear (password, 0, SALT_BYTES);
+-
+-                       using (SymmetricAlgorithm alg = GetAlg (out
+decryptionKey)) {
+-                               using (ICryptoTransform encryptor =
+alg.CreateEncryptor (decryptionKey, iv)) {
+-                                       return
+encryptor.TransformFinalBlock (password, 0, password.Length);
++                       byte [] iv = new byte [AlgorithmIVSize];
++                       Array.Copy (password, 0, iv, 0,
+algorithmIVSize);
++                       byte [] passwd = new byte [password.Length -
+algorithmIVSize];
++                       Array.Copy (password, algorithmIVSize, passwd,
+0, password.Length - algorithmIVSize);
++                       
++                       using (SymmetricAlgorithm alg = GetAlg (iv)) {
++                               using (ICryptoTransform encryptor =
+alg.CreateEncryptor ()) {
++                                       byte [] buf =
+EncryptDecryptPassword (passwd, encryptor);
++                                       byte [] ret = new byte
+[algorithmIVSize + buf.Length];
++                                       Array.Copy (alg.IV, 0, ret, 0,
+algorithmIVSize);
++                                       Array.Copy (buf, 0, ret,
+algorithmIVSize, buf.Length);
++                                       return ret;
+                                }
+                        }
+                }
+Index: SqlMembershipProvider.cs
+===================================================================
+--- SqlMembershipProvider.cs    (revision 68230)
++++ SqlMembershipProvider.cs    (working copy)
+@@ -242,7 +242,7 @@
+                        string passwordSalt = &quot;&quot;;
+ 
+                        RandomNumberGenerator rng =
+RandomNumberGenerator.Create ();
+-                       byte [] salt = new byte [SALT_BYTES];
++                       byte [] salt = new byte [base.AlgorithmIVSize];
+                        rng.GetBytes (salt);
+                        passwordSalt = Convert.ToBase64String (salt);
+
+        You should rename &quot;salt&quot; as &quot;iv&quot; as you're using the value as
+        such.
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="021479.html">[Mono-dev] [PATCH] Fix for Membership.{Encrypt, Decrypt}Password
+</A></li>
+	<LI>Next message: <A HREF="021469.html">[Mono-dev] [PATCH] Fix for Membership.{Encrypt, Decrypt}Password
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21467">[ date ]</a>
+              <a href="thread.html#21467">[ thread ]</a>
+              <a href="subject.html#21467">[ subject ]</a>
+              <a href="author.html#21467">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

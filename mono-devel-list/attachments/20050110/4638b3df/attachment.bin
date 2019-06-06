@@ -1,0 +1,1860 @@
+Index: mono/mono/mini/mini.c
+===================================================================
+--- mono/mono/mini/mini.c	(revision 38594)
++++ mono/mono/mini/mini.c	(working copy)
+@@ -7305,6 +7305,90 @@
+ }
+ 
+ static void 
++replace_or_add_in_block (MonoCompile *cfg, MonoBasicBlock *bb, MonoBasicBlock *orig, MonoBasicBlock *repl)
++{
++	gboolean found = FALSE;
++	int i;
++
++	for (i = 0; i < bb->in_count; i++) {
++		MonoBasicBlock *ib = bb->in_bb [i];
++		if (ib == orig) {
++			if (!repl) {
++				if (bb->in_count > 1) {
++					bb->in_bb [i] = bb->in_bb [bb->in_count - 1];
++				}
++				bb->in_count--;
++			} else {
++				bb->in_bb [i] = repl;
++			}
++			found = TRUE;
++		}
++	}
++	
++	if (! found) {
++		MonoBasicBlock **new_in_bb = mono_mempool_alloc (cfg->mempool, sizeof (MonoBasicBlock*) * (bb->in_count + 1));
++		for (i = 0; i < bb->in_count; i++) {
++			new_in_bb [i] = bb->in_bb [i];
++		}
++		new_in_bb [i] = repl;
++		bb->in_count++;
++		bb->in_bb = new_in_bb;
++	}
++}
++
++
++static void
++replace_out_block_in_code (MonoBasicBlock *bb, MonoBasicBlock *orig, MonoBasicBlock *repl) {
++	MonoInst *inst;
++	
++	for (inst = bb->code; inst != NULL; inst = inst->next) {
++		if (inst->opcode == OP_CALL_HANDLER) {
++			if (inst->inst_target_bb == orig) {
++				inst->inst_target_bb = repl;
++			}
++		}
++	}
++	if (bb->last_ins != NULL) {
++		switch (bb->last_ins->opcode) {
++		case CEE_BR:
++			if (bb->last_ins->inst_target_bb == orig) {
++				bb->last_ins->inst_target_bb = repl;
++			}
++			break;
++		case CEE_SWITCH: {
++			int i;
++			int n = GPOINTER_TO_INT (bb->last_ins->klass);
++			for (i = 0; i < n; i++ ) {
++				if (bb->last_ins->inst_many_bb [i] == orig) {
++					bb->last_ins->inst_many_bb [i] = repl;
++				}
++			}
++			break;
++		}
++		case CEE_BNE_UN:
++		case CEE_BEQ:
++		case CEE_BLT:
++		case CEE_BLT_UN:
++		case CEE_BGT:
++		case CEE_BGT_UN:
++		case CEE_BGE:
++		case CEE_BGE_UN:
++		case CEE_BLE:
++		case CEE_BLE_UN:
++			if (bb->last_ins->inst_true_bb == orig) {
++				bb->last_ins->inst_true_bb = repl;
++			}
++			if (bb->last_ins->inst_false_bb == orig) {
++				bb->last_ins->inst_false_bb = repl;
++			}
++			break;
++		default:
++			break;
++		}
++	}
++}
++
++static void 
+ replace_basic_block (MonoBasicBlock *bb, MonoBasicBlock *orig,  MonoBasicBlock *repl)
+ {
+ 	int i, j;
+@@ -7320,6 +7404,96 @@
+ 
+ }
+ 
++/**
++  * Check if a bb is useless (is just made of NOPs and ends with an
++  * unconditional branch, or nothing).
++  * If it is so, unlink it from the CFG and nullify it, and return TRUE.
++  * Otherwise, return FALSE;
++  */
++static gboolean
++remove_block_if_useless (MonoCompile *cfg, MonoBasicBlock *bb, MonoBasicBlock *previous_bb) {
++	MonoBasicBlock *target_bb = NULL;
++	MonoInst *inst;
++	
++	/* Do not touch handlers */
++	if (bb->region != -1) return FALSE;
++	
++	for (inst = bb->code; inst != NULL; inst = inst->next) {
++		switch (inst->opcode) {
++		case CEE_NOP:
++			break;
++		case CEE_BR:
++			target_bb = inst->inst_target_bb;
++			break;
++		default:
++			return FALSE;
++		}
++	}
++	
++	if (target_bb == NULL) {
++		if ((bb->out_count == 1) && (bb->out_bb [0] == bb->next_bb)) {
++			target_bb = bb->next_bb;
++		} else {
++			/* Do not touch empty BBs that do not "fall through" to their next BB (like the exit BB) */
++			return FALSE;
++		}
++	}
++	
++	/* Do not touch BBs following a switch (they are the "default" branch) */
++	if ((previous_bb->last_ins != NULL) && (previous_bb->last_ins->opcode == CEE_SWITCH)) {
++		return FALSE;
++	}
++	
++	/* Do not touch BBs following the entry BB and jumping to something that is not */
++	/* thiry "next" bb (the entry BB cannot contain the branch) */
++	if ((previous_bb == cfg->bb_entry) && (bb->next_bb != target_bb)) {
++		return FALSE;
++	}
++	
++	if (target_bb != NULL) {
++		int i;
++		
++		if (cfg->verbose_level > 0) {
++			printf ("remove_block_if_useless %s, removed BB%d\n", mono_method_full_name (cfg->method, TRUE), bb->block_num);
++		}
++		
++		for (i = 0; i < bb->in_count; i++) {
++			MonoBasicBlock *in_bb = bb->in_bb [i];
++			replace_out_block (in_bb, bb, target_bb);
++			replace_out_block_in_code (in_bb, bb, target_bb);
++			if (bb->in_count == 1) {
++				replace_in_block (target_bb, bb, in_bb);
++			} else {
++				replace_or_add_in_block (cfg, target_bb, bb, in_bb);
++			}
++		}
++		
++		if ((previous_bb != cfg->bb_entry) &&
++				(previous_bb->region == bb->region) &&
++				((previous_bb->last_ins == NULL) ||
++				((previous_bb->last_ins->opcode != CEE_BR) &&
++				(! (MONO_IS_COND_BRANCH_OP (previous_bb->last_ins))) &&
++				(previous_bb->last_ins->opcode != CEE_SWITCH)))) {
++			for (i = 0; i < previous_bb->out_count; i++) {
++				if (previous_bb->out_bb [i] == target_bb) {
++					MonoInst *jump;
++					MONO_INST_NEW (cfg, jump, CEE_BR);
++					MONO_ADD_INS (previous_bb, jump);
++					jump->cil_code = previous_bb->cil_code;
++					jump->inst_target_bb = target_bb;
++					break;
++				}
++			}
++		}
++		
++		previous_bb->next_bb = bb->next_bb;
++		nullify_basic_block (bb);
++		
++		return TRUE;
++	} else {
++		return FALSE;
++	}
++}
+ 
+ static void
+ merge_basic_blocks (MonoBasicBlock *bb, MonoBasicBlock *bbn) 
+@@ -7379,16 +7553,22 @@
+ 	 */
+ 	niterations = 1000;
+ 	do {
++		MonoBasicBlock *previous_bb;
+ 		changed = FALSE;
+ 		niterations --;
+ 
+ 		/* we skip the entry block (exit is handled specially instead ) */
+-		for (bb = cfg->bb_entry->next_bb; bb; bb = bb->next_bb) {
++		for (previous_bb = cfg->bb_entry, bb = cfg->bb_entry->next_bb; bb; previous_bb = bb, bb = bb->next_bb) {
+ 
+ 			/* dont touch code inside exception clauses */
+ 			if (bb->region != -1)
+ 				continue;
+ 
++			if (remove_block_if_useless (cfg, bb, previous_bb)) {
++				changed = TRUE;
++				continue;
++			}
++
+ 			if ((bbn = bb->next_bb) && bbn->in_count == 0 && bb->region == bbn->region) {
+ 				if (cfg->verbose_level > 2)
+ 					g_print ("nullify block triggered %d\n", bbn->block_num);
+@@ -8128,6 +8308,7 @@
+ static void
+ remove_critical_edges (MonoCompile *cfg) {
+ 	MonoBasicBlock *bb;
++	MonoBasicBlock *previous_bb;
+ 	
+ 	if (cfg->verbose_level > 3) {
+ 		for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+@@ -8149,84 +8330,82 @@
+ 		}
+ 	}
+ 	
+-	for (bb = cfg->bb_entry; bb; bb = bb->next_bb) {
+-		if (bb->out_count > 1) {
+-			int out_bb_index;
+-			for (out_bb_index = 0; out_bb_index < bb->out_count; out_bb_index++) {
+-				MonoBasicBlock *out_bb = bb->out_bb [out_bb_index];
+-				if (out_bb->in_count > 1) {
+-					MonoInst *inst;
++	for (previous_bb = cfg->bb_entry, bb = previous_bb->next_bb; bb != NULL; previous_bb = previous_bb->next_bb, bb = bb->next_bb) {
++		if (bb->in_count > 1) {
++			int in_bb_index;
++			for (in_bb_index = 0; in_bb_index < bb->in_count; in_bb_index++) {
++				MonoBasicBlock *in_bb = bb->in_bb [in_bb_index];
++				if (in_bb->out_count > 1) {
+ 					MonoBasicBlock *new_bb = mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoBasicBlock));
+ 					new_bb->block_num = cfg->num_bblocks++;
+-					new_bb->next_bb = bb->next_bb;
+-					bb->next_bb = new_bb;
+-					new_bb->in_bb = mono_mempool_alloc ((cfg)->mempool, sizeof (MonoBasicBlock*));
+-					new_bb->in_bb [0] = bb;
+-					new_bb->in_count = 1;
+-					new_bb->out_bb = mono_mempool_alloc ((cfg)->mempool, sizeof (MonoBasicBlock*));
+-					new_bb->out_bb [0] = out_bb;
+-					new_bb->out_count = 1;
+-					replace_out_block (bb, out_bb, new_bb);
+-					replace_in_block (out_bb, bb, new_bb);
+-					for (inst = bb->code; inst != NULL; inst = inst->next) {
+-						if (inst->opcode == OP_CALL_HANDLER) {
+-							if (inst->inst_target_bb == out_bb) {
+-								inst->inst_target_bb = new_bb;
+-							}
+-						}
+-					}
+-					if (bb->last_ins != NULL) {
+-						switch (bb->last_ins->opcode) {
+-						case CEE_BR:
+-							if (bb->last_ins->inst_target_bb == out_bb) {
+-								bb->last_ins->inst_target_bb = new_bb;
+-							}
+-							break;
+-						case CEE_SWITCH: {
+-							int i;
+-							int n = GPOINTER_TO_INT (bb->last_ins->klass);
+-							for (i = 0; i < n; i++ ) {
+-								if (bb->last_ins->inst_many_bb [i] == out_bb) {
+-									bb->last_ins->inst_many_bb [i] = new_bb;
+-									break;
++//					new_bb->real_offset = bb->real_offset;
++					new_bb->region = bb->region;
++					
++					/* Do not alter the CFG while altering the BB list */
++					if (previous_bb->region == bb->region) {
++						if (previous_bb != cfg->bb_entry) {
++							/* If previous_bb "followed through" to bb, */
++							/* keep it linked with a CEE_BR */
++							if ((previous_bb->last_ins == NULL) ||
++									((previous_bb->last_ins->opcode != CEE_BR) &&
++									(! (MONO_IS_COND_BRANCH_OP (previous_bb->last_ins))) &&
++									(previous_bb->last_ins->opcode != CEE_SWITCH))) {
++								int i;
++								/* Make sure previous_bb really falls through bb */
++								for (i = 0; i < previous_bb->out_count; i++) {
++									if (previous_bb->out_bb [i] == bb) {
++										MonoInst *jump;
++										MONO_INST_NEW (cfg, jump, CEE_BR);
++										MONO_ADD_INS (previous_bb, jump);
++										jump->cil_code = previous_bb->cil_code;
++										jump->inst_target_bb = bb;
++										break;
++									}
+ 								}
+ 							}
+-							break;
+-						}
+-						case CEE_BNE_UN:
+-						case CEE_BEQ:
+-						case CEE_BLT:
+-						case CEE_BLT_UN:
+-						case CEE_BGT:
+-						case CEE_BGT_UN:
+-						case CEE_BGE:
+-						case CEE_BGE_UN:
+-						case CEE_BLE:
+-						case CEE_BLE_UN:
+-							if (bb->last_ins->inst_true_bb == out_bb) {
+-								bb->last_ins->inst_true_bb = new_bb;
++						} else {
++							/* We cannot add any inst to the entry BB, so we must */
++							/* put a new BB in the middle to hold the CEE_BR */
++							MonoInst *jump;
++							MonoBasicBlock *new_bb_after_entry = mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoBasicBlock));
++							new_bb_after_entry->block_num = cfg->num_bblocks++;
++//							new_bb_after_entry->real_offset = bb->real_offset;
++							new_bb_after_entry->region = bb->region;
++							
++							MONO_INST_NEW (cfg, jump, CEE_BR);
++							MONO_ADD_INS (new_bb_after_entry, jump);
++							jump->cil_code = bb->cil_code;
++							jump->inst_target_bb = bb;
++							
++							previous_bb->next_bb = new_bb_after_entry;
++							previous_bb = new_bb_after_entry;
++							
++							if (cfg->verbose_level > 2) {
++								printf ("remove_critical_edges %s, added helper BB%d jumping to BB%d\n", mono_method_full_name (cfg->method, TRUE), new_bb_after_entry->block_num, bb->block_num);
+ 							}
+-							if (bb->last_ins->inst_false_bb == out_bb) {
+-								bb->last_ins->inst_false_bb = new_bb;
+-							}
+-							break;
+-						default:
+-							break;
+ 						}
+ 					}
+-//					new_bb->real_offset = bb->real_offset;
+-					new_bb->region = bb->region;
+ 					
+-					if (new_bb->next_bb != out_bb) {
+-						MonoInst *jump;
+-						MONO_INST_NEW (cfg, jump, CEE_BR);
+-						MONO_ADD_INS (new_bb, jump);
+-						jump->cil_code = bb->cil_code;
+-						jump->inst_target_bb = out_bb;
+-					}
++					/* Insert new_bb in the BB list */
++					previous_bb->next_bb = new_bb;
++					new_bb->next_bb = bb;
++					previous_bb = new_bb;
+ 					
++					/* Setup in_bb and out_bb */
++					new_bb->in_bb = mono_mempool_alloc ((cfg)->mempool, sizeof (MonoBasicBlock*));
++					new_bb->in_bb [0] = in_bb;
++					new_bb->in_count = 1;
++					new_bb->out_bb = mono_mempool_alloc ((cfg)->mempool, sizeof (MonoBasicBlock*));
++					new_bb->out_bb [0] = bb;
++					new_bb->out_count = 1;
++					
++					/* Relink in_bb and bb to (from) new_bb */
++					replace_out_block (in_bb, bb, new_bb);
++					replace_out_block_in_code (in_bb, bb, new_bb);
++					replace_in_block (bb, in_bb, new_bb);
++					
+ 					if (cfg->verbose_level > 2) {
+-						printf ("remove_critical_edges %s, removed critical edge from BB%d to BB%d (added BB%d)\n", mono_method_full_name (cfg->method, TRUE), bb->block_num, out_bb->block_num, new_bb->block_num);
++						printf ("remove_critical_edges %s, removed critical edge from BB%d to BB%d (added BB%d)\n", mono_method_full_name (cfg->method, TRUE), in_bb->block_num, bb->block_num, new_bb->block_num);
+ 					}
+ 				}
+ 			}
+@@ -8281,7 +8460,7 @@
+ 	cfg->intvars = mono_mempool_alloc0 (cfg->mempool, sizeof (guint16) * STACK_MAX * 
+ 					    mono_method_get_header (method)->max_stack);
+ 
+-	if (cfg->verbose_level > 2)
++	if (cfg->verbose_level > 0)
+ 		g_print ("converting method %s\n", mono_method_full_name (method, TRUE));
+ 
+ 	/*
+Index: mono/mono/mini/ssapre-mini-ops.h
+===================================================================
+--- mono/mono/mini/ssapre-mini-ops.h	(revision 0)
++++ mono/mono/mini/ssapre-mini-ops.h	(revision 0)
+@@ -0,0 +1,242 @@
++
++#if 0
++
++MINI_OP(OP_OBJADDR,	"objaddr")
++MINI_OP(OP_VTADDR,	"vtaddr")
++MINI_OP(OP_RENAME,	"rename")
++
++MINI_OP(OP_GROUP, "group")
++
++MINI_OP(OP_CISINST, "cisinst")
++MINI_OP(OP_CCASTCLASS, "ccastclass")
++
++#endif
++
++MINI_OP(OP_LOAD_MEMBASE,"load_membase")
++MINI_OP(OP_LOADI1_MEMBASE,"loadi1_membase")
++MINI_OP(OP_LOADU1_MEMBASE,"loadu1_membase")
++MINI_OP(OP_LOADI2_MEMBASE,"loadi2_membase")
++MINI_OP(OP_LOADU2_MEMBASE,"loadu2_membase")
++MINI_OP(OP_LOADI4_MEMBASE,"loadi4_membase")
++MINI_OP(OP_LOADU4_MEMBASE,"loadu4_membase")
++MINI_OP(OP_LOADI8_MEMBASE,"loadi8_membase")
++MINI_OP(OP_LOADR4_MEMBASE,"loadr4_membase")
++MINI_OP(OP_LOADR8_MEMBASE,"loadr8_membase")
++MINI_OP(OP_LOADR8_SPILL_MEMBASE,"loadr8_spill_membase")
++MINI_OP(OP_LOADU4_MEM,"loadu4_mem")
++
++MINI_OP(OP_LDELEMA2D, "getldelema2")
++
++MINI_OP(OP_GETTYPE, "gettype")
++MINI_OP(OP_GETHASHCODE, "gethashcode")
++
++
++
++MINI_OP(OP_ADD_IMM,    "add_imm")
++MINI_OP(OP_SUB_IMM,    "sub_imm")
++MINI_OP(OP_MUL_IMM,    "mul_imm")
++MINI_OP(OP_DIV_IMM,    "div_imm")
++MINI_OP(OP_DIV_UN_IMM, "div_un_imm")
++MINI_OP(OP_REM_IMM,    "rem_imm")
++MINI_OP(OP_REM_UN_IMM, "rem_un_imm")
++MINI_OP(OP_AND_IMM,    "and_imm")
++MINI_OP(OP_OR_IMM,     "or_imm")
++MINI_OP(OP_XOR_IMM,    "xor_imm")
++MINI_OP(OP_SHL_IMM,    "shl_imm")
++MINI_OP(OP_SHR_IMM,    "shr_imm")
++MINI_OP(OP_SHR_UN_IMM, "shr_un_imm")
++
++MINI_OP(OP_LADD,    "long_add")
++MINI_OP(OP_LSUB,    "long_sub")
++MINI_OP(OP_LMUL,    "long_mul")
++MINI_OP(OP_LDIV,    "long_div")
++MINI_OP(OP_LDIV_UN, "long_div_un")
++MINI_OP(OP_LREM,    "long_rem")
++MINI_OP(OP_LREM_UN, "long_rem_un")
++MINI_OP(OP_LAND,    "long_and")
++MINI_OP(OP_LOR,     "long_or")
++MINI_OP(OP_LXOR,    "long_xor")
++MINI_OP(OP_LSHL,    "long_shl")
++MINI_OP(OP_LSHR,    "long_shr")
++MINI_OP(OP_LSHR_UN, "long_shr_un")
++
++MINI_OP(OP_LNEG,       "long_neg")
++MINI_OP(OP_LNOT,       "long_not")
++MINI_OP(OP_LCONV_TO_I1,"long_conv_to_i1")
++MINI_OP(OP_LCONV_TO_I2,"long_conv_to_i2")
++MINI_OP(OP_LCONV_TO_I4,"long_conv_to_i4")
++MINI_OP(OP_LCONV_TO_I8,"long_conv_to_i8")
++MINI_OP(OP_LCONV_TO_R4,"long_conv_to_r4")
++MINI_OP(OP_LCONV_TO_R8,"long_conv_to_r8")
++MINI_OP(OP_LCONV_TO_U4,"long_conv_to_u4")
++MINI_OP(OP_LCONV_TO_U8,"long_conv_to_u8")
++
++MINI_OP(OP_LCONV_TO_U2,   "long_conv_to_u2")
++MINI_OP(OP_LCONV_TO_U1,   "long_conv_to_u1")
++MINI_OP(OP_LCONV_TO_I,    "long_conv_to_i")
++MINI_OP(OP_LCONV_TO_OVF_I,"long_conv_to_ovf_i")
++MINI_OP(OP_LCONV_TO_OVF_U,"long_conv_to_ovf_u")
++MINI_OP(OP_LADD_OVF,      "long_add_ovf")
++MINI_OP(OP_LADD_OVF_UN,   "long_add_ovf_un")
++MINI_OP(OP_LMUL_OVF,      "long_mul_ovf")
++MINI_OP(OP_LMUL_OVF_UN,   "long_mul_ovf_un")
++MINI_OP(OP_LSUB_OVF,      "long_sub_ovf")
++MINI_OP(OP_LSUB_OVF_UN,   "long_sub_ovf_un")
++
++MINI_OP(OP_LCONV_TO_OVF_I1_UN,"long_conv_to_ovf_i1_un")
++MINI_OP(OP_LCONV_TO_OVF_I2_UN,"long_conv_to_ovf_i2_un")
++MINI_OP(OP_LCONV_TO_OVF_I4_UN,"long_conv_to_ovf_i4_un")
++MINI_OP(OP_LCONV_TO_OVF_I8_UN,"long_conv_to_ovf_i8_un")
++MINI_OP(OP_LCONV_TO_OVF_U1_UN,"long_conv_to_ovf_u1_un")
++MINI_OP(OP_LCONV_TO_OVF_U2_UN,"long_conv_to_ovf_u2_un")
++MINI_OP(OP_LCONV_TO_OVF_U4_UN,"long_conv_to_ovf_u4_un")
++MINI_OP(OP_LCONV_TO_OVF_U8_UN,"long_conv_to_ovf_u8_un")
++MINI_OP(OP_LCONV_TO_OVF_I_UN, "long_conv_to_ovf_i_un")
++MINI_OP(OP_LCONV_TO_OVF_U_UN, "long_conv_to_ovf_u_un")
++
++MINI_OP(OP_LCONV_TO_OVF_I1,"long_conv_to_ovf_i1")
++MINI_OP(OP_LCONV_TO_OVF_U1,"long_conv_to_ovf_u1")
++MINI_OP(OP_LCONV_TO_OVF_I2,"long_conv_to_ovf_i2")
++MINI_OP(OP_LCONV_TO_OVF_U2,"long_conv_to_ovf_u2")
++MINI_OP(OP_LCONV_TO_OVF_I4,"long_conv_to_ovf_i4")
++MINI_OP(OP_LCONV_TO_OVF_U4,"long_conv_to_ovf_u4")
++MINI_OP(OP_LCONV_TO_OVF_I8,"long_conv_to_ovf_i8")
++MINI_OP(OP_LCONV_TO_OVF_U8,"long_conv_to_ovf_u8")
++
++
++MINI_OP(OP_LCONV_TO_R_UN,"long_conv_to_r_un")
++MINI_OP(OP_LCONV_TO_U,   "long_conv_to_u")
++MINI_OP(OP_LSHR_IMM,	 "long_shr_imm")
++MINI_OP(OP_LSHR_UN_IMM,  "long_shr_un_imm")
++MINI_OP(OP_LSHL_IMM,     "long_shl_imm")
++MINI_OP(OP_LADD_IMM,     "long_add_imm")
++MINI_OP(OP_LSUB_IMM,     "long_sub_imm")
++
++
++MINI_OP(OP_IADD,    "int_add")
++MINI_OP(OP_ISUB,    "int_sub")
++MINI_OP(OP_IMUL,    "int_mul")
++MINI_OP(OP_IMUL_OVF,    "int_mul_ovf")
++MINI_OP(OP_IMUL_OVF_UN, "int_mul_ovf_un")
++MINI_OP(OP_IDIV,    "int_div")
++MINI_OP(OP_IDIV_UN, "int_div_un")
++MINI_OP(OP_IREM,    "int_rem")
++MINI_OP(OP_IREM_UN, "int_rem_un")
++MINI_OP(OP_IAND,    "int_and")
++MINI_OP(OP_IOR,     "int_or")
++MINI_OP(OP_IXOR,    "int_xor")
++MINI_OP(OP_ISHL,    "int_shl")
++MINI_OP(OP_ISHR,    "int_shr")
++MINI_OP(OP_ISHR_UN, "int_shr_un")
++MINI_OP(OP_IADC,     "int_adc")
++MINI_OP(OP_IADC_IMM, "int_adc_imm")
++MINI_OP(OP_ISBB,     "int_sbb")
++MINI_OP(OP_ISBB_IMM, "int_sbb_imm")
++MINI_OP(OP_IADDCC,   "int_addcc")
++MINI_OP(OP_ISUBCC,   "int_subcc")
++
++MINI_OP(OP_IADD_IMM,    "int_add_imm")
++MINI_OP(OP_ISUB_IMM,    "int_sub_imm")
++MINI_OP(OP_IMUL_IMM,    "int_mul_imm")
++MINI_OP(OP_IDIV_IMM,    "int_div_imm")
++MINI_OP(OP_IDIV_UN_IMM, "int_div_un_imm")
++MINI_OP(OP_IREM_IMM,    "int_rem_imm")
++MINI_OP(OP_IREM_UN_IMM, "int_rem_un_imm")
++MINI_OP(OP_IAND_IMM,    "int_and_imm")
++MINI_OP(OP_IOR_IMM,     "int_or_imm")
++MINI_OP(OP_IXOR_IMM,    "int_xor_imm")
++MINI_OP(OP_ISHL_IMM,    "int_shl_imm")
++MINI_OP(OP_ISHR_IMM,    "int_shr_imm")
++MINI_OP(OP_ISHR_UN_IMM, "int_shr_un_imm")
++
++MINI_OP(OP_INEG,       "int_neg")
++MINI_OP(OP_INOT,       "int_not")
++
++MINI_OP(OP_LONG_SHRUN_32, "long_shr_un_32")
++
++MINI_OP(OP_FADD,   "float_add")
++MINI_OP(OP_FSUB,   "float_sub")
++MINI_OP(OP_FMUL,   "float_mul")
++MINI_OP(OP_FDIV,   "float_div")
++MINI_OP(OP_FDIV_UN,"float_div_un")
++MINI_OP(OP_FREM,   "float_rem")
++MINI_OP(OP_FREM_UN,"float_rem_un")
++
++MINI_OP(OP_FNEG,       "float_neg")
++MINI_OP(OP_FNOT,       "float_not")
++MINI_OP(OP_FCONV_TO_I1,"float_conv_to_i1")
++MINI_OP(OP_FCONV_TO_I2,"float_conv_to_i2")
++MINI_OP(OP_FCONV_TO_I4,"float_conv_to_i4")
++MINI_OP(OP_FCONV_TO_I8,"float_conv_to_i8")
++MINI_OP(OP_FCONV_TO_R4,"float_conv_to_r4")
++MINI_OP(OP_FCONV_TO_R8,"float_conv_to_r8")
++MINI_OP(OP_FCONV_TO_U4,"float_conv_to_u4")
++MINI_OP(OP_FCONV_TO_U8,"float_conv_to_u8")
++
++MINI_OP(OP_FCONV_TO_U2,   "float_conv_to_u2")
++MINI_OP(OP_FCONV_TO_U1,   "float_conv_to_u1")
++MINI_OP(OP_FCONV_TO_I,    "float_conv_to_i")
++MINI_OP(OP_FCONV_TO_OVF_I,"float_conv_to_ovf_i")
++MINI_OP(OP_FCONV_TO_OVF_U,"float_conv_to_ovd_u")
++MINI_OP(OP_FADD_OVF,      "float_add_ovf")
++MINI_OP(OP_FADD_OVF_UN,   "float_add_ovf_un")
++MINI_OP(OP_FMUL_OVF,      "float_mul_ovf")
++MINI_OP(OP_FMUL_OVF_UN,   "float_mul_ovf_un")
++MINI_OP(OP_FSUB_OVF,      "float_sub_ovf")
++MINI_OP(OP_FSUB_OVF_UN,   "float_sub_ovf_un")
++
++MINI_OP(OP_FCONV_TO_OVF_I1_UN,"float_conv_to_ovf_i1_un")
++MINI_OP(OP_FCONV_TO_OVF_I2_UN,"float_conv_to_ovf_i2_un")
++MINI_OP(OP_FCONV_TO_OVF_I4_UN,"float_conv_to_ovf_i4_un")
++MINI_OP(OP_FCONV_TO_OVF_I8_UN,"float_conv_to_ovf_i8_un")
++MINI_OP(OP_FCONV_TO_OVF_U1_UN,"float_conv_to_ovf_u1_un")
++MINI_OP(OP_FCONV_TO_OVF_U2_UN,"float_conv_to_ovf_u2_un")
++MINI_OP(OP_FCONV_TO_OVF_U4_UN,"float_conv_to_ovf_u4_un")
++MINI_OP(OP_FCONV_TO_OVF_U8_UN,"float_conv_to_ovf_u8_un")
++MINI_OP(OP_FCONV_TO_OVF_I_UN, "float_conv_to_ovf_i_un")
++MINI_OP(OP_FCONV_TO_OVF_U_UN, "float_conv_to_ovf_u_un")
++
++MINI_OP(OP_FCONV_TO_OVF_I1,"float_conv_to_ovf_i1")
++MINI_OP(OP_FCONV_TO_OVF_U1,"float_conv_to_ovf_u1")
++MINI_OP(OP_FCONV_TO_OVF_I2,"float_conv_to_ovf_i2")
++MINI_OP(OP_FCONV_TO_OVF_U2,"float_conv_to_ovf_u2")
++MINI_OP(OP_FCONV_TO_OVF_I4,"float_conv_to_ovf_i4")
++MINI_OP(OP_FCONV_TO_OVF_U4,"float_conv_to_ovf_u4")
++MINI_OP(OP_FCONV_TO_OVF_I8,"float_conv_to_ovf_i8")
++MINI_OP(OP_FCONV_TO_OVF_U8,"float_conv_to_ovf_u8")
++
++
++MINI_OP(OP_FCONV_TO_U,	"float_conv_to_u")
++
++MINI_OP(OP_BIGMUL, "op_bigmul")
++MINI_OP(OP_BIGMUL_UN, "op_bigmul_un")
++
++MINI_OP(OP_ADC,     "adc")
++MINI_OP(OP_ADC_IMM, "adc_imm")
++MINI_OP(OP_SBB,     "sbb")
++MINI_OP(OP_SBB_IMM, "sbb_imm")
++MINI_OP(OP_ADDCC,   "addcc")
++MINI_OP(OP_ADDCC_IMM,   "addcc_imm")
++MINI_OP(OP_SUBCC,   "subcc")
++MINI_OP(OP_SUBCC_IMM,   "subcc_imm")
++MINI_OP(OP_BR_REG,  "br_reg")
++MINI_OP(OP_SEXT_I1,  "sext_i1")
++MINI_OP(OP_SEXT_I2,  "sext_i2")
++MINI_OP(OP_CNE,      "cne")
++
++
++MINI_OP(OP_ADD_OVF_CARRY,   "add_ovf_carry")
++MINI_OP(OP_SUB_OVF_CARRY,   "sub_ovf_carry")
++MINI_OP(OP_ADD_OVF_UN_CARRY,   "add_ovf_un_carry")
++MINI_OP(OP_SUB_OVF_UN_CARRY,   "sub_ovf_un_carry")
++
++MINI_OP(OP_SIN,     "sin")
++MINI_OP(OP_COS,     "cos")
++MINI_OP(OP_ABS,     "abs")
++MINI_OP(OP_TAN,     "tan")
++MINI_OP(OP_ATAN,    "atan")
++MINI_OP(OP_SQRT,    "sqrt")
++
++MINI_OP(OP_GETCHR, "getchar")
++MINI_OP(OP_STRLEN, "strlen")
++
+Index: mono/mono/mini/driver.c
+===================================================================
+--- mono/mono/mini/driver.c	(revision 38594)
++++ mono/mono/mini/driver.c	(working copy)
+@@ -90,10 +90,11 @@
+ 	MONO_OPT_LINEARS |	\
+ 	MONO_OPT_INTRINS |  \
+ 	MONO_OPT_LOOP |  \
++	MONO_OPT_SSAPRE |  \
+ 	MONO_OPT_AOT)
+ 
+ /* SSAPRE does not work correctly on non x86 platforms (bug #70637) */
+-#define EXCLUDED_FROM_ALL (MONO_OPT_SHARED | MONO_OPT_PRECOMP | MONO_OPT_SSAPRE)
++#define EXCLUDED_FROM_ALL (MONO_OPT_SHARED | MONO_OPT_PRECOMP)
+ 
+ static guint32
+ parse_optimizations (const char* p)
+@@ -230,9 +231,7 @@
+        MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE,
+        MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE | MONO_OPT_LOOP | MONO_OPT_INLINE | MONO_OPT_INTRINS,
+        MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE | MONO_OPT_LOOP | MONO_OPT_INLINE | MONO_OPT_INTRINS | MONO_OPT_ABCREM,
+-	   /* SSAPRE does not work correctly on non x86 platforms (bug #70637)
+        MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE | MONO_OPT_LOOP | MONO_OPT_INLINE | MONO_OPT_INTRINS | MONO_OPT_SSAPRE,
+-	   */
+        MONO_OPT_BRANCH | MONO_OPT_PEEPHOLE | MONO_OPT_LINEARS | MONO_OPT_COPYPROP | MONO_OPT_CONSPROP | MONO_OPT_DEADCE | MONO_OPT_LOOP | MONO_OPT_INLINE | MONO_OPT_INTRINS | MONO_OPT_ABCREM | MONO_OPT_SHARED
+ };
+ 
+Index: mono/mono/mini/ssapre-cee-ops.h
+===================================================================
+--- mono/mono/mini/ssapre-cee-ops.h	(revision 0)
++++ mono/mono/mini/ssapre-cee-ops.h	(revision 0)
+@@ -0,0 +1,120 @@
++
++#if 0
++
++OPDEF(CEE_LDIND_I1, "ldind.i1", PopI, PushI, InlineNone, X, 1, 0xFF, 0x46, NEXT)
++OPDEF(CEE_LDIND_U1, "ldind.u1", PopI, PushI, InlineNone, X, 1, 0xFF, 0x47, NEXT)
++OPDEF(CEE_LDIND_I2, "ldind.i2", PopI, PushI, InlineNone, X, 1, 0xFF, 0x48, NEXT)
++OPDEF(CEE_LDIND_U2, "ldind.u2", PopI, PushI, InlineNone, X, 1, 0xFF, 0x49, NEXT)
++OPDEF(CEE_LDIND_I4, "ldind.i4", PopI, PushI, InlineNone, X, 1, 0xFF, 0x4A, NEXT)
++OPDEF(CEE_LDIND_U4, "ldind.u4", PopI, PushI, InlineNone, X, 1, 0xFF, 0x4B, NEXT)
++OPDEF(CEE_LDIND_I8, "ldind.i8", PopI, PushI8, InlineNone, X, 1, 0xFF, 0x4C, NEXT)
++OPDEF(CEE_LDIND_I, "ldind.i", PopI, PushI, InlineNone, X, 1, 0xFF, 0x4D, NEXT)
++OPDEF(CEE_LDIND_R4, "ldind.r4", PopI, PushR4, InlineNone, X, 1, 0xFF, 0x4E, NEXT)
++OPDEF(CEE_LDIND_R8, "ldind.r8", PopI, PushR8, InlineNone, X, 1, 0xFF, 0x4F, NEXT)
++OPDEF(CEE_LDIND_REF, "ldind.ref", PopI, PushRef, InlineNone, X, 1, 0xFF, 0x50, NEXT)
++OPDEF(CEE_LDSTR, "ldstr", Pop0, PushRef, InlineString, X, 1, 0xFF, 0x72, NEXT)
++
++OPDEF(CEE_CPOBJ, "cpobj", PopI+PopI, Push0, InlineType, X, 1, 0xFF, 0x70, NEXT)
++OPDEF(CEE_LDOBJ, "ldobj", PopI, Push1, InlineType, X, 1, 0xFF, 0x71, NEXT)
++OPDEF(CEE_CASTCLASS, "castclass", PopRef, PushRef, InlineType, X, 1, 0xFF, 0x74, NEXT)
++OPDEF(CEE_UNBOX, "unbox", PopRef, PushI, InlineType, X, 1, 0xFF, 0x79, NEXT)
++OPDEF(CEE_UNBOX_ANY, "unbox.any", PopRef, Push1, InlineType, X, 1, 0xFF, 0xA5, NEXT)
++OPDEF(CEE_LDFLD, "ldfld", PopRef, Push1, InlineField, X, 1, 0xFF, 0x7B, NEXT)
++OPDEF(CEE_LDFLDA, "ldflda", PopRef, PushI, InlineField, X, 1, 0xFF, 0x7C, NEXT)
++OPDEF(CEE_STFLD, "stfld", PopRef+Pop1, Push0, InlineField, X, 1, 0xFF, 0x7D, NEXT)
++OPDEF(CEE_LDSFLD, "ldsfld", Pop0, Push1, InlineField, X, 1, 0xFF, 0x7E, NEXT)
++OPDEF(CEE_LDSFLDA, "ldsflda", Pop0, PushI, InlineField, X, 1, 0xFF, 0x7F, NEXT)
++OPDEF(CEE_STSFLD, "stsfld", Pop1, Push0, InlineField, X, 1, 0xFF, 0x80, NEXT)
++OPDEF(CEE_STOBJ, "stobj", PopI+Pop1, Push0, InlineType, X, 1, 0xFF, 0x81, NEXT)
++
++OPDEF(CEE_MONO_OBJADDR, "mono_objaddr", Pop1, PushI, InlineNone, X, 2, 0xF0, 0x01, NEXT)
++OPDEF(CEE_MONO_LDPTR, "mono_ldptr", Pop0, PushI, InlineI, X, 2, 0xF0, 0x02, NEXT)
++OPDEF(CEE_MONO_VTADDR, "mono_vtaddr", Pop1, PushI, InlineNone, X, 2, 0xF0, 0x03, NEXT)
++OPDEF(CEE_MONO_LDNATIVEOBJ, "mono_ldnativeobj", PopI, Push1, InlineType, X, 2, 0xF0, 0x06, RETURN)
++OPDEF(CEE_MONO_CISINST, "mono_cisinst", PopRef, Push1, InlineType, X, 2, 0xF0, 0x07, NEXT)
++OPDEF(CEE_MONO_CCASTCLASS, "mono_ccastclass", PopRef, Push1, InlineType, X, 2, 0xF0, 0x08, NEXT)
++
++#endif
++
++
++OPDEF(CEE_LDARG, "ldarg", Pop0, Push1, InlineVar, X, 2, 0xFE, 0x09, NEXT)
++OPDEF(CEE_LDARGA, "ldarga", Pop0, PushI, InlineVar, X, 2, 0xFE, 0x0A, NEXT)
++
++OPDEF(CEE_LDLOC, "ldloc", Pop0, Push1, InlineVar, X, 2, 0xFE, 0x0C, NEXT)
++OPDEF(CEE_LDLOCA, "ldloca", Pop0, PushI, InlineVar, X, 2, 0xFE, 0x0D, NEXT)
++
++
++OPDEF(CEE_LDLEN, "ldlen", PopRef, PushI, InlineNone, X, 1, 0xFF, 0x8E, NEXT)
++OPDEF(CEE_LDELEMA, "ldelema", PopRef+PopI, PushI, InlineType, X, 1, 0xFF, 0x8F, NEXT)
++OPDEF(CEE_LDELEM_I1, "ldelem.i1", PopRef+PopI, PushI, InlineNone, X, 1, 0xFF, 0x90, NEXT)
++OPDEF(CEE_LDELEM_U1, "ldelem.u1", PopRef+PopI, PushI, InlineNone, X, 1, 0xFF, 0x91, NEXT)
++OPDEF(CEE_LDELEM_I2, "ldelem.i2", PopRef+PopI, PushI, InlineNone, X, 1, 0xFF, 0x92, NEXT)
++OPDEF(CEE_LDELEM_U2, "ldelem.u2", PopRef+PopI, PushI, InlineNone, X, 1, 0xFF, 0x93, NEXT)
++OPDEF(CEE_LDELEM_I4, "ldelem.i4", PopRef+PopI, PushI, InlineNone, X, 1, 0xFF, 0x94, NEXT)
++OPDEF(CEE_LDELEM_U4, "ldelem.u4", PopRef+PopI, PushI, InlineNone, X, 1, 0xFF, 0x95, NEXT)
++OPDEF(CEE_LDELEM_I8, "ldelem.i8", PopRef+PopI, PushI8, InlineNone, X, 1, 0xFF, 0x96, NEXT)
++OPDEF(CEE_LDELEM_I, "ldelem.i", PopRef+PopI, PushI, InlineNone, X, 1, 0xFF, 0x97, NEXT)
++OPDEF(CEE_LDELEM_R4, "ldelem.r4", PopRef+PopI, PushR4, InlineNone, X, 1, 0xFF, 0x98, NEXT)
++OPDEF(CEE_LDELEM_R8, "ldelem.r8", PopRef+PopI, PushR8, InlineNone, X, 1, 0xFF, 0x99, NEXT)
++OPDEF(CEE_LDELEM_REF, "ldelem.ref", PopRef+PopI, PushRef, InlineNone, X, 1, 0xFF, 0x9A, NEXT)
++OPDEF(CEE_LDELEM_ANY, "ldelem.any", PopRef+PopI, Push1, InlineType, X, 1, 0xFF, 0xA3, NEXT)
++
++
++OPDEF(CEE_ADD, "add", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x58, NEXT)
++OPDEF(CEE_SUB, "sub", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x59, NEXT)
++OPDEF(CEE_MUL, "mul", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x5A, NEXT)
++OPDEF(CEE_DIV, "div", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x5B, NEXT)
++OPDEF(CEE_DIV_UN, "div.un", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x5C, NEXT)
++OPDEF(CEE_REM, "rem", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x5D, NEXT)
++OPDEF(CEE_REM_UN, "rem.un", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x5E, NEXT)
++OPDEF(CEE_AND, "and", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x5F, NEXT)
++OPDEF(CEE_OR, "or", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x60, NEXT)
++OPDEF(CEE_XOR, "xor", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x61, NEXT)
++OPDEF(CEE_SHL, "shl", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x62, NEXT)
++OPDEF(CEE_SHR, "shr", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x63, NEXT)
++OPDEF(CEE_SHR_UN, "shr.un", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0x64, NEXT)
++OPDEF(CEE_NEG, "neg", Pop1, Push1, InlineNone, X, 1, 0xFF, 0x65, NEXT)
++OPDEF(CEE_NOT, "not", Pop1, Push1, InlineNone, X, 1, 0xFF, 0x66, NEXT)
++OPDEF(CEE_CONV_I1, "conv.i1", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x67, NEXT)
++OPDEF(CEE_CONV_I2, "conv.i2", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x68, NEXT)
++OPDEF(CEE_CONV_I4, "conv.i4", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x69, NEXT)
++OPDEF(CEE_CONV_I8, "conv.i8", Pop1, PushI8, InlineNone, X, 1, 0xFF, 0x6A, NEXT)
++OPDEF(CEE_CONV_R4, "conv.r4", Pop1, PushR4, InlineNone, X, 1, 0xFF, 0x6B, NEXT)
++OPDEF(CEE_CONV_R8, "conv.r8", Pop1, PushR8, InlineNone, X, 1, 0xFF, 0x6C, NEXT)
++OPDEF(CEE_CONV_U4, "conv.u4", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x6D, NEXT)
++OPDEF(CEE_CONV_U8, "conv.u8", Pop1, PushI8, InlineNone, X, 1, 0xFF, 0x6E, NEXT)
++OPDEF(CEE_CONV_R_UN, "conv.r.un", Pop1, PushR8, InlineNone, X, 1, 0xFF, 0x76, NEXT)
++
++
++OPDEF(CEE_CONV_OVF_I1_UN, "conv.ovf.i1.un", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x82, NEXT)
++OPDEF(CEE_CONV_OVF_I2_UN, "conv.ovf.i2.un", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x83, NEXT)
++OPDEF(CEE_CONV_OVF_I4_UN, "conv.ovf.i4.un", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x84, NEXT)
++OPDEF(CEE_CONV_OVF_I8_UN, "conv.ovf.i8.un", Pop1, PushI8, InlineNone, X, 1, 0xFF, 0x85, NEXT)
++OPDEF(CEE_CONV_OVF_U1_UN, "conv.ovf.u1.un", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x86, NEXT)
++OPDEF(CEE_CONV_OVF_U2_UN, "conv.ovf.u2.un", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x87, NEXT)
++OPDEF(CEE_CONV_OVF_U4_UN, "conv.ovf.u4.un", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x88, NEXT)
++OPDEF(CEE_CONV_OVF_U8_UN, "conv.ovf.u8.un", Pop1, PushI8, InlineNone, X, 1, 0xFF, 0x89, NEXT)
++OPDEF(CEE_CONV_OVF_I_UN, "conv.ovf.i.un", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x8A, NEXT)
++OPDEF(CEE_CONV_OVF_U_UN, "conv.ovf.u.un", Pop1, PushI, InlineNone, X, 1, 0xFF, 0x8B, NEXT)
++
++OPDEF(CEE_CONV_OVF_I1, "conv.ovf.i1", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xB3, NEXT)
++OPDEF(CEE_CONV_OVF_U1, "conv.ovf.u1", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xB4, NEXT)
++OPDEF(CEE_CONV_OVF_I2, "conv.ovf.i2", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xB5, NEXT)
++OPDEF(CEE_CONV_OVF_U2, "conv.ovf.u2", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xB6, NEXT)
++OPDEF(CEE_CONV_OVF_I4, "conv.ovf.i4", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xB7, NEXT)
++OPDEF(CEE_CONV_OVF_U4, "conv.ovf.u4", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xB8, NEXT)
++OPDEF(CEE_CONV_OVF_I8, "conv.ovf.i8", Pop1, PushI8, InlineNone, X, 1, 0xFF, 0xB9, NEXT)
++OPDEF(CEE_CONV_OVF_U8, "conv.ovf.u8", Pop1, PushI8, InlineNone, X, 1, 0xFF, 0xBA, NEXT)
++
++OPDEF(CEE_CONV_U2, "conv.u2", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xD1, NEXT)
++OPDEF(CEE_CONV_U1, "conv.u1", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xD2, NEXT)
++OPDEF(CEE_CONV_I, "conv.i", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xD3, NEXT)
++OPDEF(CEE_CONV_OVF_I, "conv.ovf.i", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xD4, NEXT)
++OPDEF(CEE_CONV_OVF_U, "conv.ovf.u", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xD5, NEXT)
++OPDEF(CEE_ADD_OVF, "add.ovf", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0xD6, NEXT)
++OPDEF(CEE_ADD_OVF_UN, "add.ovf.un", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0xD7, NEXT)
++OPDEF(CEE_MUL_OVF, "mul.ovf", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0xD8, NEXT)
++OPDEF(CEE_MUL_OVF_UN, "mul.ovf.un", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0xD9, NEXT)
++OPDEF(CEE_SUB_OVF, "sub.ovf", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0xDA, NEXT)
++OPDEF(CEE_SUB_OVF_UN, "sub.ovf.un", Pop1+Pop1, Push1, InlineNone, X, 1, 0xFF, 0xDB, NEXT)
++OPDEF(CEE_CONV_U, "conv.u", Pop1, PushI, InlineNone, X, 1, 0xFF, 0xE0, NEXT)
+Index: mono/mono/mini/ssapre.c
+===================================================================
+--- mono/mono/mini/ssapre.c	(revision 38594)
++++ mono/mono/mini/ssapre.c	(working copy)
+@@ -9,6 +9,7 @@
+ 
+ #include <string.h>
+ #include <stdio.h>
++#include <math.h>
+ 
+ #include <mono/metadata/debug-helpers.h>
+ #include <mono/metadata/opcodes.h>
+@@ -79,6 +80,57 @@
+ 	}
+ }
+ 
++#if (MONO_APPLY_SSAPRE_TO_SINGLE_EXPRESSION)
++static int
++snprint_argument (char *string, size_t max_length, MonoSsapreExpressionArgument *argument) {
++	int length;
++	switch (argument->type) {
++		case MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY:
++			length = snprintf (string, max_length, "ANY");
++			break;
++		case MONO_SSAPRE_EXPRESSION_ARGUMENT_NOT_PRESENT:
++			length = snprintf (string, max_length, "NONE");
++			break;
++		case MONO_SSAPRE_EXPRESSION_ARGUMENT_ORIGINAL_VARIABLE:
++			length = snprintf (string, max_length, "ORIGINAL_VARIABLE %d", argument->argument.original_variable);
++			break;
++		case MONO_SSAPRE_EXPRESSION_ARGUMENT_SSA_VARIABLE:
++			length = snprintf (string, max_length, "SSA_VARIABLE %d", argument->argument.ssa_variable);
++			break;
++		case MONO_SSAPRE_EXPRESSION_ARGUMENT_INTEGER_CONSTANT:
++			length = snprintf (string, max_length, "INTEGER_CONSTANT %d", argument->argument.integer_constant);
++			break;
++		case MONO_SSAPRE_EXPRESSION_ARGUMENT_LONG_COSTANT:
++			length = snprintf (string, max_length, "LONG_COSTANT %lld", *(argument->argument.long_constant));
++			break;
++		case MONO_SSAPRE_EXPRESSION_ARGUMENT_FLOAT_COSTANT:
++			length = snprintf (string, max_length, "FLOAT_COSTANT %f", *(argument->argument.float_constant));
++			break;
++		case MONO_SSAPRE_EXPRESSION_ARGUMENT_DOUBLE_COSTANT:
++			length = snprintf (string, max_length, "DOUBLE_COSTANT %f", *(argument->argument.double_constant));
++			break;
++		default:
++			length = snprintf (string, max_length, "UNKNOWN: %d", argument->type);
++	}
++	return length;
++}
++
++static int
++snprint_expression_description (char *string, size_t max_length, MonoSsapreExpressionDescription *expression_description) {
++	int length = 0;
++	if (expression_description->opcode != 0) {
++		length += snprintf (string + length, max_length - length, "%s ([", mono_inst_name (expression_description->opcode) );
++		length += snprint_argument (string + length, max_length - length, &(expression_description->left_argument));
++		length += snprintf (string + length, max_length - length, "],[");
++		length += snprint_argument (string + length, max_length - length, &(expression_description->right_argument));
++		length += snprintf (string + length, max_length - length, "])");
++	} else {
++		length += snprintf (string + length, max_length - length, "ANY");
++	}
++	return length;
++}
++#endif
++
+ #define GBOOLEAN_TO_STRING(b) ((b)?"TRUE":"FALSE")
+ 
+ static void
+@@ -244,7 +296,12 @@
+ 	case CEE_LDIND_R4:
+ 	case CEE_LDIND_R8:
+ 	case CEE_LDIND_REF:
+-		analyze_argument (argument->inst_left, result);
++		if ((argument->inst_left->opcode == OP_LOCAL) || (argument->inst_left->opcode == OP_ARG)) {
++			result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_SSA_VARIABLE;
++			result->argument.ssa_variable = argument->inst_left->inst_c0;
++		} else {
++			result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY;
++		}
+ 		break;
+ 	case OP_ICONST:
+ 		result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_INTEGER_CONSTANT;
+@@ -255,23 +312,27 @@
+ 		result->argument.long_constant = &(argument->inst_l);
+ 		break;
+ 	case OP_R4CONST:
+-		result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_FLOAT_COSTANT;
+-		result->argument.float_constant = (float*)argument->inst_p0;
++		if (! isnan (*((float*)argument->inst_p0))) {
++			result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_FLOAT_COSTANT;
++			result->argument.float_constant = (float*)argument->inst_p0;
++		} else {
++			result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY;
++		}
+ 		break;
+ 	case OP_R8CONST:
+-		result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_DOUBLE_COSTANT;
+-		result->argument.double_constant = (double*)argument->inst_p0;
++		if (! isnan (*((double*)argument->inst_p0))) {
++			result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_DOUBLE_COSTANT;
++			result->argument.double_constant = (double*)argument->inst_p0;
++		} else {
++			result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY;
++		}
+ 		break;
+-	case OP_ARG:
+-	case OP_LOCAL:
+-		result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_SSA_VARIABLE;
+-		result->argument.ssa_variable = argument->inst_c0;
+-		break;
+ 	default:
+ 		result->type = MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY;
+ 	}
+ }
+ 
++
+ /*
+  * Given a MonoInst, it tries to describe it as an expression.
+  * If this is not possible, the result will have opcode 0.
+@@ -279,85 +340,55 @@
+ static void
+ analyze_expression (MonoInst *expression, MonoSsapreExpressionDescription *result) {
+ 	switch (expression->opcode) {
+-	case CEE_LDIND_I1:
+-	case CEE_LDIND_U1:
+-	case CEE_LDIND_I2:
+-	case CEE_LDIND_U2:
+-	case CEE_LDIND_I4:
+-	case CEE_LDIND_U4:
+-	case CEE_LDIND_I8:
+-	case CEE_LDIND_I:
+-	case CEE_LDIND_R4:
+-	case CEE_LDIND_R8:
+-	case CEE_LDIND_REF:
+-		analyze_expression (expression->inst_left, result);
+-		break;
+-	case CEE_SWITCH:
+-	case CEE_ISINST:
+-	case CEE_CASTCLASS:
+-	case OP_OUTARG:
+-	case OP_CALL_REG:
+-	case OP_FCALL_REG:
+-	case OP_LCALL_REG:
+-	case OP_VCALL_REG:
+-	case OP_VOIDCALL_REG:
+-	case CEE_CALL:
+-	case CEE_CALLVIRT:
+-	case OP_FCALL:
+-	case OP_FCALLVIRT:
+-	case OP_LCALL:
+-	case OP_LCALLVIRT:
+-	case OP_VCALL:
+-	case OP_VCALLVIRT:
+-	case OP_VOIDCALL:
+-	case OP_VOIDCALLVIRT:
+-	case OP_RENAME:
+-	case OP_RETARG:
+-//	case OP_OUTARG:
+-	case OP_OUTARG_REG:
+-	case OP_OUTARG_IMM:
+-	case OP_OUTARG_R4:
+-	case OP_OUTARG_R8:
+-	case OP_OUTARG_VT:
+-	case CEE_NOP:
+-	case CEE_JMP:
+-	case CEE_BREAK:
+-	case OP_COMPARE:
+-	case OP_COMPARE_IMM:
+-	case OP_FCOMPARE:
+-	case OP_LCOMPARE:
+-	case OP_ICOMPARE:
+-	case OP_ICOMPARE_IMM:
+-		result->opcode = 0;
+-		break;
+-	default:
++#define OPDEF(a1,a2,a3,a4,a5,a6,a7,a8,a9,a10) case a1:
++#include "ssapre-cee-ops.h"
++#undef OPDEF
++#define MINI_OP(a1,a2) case a1:
++#include "ssapre-mini-ops.h"
++#undef MINI_OP
+ 		if ( (expression->type == STACK_I4) ||
++				(expression->type == STACK_PTR) ||
++				(expression->type == STACK_MP) ||
+ 				(expression->type == STACK_I8) ||
+ 				(expression->type == STACK_R8) ) {
+ 			if (mono_burg_arity [expression->opcode] > 0) {
++				result->opcode = expression->opcode;
+ 				analyze_argument (expression->inst_left, &(result->left_argument));
+-				if (result->left_argument.type != MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY) {
+-					if (mono_burg_arity [expression->opcode] > 1) {
+-						analyze_argument (expression->inst_right, &(result->right_argument));
+-						if (result->right_argument.type != MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY) {
+-							result->opcode = expression->opcode;
+-						} else {
+-							result->opcode = 0;
+-						}
+-					} else {
+-						result->right_argument.type = MONO_SSAPRE_EXPRESSION_ARGUMENT_NOT_PRESENT;
+-						result->opcode = expression->opcode;
+-					}
++				if (mono_burg_arity [expression->opcode] > 1) {
++					analyze_argument (expression->inst_right, &(result->right_argument));
+ 				} else {
+-					result->opcode = 0;
++					result->right_argument.type = MONO_SSAPRE_EXPRESSION_ARGUMENT_NOT_PRESENT;
+ 				}
+ 			} else {
+ 				result->opcode = 0;
+ 			}
+ 		} else {
+ 			result->opcode = 0;
++			//~ if (expression->type != 0) {
++				//~ MonoType *type = mono_type_from_stack_type (expression);
++				//~ printf ("SSAPRE refuses opcode %s (%d) with type %s (%d)\n", mono_inst_name (expression->opcode), expression->opcode, mono_type_full_name (type), expression->type);
++			//~ } else {
++				//~ printf ("SSAPRE cannot really handle expression of opcode %s (%d)\n", mono_inst_name (expression->opcode), expression->opcode);
++			//~ }
+ 		}
++		break;
++	default:
++		result->opcode = 0;
++		result->left_argument.type = MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY;
++		result->right_argument.type = MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY;
+ 	}
++	switch (expression->opcode) {
++	//~ case CEE_ADD:
++		//~ if ((result->left_argument.type != MONO_SSAPRE_EXPRESSION_ARGUMENT_INTEGER_CONSTANT) &&
++				//~ (result->right_argument.type != MONO_SSAPRE_EXPRESSION_ARGUMENT_INTEGER_CONSTANT)) {
++			//~ break;
++		//~ }
++	case CEE_LDELEMA:
++	case CEE_LDLEN:
++		result->opcode = 0;
++		result->left_argument.type = MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY;
++		result->right_argument.type = MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY;
++	}
+ }
+ 
+ /*
+@@ -611,20 +642,55 @@
+ 	}
+ }
+ 
++#if (MONO_APPLY_SSAPRE_TO_SINGLE_EXPRESSION)
++static char *mono_ssapre_expression_name = NULL;
++static gboolean
++check_ssapre_expression_name (MonoSsapreWorkArea *area, MonoSsapreExpressionDescription *expression_description) {
++	if (area->expression_is_handled_father) {
++		return TRUE;
++	}
++	if (mono_ssapre_expression_name == NULL) {
++		mono_ssapre_expression_name = getenv ("MONO_SSAPRE_EXPRESSION_NAME");
++	}
++	if (mono_ssapre_expression_name != NULL) {
++		char expression_name[1024];
++		snprint_expression_description (expression_name, 1024, expression_description);
++		if (strstr (expression_name, mono_ssapre_expression_name) != NULL) {
++			return TRUE;
++		} else {
++			return FALSE;
++		}
++	} else {
++		return TRUE;
++	}
++}
++#endif
++
+ /*
+- * Adds an expression to the worklist (putting the given occurrence as first
++ * Adds an expression to the worklist (putting the current occurrence as first
+  * occurrence of this expression).
+  */
+ static void
+-add_expression_to_worklist (MonoSsapreWorkArea *area, MonoSsapreExpressionOccurrence *occurrence) {
+-	MonoSsapreExpression *expression;
++add_expression_to_worklist (MonoSsapreWorkArea *area) {
++	MonoSsapreExpressionOccurrence *occurrence = area->current_occurrence;
++	MonoSsapreExpression *expression = (MonoSsapreExpression*) mono_mempool_alloc (area->mempool, sizeof (MonoSsapreExpression));
+ 	
+-	expression = (MonoSsapreExpression*) mono_mempool_alloc (area->mempool, sizeof (MonoSsapreExpression));
++	convert_ssa_variables_to_original_names (&(expression->description), &(occurrence->description), area->cfg);
+ 	
+-	convert_ssa_variables_to_original_names (&(expression->description), &(occurrence->description), area->cfg);
++#if (MONO_APPLY_SSAPRE_TO_SINGLE_EXPRESSION)
++	if (! check_ssapre_expression_name (area, &(expression->description))) return;
++#endif	
++	
+ 	expression->type = mono_type_from_stack_type (occurrence->occurrence);
+ 	expression->occurrences = NULL;
+ 	expression->last_occurrence = NULL;
++	expression->next_in_queue = NULL;
++	if (area->last_in_queue != NULL) {
++		area->last_in_queue->next_in_queue = expression;
++	} else {
++		area->first_in_queue = expression;
++	}
++	area->last_in_queue = expression;
+ 	MONO_SSAPRE_ADD_EXPRESSION_OCCURRANCE (expression, occurrence);
+ 	
+ 	area->worklist = add_expression_to_tree (area->worklist, expression);
+@@ -632,16 +698,16 @@
+ }
+ 
+ /*
+- * Adds an expression occurrence to the worklist.
++ * Adds the current expression occurrence to the worklist.
+  * If its expression is not yet in the worklist, it is created.
+  */
+ static void
+-add_occurrence_to_worklist (MonoSsapreWorkArea *area, MonoSsapreExpressionOccurrence *occurrence) {
++add_occurrence_to_worklist (MonoSsapreWorkArea *area) {
+ 	MonoSsapreExpressionDescription description;
+ 	MonoSsapreExpression *current_expression;
+ 	int comparison;
+ 	
+-	convert_ssa_variables_to_original_names (&description, &(occurrence->description), area->cfg);
++	convert_ssa_variables_to_original_names (&description, &(area->current_occurrence->description), area->cfg);
+ 	current_expression = area->worklist;
+ 	
+ 	do {
+@@ -653,66 +719,75 @@
+ 			} else if (comparison < 0) {
+ 				current_expression = current_expression->previous;
+ 			} else {
+-				MONO_SSAPRE_ADD_EXPRESSION_OCCURRANCE (current_expression, occurrence);
++				MONO_SSAPRE_ADD_EXPRESSION_OCCURRANCE (current_expression, area->current_occurrence);
+ 			}
+ 		} else {
+-			add_expression_to_worklist (area, occurrence);
++			add_expression_to_worklist (area);
+ 			comparison = 0;
+ 		}
+ 	} while (comparison != 0);
++	
++	area->current_occurrence = (MonoSsapreExpressionOccurrence*) mono_mempool_alloc (area->mempool, sizeof (MonoSsapreExpressionOccurrence));
+ }
+ 
+ /*
+  * Process a MonoInst, and of it is a valid expression add it to the worklist.
+  */
+-static MonoSsapreExpressionOccurrence*
+-process_inst (MonoSsapreWorkArea *area, MonoInst* inst, MonoInst* previous_inst, MonoSsapreBBInfo *bb_info, MonoSsapreExpressionOccurrence *current_occurrence) {
++static void
++process_inst (MonoSsapreWorkArea *area, MonoInst* inst, MonoInst* previous_inst, MonoSsapreFatherExpression*** father_in_tree, MonoSsapreBBInfo *bb_info) {
++	MonoSsapreFatherExpression** left_father_in_tree = NULL;
++	MonoSsapreFatherExpression** right_father_in_tree = NULL;
+ 	
+-	/* Ugly hack to fix missing variable definitions */
+-	/* (the SSA construction code should have done it already!) */
+-	switch (inst->opcode) {
+-	case CEE_STIND_REF:
+-	case CEE_STIND_I:
+-	case CEE_STIND_I4:
+-	case CEE_STIND_I1:
+-	case CEE_STIND_I2:
+-	case CEE_STIND_I8:
+-	case CEE_STIND_R4:
+-	case CEE_STIND_R8:
+-		if ((inst->inst_left->opcode == OP_LOCAL) || (inst->inst_left->opcode == OP_ARG)) {
+-			int variable_index = inst->inst_left->inst_c0;
+-			
+-			if (area->cfg->vars [variable_index]->def_bb == NULL) {
+-				if (area->cfg->verbose_level >= 4) {
+-					printf ("SSAPRE WARNING: variable %d has no definition, fixing.\n", variable_index);
+-				}
+-				area->cfg->vars [variable_index]->def_bb = bb_info->bb;
+-			}
+-		}
+-		break;
+-	default:
+-		break;
+-	}
+-	
+ 	if (mono_burg_arity [inst->opcode] > 0) {
+-		current_occurrence = process_inst (area, inst->inst_left, previous_inst, bb_info, current_occurrence);
++		process_inst (area, inst->inst_left, previous_inst, &left_father_in_tree, bb_info);
+ 		if (mono_burg_arity [inst->opcode] > 1) {
+-			current_occurrence = process_inst (area, inst->inst_right, previous_inst, bb_info, current_occurrence);
++			process_inst (area, inst->inst_right, previous_inst, &right_father_in_tree, bb_info);
+ 		}
+ 	}
+ 	
+-	analyze_expression (inst, &(current_occurrence->description));
+-	if (current_occurrence->description.opcode != 0) {
+-		current_occurrence->occurrence = inst;
+-		current_occurrence->previous_tree = previous_inst;
+-		current_occurrence->bb_info = bb_info;
+-		current_occurrence->is_first_in_bb = FALSE;
+-		current_occurrence->is_last_in_bb = FALSE;
+-		add_occurrence_to_worklist (area, current_occurrence);
+-		current_occurrence = (MonoSsapreExpressionOccurrence*) mono_mempool_alloc (area->mempool, sizeof (MonoSsapreExpressionOccurrence));
++	analyze_expression (inst, &(area->current_occurrence->description));
++	if (area->current_occurrence->description.opcode != 0) {
++		if ((left_father_in_tree != NULL) || (right_father_in_tree != NULL)) {
++			MonoSsapreFatherExpression *current_inst_as_father = (MonoSsapreFatherExpression*) mono_mempool_alloc (area->mempool, sizeof (MonoSsapreFatherExpression));
++			current_inst_as_father->father_occurrence = inst;
++			current_inst_as_father->grand_father = NULL;
++			*father_in_tree = &(current_inst_as_father->grand_father);
++			if (left_father_in_tree != NULL) {
++				*left_father_in_tree = current_inst_as_father;
++			}
++			if (right_father_in_tree != NULL) {
++				*right_father_in_tree = current_inst_as_father;
++			}
++			if (DUMP_SSAPRE) {
++				printf ("Expression '");
++				mono_print_tree (inst);
++				printf ("' is a potential father ( ");
++				if (left_father_in_tree != NULL) {
++					printf ("LEFT ");
++				}
++				if (right_father_in_tree != NULL) {
++					printf ("RIGHT ");
++				}
++				printf (")\n");
++			}
++		} else if ((area->current_occurrence->description.left_argument.type != MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY) &&
++				(area->current_occurrence->description.right_argument.type != MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY)) {
++			area->current_occurrence->occurrence = inst;
++			area->current_occurrence->previous_tree = previous_inst;
++			area->current_occurrence->bb_info = bb_info;
++			area->current_occurrence->is_first_in_bb = FALSE;
++			area->current_occurrence->is_last_in_bb = FALSE;
++			
++			area->current_occurrence->father_in_tree = NULL;
++			*father_in_tree = &(area->current_occurrence->father_in_tree);
++			
++			add_occurrence_to_worklist (area);
++		} else {
++			*father_in_tree = NULL;
++		}
++	} else {
++		*father_in_tree = NULL;
+ 	}
+-	
+-	return current_occurrence;
+ }
+ 
+ /*
+@@ -721,13 +796,14 @@
+  * auxiliary MonoSsapreBBInfo fields (dt_dfn, dt_descendants) are initialized
+  * (with all the info that comes from the MonoBasicBlock).
+  */
+-static MonoSsapreExpressionOccurrence*
+-process_bb (MonoSsapreWorkArea *area, MonoBasicBlock *bb, int *dt_dfn, int *upper_descendants, MonoSsapreExpressionOccurrence *current_occurrence) {
++static void
++process_bb (MonoSsapreWorkArea *area, MonoBasicBlock *bb, int *dt_dfn, int *upper_descendants) {
+ 	MonoSsapreBBInfo *bb_info;
+ 	int descendants;
+ 	GList *dominated_bb;
+ 	MonoInst* current_inst;
+ 	MonoInst* previous_inst;
++	MonoSsapreFatherExpression** dummy_father_in_tree;
+ 	
+ 	bb_info = &(area->bb_infos [*dt_dfn]);
+ 	bb_info->dt_dfn = *dt_dfn;
+@@ -747,22 +823,53 @@
+ 	current_inst = bb->code;
+ 	previous_inst = NULL;
+ 	while (current_inst != NULL) {
++		/* Ugly hack to fix missing variable definitions */
++		/* (the SSA construction code should have done it already!) */
++		switch (current_inst->opcode) {
++		case CEE_STIND_REF:
++		case CEE_STIND_I:
++		case CEE_STIND_I4:
++		case CEE_STIND_I1:
++		case CEE_STIND_I2:
++		case CEE_STIND_I8:
++		case CEE_STIND_R4:
++		case CEE_STIND_R8:
++			if ((current_inst->inst_left->opcode == OP_LOCAL) || (current_inst->inst_left->opcode == OP_ARG)) {
++				int variable_index = current_inst->inst_left->inst_c0;
++				
++				if (area->cfg->vars [variable_index]->def_bb == NULL) {
++					if (area->cfg->verbose_level >= 4) {
++						printf ("SSAPRE WARNING: variable %d has no definition, fixing.\n", variable_index);
++					}
++					area->cfg->vars [variable_index]->def_bb = bb_info->bb;
++				}
++			}
++			break;
++		default:
++			break;
++		}
++		
+ 		if (is_phi_definition (current_inst)) {
+ 			bb_info->phi_insertion_point = current_inst;
+ 		}
+-		current_occurrence = process_inst (area, current_inst, previous_inst, bb_info, current_occurrence);
++		
++		if (mono_burg_arity [current_inst->opcode] > 0) {
++			process_inst (area, current_inst->inst_left, previous_inst, &dummy_father_in_tree, bb_info);
++			if (mono_burg_arity [current_inst->opcode] > 1) {
++				process_inst (area, current_inst->inst_right, previous_inst, &dummy_father_in_tree, bb_info);
++			}
++		}
++		
+ 		previous_inst = current_inst;
+ 		current_inst = current_inst->next;
+ 	}
+ 	
+ 	descendants = 0;
+ 	for (dominated_bb = g_list_first (bb->dominated); dominated_bb != NULL; dominated_bb = g_list_next (dominated_bb)) {
+-		current_occurrence = process_bb (area, (MonoBasicBlock*) (dominated_bb->data), dt_dfn, &descendants, current_occurrence);
++		process_bb (area, (MonoBasicBlock*) (dominated_bb->data), dt_dfn, &descendants);
+ 	}
+ 	bb_info->dt_descendants = descendants;
+ 	*upper_descendants += (descendants + 1);
+-	
+-	return current_occurrence;
+ }
+ 
+ /*
+@@ -983,35 +1090,64 @@
+ 	
+ 	/* This loop is "rename1" */
+ 	for (current_bb = area->first_interesting_bb, previous_bb = NULL; current_bb != NULL; previous_bb = current_bb, current_bb = current_bb->next_interesting_bb) {
+-		if ((previous_bb != NULL) && ! dominates (previous_bb, current_bb)) {
+-			if ((area->bb_on_top_of_renaming_stack != NULL) && (area->top_of_renaming_stack == NULL) && (previous_bb->phi_argument_has_real_use == FALSE)) {
+-				if (TRACE_SSAPRE) {
+-					printf ("Clearing down safe in PHI %d because of backtracking (previous block is [bb %d [ID %d]])\n",
+-							area->bb_on_top_of_renaming_stack->phi_redundancy_class, previous_bb->cfg_dfn, previous_bb->bb->block_num);
++		if (previous_bb != NULL) {
++			if (! dominates (previous_bb, current_bb)) {
++				/* This means we are backtracking in the dominator tree */
++				MonoSsapreBBInfo *first_interesting_dominator = current_bb->idominator;
++				while ((first_interesting_dominator->next_interesting_bb == NULL) && (first_interesting_dominator->idominator != NULL)) {
++					first_interesting_dominator = first_interesting_dominator->idominator;
+ 				}
+-				area->bb_on_top_of_renaming_stack->phi_is_down_safe = FALSE;
+-			}
+-			while ((area->bb_on_top_of_renaming_stack != NULL) && ! dominates (area->bb_on_top_of_renaming_stack, current_bb)) {
+-				MonoSsapreBBInfo *top_bb = area->bb_on_top_of_renaming_stack;
+-				if (top_bb->next_in_renaming_stack != NULL) {
+-					area->top_of_renaming_stack = top_bb->next_in_renaming_stack->top_of_local_renaming_stack;
+-				} else {
+-					area->top_of_renaming_stack = NULL;
++				current_bb->phi_argument_has_real_use = first_interesting_dominator->phi_argument_has_real_use;
++				
++				if ((area->bb_on_top_of_renaming_stack != NULL) && (area->top_of_renaming_stack == NULL) && (previous_bb->phi_argument_has_real_use == FALSE)) {
++					if (TRACE_SSAPRE) {
++						printf ("Clearing down safe in PHI %d because of backtracking (current block is [bb %d [ID %d]], previous block is [bb %d [ID %d]])\n",
++								area->bb_on_top_of_renaming_stack->phi_redundancy_class, current_bb->cfg_dfn, current_bb->bb->block_num, previous_bb->cfg_dfn, previous_bb->bb->block_num);
++					}
++					area->bb_on_top_of_renaming_stack->phi_is_down_safe = FALSE;
+ 				}
+-				area->bb_on_top_of_renaming_stack = top_bb->next_in_renaming_stack;
++				while ((area->bb_on_top_of_renaming_stack != NULL) && ! dominates (area->bb_on_top_of_renaming_stack, current_bb)) {
++					MonoSsapreBBInfo *top_bb = area->bb_on_top_of_renaming_stack;
++					if (top_bb->next_in_renaming_stack != NULL) {
++						area->top_of_renaming_stack = top_bb->next_in_renaming_stack->top_of_local_renaming_stack;
++					} else {
++						area->top_of_renaming_stack = NULL;
++					}
++					area->bb_on_top_of_renaming_stack = top_bb->next_in_renaming_stack;
++				}
++				if (DUMP_SSAPRE) {
++					printf ("Backtracked, getting real use flag from bb %d [ID %d], current top of the stack is class ",
++							first_interesting_dominator->cfg_dfn, first_interesting_dominator->bb->block_num);
++					if (area->top_of_renaming_stack != NULL) {
++						printf ("%d\n", area->top_of_renaming_stack->redundancy_class);
++					} else if (area->bb_on_top_of_renaming_stack != NULL) {
++						printf ("%d\n", area->bb_on_top_of_renaming_stack->phi_redundancy_class);
++					} else {
++						printf ("BOTTOM\n");
++					}
++				}
++			} else {
++				/* With no backtracking we just propagate the flag */
++				current_bb->phi_argument_has_real_use = previous_bb->phi_argument_has_real_use;
+ 			}
+-		}
+-		if (current_bb->idominator != NULL) {
+-			current_bb->phi_argument_has_real_use = current_bb->idominator->phi_argument_has_real_use;
+ 		} else {
++			/* Start condition */
+ 			current_bb->phi_argument_has_real_use = FALSE;
+ 		}
++		if (DUMP_SSAPRE) {
++			printf ("Real use flag is %s at the beginning of block [bb %d [ID %d]]\n",
++					GBOOLEAN_TO_STRING (current_bb->phi_argument_has_real_use), current_bb->cfg_dfn, current_bb->bb->block_num);
++		}
+ 		
+ 		if (current_bb->has_phi) {
+ 			current_bb->phi_is_down_safe = TRUE;
+ 			current_bb->phi_redundancy_class = current_class;
+ 			current_class++;
+ 			PUSH_PHI_OCCURRENCE (current_bb);
++			if (TRACE_SSAPRE) {
++				printf ("Assigning class %d to PHI in bb %d [ID %d]\n",
++						current_bb->phi_redundancy_class, current_bb->cfg_dfn, current_bb->bb->block_num);
++			}
+ 		}
+ 		
+ 	 	for (current_expression = current_bb->first_expression_in_bb; (current_expression != NULL) && (current_expression->bb_info == current_bb); current_expression = current_expression->next) {
+@@ -1024,11 +1160,21 @@
+ 						(current_expression->description.right_argument.argument.ssa_variable == top->description.right_argument.argument.ssa_variable))) {
+ 					current_expression->redundancy_class = top->redundancy_class;
+ 					current_expression->defined_by_real_occurrence = top;
++					if (DUMP_SSAPRE) {
++						printf ("Using class %d for occurrence '", current_expression->redundancy_class);
++						print_expression_description (&(current_expression->description));
++						printf ("' in bb %d [ID %d]\n", current_bb->cfg_dfn, current_bb->bb->block_num);
++					}
+ 				} else {
+ 					current_expression->redundancy_class = current_class;
+ 					current_class++;
+ 					current_expression->defined_by_real_occurrence = NULL;
+ 					PUSH_REAL_OCCURRENCE (current_expression);
++					if (TRACE_SSAPRE) {
++						printf ("Assigning class %d to occurrence '", current_expression->redundancy_class);
++						print_expression_description (&(current_expression->description));
++						printf ("' in bb %d [ID %d]\n", current_bb->cfg_dfn, current_bb->bb->block_num);
++					}
+ 				}
+ 				current_expression->defined_by_phi = NULL;
+ 			} else if (area->bb_on_top_of_renaming_stack != NULL) {
+@@ -1076,6 +1222,11 @@
+ 									right_argument_version, phi_bb, phi_argument);
+ 						}
+ 					}
++					if (DUMP_SSAPRE) {
++						printf ("Using class %d for occurrence '", current_expression->redundancy_class);
++						print_expression_description (&(current_expression->description));
++						printf ("' in bb %d [ID %d] (Real use flag is now TRUE)\n", current_bb->cfg_dfn, current_bb->bb->block_num);
++					}
+ 				} else {
+ 					current_expression->redundancy_class = current_class;
+ 					current_class++;
+@@ -1083,6 +1234,9 @@
+ 					PUSH_REAL_OCCURRENCE (current_expression);
+ 					phi_bb->phi_is_down_safe = FALSE;
+ 					if (TRACE_SSAPRE) {
++						printf ("Assigning class %d to occurrence '", current_expression->redundancy_class);
++						print_expression_description (&(current_expression->description));
++						printf ("' in bb %d [ID %d]\n", current_bb->cfg_dfn, current_bb->bb->block_num);
+ 						printf ("Clearing down safe in PHI %d because of real occurrence %d\n",
+ 								phi_bb->phi_redundancy_class, current_expression->redundancy_class);
+ 					}
+@@ -1094,6 +1248,11 @@
+ 				current_expression->defined_by_real_occurrence = NULL;
+ 				current_expression->defined_by_phi = NULL;
+ 				PUSH_REAL_OCCURRENCE (current_expression);
++				if (TRACE_SSAPRE) {
++					printf ("Assigning class %d to occurrence '", current_expression->redundancy_class);
++					print_expression_description (&(current_expression->description));
++					printf ("' in bb %d [ID %d]\n", current_bb->cfg_dfn, current_bb->bb->block_num);
++				}
+ 			}
+ 		}
+ 		
+@@ -1107,6 +1266,10 @@
+ 			} else {
+ 				current_bb->phi_argument_class = BOTTOM_REDUNDANCY_CLASS;
+ 			}
++			if ((DUMP_SSAPRE) && (current_bb->phi_argument_class != BOTTOM_REDUNDANCY_CLASS)) {
++				printf ("Temporarily using class %d for PHI argument in bb %d [ID %d]\n",
++						current_bb->phi_argument_class, current_bb->cfg_dfn, current_bb->bb->block_num);
++			}
+ 		}
+ 	}
+ 	if ((area->bb_on_top_of_renaming_stack != NULL) && (area->top_of_renaming_stack == NULL) && (previous_bb->phi_argument_has_real_use == FALSE)) {
+@@ -1161,6 +1324,11 @@
+ 					current_bb->phi_argument_defined_by_phi->phi_is_down_safe = FALSE;
+ 				}
+ 				current_bb->phi_argument_has_real_use = FALSE;
++				
++				if (DUMP_SSAPRE) {
++					printf ("Cleared real use flag in block [bb %d [ID %d]] because phi argument class is now BOTTOM\n",
++							current_bb->cfg_dfn, current_bb->bb->block_num);
++				}
+ 			}
+ 		}
+ 	}
+@@ -1187,9 +1355,6 @@
+ 	if ((phi_argument->phi_argument_class != BOTTOM_REDUNDANCY_CLASS) && (! phi_argument->phi_argument_has_real_use) && (phi_argument->phi_argument_defined_by_phi != NULL) && (phi_argument->phi_argument_defined_by_phi->phi_is_down_safe)) {
+ 		int i;
+ 		MonoSsapreBBInfo *phi = phi_argument->phi_argument_defined_by_phi;
+-//		if (TRACE_SSAPRE) {
+-//			printf ("Clearing down safe in PHI %d inside reset_down_safe\n", phi->phi_redundancy_class);
+-//		}
+ 		phi->phi_is_down_safe = FALSE;
+ 		for (i = 0; i < phi->in_count; i++) {
+ 			reset_down_safe (phi->in_bb [i]);
+@@ -1223,6 +1388,11 @@
+ reset_can_be_available (MonoSsapreWorkArea *area, MonoSsapreBBInfo *phi) {
+ 	MonoSsapreBBInfo *current_bb = NULL;
+ 	
++	if (DUMP_SSAPRE) {
++		printf ("Resetting availability for PHI %d in block [bb %d [ID %d]]\n",
++				phi->phi_redundancy_class, phi->cfg_dfn, phi->bb->block_num);
++	}
++	
+ 	phi->phi_can_be_available = FALSE;
+ 	for (current_bb = area->first_interesting_bb; current_bb != NULL; current_bb = current_bb->next_interesting_bb) {
+ 		if (current_bb->has_phi) {
+@@ -1265,6 +1435,10 @@
+ 				}
+ 				
+ 				if (phi_is_interesting) {
++					if (DUMP_SSAPRE) {
++						printf ("Availability computation working on PHI %d in block [bb %d [ID %d]]\n",
++								current_bb->phi_redundancy_class, current_bb->cfg_dfn, current_bb->bb->block_num);
++					}
+ 					reset_can_be_available (area, current_bb);
+ 				}
+ 			}
+@@ -1522,33 +1696,76 @@
+  * Create a MonoInst that represents an expression
+  */
+ static MonoInst*
+-create_expression (MonoSsapreWorkArea *area, MonoSsapreExpressionDescription *expression) {
++create_expression (MonoSsapreWorkArea *area, MonoSsapreExpressionDescription *expression, MonoInst *prototype_occurrence) {
+ 	MonoInst *result;
+ 	NEW_INST (result, expression->opcode);
++	*result = *prototype_occurrence;
+ 	result->inst_left = create_expression_argument (area, &(expression->left_argument));
+ 	result->inst_right = create_expression_argument (area, &(expression->right_argument));
+ 	return result;
+ }
+ 
+ /*
++ * Handles the father expression of a MonoInst that has been turned
++ * into a load (eventually inserting it into the worklist).
++ * Assumes "current_expression->father_in_tree != NULL".
++ */
++static void
++handle_father_expression (MonoSsapreWorkArea *area, MonoSsapreExpressionOccurrence *current_expression, MonoInst *previous_tree) {
++	if (DUMP_SSAPRE) {
++		printf ("After reload, father expression becomes ");
++		mono_print_tree_nl (current_expression->father_in_tree->father_occurrence);
++	}
++	
++	analyze_expression (current_expression->father_in_tree->father_occurrence, &(area->current_occurrence->description));
++	if ((area->current_occurrence->description.opcode != 0) &&
++			(area->current_occurrence->description.left_argument.type != MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY) &&
++			(area->current_occurrence->description.right_argument.type != MONO_SSAPRE_EXPRESSION_ARGUMENT_ANY)) {
++		area->current_occurrence->occurrence = current_expression->father_in_tree->father_occurrence;
++		area->current_occurrence->previous_tree = previous_tree;
++		area->current_occurrence->father_in_tree = current_expression->father_in_tree->grand_father;
++		area->current_occurrence->bb_info = current_expression->bb_info;
++		area->current_occurrence->is_first_in_bb = FALSE;
++		area->current_occurrence->is_last_in_bb = FALSE;
++		add_occurrence_to_worklist (area);
++	}
++}
++
++/*
+  * See paper, section 3.6
+  */
+ static void code_motion (MonoSsapreWorkArea *area) {
+ 	MonoSsapreBBInfo *current_bb = NULL;
+ 	MonoSsapreExpressionOccurrence *current_expression = NULL;
++	gssize original_variable_index = BOTTOM_REDUNDANCY_CLASS;
++	MonoInst prototype_occurrence;
++	prototype_occurrence.opcode = 0;
+ 	
+ 	for (current_bb = area->first_interesting_bb; current_bb != NULL; current_bb = current_bb->next_interesting_bb) {	
+ 		if ((current_bb->has_phi) && (current_bb->phi_can_be_available && ! current_bb->phi_is_later)) {
+ 			MonoInst *new_var = mono_compile_create_var (area->cfg, area->current_expression->type, OP_LOCAL);
+ 			current_bb->phi_variable_index = new_var->inst_c0;
++			if (original_variable_index == BOTTOM_REDUNDANCY_CLASS) {
++				original_variable_index = new_var->inst_c0;
++			}
++			area->cfg->vars [new_var->inst_c0]->reg = original_variable_index;
++			area->cfg->vars [new_var->inst_c0]->def_bb = current_bb->bb;
+ 		} else {
+ 			current_bb->phi_variable_index = BOTTOM_REDUNDANCY_CLASS;
+ 		}
+ 		
+ 	 	for (current_expression = current_bb->first_expression_in_bb; (current_expression != NULL) && (current_expression->bb_info == current_bb); current_expression = current_expression->next) {
++			if (prototype_occurrence.opcode == 0) {
++				prototype_occurrence = *(current_expression->occurrence);
++			}
+ 	 		if (current_expression->save) {
+ 				MonoInst *new_var = mono_compile_create_var (area->cfg, area->current_expression->type, OP_LOCAL);
+ 				current_expression->variable_index = new_var->inst_c0;
++				if (original_variable_index == BOTTOM_REDUNDANCY_CLASS) {
++					original_variable_index = new_var->inst_c0;
++				}
++				area->cfg->vars [new_var->inst_c0]->reg = original_variable_index;
++				area->cfg->vars [new_var->inst_c0]->def_bb = current_bb->bb;
+ 	 		} else {
+ 				current_expression->variable_index = BOTTOM_REDUNDANCY_CLASS;
+ 	 		}
+@@ -1557,6 +1774,11 @@
+ 		if ((current_bb->has_phi_argument) && (current_bb->phi_argument_needs_insert)) {
+ 			MonoInst *new_var = mono_compile_create_var (area->cfg, area->current_expression->type, OP_LOCAL);
+ 			current_bb->phi_argument_variable_index = new_var->inst_c0;
++			if (original_variable_index == BOTTOM_REDUNDANCY_CLASS) {
++				original_variable_index = new_var->inst_c0;
++			}
++			area->cfg->vars [new_var->inst_c0]->reg = original_variable_index;
++			area->cfg->vars [new_var->inst_c0]->def_bb = current_bb->bb;
+ 		} else {
+ 			current_bb->phi_argument_variable_index = BOTTOM_REDUNDANCY_CLASS;
+ 		}
+@@ -1569,6 +1791,7 @@
+ 			int in_bb;
+ 			
+ 			NEW_INST (phi, OP_PHI);
++			phi->inst_c0 = area->cfg->vars [current_bb->phi_variable_index]->reg;
+ 			phi->inst_phi_args = mono_mempool_alloc (area->cfg->mempool, (sizeof (int) * ((current_bb->in_count) + 1)));
+ 			phi->inst_phi_args [0] = current_bb->in_count;
+ 			for (in_bb = 0; in_bb < current_bb->in_count; in_bb++) {
+@@ -1593,6 +1816,7 @@
+ 				store->next = current_bb->bb->code;
+ 				current_bb->bb->code = store;
+ 			}
++			area->cfg->vars [current_bb->phi_variable_index]->def = store;
+ 			current_bb->phi_insertion_point = store;
+ 			
+ 			area->added_phis ++;
+@@ -1600,21 +1824,6 @@
+ 		
+ 	 	for (current_expression = current_bb->first_expression_in_bb; (current_expression != NULL) && (current_expression->bb_info == current_bb); current_expression = current_expression->next) {
+ 	 		gboolean altered = FALSE;
+-	 		if (current_expression->reload) {
+-	 			gssize variable_index;
+-	 			if (current_expression->defined_by_phi != NULL) {
+-	 				variable_index = current_expression->defined_by_phi->phi_variable_index;
+-	 			} else if (current_expression->defined_by_real_occurrence != NULL) {
+-	 				variable_index = current_expression->defined_by_real_occurrence->variable_index;
+-	 			} else {
+-	 				variable_index = BOTTOM_REDUNDANCY_CLASS;
+-	 				g_assert_not_reached ();
+-	 			}
+-	 			mono_compile_make_var_load (area->cfg, current_expression->occurrence, variable_index);
+-	 			
+-	 			area->reloaded_occurrences ++;
+-	 			altered = TRUE;
+-	 		}
+ 	 		if (current_expression->save) {
+ 	 			MonoInst *store;
+ 	 			MonoInst *moved_expression = mono_mempool_alloc (area->cfg->mempool, sizeof (MonoInst));
+@@ -1627,11 +1836,33 @@
+ 		 			store->next = current_bb->bb->code;
+ 		 			current_bb->bb->code = store;
+ 	 			}
++				area->cfg->vars [current_expression->variable_index]->def = store;
+ 	 			mono_compile_make_var_load (area->cfg, current_expression->occurrence, current_expression->variable_index);
+-	 			
++				if (current_expression->father_in_tree != NULL) {
++					handle_father_expression (area, current_expression, store);
++				}
++				
+ 	 			area->saved_occurrences ++;
+ 	 			altered = TRUE;
+ 	 		}
++	 		if (current_expression->reload) {
++	 			gssize variable_index;
++	 			if (current_expression->defined_by_phi != NULL) {
++	 				variable_index = current_expression->defined_by_phi->phi_variable_index;
++	 			} else if (current_expression->defined_by_real_occurrence != NULL) {
++	 				variable_index = current_expression->defined_by_real_occurrence->variable_index;
++	 			} else {
++	 				variable_index = BOTTOM_REDUNDANCY_CLASS;
++	 				g_assert_not_reached ();
++	 			}
++	 			mono_compile_make_var_load (area->cfg, current_expression->occurrence, variable_index);
++				if (current_expression->father_in_tree != NULL) {
++					handle_father_expression (area, current_expression, current_expression->previous_tree);
++				}
++				
++	 			area->reloaded_occurrences ++;
++	 			altered = TRUE;
++	 		}
+ 	 		if (! altered) {
+ 	 			area->unaltered_occurrences ++;
+ 	 		}
+@@ -1652,8 +1883,9 @@
+ 	 			expression_description.right_argument.type = MONO_SSAPRE_EXPRESSION_ARGUMENT_SSA_VARIABLE;
+ 	 		}
+ 	 		
+-	 		inserted_expression = create_expression (area, &expression_description);
++	 		inserted_expression = create_expression (area, &expression_description, &prototype_occurrence);
+ 	 		store = mono_compile_create_var_store (area->cfg, current_bb->phi_argument_variable_index, inserted_expression);
++			area->cfg->vars [current_bb->phi_argument_variable_index]->def = store;
+ 	 		store->next = NULL;
+ 	 		mono_add_ins_to_end (current_bb->bb, store);
+ 	 		
+@@ -1663,11 +1895,13 @@
+ }
+ 
+ /*
+- * Perform all SSAPRE steps for an expression
++ * Perform all SSAPRE steps for the current expression
+  */
+ static void
+-process_expression (MonoSsapreWorkArea *area, MonoSsapreExpression *expression) {
+-	if (area->cfg->verbose_level >= TRACE_LEVEL) {
++process_expression (MonoSsapreWorkArea *area) {
++	MonoSsapreExpression *expression = area->current_expression;
++	
++	if (area->cfg->verbose_level >= STATISTICS_LEVEL) {
+ 		printf ("SSAPRE STARTS PROCESSING EXPRESSION ");
+ 		print_expression_description (&(expression->description));
+ 		printf ("\n");
+@@ -1713,31 +1947,16 @@
+ 	}
+ }
+ 
+-/*
+- * Perform all SSAPRE steps for all the expressions in the worklist
+- */
+-static void
+-process_worklist (MonoSsapreWorkArea *area, MonoSsapreExpression *expression) {
+-	if (expression != NULL) {
+-		process_worklist (area, expression->previous);
+-		process_expression (area, expression);
+-		process_worklist (area, expression->next);
+-	}
+-}
+-
+-/*
+- * Hack to apply SSAPRE only to a given method (invaluable in debugging)
+- */
+-#define APPLY_SSAPRE_TO_SINGLE_METHOD 0
+-#if (APPLY_SSAPRE_TO_SINGLE_METHOD)
+-static char *mono_ssapre_method_name = NULL;
++#if (MONO_APPLY_SSAPRE_TO_SINGLE_METHOD)
++static char*
++mono_ssapre_method_name = NULL;
+ static gboolean check_ssapre_method_name (MonoCompile *cfg) {
+ 	if (mono_ssapre_method_name == NULL) {
+ 		mono_ssapre_method_name = getenv ("MONO_SSAPRE_METHOD_NAME");
+ 	}
+ 	if (mono_ssapre_method_name != NULL) {
+ 		char *method_name = mono_method_full_name (cfg->method, TRUE);
+-		if (strstr (mono_ssapre_method_name, method_name) != NULL) {
++		if (strstr (method_name, mono_ssapre_method_name) != NULL) {
+ 			return TRUE;
+ 		} else {
+ 			return FALSE;
+@@ -1754,12 +1973,14 @@
+ void
+ mono_perform_ssapre (MonoCompile *cfg) {
+ 	MonoSsapreWorkArea area;
+-	MonoSsapreExpressionOccurrence *current_occurrence;
+ 	int dt_dfn, descendants, block, i;
+ 	
+-#if (APPLY_SSAPRE_TO_SINGLE_METHOD)
++#if (MONO_APPLY_SSAPRE_TO_SINGLE_METHOD)
+ 	if (! check_ssapre_method_name (cfg)) return;
+ #endif
++#if (MONO_APPLY_SSAPRE_TO_SINGLE_EXPRESSION)
++	area.expression_is_handled_father = FALSE;
++#endif
+ 	
+ 	area.cfg = cfg;
+ 	area.mempool = mono_mempool_new ();
+@@ -1781,10 +2002,12 @@
+ 		printf ("SSAPRE STARTS PROCESSING METHOD %s\n", mono_method_full_name (cfg->method, TRUE));
+ 	}
+ 	
+-	current_occurrence = (MonoSsapreExpressionOccurrence*) mono_mempool_alloc (area.mempool, sizeof (MonoSsapreExpressionOccurrence));
++	area.first_in_queue = NULL;
++	area.last_in_queue = NULL;
++	area.current_occurrence = (MonoSsapreExpressionOccurrence*) mono_mempool_alloc (area.mempool, sizeof (MonoSsapreExpressionOccurrence));
+ 	dt_dfn = 0;
+ 	descendants = 0;
+-	process_bb (&area, cfg->bblocks [0], &dt_dfn, &descendants, current_occurrence);
++	process_bb (&area, cfg->bblocks [0], &dt_dfn, &descendants);
+ 	for (block = 0; block < area.num_bblocks; block++) {
+ 		MonoSsapreBBInfo *bb_info = &(area.bb_infos [block]);
+ 		MonoBasicBlock *bb = bb_info->bb;
+@@ -1807,7 +2030,12 @@
+ 		printf ("SSAPRE END WORKLIST\n");
+ 	}
+ 	
+-	process_worklist (&area, area.worklist);
++#if (MONO_APPLY_SSAPRE_TO_SINGLE_EXPRESSION)
++	area.expression_is_handled_father = TRUE;
++#endif
++	for (area.current_expression = area.first_in_queue; area.current_expression != NULL; area.current_expression = area.current_expression->next_in_queue) {
++		process_expression (&area);		
++	}
+ 	
+ 	if (area.cfg->verbose_level >= TRACE_LEVEL) {
+ 		printf ("SSAPRE ENDS PROCESSING METHOD %s\n", mono_method_full_name (cfg->method, TRUE));
+Index: mono/mono/mini/ssapre.h
+===================================================================
+--- mono/mono/mini/ssapre.h	(revision 38594)
++++ mono/mono/mini/ssapre.h	(working copy)
+@@ -15,6 +15,16 @@
+ #include <mono/metadata/mempool.h>
+ 
+ /*
++ * Hack to apply SSAPRE only to a given method (invaluable in debugging)
++ */
++#define MONO_APPLY_SSAPRE_TO_SINGLE_METHOD 1
++
++/*
++ * Hack to apply SSAPRE only to a given expression (invaluable in debugging)
++ */
++#define MONO_APPLY_SSAPRE_TO_SINGLE_EXPRESSION 0
++
++/*
+  * All the different kind of arguments we can handle.
+  * "ANY" means the argument is unknown or cannot be handled, and "NOT_PRESENT"
+  * that the expression does not have this argument (has not "enough" arity).
+@@ -184,11 +194,25 @@
+ 
+ 
+ /*
++ * The father of an occurrence in the tree of MonoInst.
++ * (needed just because a MonoInst cannot point to its father)
++ */
++typedef struct MonoSsapreFatherExpression {
++	/* The father occurrence */
++	MonoInst *father_occurrence;
++	/* The MonoSsapreFatherExpression node of the "grand father" */
++	struct MonoSsapreFatherExpression *grand_father;
++} MonoSsapreFatherExpression;
++
++/*
+  * A "real" occurrence.
+  */
+ typedef struct MonoSsapreExpressionOccurrence {
+ 	/* The occurrence in the CFG */
+ 	MonoInst *occurrence;
++	/* The "father" of this occurrence in the inst tree (if the occurrence is */
++	/* part of a compound expression, otherwise it is NULL) */
++	MonoSsapreFatherExpression *father_in_tree;
+ 	/* The tree just before the occurrence in the CFG (if the occurrence must */
+ 	/* saved into a temporary, the definition will be placed just after that tree) */
+ 	MonoInst *previous_tree;
+@@ -198,7 +222,7 @@
+ 	MonoSsapreExpressionDescription description;
+ 	/* Next occurrence of this expression */
+ 	struct MonoSsapreExpressionOccurrence *next;
+-	/* Previois occurrence of this expression */
++	/* Previous occurrence of this expression */
+ 	struct MonoSsapreExpressionOccurrence *previous;
+ 	/* True if this occurrence is the first in its BB */
+ 	gboolean is_first_in_bb;
+@@ -241,6 +265,9 @@
+ 	struct MonoSsapreExpression *previous;
+ 	struct MonoSsapreExpression *next;
+ 	gssize tree_size;
++	
++	/* Next expression to be processed in the worklist */
++	struct MonoSsapreExpression *next_in_queue;	
+ } MonoSsapreExpression;
+ 
+ /*
+@@ -340,8 +367,15 @@
+ 	/* The expression worklist */
+ 	MonoSsapreExpression *worklist;
+ 	
++	/* The expression queue head */
++	MonoSsapreExpression *first_in_queue;
++	/* The expression queue tail */
++	MonoSsapreExpression *last_in_queue;
++	
+ 	/* The expression being processed */
+ 	MonoSsapreExpression *current_expression;
++	/* The expression being allocated */
++	MonoSsapreExpressionOccurrence *current_occurrence;
+ 	
+ 	/* The BB on top of the renaming stack (if "top_of_renaming_stack" is NULL */
+ 	/* but this is not, then the top of the stack is the PHI in this BB) */
+@@ -361,6 +395,10 @@
+ 	int inserted_occurrences;
+ 	int unaltered_occurrences;
+ 	int added_phis;
++	
++#if (MONO_APPLY_SSAPRE_TO_SINGLE_EXPRESSION)
++	gboolean expression_is_handled_father;
++#endif
+ } MonoSsapreWorkArea;
+ 
+ 

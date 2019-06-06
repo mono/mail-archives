@@ -1,0 +1,209 @@
+Index: mono/mini/method-to-ir.c
+===================================================================
+--- mono/mini/method-to-ir.c	(revision 141866)
++++ mono/mini/method-to-ir.c	(working copy)
+@@ -4799,6 +4799,26 @@
+ 	return MONO_TYPE_IS_REFERENCE (type);
+ }
+ 
++static void
++coreclr_array_check (MonoCompile *cfg, MonoClass *element)
++{
++	MonoSecurityCoreCLRLevel alevel;
++	MonoMethod *caller = cfg->method;
++
++	/* we check rank == 0 because this is the "newarr" instruction, i.e. newarr Char --> Char[] */
++	if (element->rank != 0)
++		return;
++
++	alevel = mono_security_core_clr_class_level (element);
++	if (alevel == MONO_SECURITY_CORE_CLR_CRITICAL) {
++		MonoSecurityCoreCLRLevel mlevel = mono_security_core_clr_method_level (caller, TRUE);
++		if (mlevel == MONO_SECURITY_CORE_CLR_TRANSPARENT) {
++			cfg->exception_type = MONO_EXCEPTION_TYPE_LOAD;
++			cfg->exception_message = g_strdup_printf ("Invalid array of [SecurityCritical] '%s' type.", element->name);
++		}
++	}
++}
++
+ /**
+  * mono_decompose_array_access_opts:
+  *
+@@ -4861,8 +4881,15 @@
+ 						dest = mono_emit_jit_icall (cfg, mono_array_new, iargs);
+ 						dest->dreg = ins->dreg;
+ 					} else {
+-						MonoVTable *vtable = mono_class_vtable (cfg->domain, mono_array_class_get (ins->inst_newa_class, 1));
++						MonoClass *class = ins->inst_newa_class;
++						MonoVTable *vtable;
+ 
++						/* Array of [SecurityCritical] types are not allowed (but multidimentional and 
++						 * jagged arrays are fine) from Transparent code */
++						if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
++							coreclr_array_check (cfg, class);
++
++						vtable = mono_class_vtable (cfg->domain, mono_array_class_get (class, 1));
+ 						g_assert (vtable);
+ 						NEW_VTABLECONST (cfg, iargs [0], vtable);
+ 						MONO_ADD_INS (cfg->cbb, iargs [0]);
+Index: mono/mini/ChangeLog
+===================================================================
+--- mono/mini/ChangeLog	(revision 141866)
++++ mono/mini/ChangeLog	(working copy)
+@@ -1,3 +1,9 @@
++2009-09-13  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* method-to-ir.c: For CoreCLR throw a TypeLoadException if an 
++	array of a critical type is created by transparent code (note
++	that multidimentional and jagged arrays are accepted).
++
+ 2009-09-10  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* aot-compiler.c (arch_emit_static_rgctx_trampoline): Don't clobber argument
+Index: mono/tests/coreclr-security.cs
+===================================================================
+--- mono/tests/coreclr-security.cs	(revision 141866)
++++ mono/tests/coreclr-security.cs	(working copy)
+@@ -273,6 +273,68 @@
+ 	[DllImport ("/lib64/libc.so.6")]
+ 	static extern int getpid ();
+ 
++
++	static void ArraysCreatedByTransparentCaller ()
++	{
++		// Transparent creating an array of a Critical type
++		// using Class[] (rank == 1) would throw a TypeLoadException too early to catch here
++		// but we have such a test in moon/test/2.0/moon-unit/security/MiscTest.cs
++		//CClass[] c_array = new CClass [0];
++		// Transparent creating an array of a SafeCritical type
++		SCClass[] sc_array = new SCClass [0];
++
++		// Transparent creating a multidimentional array of a Critical type
++		CClass[,] c_multi = new CClass [0,0];
++		// Transparent creating a multidimentional array of a SafeCritical type
++		SCClass[,] sc_multi = new SCClass [0,0];
++
++		// Transparent creating a jagged array of a Critical type
++		CClass[][] c_jagged = new CClass [0][];
++		// Transparent creating a jagged array of a Critical type
++		SCClass[][] sc_jagged = new SCClass [0][];
++	}
++
++	[SecuritySafeCritical]
++	static void ArraysCreatedBySafeCriticalCaller ()
++	{
++		// SafeCritical creating an array of a Critical type
++		CClass[] c_array = new CClass [0];
++		// SafeCritical creating an array of a SafeCritical type
++		SCClass[] sc_array = new SCClass [0];
++
++		// SafeCritical creating a multidimentional array of a Critical type
++		CClass[,] c_multi = new CClass [0,0];
++		// SafeCritical creating a multidimentional array of a SafeCritical type
++		SCClass[,] sc_multi = new SCClass [0,0];
++
++		// SafeCritical creating a jagged array of a Critical type
++		CClass[][] c_jagged = new CClass [0][];
++		// SafeCritical creating a jagged array of a Critical type
++		SCClass[][] sc_jagged = new SCClass [0][];
++
++		// Transparent Main could not call a critical method by itself
++		ArraysCreatedByCriticalCaller ();
++	}
++
++	[SecurityCritical]
++	static void ArraysCreatedByCriticalCaller ()
++	{
++		// Critical creating an array of a Critical type
++		CClass[] c_array = new CClass [0];
++		// Critical creating an array of a SafeCritical type
++		SCClass[] sc_array = new SCClass [0];
++
++		// Critical creating a multidimentional array of a Critical type
++		CClass[,] c_multi = new CClass [0,0];
++		// Critical creating a multidimentional array of a SafeCritical type
++		SCClass[,] sc_multi = new SCClass [0,0];
++
++		// Critical creating a jagged array of a Critical type
++		CClass[][] c_jagged = new CClass [0][];
++		// Critical creating a jagged array of a Critical type
++		SCClass[][] sc_jagged = new SCClass [0][];
++	}
++
+ 	public static int Main ()
+ 	{
+ 		SCMethod ();
+@@ -404,6 +466,11 @@
+ 		}
+ 		new SafeInheritFromSafeCriticalDefaultConstructor ();
+ 
++		// arrays creation tests
++		ArraysCreatedByTransparentCaller ();
++		ArraysCreatedBySafeCriticalCaller ();
++		// the above also calls ArraysCreatedBySafeCriticalCaller since (Transparent) Main cannot call it directly
++
+ 		if (haveError)
+ 			return 1;
+ 
+Index: mono/tests/ChangeLog
+===================================================================
+--- mono/tests/ChangeLog	(revision 141866)
++++ mono/tests/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2009-09-13  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* coreclr-security.cs: Add test cases for arrays (one dimension, 
++	multidimentional and jagged) creation.
++
+ 2009-09-10  Bill Holmes  <billholmes54@gmail.com>
+ 
+ 	* cominterop.cs : Adding a test for invoking delegates that 
+Index: ../moon/test/2.0/moon-unit/ChangeLog
+===================================================================
+--- ../moon/test/2.0/moon-unit/ChangeLog	(revision 141866)
++++ ../moon/test/2.0/moon-unit/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2009-09-13  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* security/MiscTest.cs: Remove [MoonlightBug] from Array_Critical
++	and add test case for jagged arrays
++
+ 2009-09-10  Mario Carrion  <mcarrion@novell.com>
+ 
+ 	* moon-unit.csproj: New file added ProgressBarAutomationPeerTest.cs.
+Index: ../moon/test/2.0/moon-unit/security/MiscTest.cs
+===================================================================
+--- ../moon/test/2.0/moon-unit/security/MiscTest.cs	(revision 141866)
++++ ../moon/test/2.0/moon-unit/security/MiscTest.cs	(working copy)
+@@ -58,10 +58,11 @@
+ 		}
+ 
+ 		[TestMethod]
+-		[MoonlightBug]
+ 		[ExpectedException (typeof (TypeLoadException))]
+ 		public void Array_Critical ()
+ 		{
++			// exception occurs before reaching the code (JIT time) and the harness consider this a success
++			Assert.IsFalse (true, "This fails before the method is executed");
+ 			// critical type
+ 			AppDomainManager [] adm = new AppDomainManager [0];
+ 			Assert.IsNotNull (adm, "AppDomainManager[]");
+@@ -80,6 +81,18 @@
+ 		}
+ 
+ 		[TestMethod]
++		public void JaggedArrays ()
++		{
++			// transparent type
++			FrameworkElement [][] fe = new FrameworkElement [0][];
++			Assert.IsNotNull (fe, "FrameworkElement[,]");
++
++			// critical type
++			AppDomainManager [][] adm = new AppDomainManager [0][];
++			Assert.IsNotNull (adm, "AppDomainManager[,]");
++		}
++
++		[TestMethod]
+ 		[ExpectedException (typeof (SecurityException))]
+ 		[MoonlightBug ("smcs compiles this as using mscorlib, while csc compile this using the newly defined type")]
+ 		public void RedefineNonCriticalInternalCall ()

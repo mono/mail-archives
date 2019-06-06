@@ -1,0 +1,167 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH] Handle more gracefully invalid	generic	instantiations
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Handle%20more%20gracefully%20invalid%0A%09generic%09instantiations&In-Reply-To=8cca42d80906260811r6e39e7edy7fe083f62f763cf6%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032493.html">
+   <LINK REL="Next"  HREF="032497.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH] Handle more gracefully invalid	generic	instantiations</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20Handle%20more%20gracefully%20invalid%0A%09generic%09instantiations&In-Reply-To=8cca42d80906260811r6e39e7edy7fe083f62f763cf6%40mail.gmail.com"
+       TITLE="[Mono-dev] [PATCH] Handle more gracefully invalid	generic	instantiations">lupus at ximian.com
+       </A><BR>
+    <I>Fri Jun 26 12:35:26 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032493.html">[Mono-dev] [PATCH] Handle more gracefully invalid generic	instantiations
+</A></li>
+        <LI>Next message: <A HREF="032497.html">[Mono-dev] [PATCH] Handle more gracefully invalid generic	instantiations
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32496">[ date ]</a>
+              <a href="thread.html#32496">[ thread ]</a>
+              <a href="subject.html#32496">[ subject ]</a>
+              <a href="author.html#32496">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 06/26/09 Rodrigo Kumpera wrote:
+&gt;<i> The attached patch changes class.c/inflate_generic_type to not abort the
+</I>&gt;<i> runtime when facing a bad instantiation.
+</I>&gt;<i> 
+</I>&gt;<i> My only issue is that I'm not sure if mono_class_inflate_generic_type* and
+</I>&gt;<i> mono_class_inflate_generic_class should
+</I>&gt;<i> set a loader error when returning null. I don't think this is necessary as
+</I>&gt;<i> this is something their callers should do. But maybe
+</I>&gt;<i> mono_class_inflate_generic_method_full should.
+</I>
+In general only the low-level code knows the reason for the failure, so
+the low-level code should propagate this info (and the exact reason for
+the failure is often useful when debugging). Note how instead your patch
+removes some potentially useful info.
+For that reason I'm not much a fan of having functions return a boolean,
+because that gives very little information.
+On the other hand, using something like GError, with it's forced
+malloc() usage may not be an appropriate pattern for use in the whole
+runtime.
+
+A compromise suggestion could be something like this:
+	typedef struct {
+		unsigned short error_code; // this can be MONO_EXCEPTION_*
+		unsigned short flags;
+		void *data0; // same as exception_data in MonoClass or other fields in MonoLoaderError
+		void *data1;
+		void *data2;
+		void *datan;
+		char message [128];
+	} MonoError;
+
+A few considerations:
+*) the struct would be passed by ref as the last argument of the runtime
+functions
+*) it can be stack allocated, so the malloc is avoided and it can be
+used also in signals etc. This means that message should be kept small,
+no more than 256, though.
+*) eventually it should be also the mechanism for reporting errors with
+the embedding interface, so there are a few dummy fields for future
+expansion, but the internals should be considered private and once
+published the struct won't be changed.
+*) setting the error should be done with a few simple functions like:
+
+	void mono_error_set_ok        (MonoError *error); // no error
+	void mono_error_set_bad_image (MonoError *error, MonoImage *image, char *msg_format, ...);
+	etc.
+*) I think it would be a good idea to always require the error
+argument to be non-null.
+*) error checking would be done with the (macro equivalent) of:
+	gboolean mono_error_ok (MonoError *error);
+
+See below how the first snippet of code would become.
+
+&gt;<i> --- a/mono/metadata/class.c
+</I>&gt;<i> +++ b/mono/metadata/class.c
+</I>&gt;<i> @@ -490,20 +490,24 @@ mono_class_is_open_constructed_type (MonoType *t)
+</I>&gt;<i>  	}
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i> -static MonoType*
+</I>&gt;<i> -inflate_generic_type (MonoImage *image, MonoType *type, MonoGenericContext *context)
+</I>&gt;<i> +/*
+</I>&gt;<i> + * This function returns TRUE if it could proper inflate @type.
+</I>&gt;<i> + * The resulting type can be found in @res  
+</I>&gt;<i> + */
+</I>&gt;<i> +static gboolean
+</I>&gt;<i> +inflate_generic_type (MonoImage *image, MonoType *type, MonoGenericContext *context, MonoType **res)
+</I>&gt;<i>  {
+</I>&gt;<i> +#define SUCCESS(VAL) do { *res = VAL; return TRUE; } while (0)
+</I>&gt;<i> +#define ERROR() do { *res = NULL; return FALSE; } while (0)
+</I>&gt;<i>  	switch (type-&gt;type) {
+</I>&gt;<i>  	case MONO_TYPE_MVAR: {
+</I>&gt;<i>  		MonoType *nt;
+</I>&gt;<i>  		int num = mono_type_get_generic_param_num (type);
+</I>&gt;<i>  		MonoGenericInst *inst = context-&gt;method_inst;
+</I>&gt;<i>  		if (!inst || !inst-&gt;type_argv)
+</I>&gt;<i> -			return NULL;
+</I>&gt;<i> +			SUCCESS (NULL);
+</I>&gt;<i>  		if (num &gt;= inst-&gt;type_argc)
+</I>&gt;<i> -			g_error (&quot;MVAR %d (%s) cannot be expanded in this context with %d instantiations&quot;,
+</I>&gt;<i> -				num, mono_generic_param_info (type-&gt;data.generic_param)-&gt;name, inst-&gt;type_argc);
+</I>&gt;<i> -
+</I>&gt;<i> +			ERROR ();
+</I>
+static MonoType*
+inflate_generic_type (MonoImage *image, MonoType *type, MonoGenericContext *context, MonoError *error)
+{
+	mono_error_set_ok (error);
+	switch (type-&gt;type) {
+	case MONO_TYPE_MVAR: {
+		MonoType *nt;
+		int num = mono_type_get_generic_param_num (type);
+		MonoGenericInst *inst = context-&gt;method_inst;
+		if (!inst || !inst-&gt;type_argv)
+			return NULL;
+		if (num &gt;= inst-&gt;type_argc)
+			mono_error_set_bad_image (error, image, &quot;MVAR %d (%s) cannot be expanded in this context with %d instantiations&quot;,
+				num, mono_generic_param_info (type-&gt;data.generic_param)-&gt;name, inst-&gt;type_argc);
+			return NULL;
+...
+
+Comments welcome (also by future users of the embedding interface).
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032493.html">[Mono-dev] [PATCH] Handle more gracefully invalid generic	instantiations
+</A></li>
+	<LI>Next message: <A HREF="032497.html">[Mono-dev] [PATCH] Handle more gracefully invalid generic	instantiations
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32496">[ date ]</a>
+              <a href="thread.html#32496">[ thread ]</a>
+              <a href="subject.html#32496">[ subject ]</a>
+              <a href="author.html#32496">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

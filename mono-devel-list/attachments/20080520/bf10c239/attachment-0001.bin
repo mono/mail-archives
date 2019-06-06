@@ -1,0 +1,159 @@
+Index: mini.c
+===================================================================
+--- mini.c	(revision 103481)
++++ mini.c	(working copy)
+@@ -12764,7 +12764,24 @@
+ 	}
+ }
+ 
++#ifdef MONO_ARCH_HAVE_INTERRUPT_TRAMPOLINE
+ static void
++deliver_thread_interrupt (MonoContext *ctx) {
++	MonoException *exc = mono_thread_request_interruption (TRUE); 
++	if (exc)
++		mono_handle_exception (ctx, exc, (gpointer)ctx->eip, FALSE);
++}
++
++static void 
++install_interrupt_trampoline (void *sigctx)
++{
++	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
++	jit_tls->interrupt_managed_code_ip = mono_arch_ip_from_context (sigctx);
++	mono_arch_set_ip_in_context (sigctx, mono_arch_get_call_interrupt_trampoline (deliver_thread_interrupt));
++}
++#endif
++
++static void
+ SIG_HANDLER_SIGNATURE (sigusr1_signal_handler)
+ {
+ 	gboolean running_managed;
+@@ -12789,6 +12806,13 @@
+ 	ji = mono_jit_info_table_find (mono_domain_get (), mono_arch_ip_from_context(ctx));
+ 	running_managed = ji != NULL;
+ 	
++#ifdef MONO_ARCH_HAVE_INTERRUPT_TRAMPOLINE
++	if (running_managed) {
++		install_interrupt_trampoline (ctx);
++		return;
++	}
++#endif
++
+ 	exc = mono_thread_request_interruption (running_managed); 
+ 	if (!exc) return;
+ 
+Index: mini.h
+===================================================================
+--- mini.h	(revision 103481)
++++ mini.h	(working copy)
+@@ -643,6 +643,7 @@
+ 	void            (*abort_func) (MonoObject *object);
+ 	/* Used to implement --debug=casts */
+ 	MonoClass       *class_cast_from, *class_cast_to;
++	void			*interrupt_managed_code_ip;
+ } MonoJitTlsData;
+ 
+ typedef enum {
+@@ -1275,6 +1276,8 @@
+ MonoVTable* mono_arch_find_static_call_vtable (gpointer *regs, guint8 *code) MONO_INTERNAL;
+ gpointer    mono_arch_build_imt_thunk           (MonoVTable *vtable, MonoDomain *domain, MonoIMTCheckItem **imt_entries, int count) MONO_INTERNAL;
+ void    mono_arch_notify_pending_exc (void) MONO_INTERNAL;
++void mono_arch_set_ip_in_context (void *sigctx, void *new_ip) MONO_INTERNAL;
++gpointer mono_arch_get_call_interrupt_trampoline (gpointer process_interrup_function) MONO_INTERNAL;
+ 
+ /* Exception handling */
+ void     mono_exceptions_init                   (void) MONO_INTERNAL;
+Index: mini-x86.h
+===================================================================
+--- mini-x86.h	(revision 103481)
++++ mini-x86.h	(working copy)
+@@ -279,6 +279,7 @@
+ #define MONO_ARCH_COMMON_VTABLE_TRAMPOLINE 1
+ #define MONO_ARCH_RGCTX_REG X86_EDX
+ #define MONO_ARCH_ENABLE_NORMALIZE_OPCODES 1
++#define MONO_ARCH_HAVE_INTERRUPT_TRAMPOLINE 1
+ 
+ #if !defined(__APPLE__)
+ #define MONO_ARCH_AOT_SUPPORTED 1
+Index: exceptions-x86.c
+===================================================================
+--- exceptions-x86.c	(revision 103481)
++++ exceptions-x86.c	(working copy)
+@@ -884,3 +884,78 @@
+ #endif
+ }
+ 
++
++gpointer
++mono_arch_get_call_interrupt_trampoline (gpointer process_interrup_function) /*FIXME should I use a function pointer here*/
++{
++	static guint8 *start = NULL;
++	guint8 *code;
++
++	if (start)
++		return start;
++
++	start = code = mono_global_codeman_reserve (128);
++	/*
++	 * The stack arives empty and it should be fixed to have the return address.
++	 * We must make sure not messing with all registers. 
++	 */
++
++	/* This code push the equivalente of a mono_context on stack */
++	x86_push_imm (code, 0); /*Here will be stored the return address / EIP*/
++	x86_push_reg (code, X86_EDI);
++	x86_push_reg (code, X86_ESI);
++	/*we need to push the original ESP value*/
++	x86_mov_reg_reg (code, X86_ESI, X86_ESP, 4);
++	x86_alu_reg_imm (code, X86_ADD, X86_ESI, 12);
++	x86_push_reg (code, X86_ESI);
++	x86_push_reg (code, X86_EBP);
++	x86_push_reg (code, X86_EDX);
++	x86_push_reg (code, X86_ECX);
++	x86_push_reg (code, X86_EBX);
++	x86_push_reg (code, X86_EAX);
++
++	/*recover managed frame IP*/
++	x86_push_imm (code, mono_jit_tls_id);
++	x86_call_code (code, TlsGetValue); /*get MonoJitTlsData*/
++	x86_mov_reg_membase (code, X86_EAX, X86_EAX, G_STRUCT_OFFSET (MonoJitTlsData, interrupt_managed_code_ip), 4); /*load interrupt_managed_code_ip*/
++	x86_alu_reg_imm (code, X86_ADD, X86_ESP, 4);
++	x86_mov_membase_reg (code, X86_ESP, 8 * 4, X86_EAX, 4); /*store return address into the proper MonoContext slot*/
++	
++	/*push a pointer to the start of the MonoContext struct*/
++	x86_push_reg (code, X86_ESP);
++	x86_call_code (code, process_interrup_function);
++
++	x86_pop_reg (code, X86_EAX); /*pop MonoContext* from stack*/
++
++	/*we restore the context on return*/
++	x86_pop_reg (code, X86_EAX);
++	x86_pop_reg (code, X86_EBX);
++	x86_pop_reg (code, X86_ECX);
++	x86_pop_reg (code, X86_EDX);
++	x86_pop_reg (code, X86_ESI);
++	x86_pop_reg (code, X86_EBP);
++
++	x86_pop_reg (code, X86_ESI); /*This is the context ESP, we don't care about it when returning*/
++	x86_pop_reg (code, X86_ESI);
++	x86_pop_reg (code, X86_EDI);
++	x86_ret (code);
++	/*x86_breakpoint (code);*/
++
++	g_assert ((code - start) < 128);
++
++	return start;
++}
++
++void
++mono_arch_set_ip_in_context (void *sigctx, void *new_ip)
++{
++#ifdef MONO_ARCH_USE_SIGACTION
++	ucontext_t *ctx = (ucontext_t*)sigctx;
++	UCONTEXT_REG_EIP (ctx) = new_ip;
++#else
++	struct sigcontext *ctx = sigctx;
++	ctx->SC_EIP = new_ip;
++#endif	
++}
++
++

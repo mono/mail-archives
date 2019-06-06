@@ -1,0 +1,261 @@
+Index: assembly.c
+===================================================================
+--- assembly.c	(revisión: 48811)
++++ assembly.c	(copia de trabajo)
+@@ -449,6 +449,7 @@
+ 
+ 	mono_metadata_decode_row (t, 0, cols, MONO_ASSEMBLY_SIZE);
+ 
++	aname->is_persistent = TRUE;
+ 	aname->hash_len = 0;
+ 	aname->hash_value = NULL;
+ 	aname->name = mono_metadata_string_heap (image, cols [MONO_ASSEMBLY_NAME]);
+@@ -458,6 +459,7 @@
+ 	aname->minor = cols [MONO_ASSEMBLY_MINOR_VERSION];
+ 	aname->build = cols [MONO_ASSEMBLY_BUILD_NUMBER];
+ 	aname->revision = cols [MONO_ASSEMBLY_REV_NUMBER];
++	aname->is_version_defined = TRUE;
+ 	aname->hash_alg = cols [MONO_ASSEMBLY_HASH_ALG];
+ 	if (cols [MONO_ASSEMBLY_PUBLIC_KEY]) {
+ 		gchar* token = g_malloc (8);
+@@ -1169,23 +1171,35 @@
+ 	g_free ((void *) aname->name);
+ 	g_free ((void *) aname->culture);
+ 	g_free ((void *) aname->hash_value);
++
++	if (!aname->is_persistent)
++		g_free ((void *) aname->public_key);
+ }
+ 
+ static gboolean
+-build_assembly_name (const char *name, const char *version, const char *culture, const char *token, MonoAssemblyName *aname)
++build_assembly_name (const char *name, const char *version, const char *culture, const char *token, const char *key, MonoAssemblyName *aname)
+ {
+ 	gint major, minor, build, revision;
+ 
+ 	memset (aname, 0, sizeof (MonoAssemblyName));
+ 
+ 	if (version) {
+-		if (sscanf (version, "%u.%u.%u.%u", &major, &minor, &build, &revision) != 4)
++		gchar **tmp, **parts = g_strsplit (version, ".", 4);
++
++		tmp = parts;
++		major = *tmp ? atoi (*tmp++) : -1;
++		minor = *tmp ? atoi (*tmp++) : -1;
++		build = *tmp ? atoi (*tmp++) : -1;
++		revision = *tmp ? atoi (*tmp++) : -1;
++		g_strfreev (parts);
++		if (major < 0 || minor < 0 || build < 0 || revision < 0)
+ 			return FALSE;
+-
+-		aname->major = major;
+-		aname->minor = minor;
+-		aname->build = build;
+-		aname->revision = revision;
++		
++		aname->major = (guint16) major;
++		aname->minor = (guint16) minor;
++		aname->build = (guint16) build;
++		aname->revision = (guint16) revision;
++		aname->is_version_defined = TRUE;
+ 	}
+ 	
+ 	aname->name = g_strdup (name);
+@@ -1197,8 +1211,35 @@
+ 			aname->culture = g_strdup (culture);
+ 	}
+ 	
+-	if (token && strncmp (token, "null", 4) != 0)
++	if (token && strncmp (token, "null", 4) != 0) {
++		if (strlen (token) != MONO_PUBLIC_KEY_TOKEN_LENGTH - 1)
++			return FALSE;
++		
+ 		g_strlcpy ((char*)aname->public_key_token, token, MONO_PUBLIC_KEY_TOKEN_LENGTH);
++	}
++
++	if (key && strncmp (key, "null", 4) != 0) {
++		gchar *arr, *tok, *encoded;
++		int i, j;
++		
++		if (strlen (key) != MONO_PUBLIC_KEY_LENGTH)
++			return FALSE;
++		
++		arr = g_malloc (160);
++		for (i = 0, j = 0; i < 160; i++) {
++			arr [i] = g_ascii_xdigit_value (key [j++]) << 4;
++			arr [i] |= g_ascii_xdigit_value (key [j++]);
++		}
++		aname->public_key = (guint8*) arr;
++		
++		// We also need to generate the key token
++		tok = g_malloc (8);
++		mono_digest_get_public_token ((guchar*) tok, aname->public_key, 160);
++		encoded = encode_public_tok ((guchar*) tok, 8);
++		g_strlcpy ((char*)aname->public_key_token, encoded, MONO_PUBLIC_KEY_TOKEN_LENGTH);
++		g_free (tok);
++		g_free (encoded);
++	}
+ 	
+ 	return TRUE;
+ }
+@@ -1215,7 +1256,7 @@
+ 		return FALSE;
+ 	}
+ 	
+-	res = build_assembly_name (name, parts[0], parts[1], parts[2], aname);
++	res = build_assembly_name (name, parts[0], parts[1], parts[2], NULL, aname);
+ 	g_strfreev (parts);
+ 	return res;
+ }
+@@ -1236,6 +1277,7 @@
+ 	gchar *version = NULL;
+ 	gchar *culture = NULL;
+ 	gchar *token = NULL;
++	gchar *key = NULL;
+ 	gboolean res;
+ 	gchar *value;
+ 	gchar **parts;
+@@ -1270,12 +1312,18 @@
+ 			tmp++;
+ 			continue;
+ 		}
++
++		if (!g_ascii_strncasecmp (value, "PublicKey=", 10)) {
++			key = g_strstrip (value + 10);
++			tmp++;
++			continue;
++		}
+ 		
+ 		g_strfreev (parts);
+ 		return FALSE;
+ 	}
+ 
+-	res = build_assembly_name (dllname, version, culture, token, aname);
++	res = build_assembly_name (dllname, version, culture, token, key, aname);
+ 	g_strfreev (parts);
+ 	return res;
+ }
+Index: image.h
+===================================================================
+--- image.h	(revisión: 48811)
++++ image.h	(copia de trabajo)
+@@ -12,6 +12,7 @@
+ typedef struct _MonoTableInfo MonoTableInfo;
+ 
+ #define MONO_PUBLIC_KEY_TOKEN_LENGTH	17
++#define MONO_PUBLIC_KEY_LENGTH	320
+ 
+ typedef struct {
+ 	const char *name;
+@@ -24,6 +25,8 @@
+ 	guint32 hash_len;
+ 	guint32 flags;
+ 	guint16 major, minor, build, revision;
++	guint is_persistent : 1;
++	guint is_version_defined : 1;
+ } MonoAssemblyName;
+ 
+ typedef enum {
+Index: icall.c
+===================================================================
+--- icall.c	(revisión: 48811)
++++ icall.c	(copia de trabajo)
+@@ -4132,12 +4132,14 @@
+ 	MONO_ARCH_SAVE_REGS;
+ 
+ 	aname->name = mono_string_new (domain, name->name);
+-	aname->major = name->major;
+-	aname->minor = name->minor;
+-	aname->build = name->build;
+-	aname->revision = name->revision;
+ 	aname->hashalg = name->hash_alg;
+-	aname->version = create_version (domain, name->major, name->minor, name->build, name->revision);
++	if (name->is_version_defined) {
++		aname->major = name->major;
++		aname->minor = name->minor;
++		aname->build = name->build;
++		aname->revision = name->revision;
++		aname->version = create_version (domain, name->major, name->minor, name->build, name->revision);
++	}
+ 	
+ 	codebase = g_filename_to_uri (absolute, NULL, NULL);
+ 	if (codebase) {
+@@ -4145,20 +4147,28 @@
+ 		g_free (codebase);
+ 	}
+ 
+-	if (!create_culture) {
++	if (!create_culture && name->culture) {
+ 		MonoMethodDesc *desc = mono_method_desc_new ("System.Globalization.CultureInfo:CreateSpecificCulture(string)", TRUE);
+ 		create_culture = mono_method_desc_search_in_image (desc, mono_defaults.corlib);
+ 		g_assert (create_culture);
+ 		mono_method_desc_free (desc);
+ 	}
+ 
+-	args [0] = mono_string_new (domain, name->culture);
+-	aname->cultureInfo = 
+-		mono_runtime_invoke (create_culture, NULL, args, NULL);
++	if (name->culture) {
++		args [0] = mono_string_new (domain, name->culture);
++		aname->cultureInfo = 
++			mono_runtime_invoke (create_culture, NULL, args, NULL);
++	}
+ 
+ 	if (name->public_key) {
+-		pkey_ptr = (char*)name->public_key;
+-		pkey_len = mono_metadata_decode_blob_size (pkey_ptr, &pkey_ptr);
++		// We could be getting a user generated key
++		if (!name->is_persistent) {
++			pkey_ptr = (char*)name->public_key;
++			pkey_len = 160; // Default length
++		} else {
++			pkey_ptr = (char*)name->public_key;
++			pkey_len = mono_metadata_decode_blob_size (pkey_ptr, &pkey_ptr);
++		}
+ 
+ 		aname->publicKey = mono_array_new (domain, mono_defaults.byte_class, pkey_len);
+ 		memcpy (mono_array_addr (aname->publicKey, guint8, 0), pkey_ptr, pkey_len);
+@@ -4445,6 +4455,24 @@
+ 	return res;
+ }
+ 
++static void
++ves_icall_System_Reflection_AssemblyName_ParseName (MonoReflectionAssemblyName *name, MonoString *assname)
++{
++	MonoAssemblyName aname;
++	MonoDomain *domain = mono_object_domain (name);
++	char *val;
++
++	val = mono_string_to_utf8 (assname);
++	if (!mono_assembly_name_parse (val, &aname)) {
++		MonoException *exc = mono_exception_from_name_msg (mono_get_corlib (), "System.IO", "FileLoadException", "The assembly name is invalid.");
++		mono_raise_exception (exc);
++	}
++	fill_reflection_assembly_name (domain, name, &aname, "");
++
++	mono_assembly_name_free (&aname);
++	g_free (val);
++}
++
+ static MonoReflectionType*
+ ves_icall_System_Reflection_Module_GetGlobalType (MonoReflectionModule *module)
+ {
+@@ -6539,6 +6567,10 @@
+ 	{"load_with_partial_name", ves_icall_System_Reflection_Assembly_load_with_partial_name}
+ };
+ 
++static const IcallEntry assembly_name_icalls [] = {
++	{"ParseName", ves_icall_System_Reflection_AssemblyName_ParseName}
++};
++
+ static const IcallEntry methodbase_icalls [] = {
+ 	{"GetCurrentMethod", ves_icall_GetCurrentMethod},
+ 	{"GetMethodBodyInternal", ves_icall_System_Reflection_MethodBase_GetMethodBodyInternal},
+@@ -7077,6 +7109,7 @@
+ 	{"System.Net.Sockets.SocketException", socketex_icalls, G_N_ELEMENTS (socketex_icalls)},
+ 	{"System.Object", object_icalls, G_N_ELEMENTS (object_icalls)},
+ 	{"System.Reflection.Assembly", assembly_icalls, G_N_ELEMENTS (assembly_icalls)},
++	{"System.Reflection.AssemblyName", assembly_name_icalls, G_N_ELEMENTS (assembly_name_icalls)},
+ 	{"System.Reflection.Emit.AssemblyBuilder", assemblybuilder_icalls, G_N_ELEMENTS (assemblybuilder_icalls)},
+ 	{"System.Reflection.Emit.CustomAttributeBuilder", customattrbuilder_icalls, G_N_ELEMENTS (customattrbuilder_icalls)},
+ 	{"System.Reflection.Emit.DynamicMethod", dynamicmethod_icalls, G_N_ELEMENTS (dynamicmethod_icalls)},

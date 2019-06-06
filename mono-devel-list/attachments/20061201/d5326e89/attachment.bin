@@ -1,0 +1,1721 @@
+Index: mono/mono/metadata/loader.c
+===================================================================
+--- mono/mono/metadata/loader.c	(revision 68741)
++++ mono/mono/metadata/loader.c	(working copy)
+@@ -1377,7 +1377,7 @@
+ 	    !(cols [1] & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) &&
+ 	    !(result->iflags & METHOD_IMPL_ATTRIBUTE_RUNTIME) && container) {
+ 		gpointer loc = mono_image_rva_map (image, cols [0]);
+-		g_assert (loc);
++		g_assert (loc) ;
+ 		((MonoMethodNormal *) result)->header = mono_metadata_parse_mh_full (image, container, loc);
+ 	}
+ 
+Index: mono/mono/metadata/domain.c
+===================================================================
+--- mono/mono/metadata/domain.c	(revision 68741)
++++ mono/mono/metadata/domain.c	(working copy)
+@@ -812,14 +812,24 @@
+ 
+ 	mono_defaults.variant_class = mono_class_from_name (
+ 	        mono_defaults.corlib, "System", "Variant");
++	g_assert (mono_defaults.variant_class != 0);
+ 
+ 	mono_defaults.com_object_class = mono_class_from_name (
+ 	        mono_defaults.corlib, "System", "__ComObject");
++	g_assert (mono_defaults.com_object_class != 0);
+ 
+ 	mono_defaults.com_interop_proxy_class = mono_class_from_name (
+ 	        mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
++	g_assert (mono_defaults.com_interop_proxy_class != 0);
+ 
++	mono_defaults.iunknown_class = mono_class_from_name (
++	        mono_defaults.corlib, "Mono.Interop", "IUnknown");
++	g_assert (mono_defaults.iunknown_class != 0);
+ 
++	mono_defaults.idispatch_class = mono_class_from_name (
++	        mono_defaults.corlib, "Mono.Interop", "IDispatch");
++	g_assert (mono_defaults.idispatch_class != 0);
++
+ 	/*
+ 	 * Note that mono_defaults.generic_*_class is only non-NULL if we're
+ 	 * using the 2.0 corlib.
+Index: mono/mono/metadata/ChangeLog
+===================================================================
+--- mono/mono/metadata/ChangeLog	(revision 68741)
++++ mono/mono/metadata/ChangeLog	(working copy)
+@@ -1,4 +1,29 @@
+-
++2006-12-01  Jonathan Chambers  <joncham@gmail.com>
++  
++	* domain.c (mono_init_internal): Add iunknown and idispatch classes
++	to mono defaults structure.
++	* debug-helpers.c: Add COM callable wrapper debug strings.
++	* class-internals.h: Add COM callable wrapper enums and rename
++	to better describe them. Add iunknown and idispatch classes to 
++	mono defaults structure.
++	* object-internals.h: Add MonoReflectionGuidAttribute.
++	* marshal.c: 
++		Added MonoCCW and MonoCCWEntry structs.
++		Added IUnknown implementation for managed objects, and
++		stub implementation for IDispatch.
++		(cominterop_get_com_slot_begin): Added.
++		(cominterop_get_com_slot_for_method): Change to use cominterop_get_com_slot_begin.
++		(cominterop_get_ccw): Returns (creates if necessary) a CCW for a managed object.
++		(cominterop_get_ccw_object): Gets corresponding managed object for CCW.
++		(emit_marshal_object): Update COM marshalling code.
++		(cominterop_get_managed_wrapper_adjusted): Map managed method to unmanaged method
++		for CCW's.
++		(mono_marshal_free_ccw): Expose method so finalizer routine can call.
++	* marshal.h (mono_marshal_free_ccw): Expose method so finalizer routine can call.
++	* gc.c: Call mono_marshal_free_ccw to free COM Callable Wrappers.
++	
++	Signed-off-by: Jonathan Chambers <joncham@gmail.com>
++	
+ Thu Nov 30 11:11:37 CET 2006 Paolo Molaro <lupus@ximian.com>
+ 
+ 	* icall.c: back out GetFields () fix until the serialization code is
+Index: mono/mono/metadata/debug-helpers.c
+===================================================================
+--- mono/mono/metadata/debug-helpers.c	(revision 68741)
++++ mono/mono/metadata/debug-helpers.c	(working copy)
+@@ -44,8 +44,11 @@
+ 	"ldflda",
+ 	"write-barrier",
+ 	"unknown",
+-	"cominterop-invoke",
+-	"cominterop"
++	"rcw",
++	"rcw-adjust",
++	"rcw-invoke",
++	"ccw",
++	"ccw-adjust"
+ };
+ 
+ static void
+Index: mono/mono/metadata/class-internals.h
+===================================================================
+--- mono/mono/metadata/class-internals.h	(revision 68741)
++++ mono/mono/metadata/class-internals.h	(working copy)
+@@ -49,8 +49,11 @@
+ 	MONO_WRAPPER_LDFLDA,
+ 	MONO_WRAPPER_WRITE_BARRIER,
+ 	MONO_WRAPPER_UNKNOWN,
+-	MONO_WRAPPER_COMINTEROP_INVOKE,
+-	MONO_WRAPPER_COMINTEROP
++	MONO_WRAPPER_RCW,
++	MONO_WRAPPER_RCW_ADJUST,
++	MONO_WRAPPER_RCW_INVOKE,
++	MONO_WRAPPER_CCW,
++	MONO_WRAPPER_CCW_ADJUST
+ } MonoWrapperType;
+ 
+ typedef enum {
+@@ -716,6 +719,8 @@
+ 	MonoClass *variant_class;
+ 	MonoClass *com_object_class;
+ 	MonoClass *com_interop_proxy_class;
++	MonoClass *iunknown_class;
++	MonoClass *idispatch_class;
+ } MonoDefaults;
+ 
+ extern MonoDefaults mono_defaults MONO_INTERNAL;
+Index: mono/mono/metadata/object-internals.h
+===================================================================
+--- mono/mono/metadata/object-internals.h	(revision 68741)
++++ mono/mono/metadata/object-internals.h	(working copy)
+@@ -984,6 +984,11 @@
+ 
+ typedef struct {
+ 	MonoObject object;
++	MonoString *guid;
++} MonoReflectionGuidAttribute;
++
++typedef struct {
++	MonoObject object;
+ 	MonoMethod *mhandle;
+ 	MonoString *name;
+ 	MonoReflectionType *rtype;
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 68741)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -189,6 +189,63 @@
+ 	return sig;
+ }
+ 
++/* Begin COM Interop related stuff until seperate file */
++
++
++// STDCALL on windows, CDECL everywhere else to work with XPCOM and MainWin COM
++#ifdef  PLATFORM_WIN32
++#ifdef _MSC_VER
++#define STDCALL __stdcall
++#else
++#define STDCALL __attribute__((stdcall))
++#endif
++#else
++#define STDCALL
++#endif
++
++typedef struct {
++	MonoObject* object;
++	guint32 ref_count;
++	guint32 gc_handle;
++	GHashTable* vtable_hash;
++} MonoCCW;
++
++typedef struct {
++	gpointer vtable;
++	MonoCCW* ccw;
++} MonoCCWEntry;
++
++/* IUnknown */
++static int STDCALL cominterop_ccw_addref (MonoCCWEntry* ccwe);
++
++static int STDCALL cominterop_ccw_release (MonoCCWEntry* ccwe);
++
++static int STDCALL cominterop_ccw_queryinterface (MonoCCWEntry* ccwe, gpointer riid, gpointer* ppv);
++
++/* IDispatch */
++static int STDCALL cominterop_ccw_get_type_info_count (MonoCCWEntry* ccwe, guint32 *pctinfo);
++
++static int STDCALL cominterop_ccw_get_type_info (MonoCCWEntry* ccwe, guint32 iTInfo, guint32 lcid, gpointer *ppTInfo);
++
++static int STDCALL cominterop_ccw_get_ids_of_names (MonoCCWEntry* ccwe, gpointer riid,
++											 gunichar2** rgszNames, guint32 cNames,
++											 guint32 lcid, gint32 *rgDispId);
++
++static int STDCALL cominterop_ccw_invoke (MonoCCWEntry* ccwe, guint32 dispIdMember,
++								   gpointer riid, guint32 lcid,
++								   guint16 wFlags, gpointer pDispParams,
++								   gpointer pVarResult, gpointer pExcepInfo,
++								   guint32 *puArgErr);
++
++static MonoMethod *
++cominterop_get_managed_wrapper_adjusted (MonoMethod *method);
++
++static gpointer
++cominterop_get_ccw (MonoObject* object, MonoClass* itf);
++
++static MonoObject*
++cominterop_get_ccw_object (MonoCCWEntry* ccw_entry, gboolean verify);
++
+ /**
+  * signature_cominterop:
+  * @image: a image
+@@ -291,6 +348,28 @@
+ 	return (klass && klass == mono_defaults.com_interop_proxy_class);
+ }
+ 
++static int
++cominterop_get_com_slot_begin (MonoClass* klass)
++{
++	static MonoClass *interface_type_attribute = NULL;
++	MonoCustomAttrInfo *cinfo = NULL;
++	MonoInterfaceTypeAttribute* itf_attr = NULL; 
++
++	if (!interface_type_attribute)
++		interface_type_attribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "InterfaceTypeAttribute");
++	cinfo = mono_custom_attrs_from_class (klass);
++	if (cinfo) {
++		itf_attr = (MonoInterfaceTypeAttribute*)mono_custom_attrs_get_attr (cinfo, interface_type_attribute);
++		if (!cinfo->cached)
++			mono_custom_attrs_free (cinfo);
++	}
++
++	if (itf_attr && itf_attr->intType == 1)
++		return 3; /* 3 methods in IUnknown*/
++	else
++		return 7; /* 7 methods in IDispatch*/
++}
++
+ /**
+  * cominterop_get_com_slot_for_method:
+  * @method: a method
+@@ -300,9 +379,6 @@
+ static int
+ cominterop_get_com_slot_for_method (MonoMethod* method)
+ {
+-	static MonoClass *interface_type_attribute = NULL;
+-	MonoInterfaceTypeAttribute* itf_attr = NULL; 
+-	MonoCustomAttrInfo *cinfo = NULL;
+ 	guint32 offset = 7; 
+ 	guint32 slot = method->slot;
+ 	GPtrArray *ifaces;
+@@ -329,21 +405,7 @@
+ 	g_assert (ic);
+ 	g_assert (MONO_CLASS_IS_INTERFACE (ic));
+ 
+-	if (!interface_type_attribute)
+-		interface_type_attribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "InterfaceTypeAttribute");
+-	cinfo = mono_custom_attrs_from_class (ic);
+-	if (cinfo) {
+-		itf_attr = (MonoInterfaceTypeAttribute*)mono_custom_attrs_get_attr (cinfo, interface_type_attribute);
+-		if (!cinfo->cached)
+-			mono_custom_attrs_free (cinfo);
+-	}
+-
+-	if (itf_attr && itf_attr->intType == 1)
+-		offset = 3; /* 3 methods in IUnknown*/
+-	else
+-		offset = 7; /* 7 methods in IDispatch*/
+-
+-	return slot + offset;
++	return slot + cominterop_get_com_slot_begin (ic);
+ }
+ 
+ /**
+@@ -386,6 +448,10 @@
+ 	return rt;
+ }
+ 
++
++
++/* End COM Interop related stuff until seperate file */
++
+ void
+ mono_marshal_init (void)
+ {
+@@ -446,6 +512,8 @@
+ 		register_icall (cominterop_get_method_interface, "cominterop_get_method_interface", "object ptr", FALSE);
+ 		register_icall (cominterop_get_function_pointer, "cominterop_get_function_pointer", "ptr ptr int32", FALSE);
+ 		register_icall (cominterop_object_is_rcw, "cominterop_object_is_rcw", "int32 object", FALSE);
++		register_icall (cominterop_get_ccw, "cominterop_get_ccw", "ptr object ptr", FALSE);
++		register_icall (cominterop_get_ccw_object, "cominterop_get_ccw_object", "object ptr int32", FALSE);
+ 	}
+ }
+ 
+@@ -1796,7 +1864,7 @@
+ 		static MonoMethod* com_interop_proxy_get_proxy = NULL;
+ 		static MonoMethod* get_transparent_proxy = NULL;
+ 		int real_proxy;
+-		guint32 pos_failed = 0;
++		guint32 pos_null = 0, pos_ccw = 0, pos_end = 0;
+ 		MonoClass *klass = mono_class_from_mono_type (type);
+ 
+ 		mono_mb_emit_ldloc (mb, 1);
+@@ -1805,8 +1873,17 @@
+ 
+ 		mono_mb_emit_ldloc (mb, 0);
+ 		mono_mb_emit_byte (mb, CEE_LDIND_I);
+-		pos_failed = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++		pos_null = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
+ 
++		// load dst to store later
++		mono_mb_emit_ldloc (mb, 1);
++
++		mono_mb_emit_ldloc (mb, 0);
++		mono_mb_emit_byte (mb, CEE_LDIND_I);
++		mono_mb_emit_icon (mb, TRUE);
++		mono_mb_emit_icall (mb, cominterop_get_ccw_object);
++		pos_ccw = mono_mb_emit_short_branch (mb, CEE_BRTRUE_S);
++
+ 		if (!com_interop_proxy_class)
+ 			com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
+ 		if (!com_interop_proxy_get_proxy)
+@@ -1821,18 +1898,35 @@
+ 		mono_mb_emit_ptr (mb, &mono_defaults.com_object_class->byval_arg);
+ 		mono_mb_emit_icall (mb, type_from_handle);
+ 		mono_mb_emit_managed_call (mb, com_interop_proxy_get_proxy, NULL);
+-		mono_mb_emit_stloc (mb, real_proxy);
++		//mono_mb_emit_stloc (mb, real_proxy);
+ 
+ 		
+-		mono_mb_emit_ldloc (mb, 1);
+-		mono_mb_emit_ldloc (mb, real_proxy);
++		//mono_mb_emit_ldloc (mb, 1);
++		//mono_mb_emit_ldloc (mb, real_proxy);
+ 		mono_mb_emit_managed_call (mb, get_transparent_proxy, NULL);
+-		if (klass && klass != mono_defaults.object_class)
++		if (conv == MONO_MARSHAL_CONV_OBJECT_INTERFACE) {
++			g_assert (klass);
+ 			mono_mb_emit_op (mb, CEE_CASTCLASS, klass);
++		}
+ 		mono_mb_emit_byte (mb, CEE_STIND_REF);
++		pos_end = mono_mb_emit_short_branch (mb, CEE_BR_S);
+ 
++		// is already managed object
++		mono_mb_patch_short_branch (mb, pos_ccw);
++		mono_mb_emit_ldloc (mb, 0);
++		mono_mb_emit_byte (mb, CEE_LDIND_I);
++		mono_mb_emit_icon (mb, TRUE);
++		mono_mb_emit_icall (mb, cominterop_get_ccw_object);
++
++		if (conv == MONO_MARSHAL_CONV_OBJECT_INTERFACE) {
++			g_assert (klass);
++			mono_mb_emit_op (mb, CEE_CASTCLASS, klass);
++		}
++		mono_mb_emit_byte (mb, CEE_STIND_REF);
++
++		mono_mb_patch_short_branch (mb, pos_end);
+ 		// case if null
+-		mono_mb_patch_short_branch (mb, pos_failed);
++		mono_mb_patch_short_branch (mb, pos_null);
+ 		break;
+ 	}
+ 	case MONO_MARSHAL_CONV_STR_BSTR:
+@@ -2100,20 +2194,18 @@
+ 	case MONO_MARSHAL_CONV_OBJECT_INTERFACE:
+ 	case MONO_MARSHAL_CONV_OBJECT_IDISPATCH:
+ 	case MONO_MARSHAL_CONV_OBJECT_IUNKNOWN: {
+-		guint32 pos_failed = 0, pos_rcw = 0;
++		guint32 pos_null = 0, pos_rcw = 0, pos_end = 0;
+ 		char * msg;
+ 
+ 		mono_mb_emit_ldloc (mb, 1);
+-		//mono_mb_emit_ldloc (mb, 0);
+-		mono_mb_emit_ptr (mb, 0);
+-		//mono_mb_emit_byte (mb, CEE_LDIND_U1);
++		mono_mb_emit_byte (mb, CEE_LDNULL);
+ 		mono_mb_emit_byte (mb, CEE_STIND_I);
+ 
+ 		mono_mb_emit_ldloc (mb, 0);	
+ 		mono_mb_emit_byte (mb, CEE_LDIND_REF);
+ 
+ 		// if null just break, dst was already inited to 0
+-		pos_failed = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++		pos_null = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
+ 
+ 		mono_mb_emit_ldloc (mb, 0);	
+ 		mono_mb_emit_byte (mb, CEE_LDIND_REF);
+@@ -2157,16 +2249,33 @@
+ 			mono_mb_emit_managed_call (mb, idispatch->get, NULL);
+ 		}
+ 		else {
++			g_assert_not_reached ();
+ 		}
+ 		mono_mb_emit_byte (mb, CEE_STIND_I);
++		pos_end = mono_mb_emit_short_branch (mb, CEE_BR_S);
+ 		
+ 		// if not rcw
+ 		mono_mb_patch_short_branch (mb, pos_rcw);
+-		msg = g_strdup ("Marshalling of COM Callable Wrappers is not yet implemented.");
+-		mono_mb_emit_exception_marshal_directive (mb, msg);
++		// load dst to store later
++		mono_mb_emit_ldloc (mb, 1);
++		// load src
++		mono_mb_emit_ldloc (mb, 0);	
++		mono_mb_emit_byte (mb, CEE_LDIND_REF);
++		
++		if (conv == MONO_MARSHAL_CONV_OBJECT_INTERFACE)
++			mono_mb_emit_ptr (mb, mono_type_get_class (type));
++		else if (conv == MONO_MARSHAL_CONV_OBJECT_IUNKNOWN)
++			mono_mb_emit_ptr (mb, mono_defaults.iunknown_class);
++		else if (conv == MONO_MARSHAL_CONV_OBJECT_IDISPATCH)
++			mono_mb_emit_ptr (mb, mono_defaults.idispatch_class);
++		else
++			g_assert_not_reached ();
++		mono_mb_emit_icall (mb, cominterop_get_ccw);
++		mono_mb_emit_byte (mb, CEE_STIND_I);
+ 
++		mono_mb_patch_short_branch (mb, pos_end);
+ 		// case if null
+-		mono_mb_patch_short_branch (mb, pos_failed);
++		mono_mb_patch_short_branch (mb, pos_null);
+ 		break;
+ 	}
+ 	default: {
+@@ -3126,7 +3235,7 @@
+ 		return res;
+ 
+ 	sig = mono_method_signature (method);
+-	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_COMINTEROP);
++	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_RCW_ADJUST);
+ 
+ 	/* if method klass is import, that means method
+ 	 * is really a com call. let interop system emit it.
+@@ -3241,7 +3350,7 @@
+ 	if (!sig->hasthis)
+ 		return method;
+ 
+-	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_COMINTEROP_INVOKE);
++	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_RCW_INVOKE);
+ 
+ 	/* get real proxy object, which is a ComInteropProxy in this case*/
+ 	temp_obj = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
+@@ -3293,6 +3402,9 @@
+ 	return res;
+ }
+ 
++GHashTable* ccw_hash = NULL;
++GHashTable* ccw_entry_hash = NULL;
++
+ MonoMethod *
+ mono_marshal_get_remoting_invoke (MonoMethod *method)
+ {
+@@ -5438,24 +5550,24 @@
+ 		break;
+ 
+ 	case MARSHAL_ACTION_MANAGED_CONV_IN:
+-		if (t->byref) {
+-			conv_arg = 0;
+-			break;
+-		}
+-
+ 		conv_arg = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
+ 
+ 		mono_mb_emit_byte (mb, CEE_LDNULL);
+ 		mono_mb_emit_stloc (mb, conv_arg);
+ 
++
+ 		/* Check for null */
+ 		mono_mb_emit_ldarg (mb, argnum);
++		if (t->byref)
++			mono_mb_emit_byte (mb, CEE_LDIND_I);
+ 		pos2 = mono_mb_emit_branch (mb, CEE_BRFALSE);
+ 
+ 		mono_mb_emit_ldstr (mb, g_strdup (spec->data.custom_data.cookie));
+ 		mono_mb_emit_op (mb, CEE_CALL, get_instance);
+ 				
+ 		mono_mb_emit_ldarg (mb, argnum);
++		if (t->byref)
++			mono_mb_emit_byte (mb, CEE_LDIND_I);
+ 				
+ 		mono_mb_emit_op (mb, CEE_CALLVIRT, marshal_native_to_managed);
+ 		mono_mb_emit_stloc (mb, conv_arg);
+@@ -5492,12 +5604,24 @@
+ 		break;
+ 
+ 	case MARSHAL_ACTION_MANAGED_CONV_OUT:
+-		g_assert (!t->byref);
+ 
+ 		/* Check for null */
+ 		mono_mb_emit_ldloc (mb, conv_arg);
+ 		pos2 = mono_mb_emit_branch (mb, CEE_BRFALSE);
+ 
++
++		if (t->byref) {
++			mono_mb_emit_ldarg (mb, argnum);
++
++			mono_mb_emit_ldstr (mb, g_strdup (spec->data.custom_data.cookie));
++
++			mono_mb_emit_op (mb, CEE_CALL, get_instance);
++
++			mono_mb_emit_ldloc (mb, conv_arg);
++			mono_mb_emit_op (mb, CEE_CALLVIRT, marshal_managed_to_native);
++			mono_mb_emit_byte (mb, CEE_STIND_I);
++		}
++
+ 		/* Call CleanUpManagedData */
+ 		mono_mb_emit_ldstr (mb, g_strdup (spec->data.custom_data.cookie));
+ 
+@@ -5955,75 +6079,90 @@
+ 		else if (spec && (spec->native == MONO_NATIVE_IUNKNOWN ||
+ 			spec->native == MONO_NATIVE_IDISPATCH ||
+ 			spec->native == MONO_NATIVE_INTERFACE)) {
+-			mono_mb_emit_ptr (mb, 0);
+-			mono_mb_emit_stloc (mb, conv_arg);
++			char *msg = NULL;
++			guint32 pos_null = 0, pos_rcw = 0, pos_end = 0;
+ 
+-			if (t->byref) {
+-				/* we dont need any conversions for out parameters */
+-				if (t->attrs & PARAM_ATTRIBUTE_OUT)
+-					break;
+-				else {
+-					char *msg = g_strdup_printf ("non out object references are no implemented");
+-					MonoException *exc = mono_get_exception_not_implemented (msg);
+-					g_warning (msg);
+-					g_free (msg);
+-					mono_raise_exception (exc);
++			mono_mb_emit_ptr (mb, NULL);
++			mono_mb_emit_stloc (mb, conv_arg);	
+ 
+-				}
+-			} else {
+-				char *msg = NULL;
+-				guint32 pos_failed = 0, pos_rcw = 0;
+-				mono_mb_emit_ldarg (mb, argnum);	
+-				// if null just break, conv arg was already inited to 0
+-				pos_failed = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++			/* we dont need any conversions for out parameters */
++			if (t->byref && t->attrs & PARAM_ATTRIBUTE_OUT)
++				break;
+ 
+-				mono_mb_emit_ldarg (mb, argnum);
+-				mono_mb_emit_icall (mb, cominterop_object_is_rcw);
+-				pos_rcw = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++			mono_mb_emit_ldarg (mb, argnum);	
++			if (t->byref)
++				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++			// if null just break, conv arg was already inited to 0
++			pos_null = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
+ 
+-				mono_mb_emit_ldarg (mb, argnum);
+-				mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++			mono_mb_emit_ldarg (mb, argnum);
++			if (t->byref)
+ 				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++			mono_mb_emit_icall (mb, cominterop_object_is_rcw);
++			pos_rcw = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
+ 
+-				/* load the RCW from the ComInteropProxy*/
+-				mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoComInteropProxy, com_object));
++			mono_mb_emit_ldarg (mb, argnum);
++			if (t->byref)
+ 				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++			mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++			mono_mb_emit_byte (mb, CEE_LDIND_REF);
+ 
+-				if (klass && klass != mono_defaults.object_class) {
+-					static MonoMethod* GetInterface = NULL;
+-					
+-					if (!GetInterface)
+-						GetInterface = mono_class_get_method_from_name (mono_defaults.com_object_class, "GetInterface", 1);
+-					mono_mb_emit_ptr (mb, t);
+-					mono_mb_emit_icall (mb, type_from_handle);
+-					mono_mb_emit_managed_call (mb, GetInterface, NULL);
+-				}
+-				else if (spec->native == MONO_NATIVE_IUNKNOWN) {
+-					static MonoProperty* iunknown = NULL;
+-					
+-					if (!iunknown)
+-						iunknown = mono_class_get_property_from_name (mono_defaults.com_object_class, "IUnknown");
+-					mono_mb_emit_managed_call (mb, iunknown->get, NULL);
+-				}
+-				else if (spec->native == MONO_NATIVE_IDISPATCH) {
+-					static MonoProperty* idispatch = NULL;
+-					
+-					if (!idispatch)
+-						idispatch = mono_class_get_property_from_name (mono_defaults.com_object_class, "IDispatch");
+-					mono_mb_emit_managed_call (mb, idispatch->get, NULL);
+-				}
+-				else {
+-				}
+-				mono_mb_emit_stloc (mb, conv_arg);
++			/* load the RCW from the ComInteropProxy*/
++			mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoComInteropProxy, com_object));
++			mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++			if (klass && klass != mono_defaults.object_class) {
++				static MonoMethod* GetInterface = NULL;
+ 				
+-				// if not rcw
+-				mono_mb_patch_short_branch (mb, pos_rcw);
+-				msg = g_strdup ("Marshalling of COM Callable Wrappers is not yet implemented.");
+-				mono_mb_emit_exception_marshal_directive (mb, msg);
++				if (!GetInterface)
++					GetInterface = mono_class_get_method_from_name (mono_defaults.com_object_class, "GetInterface", 1);
++				mono_mb_emit_ptr (mb, t);
++				mono_mb_emit_icall (mb, type_from_handle);
++				mono_mb_emit_managed_call (mb, GetInterface, NULL);
++			}
++			else if (spec->native == MONO_NATIVE_IUNKNOWN) {
++				static MonoProperty* iunknown = NULL;
++				
++				if (!iunknown)
++					iunknown = mono_class_get_property_from_name (mono_defaults.com_object_class, "IUnknown");
++				mono_mb_emit_managed_call (mb, iunknown->get, NULL);
++			}
++			else if (spec->native == MONO_NATIVE_IDISPATCH) {
++				static MonoProperty* idispatch = NULL;
++				
++				if (!idispatch)
++					idispatch = mono_class_get_property_from_name (mono_defaults.com_object_class, "IDispatch");
++				mono_mb_emit_managed_call (mb, idispatch->get, NULL);
++			}
++			else {
++			}
++			mono_mb_emit_stloc (mb, conv_arg);
++			pos_end = mono_mb_emit_short_branch (mb, CEE_BR_S);
++			
++			// if not rcw
++			mono_mb_patch_short_branch (mb, pos_rcw);
++			mono_mb_emit_ldarg (mb, argnum);
++			if (t->byref)
++				mono_mb_emit_byte (mb, CEE_LDIND_REF);	
++			
++			if (klass && klass != mono_defaults.object_class)
++				mono_mb_emit_ptr (mb, klass);
++			else if (spec->native == MONO_NATIVE_IUNKNOWN)
++				mono_mb_emit_ptr (mb, mono_defaults.iunknown_class);
++			else if (spec->native == MONO_NATIVE_IDISPATCH)
++				mono_mb_emit_ptr (mb, mono_defaults.idispatch_class);
++			else if (!klass && spec->native == MONO_NATIVE_INTERFACE)
++				mono_mb_emit_ptr (mb, mono_defaults.iunknown_class);
++			else
++				g_assert_not_reached ();
++			mono_mb_emit_icall (mb, cominterop_get_ccw);
++			mono_mb_emit_stloc (mb, conv_arg);
++			//msg = g_strdup ("Marshalling of COM Callable Wrappers is not yet implemented.");
++			//mono_mb_emit_exception_marshal_directive (mb, msg);
+ 
+-				// case if null
+-				mono_mb_patch_short_branch (mb, pos_failed);
+-			}
++			// case if null
++			mono_mb_patch_short_branch (mb, pos_end);
++			mono_mb_patch_short_branch (mb, pos_null);
+ 		}
+ 		else if (klass->delegate) {
+ 			g_assert (!t->byref);
+@@ -6140,16 +6279,24 @@
+ 				static MonoClass* com_interop_proxy_class = NULL;
+ 				static MonoMethod* com_interop_proxy_get_proxy = NULL;
+ 				static MonoMethod* get_transparent_proxy = NULL;
+-				int real_proxy;
+-				guint32 pos_failed = 0;
++				int real_proxy, ccw_obj;
++				guint32 pos_null = 0, pos_ccw = 0, pos_end = 0;
++				ccw_obj = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
+ 
+ 				mono_mb_emit_ldarg (mb, argnum);
+ 				mono_mb_emit_byte (mb, CEE_LDNULL);
+ 				mono_mb_emit_byte (mb, CEE_STIND_REF);
+ 
+ 				mono_mb_emit_ldloc (mb, conv_arg);
+-				pos_failed = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++				pos_null = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
+ 
++				mono_mb_emit_ldloc (mb, conv_arg);
++				mono_mb_emit_icon (mb, TRUE);
++				mono_mb_emit_icall (mb, cominterop_get_ccw_object);
++				mono_mb_emit_stloc (mb, ccw_obj);
++				mono_mb_emit_ldloc (mb, ccw_obj);
++				pos_ccw = mono_mb_emit_short_branch (mb, CEE_BRTRUE_S);
++
+ 				if (!com_interop_proxy_class)
+ 					com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
+ 				if (!com_interop_proxy_get_proxy)
+@@ -6169,12 +6316,25 @@
+ 				mono_mb_emit_ldarg (mb, argnum);
+ 				mono_mb_emit_ldloc (mb, real_proxy);
+ 				mono_mb_emit_managed_call (mb, get_transparent_proxy, NULL);
++
+ 				if (klass && klass != mono_defaults.object_class)
+ 					mono_mb_emit_op (mb, CEE_CASTCLASS, klass);
+ 				mono_mb_emit_byte (mb, CEE_STIND_REF);
++				pos_end = mono_mb_emit_short_branch (mb, CEE_BR_S);
+ 
++				// is already managed object
++				mono_mb_patch_short_branch (mb, pos_ccw);
++				mono_mb_emit_ldarg (mb, argnum);
++				mono_mb_emit_ldloc (mb, ccw_obj);
++
++				if (klass && klass != mono_defaults.object_class)
++					mono_mb_emit_op (mb, CEE_CASTCLASS, klass);
++				mono_mb_emit_byte (mb, CEE_STIND_REF);
++
++
++				mono_mb_patch_short_branch (mb, pos_end);
+ 				// case if null
+-				mono_mb_patch_short_branch (mb, pos_failed);
++				mono_mb_patch_short_branch (mb, pos_null);
+ 			}
+ 				break;
+ 		}
+@@ -6328,8 +6488,78 @@
+ 		break;
+ 
+ 	case MARSHAL_ACTION_MANAGED_CONV_IN:
++		klass = mono_class_from_mono_type (t);
+ 		conv_arg = mono_mb_add_local (mb, &klass->byval_arg);
+ 
++		if (spec && (spec->native == MONO_NATIVE_IUNKNOWN ||
++			spec->native == MONO_NATIVE_IDISPATCH ||
++			spec->native == MONO_NATIVE_INTERFACE)) {
++
++			static MonoClass* com_interop_proxy_class = NULL;
++			static MonoMethod* com_interop_proxy_get_proxy = NULL;
++			static MonoMethod* get_transparent_proxy = NULL;
++			int real_proxy, ccw_obj;
++			guint32 pos_null = 0, pos_ccw = 0, pos_end = 0;
++			ccw_obj = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
++
++			mono_mb_emit_byte (mb, CEE_LDNULL);
++			mono_mb_emit_stloc (mb, conv_arg);
++			if (t->attrs & PARAM_ATTRIBUTE_OUT)
++				break;
++
++			mono_mb_emit_ldarg (mb, argnum);
++			if (t->byref)
++				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++			pos_null = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++
++			mono_mb_emit_ldarg (mb, argnum);
++			if (t->byref)
++				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++			mono_mb_emit_icon (mb, TRUE);
++			mono_mb_emit_icall (mb, cominterop_get_ccw_object);
++			mono_mb_emit_stloc (mb, ccw_obj);
++			mono_mb_emit_ldloc (mb, ccw_obj);
++			pos_ccw = mono_mb_emit_short_branch (mb, CEE_BRTRUE_S);
++
++			if (!com_interop_proxy_class)
++				com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
++			if (!com_interop_proxy_get_proxy)
++				com_interop_proxy_get_proxy = mono_class_get_method_from_name_flags (com_interop_proxy_class, "GetProxy", 2, METHOD_ATTRIBUTE_PRIVATE);
++			if (!get_transparent_proxy)
++				get_transparent_proxy = mono_class_get_method_from_name (mono_defaults.real_proxy_class, "GetTransparentProxy", 0);
++
++			real_proxy = mono_mb_add_local (mb, &com_interop_proxy_class->byval_arg);
++
++			mono_mb_emit_ldarg (mb, argnum);
++			if (t->byref)
++				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++			mono_mb_emit_ptr (mb, &mono_defaults.com_object_class->byval_arg);
++			mono_mb_emit_icall (mb, type_from_handle);
++			mono_mb_emit_managed_call (mb, com_interop_proxy_get_proxy, NULL);
++			mono_mb_emit_stloc (mb, real_proxy);
++
++
++			mono_mb_emit_ldloc (mb, real_proxy);
++			mono_mb_emit_managed_call (mb, get_transparent_proxy, NULL);
++
++			if (klass && klass != mono_defaults.object_class)
++				mono_mb_emit_op (mb, CEE_CASTCLASS, klass);
++			mono_mb_emit_stloc (mb, conv_arg);
++			pos_end = mono_mb_emit_short_branch (mb, CEE_BR_S);
++
++			// is already managed object
++			mono_mb_patch_short_branch (mb, pos_ccw);
++			mono_mb_emit_ldloc (mb, ccw_obj);
++			if (klass && klass != mono_defaults.object_class)
++				mono_mb_emit_op (mb, CEE_CASTCLASS, klass);
++			mono_mb_emit_stloc (mb, conv_arg);
++
++			mono_mb_patch_short_branch (mb, pos_end);
++			// case if null
++			mono_mb_patch_short_branch (mb, pos_null);
++			break;
++		}
++
+ 		if (klass->delegate) {
+ 			g_assert (!t->byref);
+ 			mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
+@@ -6390,6 +6620,94 @@
+ 		break;
+ 
+ 	case MARSHAL_ACTION_MANAGED_CONV_OUT:
++
++		
++		if (spec && (spec->native == MONO_NATIVE_IUNKNOWN ||
++			spec->native == MONO_NATIVE_IDISPATCH ||
++			spec->native == MONO_NATIVE_INTERFACE)) {
++				if (t->byref && t->attrs & PARAM_ATTRIBUTE_OUT) {
++					static MonoMethod* AddRef = NULL;
++					char *msg = NULL;
++					guint32 pos_null = 0, pos_rcw = 0, pos_end = 0;
++					if (!AddRef)
++						AddRef = mono_class_get_method_from_name (mono_defaults.marshal_class, "AddRef", 1);
++
++					mono_mb_emit_ldloc (mb, conv_arg);	
++					// if null just break, conv arg was already inited to 0
++					pos_null = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++
++					// to store later
++					mono_mb_emit_ldarg (mb, argnum);	
++					mono_mb_emit_ldloc (mb, conv_arg);	
++					mono_mb_emit_icall (mb, cominterop_object_is_rcw);
++					pos_rcw = mono_mb_emit_short_branch (mb, CEE_BRFALSE_S);
++
++					mono_mb_emit_ldloc (mb, conv_arg);	
++					mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++					mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++					/* load the RCW from the ComInteropProxy*/
++					mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoComInteropProxy, com_object));
++					mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++					if (klass && klass != mono_defaults.object_class) {
++						static MonoMethod* GetInterface = NULL;
++						
++						if (!GetInterface)
++							GetInterface = mono_class_get_method_from_name (mono_defaults.com_object_class, "GetInterface", 1);
++						mono_mb_emit_ptr (mb, t);
++						mono_mb_emit_icall (mb, type_from_handle);
++						mono_mb_emit_managed_call (mb, GetInterface, NULL);
++					}
++					else if (spec->native == MONO_NATIVE_IUNKNOWN) {
++						static MonoProperty* iunknown = NULL;
++						
++						if (!iunknown)
++							iunknown = mono_class_get_property_from_name (mono_defaults.com_object_class, "IUnknown");
++						mono_mb_emit_managed_call (mb, iunknown->get, NULL);
++					}
++					else if (spec->native == MONO_NATIVE_IDISPATCH) {
++						static MonoProperty* idispatch = NULL;
++						
++						if (!idispatch)
++							idispatch = mono_class_get_property_from_name (mono_defaults.com_object_class, "IDispatch");
++						mono_mb_emit_managed_call (mb, idispatch->get, NULL);
++					}
++					else {
++					}
++					mono_mb_emit_byte (mb, CEE_STIND_I);
++					pos_end = mono_mb_emit_short_branch (mb, CEE_BR_S);
++					
++					// if not rcw
++					mono_mb_patch_short_branch (mb, pos_rcw);
++					mono_mb_emit_ldloc (mb, conv_arg);	
++					
++					if (klass && klass != mono_defaults.object_class)
++						mono_mb_emit_ptr (mb, klass);
++					else if (spec->native == MONO_NATIVE_IUNKNOWN)
++						mono_mb_emit_ptr (mb, mono_defaults.iunknown_class);
++					else if (spec->native == MONO_NATIVE_IDISPATCH)
++						mono_mb_emit_ptr (mb, mono_defaults.idispatch_class);
++					else
++						g_assert_not_reached ();
++					mono_mb_emit_icall (mb, cominterop_get_ccw);
++					mono_mb_emit_byte (mb, CEE_STIND_I);
++					//msg = g_strdup ("Marshalling of COM Callable Wrappers is not yet implemented.");
++					//mono_mb_emit_exception_marshal_directive (mb, msg);
++
++					// case if null
++					mono_mb_patch_short_branch (mb, pos_end);
++
++					mono_mb_emit_ldarg (mb, argnum);
++					mono_mb_emit_byte (mb, CEE_LDIND_I);
++					mono_mb_emit_managed_call (mb, AddRef, NULL);
++					mono_mb_emit_byte (mb, CEE_POP);
++
++					mono_mb_patch_short_branch (mb, pos_null);
++				}
++				break;
++		}
++
+ 		if (t->byref) {
+ 			/* Check for null */
+ 			mono_mb_emit_ldloc (mb, conv_arg);
+@@ -9070,17 +9388,6 @@
+ 	return mono_string_to_bstr(ptr);
+ }
+ 
+-// STDCALL on windows, CDECL everywhere else to work with XPCOM and MainWin COM
+-#ifdef  PLATFORM_WIN32
+-#ifdef _MSC_VER
+-#define STDCALL __stdcall
+-#else
+-#define STDCALL __attribute__((stdcall))
+-#endif
+-#else
+-#define STDCALL
+-#endif
+-
+ typedef struct
+ {
+ 	int (STDCALL *QueryInterface)(gpointer pUnk, gpointer riid, gpointer* ppv);
+@@ -10040,3 +10347,488 @@
+ 
+ 	return res;
+ }
++
++/* Put COM Interop related stuff here */
++
++/**
++ * cominterop_get_ccw_object:
++ * @ccw_entry: a pointer to the CCWEntry
++ * @verify: verify ccw_entry is in fact a ccw
++ *
++ * Returns: the corresponding object for the CCW
++ */
++static MonoObject*
++cominterop_get_ccw_object (MonoCCWEntry* ccw_entry, gboolean verify)
++{
++	MonoCCW *ccw = NULL;
++
++	// no CCW's exist yet
++	if (!ccw_entry_hash)
++		return NULL;
++
++	if (verify) {
++		ccw = g_hash_table_lookup (ccw_entry_hash, ccw_entry);
++	}
++	else {
++		ccw = ccw_entry->ccw;
++		g_assert (ccw);
++	}
++	if (ccw)
++		return ccw->object;
++	else
++		return NULL;
++}
++
++static void
++cominterop_setup_marshal_context (EmitMarshalContext *m, MonoMethod *method)
++{
++	MonoMethodSignature *sig, *csig;
++	sig = mono_method_signature (method);
++	/* we copy the signature, so that we can modify it */
++	/* FIXME: which to use? */
++	csig = signature_dup (method->klass->image, sig);
++	//csig = mono_metadata_signature_dup (sig);
++	csig->call_convention = MONO_CALL_STDCALL;
++	csig->hasthis = 0;
++	csig->pinvoke = 1;
++
++	m->image = method->klass->image;
++	m->piinfo = NULL;
++	m->retobj_var = 0;
++	m->sig = sig;
++	m->csig = csig;
++}
++
++
++/**
++ * cominterop_get_ccw:
++ * @object: a pointer to the object
++ * @itf: interface type needed
++ *
++ * Returns: a value indicating if the object is a
++ * Runtime Callable Wrapper (RCW) for a COM object
++ */
++static gpointer
++cominterop_get_ccw (MonoObject* object, MonoClass* itf)
++{
++	int i;
++	MonoCCW *ccw = NULL;
++	MonoCCWEntry* ccw_entry = NULL;
++	gpointer *vtable = NULL;
++	static gpointer iunknown[3] = {NULL, NULL, NULL};
++	static gpointer idispatch[4] = {NULL, NULL, NULL, NULL};
++	MonoClass* iface = NULL;
++	MonoClass* klass = NULL;
++	EmitMarshalContext m;
++	int start_slot = 3;
++	int method_count = 0;
++
++	if (!object)
++		return NULL;
++
++	klass = mono_object_get_class (object);
++
++	if (!ccw_hash)
++		ccw_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
++	if (!ccw_entry_hash)
++		ccw_entry_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
++
++	ccw = g_hash_table_lookup (ccw_hash, object);
++
++	if (!iunknown[0]) {
++		iunknown[0] = cominterop_ccw_queryinterface;
++		iunknown[1] = cominterop_ccw_addref;
++		iunknown[2] = cominterop_ccw_release;
++	}
++
++	if (!idispatch[0]) {
++		idispatch[0] = cominterop_ccw_get_type_info_count;
++		idispatch[1] = cominterop_ccw_get_type_info;
++		idispatch[2] = cominterop_ccw_get_ids_of_names;
++		idispatch[3] = cominterop_ccw_invoke;
++	}
++
++	if (!ccw) {
++		ccw = g_new0 (MonoCCW, 1);
++		ccw->vtable_hash = g_hash_table_new (mono_aligned_addr_hash, NULL);
++		ccw->ref_count = 0;
++		ccw->object = object;
++		g_hash_table_insert (ccw_hash, object, ccw);
++		// register for finalization to clean up ccw
++		mono_object_register_finalizer (object);
++	}
++
++	iface = itf;
++	if (iface == mono_defaults.iunknown_class) {
++		start_slot = 3;
++	}
++	else if (iface == mono_defaults.idispatch_class) {
++		start_slot = 7;
++	}
++	else {
++		while (iface) {
++			method_count += iface->method.count;
++			if (iface->interface_count) {
++				iface = iface->interfaces[0];
++			}
++			else {
++				start_slot = cominterop_get_com_slot_begin (iface);
++				iface = NULL;
++			}
++		}
++	}
++
++	ccw_entry = g_hash_table_lookup (ccw->vtable_hash, itf);
++
++	if (!ccw_entry) {
++		int vtable_index = method_count-1+start_slot;
++
++		vtable = mono_mempool_alloc0 (klass->image->mempool, sizeof (gpointer)*(method_count+start_slot));
++		memcpy(vtable, iunknown, sizeof(iunknown));
++		if (start_slot == 7)
++			memcpy(vtable+3, idispatch, sizeof(idispatch));
++
++		iface = itf;
++		while (iface) {
++			for (i = iface->method.count-1; i >= 0;i--) {
++				int param_index = 0;
++				MonoMethodBuilder *mb;
++				MonoMarshalSpec ** mspecs;
++				MonoMethod *wrapper_method, *adjust_method;
++				MonoMethod *method = iface->methods[i];
++				MonoMethodSignature* sig_adjusted;
++				MonoMethodSignature* sig = mono_method_signature (method);
++
++
++				mb = mono_mb_new (iface, method->name, MONO_WRAPPER_CCW);
++				adjust_method = cominterop_get_managed_wrapper_adjusted (method);
++				sig_adjusted = mono_method_signature (adjust_method);
++				
++				mspecs = g_new (MonoMarshalSpec*, sig_adjusted->param_count + 1);
++				mono_method_get_marshal_info (method, mspecs);
++
++				
++				// move managed args up one
++				for (param_index = sig->param_count; param_index >= 1; param_index--)
++					mspecs[param_index+1] = mspecs[param_index];
++
++				// first arg is IntPtr for interface
++				mspecs[1] = NULL;
++
++				// move return spec to last param
++				if (!MONO_TYPE_IS_VOID (sig->ret))
++					mspecs[sig_adjusted->param_count] = mspecs[0];
++
++				mspecs[0] = NULL;
++
++				cominterop_setup_marshal_context (&m, adjust_method);
++				m.mb = mb;
++				mono_marshal_emit_managed_wrapper (mb, sig_adjusted, mspecs, &m, adjust_method, NULL);
++				mono_loader_lock ();
++				mono_marshal_lock ();
++				wrapper_method = mono_mb_create_method (mb, sig_adjusted, sig_adjusted->param_count + 16);
++				mono_marshal_unlock ();
++				mono_loader_unlock ();
++				vtable[vtable_index--] = mono_compile_method (wrapper_method);
++
++				
++				for (param_index = sig_adjusted->param_count; param_index >= 0; param_index--)
++					if (mspecs [param_index])
++						mono_metadata_free_marshal_spec (mspecs [param_index]);
++				g_free (mspecs);
++			}
++			if (iface->interface_count)
++				iface = iface->interfaces[0];
++			else 
++				iface = NULL;
++		}
++
++		ccw_entry = g_new0 (MonoCCWEntry, 1);
++		ccw_entry->ccw = ccw;
++		ccw_entry->vtable = vtable;
++		g_hash_table_insert (ccw->vtable_hash, itf, ccw_entry);
++		g_hash_table_insert (ccw_entry_hash, ccw_entry, ccw);
++	}
++
++	return ccw_entry;
++}
++
++
++
++static gboolean    
++mono_marshal_free_ccw_entry (gpointer key, gpointer value, gpointer user_data)
++{
++	MonoCCWEntry* entry = (MonoCCWEntry*)value;
++	g_assert (entry);
++	g_free (entry);
++	return TRUE;
++}
++
++/**
++ * mono_marshal_free_ccw:
++ * @object: the mono object
++ *
++ * Returns: whether the object had a CCW
++ */
++gboolean
++mono_marshal_free_ccw (MonoObject* object)
++{
++	MonoCCW* ccw = NULL;
++	// no ccw's were created
++	if (!ccw_hash)
++		return FALSE;
++
++	ccw = g_hash_table_lookup (ccw_hash, object);
++
++	if (!ccw)
++		return FALSE;
++
++	g_hash_table_foreach_remove (ccw->vtable_hash, mono_marshal_free_ccw_entry, NULL);
++
++	g_free (ccw);
++
++	return TRUE;
++}
++
++
++
++/**
++ * cominterop_get_native_wrapper_adjusted:
++ * @method: managed COM Interop method
++ *
++ * Returns: the generated method to call with signature matching
++ * the unmanaged COM Method signature
++ */
++static MonoMethod *
++cominterop_get_managed_wrapper_adjusted (MonoMethod *method)
++{
++	MonoMethod *res = NULL;
++	MonoMethodBuilder *mb;
++	MonoMarshalSpec **mspecs;
++	MonoMethodSignature *sig, *sig_native;
++	int i;
++
++	sig = mono_method_signature (method);
++
++	// create unmanaged wrapper
++	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_CCW_ADJUST);
++	sig_native = signature_cominterop (method->klass->image, sig);
++
++	mspecs = g_new0 (MonoMarshalSpec*, sig_native->param_count+1);
++	//memset (mspecs, 0, sizeof(MonoMarshalSpec*)*(sig_native->param_count+1));
++
++	mono_method_get_marshal_info (method, mspecs);
++
++	// move managed args up one
++	for (i = sig->param_count; i >= 1; i--)
++		mspecs[i+1] = mspecs[i];
++
++	// first arg is IntPtr for interface
++	mspecs[1] = NULL;
++
++	// move return spec to last param
++	if (!MONO_TYPE_IS_VOID (sig->ret))
++		mspecs[sig_native->param_count] = mspecs[0];
++
++	mspecs[0] = NULL;
++
++	if (!MONO_TYPE_IS_VOID (sig->ret))
++		mono_mb_emit_ldarg (mb, sig_native->param_count-1);
++
++	// the CCW -> object conversion
++	mono_mb_emit_ldarg (mb, 0);
++	mono_mb_emit_icon (mb, FALSE);
++	mono_mb_emit_icall (mb, cominterop_get_ccw_object);
++
++	for (i = 0; i < sig->param_count; i++)
++		mono_mb_emit_ldarg (mb, i+1);
++
++	mono_mb_emit_managed_call (mb, method, NULL);
++
++	// store result if we have one
++	if (!MONO_TYPE_IS_VOID (sig->ret))
++		mono_mb_emit_byte (mb, CEE_STIND_REF);
++
++	/* FIXME: need to emit try/catch block and return failure code if exception */
++	mono_mb_emit_icon (mb, 0);
++	mono_mb_emit_byte (mb, CEE_RET);
++
++	mono_loader_lock ();
++	mono_marshal_lock ();
++	res = mono_mb_create_method (mb, sig_native, sig_native->param_count + 16);	
++	mono_marshal_unlock ();
++	mono_loader_unlock ();
++
++	mono_mb_free (mb);
++
++	for (i = sig_native->param_count; i >= 0; i--)
++		if (mspecs [i])
++			mono_metadata_free_marshal_spec (mspecs [i]);
++	g_free (mspecs);
++
++	return res;
++}
++
++static gboolean
++cominterop_guids_equal (MonoString* guid1, MonoString* guid2)
++{
++	gint32 len1, len2;
++	gboolean match = FALSE;
++	len1 = mono_string_length (guid1);
++	len2 = mono_string_length (guid2);
++	if (len1 == len2) {
++		guint32 str_ind = 0;
++		match = TRUE;
++		for (str_ind = 0; str_ind < len1; str_ind++) {
++			if (g_unichar_toupper (mono_string_chars (guid1)[str_ind]) != g_unichar_toupper (mono_string_chars (guid2)[str_ind])) {
++				match = FALSE;
++				break;
++			}
++		}
++	}
++	return match;
++}
++
++static gboolean
++cominterop_class_guid_equal (gpointer guid, MonoClass* klass)
++{
++	static MonoClass *GuidAttribute = NULL;
++	MonoCustomAttrInfo *cinfo;
++	MonoReflectionGuidAttribute *attr;
++	MonoString *guid_string = mono_string_new (mono_domain_get (), mono_guid_to_string ((guint8*)guid));
++
++	/* Handle the GuidAttribute */
++	if (!GuidAttribute)
++		GuidAttribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "GuidAttribute");
++
++	cinfo = mono_custom_attrs_from_class (klass);	
++	if (cinfo) {
++		attr = (MonoReflectionGuidAttribute*)mono_custom_attrs_get_attr (cinfo, GuidAttribute);
++		if (!attr)
++			return FALSE;
++		if (!cinfo->cached)
++			mono_custom_attrs_free (cinfo);
++		return cominterop_guids_equal (guid_string, attr->guid);
++	}
++	return FALSE;
++}
++
++static int STDCALL 
++cominterop_ccw_addref (MonoCCWEntry* ccwe)
++{
++	MonoCCW* ccw = ccwe->ccw;
++	g_assert (ccw);
++	g_assert (ccw->object);
++	g_assert (ccw->ref_count >= 0);
++	ccw->ref_count++;
++	if (ccw->ref_count == 1) {
++		/* since we now have a ref count, alloc a handle*/
++		ccw->gc_handle = mono_gchandle_new (ccw->object, FALSE);
++	}
++	return ccw->ref_count;
++}
++
++static int STDCALL 
++cominterop_ccw_release (MonoCCWEntry* ccwe)
++{
++	MonoCCW* ccw = ccwe->ccw;
++	g_assert (ccw);
++	g_assert (ccw->object);
++	g_assert (ccw->ref_count > 0);
++	ccw->ref_count--;
++	if (ccw->ref_count == 0) {
++		/* allow gc of object */
++		guint32 handle = ccw->gc_handle;
++		g_assert (handle);
++		ccw->gc_handle = 0;
++		mono_gchandle_free (handle);
++	}
++	return ccw->ref_count;
++}
++
++static int STDCALL 
++cominterop_ccw_queryinterface (MonoCCWEntry* ccwe, gpointer riid, gpointer* ppv)
++{
++	GPtrArray *ifaces;
++	MonoClass *itf = NULL;
++	int i;
++	MonoCCW* ccw = ccwe->ccw;
++	MonoClass* klass = mono_object_class (ccw->object);
++
++	if (ppv)
++		*ppv = NULL;
++
++	// handle IUnknown special
++	if (cominterop_class_guid_equal (riid, mono_defaults.iunknown_class)) {
++		*ppv = cominterop_get_ccw (ccw->object, mono_defaults.iunknown_class);
++		/* remember to addref on QI */
++		cominterop_ccw_addref (*ppv);
++		return 0;
++	}
++
++	// handle IDispatch special
++	if (cominterop_class_guid_equal (riid, mono_defaults.idispatch_class)) {
++		*ppv = cominterop_get_ccw (ccw->object, mono_defaults.idispatch_class);
++		/* remember to addref on QI */
++		cominterop_ccw_addref (*ppv);
++		return 0;
++	}
++
++	ifaces = mono_class_get_implemented_interfaces (klass);
++	if (ifaces) {
++		for (i = 0; i < ifaces->len; ++i) {
++			MonoClass *ic = NULL;
++			ic = g_ptr_array_index (ifaces, i);
++			if (cominterop_class_guid_equal (riid, ic)) {
++				itf = ic;
++				break;
++			}
++		}
++		g_ptr_array_free (ifaces, TRUE);
++	}
++	if (itf) {
++		*ppv = cominterop_get_ccw (ccw->object, itf);
++		/* remember to addref on QI */
++		cominterop_ccw_addref (*ppv);
++		return 0;
++	}
++
++	return -1;
++}
++
++static int STDCALL 
++cominterop_ccw_get_type_info_count (MonoCCWEntry* ccwe, guint32 *pctinfo)
++{
++	if (pctinfo)
++		*pctinfo = 1;
++	return 0x80004001L;
++}
++
++static int STDCALL 
++cominterop_ccw_get_type_info (MonoCCWEntry* ccwe, guint32 iTInfo, guint32 lcid, gpointer *ppTInfo)
++{
++	if (ppTInfo)
++		*ppTInfo = NULL;
++	return 0x80004001L;
++}
++
++static int STDCALL 
++cominterop_ccw_get_ids_of_names (MonoCCWEntry* ccwe, gpointer riid,
++											 gunichar2** rgszNames, guint32 cNames,
++											 guint32 lcid, gint32 *rgDispId)
++{
++	return 0x80004001L;
++}
++
++static int STDCALL 
++cominterop_ccw_invoke (MonoCCWEntry* ccwe, guint32 dispIdMember,
++								   gpointer riid, guint32 lcid,
++								   guint16 wFlags, gpointer pDispParams,
++								   gpointer pVarResult, gpointer pExcepInfo,
++								   guint32 *puArgErr)
++{
++	return 0x80004001L;
++}
++
++
++
+Index: mono/mono/metadata/marshal.h
+===================================================================
+--- mono/mono/metadata/marshal.h	(revision 68741)
++++ mono/mono/metadata/marshal.h	(working copy)
+@@ -271,6 +271,9 @@
+ void * 
+ mono_marshal_realloc (gpointer ptr, gpointer size) MONO_INTERNAL;
+ 
++gboolean 
++mono_marshal_free_ccw (MonoObject* obj) MONO_INTERNAL;
++
+ void
+ ves_icall_System_Runtime_InteropServices_Marshal_copy_to_unmanaged (MonoArray *src, gint32 start_index,
+ 								    gpointer dest, gint32 length) MONO_INTERNAL;
+Index: mono/mono/metadata/gc.c
+===================================================================
+--- mono/mono/metadata/gc.c	(revision 68741)
++++ mono/mono/metadata/gc.c	(working copy)
+@@ -61,6 +61,7 @@
+ {
+ 	MonoObject *exc = NULL;
+ 	MonoObject *o, *o2;
++	MonoMethod* finalizer = NULL;
+ 	o = (MonoObject*)((char*)obj + GPOINTER_TO_UINT (data));
+ 
+ #ifndef HAVE_SGEN_GC
+@@ -100,8 +101,15 @@
+ 		return;
+ 	}
+ 
+-	mono_runtime_invoke (mono_class_get_finalizer (o->vtable->klass), o, NULL, &exc);
++	finalizer = mono_class_get_finalizer (o->vtable->klass);
+ 
++	/* if we area ccw, and have no finalizer method just return 
++	 * else run regular finalizer after freeing ccw */ 
++	if (mono_marshal_free_ccw (o) && !finalizer)
++		return;
++
++	mono_runtime_invoke (finalizer, o, NULL, &exc);
++
+ 	if (exc) {
+ 		/* fixme: do something useful */
+ 	}
+Index: mono/mono/mini/mini.c
+===================================================================
+--- mono/mono/mini/mini.c	(revision 68741)
++++ mono/mono/mini/mini.c	(working copy)
+@@ -3865,8 +3865,11 @@
+ 	dont_verify |= method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE;
+ 	dont_verify |= method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH;
+ 	dont_verify |= method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE; /* bug #77896 */
+-	dont_verify |= method->wrapper_type == MONO_WRAPPER_COMINTEROP;
+-	dont_verify |= method->wrapper_type == MONO_WRAPPER_COMINTEROP_INVOKE;
++	dont_verify |= method->wrapper_type == MONO_WRAPPER_RCW;
++	dont_verify |= method->wrapper_type == MONO_WRAPPER_RCW_ADJUST;
++	dont_verify |= method->wrapper_type == MONO_WRAPPER_RCW_INVOKE;
++	dont_verify |= method->wrapper_type == MONO_WRAPPER_CCW;
++	dont_verify |= method->wrapper_type == MONO_WRAPPER_CCW_ADJUST;
+ 
+ 	/* still some type unsafety issues in marshal wrappers... (unknown is PtrToStructure) */
+ 	dont_verify_stloc = method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE;
+Index: mono/mono/mini/ChangeLog
+===================================================================
+--- mono/mono/mini/ChangeLog	(revision 68741)
++++ mono/mono/mini/ChangeLog	(working copy)
+@@ -1,3 +1,9 @@
++2006-12-01  Jonathan Chambers  <joncham@gmail.com>
++
++	* mini.c (mono_method_to_ir): Don't verify COM Interop wrappers for now.
++	
++	Signed-off-by: Jonathan Chambers <joncham@gmail.com>
++
+ 2006-11-29  Mark Mason  <mason@broadcom.com>
+ 
+ 	* basic-calls.cs: additional tests for passing
+Index: mono/mono/tests/cominterop.cs
+===================================================================
+--- mono/mono/tests/cominterop.cs	(revision 68741)
++++ mono/mono/tests/cominterop.cs	(working copy)
+@@ -110,6 +110,27 @@
+ 	[DllImport ("libtest")]
+ 	public static extern int mono_test_marshal_com_object_ref_count (IntPtr pUnk);
+ 
++	[DllImport ("libtest")]
++	public static extern int mono_test_marshal_ccw_identity ([MarshalAs(UnmanagedType.Interface)]IMath imath);
++
++	[DllImport ("libtest")]
++	public static extern int mono_test_marshal_ccw_reflexive ([MarshalAs (UnmanagedType.Interface)]IMath imath);
++
++	[DllImport ("libtest")]
++	public static extern int mono_test_marshal_ccw_transitive ([MarshalAs (UnmanagedType.Interface)]IMath imath);
++
++	[DllImport ("libtest")]
++	public static extern int mono_test_marshal_ccw_imath_add ([MarshalAs (UnmanagedType.Interface)]IMath imath);
++
++	[DllImport ("libtest")]
++	public static extern int mono_test_marshal_ccw_imath_subtract ([MarshalAs (UnmanagedType.Interface)]IMath imath);
++
++	[DllImport ("libtest")]
++	public static extern int mono_test_marshal_ccw_imath_same ([MarshalAs (UnmanagedType.Interface)]IMath imath);
++
++	[DllImport ("libtest")]
++	public static extern int mono_test_marshal_ccw_imath_different ([MarshalAs (UnmanagedType.Interface)]IMath imath);
++
+ 	public static int Main() {
+ 
+         bool isWindows = !(((int)Environment.OSVersion.Platform == 4) || 
+@@ -264,6 +285,31 @@
+ 			//if (mono_test_marshal_com_object_destroy (pUnk) != 0)
+ 			//    return 71;
+ 			#endregion // Marshal COM Interop Tests
++
++			#region Marshal CCW Tests
++			ManagedMath math = new ManagedMath();
++
++			if (mono_test_marshal_ccw_identity (math) != 0)
++				return 100;
++
++			if (mono_test_marshal_ccw_reflexive (math) != 0)
++				return 101;
++
++			if (mono_test_marshal_ccw_transitive (math) != 0)
++				return 102;
++
++			if (mono_test_marshal_ccw_imath_add (math) != 0)
++				return 110;
++
++			if (mono_test_marshal_ccw_imath_subtract (math) != 0)
++				return 111;
++
++			if (mono_test_marshal_ccw_imath_same (math) != 0)
++				return 112;
++
++			if (mono_test_marshal_ccw_imath_different (math) != 0)
++				return 113;
++			#endregion Marshal CCW Tests
+ 		}
+ 
+         return 0;
+@@ -279,9 +325,9 @@
+         [MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
+ 		int Subtract (int a, int b);
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
+-		int Same ([MarshalAs(UnmanagedType.Interface)] out IMath imath);
++		void Same ([MarshalAs(UnmanagedType.Interface)] out IMath imath);
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
+-		int Different ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
++		void Different ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
+     }
+ 
+ 	[ComImport ()]
+@@ -293,8 +339,31 @@
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
+ 		public extern int Subtract (int a, int b);
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
+-		public extern int Same ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
++		public extern void Same ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
+-		public extern int Different ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
++		public extern void Different ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
+ 	}
++
++	public class ManagedMath : IMath
++	{
++		public int Add (int a, int b)
++		{
++			return a + b;
++		}
++
++		public int Subtract (int a, int b)
++		{
++			return a - b;
++		}
++
++		public void Same ([MarshalAs (UnmanagedType.Interface)] out IMath imath)
++		{
++			imath = this;
++		}
++
++		public void Different ([MarshalAs (UnmanagedType.Interface)] out IMath imath)
++		{
++			imath = new ManagedMath ();
++		}
++	}
+ }
+Index: mono/mono/tests/libtest.c
+===================================================================
+--- mono/mono/tests/libtest.c	(revision 68741)
++++ mono/mono/tests/libtest.c	(working copy)
+@@ -2270,4 +2270,142 @@
+ 	return pUnk->m_ref;
+ }
+ 
+-#endif //NOT_YET
++STDCALL int
++mono_test_marshal_ccw_identity (MonoComObject *pUnk)
++{
++	MonoComObject* pUnk2;
++	int hr = 0;
++
++	if (!pUnk)
++		return 1;
++
++	hr = pUnk->vtbl->QueryInterface (pUnk, &IID_IMath, (void**)&pUnk2);
++	if (hr != 0)
++		return 2;
++
++	if (!pUnk2)
++		return 3;
++
++	if (pUnk != pUnk2)
++		return 4;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_ccw_reflexive (MonoComObject *pUnk)
++{
++	MonoComObject *pUnk2 = NULL, *pDisp = NULL, *pUnk3 = NULL;
++	int hr = 0;
++
++	if (!pUnk)
++		return 1;
++
++	hr = pUnk->vtbl->QueryInterface (pUnk, &IID_IMonoDispatch, (void**)&pDisp);
++	if (hr != 0 || !pDisp)
++		return 2;
++
++	hr = pDisp->vtbl->QueryInterface (pDisp, &IID_IMath, (void**)&pUnk3);
++	if (hr != 0 || !pUnk3)
++		return 3;
++
++	if (pUnk != pUnk3)
++		return 4;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_ccw_transitive (MonoComObject *pUnk)
++{
++	MonoComObject *pUnk2 = NULL, *pDisp = NULL, *pUnk4 = NULL;
++	int hr = 0;
++
++	if (!pUnk)
++		return 1;
++
++	hr = pUnk->vtbl->QueryInterface (pUnk, &IID_IMonoUnknown, (void**)&pUnk2);
++	if (hr != 0 || !pUnk2)
++		return 2;
++
++	hr = pUnk2->vtbl->QueryInterface (pUnk2, &IID_IMonoDispatch, (void**)&pDisp);
++	if (hr != 0 || !pDisp)
++		return 3;
++
++	hr = pDisp->vtbl->QueryInterface (pDisp, &IID_IMath, (void**)&pUnk4);
++	if (hr != 0 || !pUnk4)
++		return 4;
++
++	if (pUnk != pUnk4)
++		return 5;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_ccw_imath_add (MonoComObject *pUnk)
++{
++	int hr = 0, c = 0;
++
++	if (!pUnk)
++		return 1;
++
++	hr = pUnk->vtbl->Add (pUnk, 1, 2, &c);
++
++	if (hr != 0 || c != 3)
++		return 2;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_ccw_imath_subtract (MonoComObject *pUnk)
++{
++	int hr = 0, c = 0;
++
++	if (!pUnk)
++		return 1;
++
++	hr = pUnk->vtbl->Subtract (pUnk, 10, 6, &c);
++
++	if (hr != 0 || c != 4)
++		return 2;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_ccw_imath_same (MonoComObject *pUnk)
++{
++	MonoComObject* pUnk2;
++	int hr = 0, c = 0;
++
++	if (!pUnk)
++		return 1;
++
++	hr = pUnk->vtbl->Same (pUnk, &pUnk2);
++
++	if (hr != 0 || pUnk != pUnk2)
++		return 2;
++
++	return 0;
++}
++
++STDCALL int
++mono_test_marshal_ccw_imath_different (MonoComObject *pUnk)
++{
++	MonoComObject* pUnk2;
++	int hr = 0, c = 0;
++
++	if (!pUnk)
++		return 1;
++
++	hr = pUnk->vtbl->Different (pUnk, &pUnk2);
++
++	if (hr != 0 || pUnk == pUnk2)
++		return 2;
++
++	return 0;
++}
++
++#endif

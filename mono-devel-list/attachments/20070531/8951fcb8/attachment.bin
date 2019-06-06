@@ -1,0 +1,858 @@
+Index: System.Collections.Generic/Dictionary.cs
+===================================================================
+--- System.Collections.Generic/Dictionary.cs	(revision 78207)
++++ System.Collections.Generic/Dictionary.cs	(working copy)
+@@ -6,10 +6,12 @@
+ //	Marek Safar (marek.safar@seznam.cz) (stubs)
+ //	Ankit Jain (radical@corewars.org)
+ //	David Waite (mass@akuma.org)
++//	Juraj Skripsky (js@hotfeet.ch)
+ //
+ //
+ // Copyright (C) 2004 Novell, Inc (http://www.novell.com)
+ // Copyright (C) 2005 David Waite
++// Copyright (C) 2007 HotFeet GmbH (http://www.hotfeet.ch)
+ //
+ // Permission is hereby granted, free of charge, to any person obtaining
+ // a copy of this software and associated documentation files (the
+@@ -41,7 +43,6 @@
+ using System.Runtime.InteropServices;
+ 
+ namespace System.Collections.Generic {
+-
+ 	[ComVisible(true)]
+ 	[Serializable]
+ 	public class Dictionary<TKey, TValue> : IDictionary<TKey, TValue>,
+@@ -52,80 +53,159 @@
+ 		ISerializable,
+ 		IDeserializationCallback
+ 	{
++		// The implementation of this class uses a hash table and linked lists
++		// (see: http://msdn2.microsoft.com/en-us/library/ms379571(VS.80).aspx).
++		//		
++		// We use a kind of "mini-heap" instead of reference-based linked lists.
++		// The fields "linkSlots", "dataSlots", "touchedSlots" and "emptySlot"
++		// model this mini-heap:
++		// "dataSlots" is the heap itself, it stores the data
++		// "linkSlots" contains information about how the slots in the heap
++		//             are connected into linked lists
++		// "touchedSlots" and "emptySlot" manage the free space in the heap 
++
+ 		const int INITIAL_SIZE = 10;
+ 		const float DEFAULT_LOAD_FACTOR = (90f / 100);
+-
+-		private class Slot {
+-			// Can't use KeyValuePair here since the JIT won't inline the Key/Value accessors
++		const int NO_SLOT = -1;
++		const int NO_HASHCODE = -1;
++		
++		// TODO: replace with KeyValuePair<TKey, TValue>. 
++		// modify KeyValuePair: make fields internal, add internal Set method
++		private struct KVPair {
+ 			public TKey Key;
+ 			public TValue Value;
+-			public Slot Next;
++		}
+ 
+-			public Slot (TKey Key, TValue Value, Slot Next)
+-			{
+-				this.Key = Key;
+-				this.Value = Value;
+-				this.Next = Next;
+-			}
++		private struct Link {
++			public int HashCode;
++			public int Next;
+ 		}
+ 
+-		Slot [] table;
+-		int used_slots;
+-		private int threshold;
++		// The hash table contains indices into the linkSlots array
++		int [] table;
++		
++		// All (key,value) pairs are chained into linked lists. The connection
++		// information is stored in "linkSlots" along with the key's hash code
++		// (for performance reasons).  
++		// Every link in "linkSlots" corresponds to the (key,value) pair
++		// in "dataSlots" with the same index.
++		Link [] linkSlots;
++		KVPair [] dataSlots;
+ 
++		// The number of slots in "linkSlots" and "dataSlots" that are in use
++		// (i.e. filled with data) or have been used and marked as "empty" later
++		// on.
++		int touchedSlots;
++		
++		// The index of the first slot in the "empty slots chain".
++		// "Remove()" prepends the cleared slots to the empty chain.
++		// "Add()" fills the first slot in the empty slots chain with the
++		// added item (or increases "touchedSlots" if the chain itself is empty).
++		int emptySlot;
++
++		// The number of (key,value) pairs in this dictionary.
++		int count;
++		
++		// The number of (key,value) pairs the dictionary can hold without
++		// resizing the hash table and the slots arrays.
++		int threshold;
++
+ 		IEqualityComparer<TKey> hcp;
+ 		SerializationInfo serialization_info;
+ 
+-		private uint generation;
++		// The number of changes made to this dictionary. Used by enumerators
++		// to detect changes and invalidate themselves.
++		int generation;
+ 
+ 		public int Count {
+-			get { return used_slots; }
+-			/* FIXME: this should be 'private' not 'internal'.  */
+-			internal set {
+-				used_slots = value;
+-				++generation;
+-			}
++			get { return count; }
+ 		}
+ 
+-		// This is perf critical so inline calls etc.
+ 		public TValue this [TKey key] {
+ 			get {
+ 				if (key == null)
+ 					throw new ArgumentNullException ("key");
+-				uint size = (uint)table.Length;
+-				uint i = ((uint)hcp.GetHashCode (key) & Int32.MaxValue) % size;
+-				Slot slot = table [i];
+-				while (slot != null) {
++
++				// get first item of linked list corresponding to given key
++				int hashCode = (hcp.GetHashCode (key) & Int32.MaxValue);
++				int cur = table [hashCode % table.Length];
++				
++				// walk linked list until right slot is found or end is reached 
++				while (cur != NO_SLOT) {
+ 					// The ordering is important for compatibility with MS and strange
+ 					// Object.Equals () implementations
+-					if (hcp.Equals (slot.Key, key))
+-						return slot.Value;
+-					slot = slot.Next;
++					if (linkSlots [cur].HashCode == hashCode && hcp.Equals (dataSlots [cur].Key, key))
++						return dataSlots [cur].Value;
++					cur = linkSlots [cur].Next;
+ 				}
+ 				throw new KeyNotFoundException ();
+ 			}
+ 
+ 			set {
+-				int index;
+-				Slot prev = GetPrev (key, out index);
+-				Slot slot = prev == null ? table [index] : prev.Next;
+-				if (slot == null) {
+-					if (Count++ >= threshold) {
++				if (key == null)
++					throw new ArgumentNullException ("key");
++			
++				// get first item of linked list corresponding to given key
++				int hashCode = (hcp.GetHashCode (key) & Int32.MaxValue);
++				int index = hashCode % table.Length;
++				int cur = table [index];
++
++				// walk linked list until right slot (and its predecessor) is
++				// found or end is reached
++				int prev = NO_SLOT;
++				if (cur != NO_SLOT) {
++					do {
++						// The ordering is important for compatibility with MS and strange
++						// Object.Equals () implementations
++						if (linkSlots [cur].HashCode == hashCode && hcp.Equals (dataSlots [cur].Key, key))
++							break;
++						prev = cur;
++						cur = linkSlots [cur].Next;
++					} while (cur != NO_SLOT);
++				}
++
++				// is there no slot for the given key yet? 				
++				if (cur == NO_SLOT) {
++					// there is no existing slot for the given key,
++					// allocate one and prepend it to its corresponding linked
++					// list
++				
++					if (++count > threshold) {
+ 						Resize ();
+-						index = DoHash (key);
++						index = (hashCode & Int32.MaxValue) % table.Length;
+ 					}
+-					table [index] = new Slot (key, value, table [index]);
++
++					// find an empty slot
++					cur = emptySlot;
++					if (cur == NO_SLOT)
++						cur = touchedSlots++;
++					else 
++						emptySlot = linkSlots [cur].Next;
++					
++					// prepend the added item to its linked list,
++					// update the hash table
++					linkSlots [cur].Next = table[index];
++					table [index] = cur;
+ 				} else {
+-					++generation;
+-					if (prev != null) {
+-						// move-to-front on update
+-						prev.Next = slot.Next;
+-						slot.Next = table [index];
+-						table [index] = slot;
++					// we already have a slot for the given key,
++					// update the existing slot		
++
++					// if the slot is not at the front of its linked list,
++					// we move it there
++					if (prev != NO_SLOT) {
++						linkSlots [prev].Next = linkSlots [cur].Next;
++						linkSlots [cur].Next = table [index];
++						table [index] = cur;
+ 					}
+-					slot.Key = key;
+-					slot.Value = value;
+ 				}
++
++				// store the hash code of the new item and
++				// the item's data itself 
++				linkSlots [cur].HashCode = hashCode;
++				dataSlots [cur].Key = key;
++				dataSlots [cur].Value = value;
++				
++				generation++;
+ 			}
+ 		}
+ 
+@@ -169,13 +249,6 @@
+ 			serialization_info = info;
+ 		}
+ 
+-		void SetThreshold ()
+-		{
+-			threshold = (int)(table.Length * DEFAULT_LOAD_FACTOR);
+-			if (threshold == 0 && table.Length > 0)
+-				threshold = 1;
+-		}
+-
+ 		private void Init (int capacity, IEqualityComparer<TKey> hcp)
+ 		{
+ 			if (capacity < 0)
+@@ -187,11 +260,26 @@
+ 			/* Modify capacity so 'capacity' elements can be added without resizing */
+ 			capacity = (int)(capacity / DEFAULT_LOAD_FACTOR) + 1;
+ 			
+-			table = new Slot [capacity];
+-			SetThreshold ();
++			InitArrays (capacity);
+ 			generation = 0;
+ 		}
++		
++		private void InitArrays (int size) {
++			table = new int [size];
++			for (int i = 0; i < size; i++)
++				table [i] = NO_SLOT;
+ 
++			linkSlots = new Link [size];
++			emptySlot = NO_SLOT;
++
++			dataSlots = new KVPair [size];
++			touchedSlots = 0;
++
++			threshold = (int)(table.Length * DEFAULT_LOAD_FACTOR);
++			if (threshold == 0 && table.Length > 0)
++				threshold = 1;
++		}
++		
+ 		void CopyTo (KeyValuePair<TKey, TValue> [] array, int index)
+ 		{
+ 			if (array == null)
+@@ -203,91 +291,139 @@
+ 				throw new ArgumentException ("index larger than largest valid index of array");
+ 			if (array.Length - index < Count)
+ 				throw new ArgumentException ("Destination array cannot hold the requested elements!");
+-
+-			for (int i = 0; i < table.Length; ++i) {
+-				for (Slot slot = table [i]; slot != null; slot = slot.Next)
+-					array [index++] = new KeyValuePair<TKey, TValue> (slot.Key, slot.Value);
++			
++			for (int i = 0; i < touchedSlots; i++) {
++				if (linkSlots [i].HashCode != NO_HASHCODE)
++					array [index++] = new KeyValuePair<TKey, TValue> (dataSlots [i].Key, dataSlots [i].Value);
+ 			}
+ 		}
+-
++		
+ 		private void Resize ()
+ 		{
+ 			// From the SDK docs:
+ 			//	 Hashtable is automatically increased
+ 			//	 to the smallest prime number that is larger
+ 			//	 than twice the current number of Hashtable buckets
+-			uint newSize = (uint) Hashtable.ToPrime ((table.Length << 1) | 1);
++			int newSize = Hashtable.ToPrime ((table.Length << 1) | 1);
+ 
+-			Slot nextslot = null;
+-			Slot [] oldTable = table;
++			// allocate and clear new hash table
++			table = new int [newSize];
++			for (int i = 0; i < newSize; i++)
++				table [i] = NO_SLOT;
+ 
+-			table = new Slot [newSize];
+-			SetThreshold ();
++			// allocate new link slots array
++			// copy hash codes, populate hash table and build linked lists
++			Link[] newLinkSlots = new Link[newSize];
++			for (int i = 0; i < touchedSlots; i++) {
++				int hashCode = newLinkSlots [i].HashCode = linkSlots [i].HashCode;
++				int index = hashCode % newSize;
++				newLinkSlots [i].Next = table[index];
++				table [index] = i;
++			}
++			linkSlots = newLinkSlots;
+ 
+-			int index;
+-			for (int i = 0; i < oldTable.Length; i++) {
+-				for (Slot slot = oldTable [i]; slot != null; slot = nextslot) {
+-					nextslot = slot.Next;
++			// allocate new data slots, copy data			
++			KVPair[] newDataSlots = new KVPair[newSize];
++			Array.Copy (dataSlots, 0, newDataSlots, 0, touchedSlots);
++			dataSlots = newDataSlots;
+ 
+-					index = DoHash (slot.Key);
+-					slot.Next = table [index];
+-					table [index] = slot;
+-				}
+-			}
++			threshold = (int)(newSize * DEFAULT_LOAD_FACTOR);
+ 		}
+-
++		
+ 		public void Add (TKey key, TValue value)
+ 		{
+-			int index;
+-			Slot slot = GetSlot (key, out index);
+-			if (slot != null)
+-				throw new ArgumentException ("An element with the same key already exists in the dictionary.");
+-			DoAdd (index, key, value);
+-		}
++			if (key == null)
++				throw new ArgumentNullException ("key");
+ 
+-		void DoAdd (int index, TKey key, TValue value)
+-		{
+-			if (Count++ >= threshold) {
++			// get first item of linked list corresponding to given key
++			int hashCode = (hcp.GetHashCode (key) & Int32.MaxValue);
++			int index = hashCode % table.Length;
++			int cur = table [index];
++
++			// walk linked list until end is reached (throw an exception if a
++			// existing slot is found having an equivalent key)
++			while (cur != NO_SLOT) {
++				// The ordering is important for compatibility with MS and strange
++				// Object.Equals () implementations
++				if (linkSlots [cur].HashCode == hashCode && hcp.Equals (dataSlots [cur].Key, key))
++					throw new ArgumentException ("An element with the same key already exists in the dictionary.");
++				cur = linkSlots [cur].Next;
++			}
++
++			if (++count > threshold) {
+ 				Resize ();
+-				index = DoHash (key);
++				index = hashCode % table.Length;
+ 			}
+-			table [index] = new Slot (key, value, table [index]);
+-		}
++			
++			// find an empty slot
++			cur = emptySlot;
++			if (cur == NO_SLOT)
++				cur = touchedSlots++;
++			else 
++				emptySlot = linkSlots [cur].Next;
+ 
+-		private int DoHash (TKey key)
+-		{
+-			uint size = (uint)this.table.Length;
+-			uint h = (uint)hcp.GetHashCode (key) & Int32.MaxValue;
+-			int spot = (int) (h % size);
+-			return spot;
++			// store the hash code of the added item,
++			// prepend the added item to its linked list,
++			// update the hash table
++			linkSlots [cur].HashCode = hashCode;
++			linkSlots [cur].Next = table[index];
++			table [index] = cur;
++
++			// store item's data 
++			dataSlots [cur].Key = key;
++			dataSlots [cur].Value = value;
++
++			generation++;
+ 		}
+-
++		
+ 		public IEqualityComparer<TKey> Comparer {
+ 			get { return hcp; }
+ 		}
+ 
+ 		public void Clear ()
+ 		{
+-			Count = 0;
++			count = 0;
++			// clear the hash table
+ 			for (int i = 0; i < table.Length; i++)
+-				table [i] = null;
++				table [i] = NO_SLOT;
++
++			// empty the "empty slots chain"
++			emptySlot = NO_SLOT;
++			
++			touchedSlots = 0;
++			generation++;
+ 		}
+ 
+ 		public bool ContainsKey (TKey key)
+ 		{
+-			int index;
+-			return GetSlot (key, out index) != null;
++			// get first item of linked list corresponding to given key
++			int hashCode = (hcp.GetHashCode (key) & Int32.MaxValue);
++			int cur = table [hashCode % table.Length];
++			
++			// walk linked list until right slot is found or end is reached
++			while (cur != NO_SLOT) {
++				// The ordering is important for compatibility with MS and strange
++				// Object.Equals () implementations
++				if (linkSlots [cur].HashCode == hashCode && hcp.Equals (dataSlots [cur].Key, key))
++					return true;
++				cur = linkSlots [cur].Next;
++			}
++
++			return false;
+ 		}
+ 
+ 		public bool ContainsValue (TValue value)
+ 		{
+ 			IEqualityComparer<TValue> cmp = EqualityComparer<TValue>.Default;
+ 
+-			for (int i = 0; i < table.Length; ++i) {
+-				for (Slot slot = table [i]; slot != null; slot = slot.Next) {
+-					if (cmp.Equals (slot.Value, value))
+-						return true;
+-				}
++			// scan all used data slots for the given value
++			for (int i = 0; i < touchedSlots; i++) {
++				// skip empty slots
++				if (linkSlots [i].HashCode == NO_HASHCODE)
++					continue;
++					
++				if (cmp.Equals (dataSlots [i].Value, value))
++					return true;
+ 			}
+ 			return false;
+ 		}
+@@ -298,14 +434,15 @@
+ 			if (info == null)
+ 				throw new ArgumentNullException ("info");
+ 
+-			info.AddValue ("hcp", hcp);
++			info.AddValue ("Version", generation);
++			info.AddValue ("Comparer", hcp);
+ 			KeyValuePair<TKey, TValue> [] data = null;
+-			if (Count > 0) {
+-				data = new KeyValuePair<TKey,TValue> [Count];
++			if (count > 0) {
++				data = new KeyValuePair<TKey,TValue> [count];
+ 				CopyTo (data, 0);
+ 			}
+-			info.AddValue ("data", data);
+-			info.AddValue ("buckets_hint", table.Length);
++			info.AddValue ("HashSize", table.Length);
++			info.AddValue ("KeyValuePairs", data);
+ 		}
+ 
+ 		public virtual void OnDeserialization (object sender)
+@@ -313,90 +450,99 @@
+ 			if (serialization_info == null)
+ 				return;
+ 
+-			hcp = (IEqualityComparer<TKey>) serialization_info.GetValue ("hcp", typeof (IEqualityComparer<TKey>));
++			generation = serialization_info.GetInt32 ("Version");
++			hcp = (IEqualityComparer<TKey>) serialization_info.GetValue ("Comparer", typeof (IEqualityComparer<TKey>));
++
++			int hashSize = serialization_info.GetInt32 ("HashSize");
+ 			KeyValuePair<TKey, TValue> [] data =
+ 				(KeyValuePair<TKey, TValue> [])
+-				serialization_info.GetValue ("data", typeof (KeyValuePair<TKey, TValue> []));
++				serialization_info.GetValue ("KeyValuePairs", typeof (KeyValuePair<TKey, TValue> []));
+ 
+-			int buckets = serialization_info.GetInt32 ("buckets_hint");
+-			if (buckets < INITIAL_SIZE)
+-				buckets = INITIAL_SIZE;
++			if (hashSize < INITIAL_SIZE)
++				hashSize = INITIAL_SIZE;
++			InitArrays (hashSize);
++			count = 0;
+ 
+-			table = new Slot [buckets];
+-			SetThreshold ();
+-			Count = 0;
+-
+ 			if (data != null) {
+ 				for (int i = 0; i < data.Length; ++i)
+ 					Add (data [i].Key, data [i].Value);
+ 			}
++			generation++;
+ 			serialization_info = null;
+ 		}
+ 
+ 		public bool Remove (TKey key)
+ 		{
+-			int index;
+-			Slot prev = GetPrev (key, out index);
+-			Slot slot = prev == null ? table [index] : prev.Next;
+-			if (slot == null)
++			if (key == null)
++				throw new ArgumentNullException ("key");
++
++			// get first item of linked list corresponding to given key
++			int hashCode = (hcp.GetHashCode (key) & Int32.MaxValue);
++			int index = hashCode % table.Length;
++			int cur = table [index];
++			
++			// if there is no linked list, return false
++			if (cur == NO_SLOT)
+ 				return false;
+-			--Count;
+-			if (prev == null)
+-				table [index] = slot.Next;
++				
++			// walk linked list until right slot (and its predecessor) is
++			// found or end is reached
++			int prev = NO_SLOT;
++			do {
++				// The ordering is important for compatibility with MS and strange
++				// Object.Equals () implementations
++				if (linkSlots [cur].HashCode == hashCode && hcp.Equals (dataSlots [cur].Key, key))
++					break;
++				prev = cur;
++				cur = linkSlots [cur].Next;
++			} while (cur != NO_SLOT);
++
++			// if we reached the end of the chain, return false
++			if (cur == NO_SLOT)
++				return false;
++
++			count--;
++			// remove slot from linked list
++			// is slot at beginning of linked list?
++			if (prev == NO_SLOT)
++				table [index] = linkSlots [cur].Next;
+ 			else
+-				prev.Next = slot.Next;
++				linkSlots [prev].Next = linkSlots [cur].Next;
++
++			// mark slot as empty and prepend it to "empty slots chain"				
++			linkSlots [cur].HashCode = NO_HASHCODE;
++			linkSlots [cur].Next = emptySlot;
++			emptySlot = cur;
++			
++			generation++;
+ 			return true;
+ 		}
+ 
+-		//
+-		// Return the predecessor of the slot containing 'key', and set 'index' to the 
+-		// chain the key was found in.
+-		// If the key is not found, return null and set 'index' to the chain that would've 
+-		// contained the key.
+-		//
+-		private Slot GetPrev (TKey key, out int index)
++		public bool TryGetValue (TKey key, out TValue value)
+ 		{
+-			// This method is perf critical so inline DoHash () etc.
+ 			if (key == null)
+ 				throw new ArgumentNullException ("key");
+-			uint size = (uint)table.Length;
+-			// Use uint to help ABCREM
+-			uint i = ((uint)hcp.GetHashCode (key) & Int32.MaxValue) % size;
+-			Slot slot = table [i];
+-			if (slot != null) {
+-				Slot prev = null;
+-				do {
+-					// The ordering is important for compatibility with MS and strange
+-					// Object.Equals () implementations
+-					if (hcp.Equals (slot.Key, key))
+-						break;
+-					prev = slot;
+-					slot = slot.Next;
+-				} while (slot != null);
+-				index = (int)i;
+-				return prev;
++
++			// get first item of linked list corresponding to given key
++			int hashCode = (hcp.GetHashCode (key) & Int32.MaxValue);
++			int cur = table [hashCode % table.Length];
++
++			// walk linked list until right slot is found or end is reached
++			while (cur != NO_SLOT) {
++				// The ordering is important for compatibility with MS and strange
++				// Object.Equals () implementations
++				if (linkSlots [cur].HashCode == hashCode && hcp.Equals (dataSlots [cur].Key, key)) {
++					value = dataSlots [cur].Value;
++					return true;
++				}
++				cur = linkSlots [cur].Next;
+ 			}
+-			else {
+-				index = (int)i;
+-				return null;
+-			}
+-		}
+ 
+-		private Slot GetSlot (TKey key, out int index)
+-		{
+- 			Slot prev = GetPrev (key, out index);
+-			return prev == null ? table [index] : prev.Next;
++			// we did not find the slot
++			value = default (TValue);
++			return false;
+ 		}
+ 
+-		public bool TryGetValue (TKey key, out TValue value)
+-		{
+-			int index;
+-			Slot slot = GetSlot (key, out index);
+-			bool found = slot != null;
+-			value = found ? slot.Value : default (TValue);
+-			return found;
+-		}
+-
+ 		ICollection<TKey> IDictionary<TKey, TValue>.Keys {
+ 			get { return Keys; }
+ 		}
+@@ -517,12 +663,12 @@
+ 			// we want no exception for index==array.Length && Count == 0
+ 			if (index > array.Length)
+ 				throw new ArgumentException ("index larger than largest valid index of array");
+-			if (array.Length - index < Count)
++			if (array.Length - index < count)
+ 				throw new ArgumentException ("Destination array cannot hold the requested elements!");
+ 
+-			for (int i = 0; i < table.Length; ++i) {
+-				for (Slot slot = table [i]; slot != null; slot = slot.Next)
+-					array.SetValue (new DictionaryEntry (slot.Key, slot.Value), index++);
++			for (int i = 0; i < touchedSlots; i++) {
++				if (linkSlots [i].HashCode != NO_HASHCODE)
++					array.SetValue (new DictionaryEntry (dataSlots [i].Key, dataSlots [i].Value), index++);
+ 			}
+ 		}
+ 
+@@ -594,11 +740,9 @@
+ 			IDisposable, IDictionaryEnumerator, IEnumerator
+ 		{
+ 			Dictionary<TKey, TValue> dictionary;
+-			uint stamp;
++			int current;
++			int stamp;
+ 
+-			Slot current;
+-			int next_index;
+-
+ 			internal Enumerator (Dictionary<TKey, TValue> dictionary)
+ 			{
+ 				this.dictionary = dictionary;
+@@ -606,31 +750,40 @@
+ 
+ 				// The following stanza is identical to IEnumerator.Reset (),
+ 				// but because of the definite assignment rule, we cannot call it here.
+-				next_index = 0;
+-				current = null;
++				current = -1;
+ 			}
+ 
+ 			public bool MoveNext ()
+ 			{
+ 				VerifyState ();
++				while (++current < dictionary.touchedSlots && dictionary.linkSlots [current].HashCode == NO_HASHCODE);
+ 
+-				// Pre-condition: current == null => this is the first call to MoveNext ()
+-				if (current != null)
+-					current = current.Next;
+-
+-				while (current == null && next_index < dictionary.table.Length)
+-					current = dictionary.table [next_index++];
+-
+-				// Post-condition: current == null => this is the last call to MoveNext()
+-				return current != null;
++				return current != dictionary.touchedSlots;
+ 			}
+ 
+ 			public KeyValuePair<TKey, TValue> Current {
+ 				get { 
+-					Slot s = CurrentSlot (); 
+-					return new KeyValuePair <TKey, TValue> (s.Key, s.Value);
++					VerifyCurrent (); 
++					return new KeyValuePair <TKey, TValue> (
++						dictionary.dataSlots [current].Key,
++						dictionary.dataSlots [current].Value
++					);
+ 				}
+ 			}
++			
++			internal TKey CurrentKey {
++				get {
++					VerifyCurrent ();
++					return dictionary.dataSlots [current].Key;
++				}
++			}
++			
++			internal TValue CurrentValue {
++				get {
++					VerifyCurrent ();
++					return dictionary.dataSlots [current].Value;
++				}
++			}
+ 
+ 			object IEnumerator.Current {
+ 				get { return Current; }
+@@ -638,23 +791,31 @@
+ 
+ 			void IEnumerator.Reset ()
+ 			{
+-				next_index = 0;
+-				current = null;
++				current = -1;
+ 			}
+ 
+ 			DictionaryEntry IDictionaryEnumerator.Entry {
+ 				get {
+-					Slot s = CurrentSlot ();
+-					return new DictionaryEntry (s.Key, s.Value);
++					VerifyCurrent ();
++					return new DictionaryEntry (
++						dictionary.dataSlots [current].Key,
++						dictionary.dataSlots [current].Value
++					);
+ 				}
+ 			}
+ 
+ 			object IDictionaryEnumerator.Key {
+-				get { return Current.Key; }
++				get {
++					VerifyCurrent();
++					return dictionary.dataSlots [current].Key;
++				}
+ 			}
+ 
+ 			object IDictionaryEnumerator.Value {
+-				get { return Current.Value; }
++				get {
++					VerifyCurrent();
++					return dictionary.dataSlots [current].Value;
++				}
+ 			}
+ 
+ 			void VerifyState ()
+@@ -665,17 +826,15 @@
+ 					throw new InvalidOperationException ("out of sync");
+ 			}
+ 
+-			Slot CurrentSlot ()
++			void VerifyCurrent ()
+ 			{
+ 				VerifyState ();
+-				if (current == null)
++				if (current == -1 || current == dictionary.touchedSlots)
+ 					throw new InvalidOperationException ("Current is not valid");
+-				return current;
+ 			}
+ 
+ 			public void Dispose ()
+ 			{
+-				current = null;
+ 				dictionary = null;
+ 			}
+ 		}
+@@ -704,8 +863,10 @@
+ 				if (array.Length - index < dictionary.Count)
+ 					throw new ArgumentException ("Destination array cannot hold the requested elements!");
+ 
+-				foreach (TKey k in this)
+-					array [index++] = k;
++				for (int i = 0; i < dictionary.touchedSlots; i++) {
++					if (dictionary.linkSlots [i].HashCode != NO_HASHCODE)
++						array [index++] = dictionary.dataSlots [i].Key;
++				}
+ 			}
+ 
+ 			public Enumerator GetEnumerator ()
+@@ -784,11 +945,11 @@
+ 				}
+ 
+ 				public TKey Current {
+-					get { return host_enumerator.Current.Key; }
++					get { return host_enumerator.CurrentKey; }
+ 				}
+ 
+ 				object IEnumerator.Current {
+-					get { return host_enumerator.Current.Key; }
++					get { return host_enumerator.CurrentKey; }
+ 				}
+ 
+ 				void IEnumerator.Reset ()
+@@ -822,8 +983,10 @@
+ 				if (array.Length - index < dictionary.Count)
+ 					throw new ArgumentException ("Destination array cannot hold the requested elements!");
+ 
+-				foreach (TValue k in this)
+-					array [index++] = k;
++				for (int i = 0; i < dictionary.touchedSlots; i++) {
++					if (dictionary.linkSlots [i].HashCode != NO_HASHCODE)
++						array [index++] = dictionary.dataSlots [i].Value;
++				}
+ 			}
+ 
+ 			public Enumerator GetEnumerator ()
+@@ -902,11 +1065,11 @@
+ 				}
+ 
+ 				public TValue Current {
+-					get { return host_enumerator.Current.Value; }
++					get { return host_enumerator.CurrentValue; }
+ 				}
+ 
+ 				object IEnumerator.Current {
+-					get { return host_enumerator.Current.Value; }
++					get { return host_enumerator.CurrentValue; }
+ 				}
+ 
+ 				void IEnumerator.Reset ()
+Index: System.Collections.Generic/EqualityComparer.cs
+===================================================================
+--- System.Collections.Generic/EqualityComparer.cs	(revision 78207)
++++ System.Collections.Generic/EqualityComparer.cs	(working copy)
+@@ -37,7 +37,7 @@
+ 		static EqualityComparer ()
+ 		{
+ 			if (typeof (IEquatable <T>).IsAssignableFrom (typeof (T)))
+-				_default = (EqualityComparer <T>) Activator.CreateInstance (typeof (IEquatableOfTEqualityComparer <>).MakeGenericType (typeof (T)));
++				_default = (EqualityComparer <T>) Activator.CreateInstance (typeof (GenericEqualityComparer <>).MakeGenericType (typeof (T)));
+ 			else
+ 				_default = new DefaultComparer ();
+ 		}
+@@ -83,7 +83,7 @@
+ 	}
+ 	
+ 	[Serializable]
+-	class IEquatableOfTEqualityComparer <T> : EqualityComparer <T> where T : IEquatable <T> {
++	class GenericEqualityComparer <T> : EqualityComparer <T> where T : IEquatable <T> {
+ 
+ 		public override int GetHashCode (T obj)
+ 		{

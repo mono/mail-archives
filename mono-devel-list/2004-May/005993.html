@@ -1,0 +1,308 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] [patch] stabs debugging info on --aot code
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5Bpatch%5D%20stabs%20debugging%20info%20on%20--aot%20code&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="006011.html">
+   <LINK REL="Next"  HREF="006036.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] [patch] stabs debugging info on --aot code</H1>
+    <B>vladimir at pobox.com</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5Bpatch%5D%20stabs%20debugging%20info%20on%20--aot%20code&In-Reply-To="
+       TITLE="[Mono-devel-list] [patch] stabs debugging info on --aot code">vladimir at pobox.com
+       </A><BR>
+    <I>Wed May 26 05:22:56 EDT 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="006011.html">[Mono-devel-list] mono beta &amp; fedora core 2 &amp; mandrake 10
+</A></li>
+        <LI>Next message: <A HREF="006036.html">[Mono-devel-list] [patch] stabs debugging info on --aot code
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5993">[ date ]</a>
+              <a href="thread.html#5993">[ thread ]</a>
+              <a href="subject.html#5993">[ subject ]</a>
+              <a href="author.html#5993">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>
+Hi,
+
+I've started doing some poking around at adding some basic stabs
+debug info to the --aot generated assembly output.  This gives you
+more useful gdb backtraces:
+
+#0  0x00a803a6 in Hello.ComputeIt ()
+   from /home/vladimir/proj/mono-cvs/test/hello.exe.so
+#1  0x00a80427 in Hello.Main ()
+   from /home/vladimir/proj/mono-cvs/test/hello.exe.so
+#2  0x0026934b in ?? ()
+#3  0x08320588 in ?? ()
+#4  0x00258b08 in ?? () from /usr/local/lib/libmono.so.0
+#5  0x00269330 in ?? ()
+#6  0x08320588 in ?? ()
+#7  0x0080f8c8 in ?? ()
+#8  0x00153fad in mono_jit_compile_method (method=0x0) at mini.c:8008
+#9  0x0015408e in mono_jit_runtime_invoke (method=0x8320588, obj=0x0,
+
+(The ??'s are from stuff that I didn't --aot, also internally generated
+stuff)  It's also the first step to being able to generate oprofile data
+for JIT'd code, at least AOT code.  Note that the Java guys are talking
+about getting oprofile data working natively with JIT'd code; someone
+who has a better understanding of the JIT than I should probably jump
+into this conversation:
+<A HREF="http://marc.theaimsgroup.com/?l=oprofile-list&amp;m=108490766726601&amp;w=2">http://marc.theaimsgroup.com/?l=oprofile-list&amp;m=108490766726601&amp;w=2</A> so that
+whatever mechanism ends up in oprofile is usable for us as well.
+
+The patch also sets use_loaded_code to TRUE if --debug is given; without
+this, the symbols don't match the actual memory address (because the code
+gets copied).  --debug also should be specified with --aot, to get
+source file info (and, eventually, line number info).  Thinking about it,
+--debug should probably control whether the stabs data is emitted or not.
+
+Thanks,
+	- Vlad
+
+-------------- next part --------------
+Index: mini/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/ChangeLog,v
+retrieving revision 1.552
+diff -u -u -r1.552 ChangeLog
+--- mini/ChangeLog	25 May 2004 22:23:23 -0000	1.552
++++ mini/ChangeLog	26 May 2004 07:55:56 -0000
+@@ -1,3 +1,15 @@
++2004-05-25  Vladimir Vukicevic  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">vladimir at pobox.com</A>&gt;
++
++	* driver.c (mono_main): call mono_aot_use_loaded_code if --debug
++	is passed
++
++	* aot.c, mini.h: mono_aot_use_loaded_code() to set use_loaded_code
++	AOT flag
++
++	* aot.c (emit_stabs_function, emit_stabs, emit_method, 
++	mono_compile_assembly): Emit primitive STABS debugging output
++	into the AOT .so; just function names for now.
++
+ 2004-05-26  Gonzalo Paniagua Javier &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">gonzalo at ximian.com</A>&gt;
+ 
+ 	* Makefile.am: don't distribute generated inssel.[ch] files.
+Index: mini/aot.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/aot.c,v
+retrieving revision 1.33
+diff -u -u -r1.33 aot.c
+--- mini/aot.c	8 Apr 2004 18:01:12 -0000	1.33
++++ mini/aot.c	26 May 2004 07:55:56 -0000
+@@ -29,6 +29,7 @@
+ #include &lt;mono/metadata/tokentype.h&gt;
+ #include &lt;mono/metadata/appdomain.h&gt;
+ #include &lt;mono/metadata/debug-helpers.h&gt;
++#include &lt;mono/metadata/mono-debug.h&gt;
+ #include &lt;mono/metadata/assembly.h&gt;
+ #include &lt;mono/metadata/marshal.h&gt;
+ #include &lt;mono/os/gc_wrapper.h&gt;
+@@ -653,23 +654,97 @@
+ 
+ 	emit_section_change (fp, &quot;.text&quot;, 1);
+ 
+	fprintf (fp, &quot;.globl %s\n&quot;, name);
+ 	fprintf (fp, &quot;\t.align %d\n&quot;, align);
+ 	fprintf (fp, &quot;\t.type %s,#object\n&quot;, name);
+ 	fprintf (fp, &quot;\t.size %s,%d\n&quot;, name, size);
+ 	fprintf (fp, &quot;%s:\n&quot;, name);
+ 	for (i = 0; i &lt; size; i++) { 
+		fprintf (fp, &quot;.byte %d\n&quot;, buf [i]);
+ 	}
+ 	
+ }
+ #endif
+ 
+ static void
++emit_stabs_function (FILE *fp, MonoMethod *mm, const char *mname)
++{
++	/* Emit the filename info, if its changed */
++	static gchar* aot_last_debug_dir = NULL;
++	static gchar* aot_last_debug_file = NULL;
++
++	guint32 linenum;
++	gchar *sourceloc;
++
++	sourceloc = mono_debug_source_location_from_il_offset (mm, 0, &amp;linenum);
++	if (sourceloc) {
++		gchar *dirname, *filename;
++		gchar *slash = strrchr (sourceloc, '/');
++
++		if (slash) {
++			*slash = 0;
++			dirname = sourceloc;
++			filename = slash+1;
++		} else {
++			dirname = NULL;
++			filename = sourceloc;
++		}
++
++		if (aot_last_debug_dir == NULL ||
++			strcmp(aot_last_debug_dir, dirname) ||
++			strcmp(aot_last_debug_file, filename))
++		{
++			/* The file or the dir has changed, so we emit */
++			fprintf (fp, &quot;\t.file \&quot;%s\&quot;\n&quot;, filename);
++			if (dirname)
++				fprintf (fp, &quot;\t.stabs \&quot;%s/\&quot;,100,0,0,0\n&quot;, dirname);
++			fprintf (fp, &quot;\t.stabs \&quot;%s\&quot;,100,0,0,0\n&quot;, filename);
++
++			if (aot_last_debug_dir) g_free (aot_last_debug_dir);
++			if (aot_last_debug_file) g_free (aot_last_debug_file);
++
++			aot_last_debug_dir = g_strdup (dirname);
++			aot_last_debug_file = g_strdup (filename);
++		}
++
++		g_free (sourceloc);
++	} else {
++		/* Emit dummy file */
++		fprintf (fp, &quot;\t.file \&quot;DUMMY\&quot;\n&quot;);
++		fprintf (fp, &quot;\t.stabs \&quot;DUMMY\&quot;,100,0,0,0\n&quot;);
++	}
++	
++	if (mm-&gt;klass) {
++		fprintf (fp, &quot;\t.stabs \&quot;%s%s%s%s%s:F0\&quot;,36,0,0,%s\n&quot;,
++				 (mm-&gt;klass-&gt;name_space &amp;&amp; *(mm-&gt;klass-&gt;name_space)) ? mm-&gt;klass-&gt;name_space : &quot;&quot;,
++				 (mm-&gt;klass-&gt;name_space &amp;&amp; *(mm-&gt;klass-&gt;name_space)) ? &quot;.&quot; : &quot;&quot;,
++				 mm-&gt;klass-&gt;name ? mm-&gt;klass-&gt;name : &quot;&quot;,
++				 mm-&gt;klass-&gt;name ? &quot;.&quot; : &quot;&quot;,
++				 mm-&gt;name,
++				 mname);
++	} else {
++		fprintf (fp, &quot;\t.stabs \&quot;%s:F0\&quot;,36,0,0,%s\n&quot;,
++				 mm-&gt;name,
++				 mname);
++	}
++}
++
++static void
++emit_stabs (FILE *fp, const char *sname, const char *sargs, int type, int other, int desc, const char *value)
++{
++	fprintf (fp, &quot;\t.stabs \&quot;%s%s%s\&quot;,%d,%d,%d,%s\n&quot;,
++			 sname,
++			 sargs != NULL ? &quot;:&quot; : &quot;&quot;,
++			 sargs != NULL ? sargs : &quot;&quot;,
++			 type, other, desc,
++			 value != NULL ? value : &quot;0&quot;);
++}
++
++static void
+ write_string_symbol (FILE *fp, const char *name, const char *value)
+ {
+ 	emit_section_change (fp, &quot;.text&quot;, 1);
+	fprintf (fp, &quot;.globl %s\n&quot;, name);
+ 	fprintf (fp, &quot;%s:\n&quot;, name);
+ 	fprintf (fp, &quot;\t%s \&quot;%s\&quot;\n&quot;, AS_STRING_DIRECTIVE, value);
+ }
+@@ -806,7 +881,8 @@
+ 	emit_section_change (tmpfp, &quot;.text&quot;, 0);
+ 	mname = g_strdup_printf (&quot;m_%x&quot;, mono_metadata_token_index (method-&gt;token));
+ 	fprintf (tmpfp, &quot;\t.align %d\n&quot;, func_alignment);
+	fprintf (tmpfp, &quot;.globl %s\n&quot;, mname);
++	emit_stabs_function (tmpfp, method, mname);
+ #if defined(sparc)
+ 	fprintf (tmpfp, &quot;\t.type %s,#function\n&quot;, mname);
+ #else
+@@ -1136,6 +1212,11 @@
+ 	acfg-&gt;image_hash = g_hash_table_new (NULL, NULL);
+ 	acfg-&gt;image_table = g_ptr_array_new ();
+ 
++    /* Set up initial stab data so that debuggers don't complain */
++	fprintf (tmpfp, &quot;\t.file \&quot;DUMMY\&quot;\n&quot;);
++	fprintf (tmpfp, &quot;\t.stabs \&quot;DUMMY\&quot;,100,0,0,0\n&quot;);
++	emit_stabs (tmpfp, &quot;void&quot;, &quot;t0=0&quot;, 128, 0, 0, NULL);
++
+ 	write_string_symbol (tmpfp, &quot;mono_assembly_guid&quot; , image-&gt;guid);
+ 
+ 	write_string_symbol (tmpfp, &quot;mono_aot_version&quot;, MONO_AOT_FILE_VERSION);
+@@ -1321,10 +1402,14 @@
+ 	printf (&quot;%d methods contain wrapper references (%d%%)\n&quot;, wrappercount, mcount ? (wrappercount*100)/mcount : 100);
+ 	printf (&quot;%d methods contain lmf pointers (%d%%)\n&quot;, lmfcount, mcount ? (lmfcount*100)/mcount : 100);
+ 	printf (&quot;%d methods have other problems (%d%%)\n&quot;, ocount, mcount ? (ocount*100)/mcount : 100);
+ 
+ 	return 0;
+ }
+ 
+-
++void
++mono_aot_use_loaded_code (gboolean use)
++{
++	use_loaded_code = use;
++}
+Index: mini/driver.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/driver.c,v
+retrieving revision 1.51
+diff -u -u -r1.51 driver.c
+--- mini/driver.c	24 May 2004 10:10:28 -0000	1.51
++++ mini/driver.c	26 May 2004 07:55:56 -0000
+@@ -483,6 +483,6 @@
+ 	MainThreadArgs *main_args = user_data;
+ 	MonoAssembly *assembly;
+ 
+ 	assembly = mono_domain_assembly_open (main_args-&gt;domain, main_args-&gt;file);
+ 	if (!assembly){
+ 		fprintf (stderr, &quot;Can not open image %s\n&quot;, main_args-&gt;file);
+@@ -756,8 +758,10 @@
+ 		break;
+ 	}
+ 
+-	if (enable_debugging)
++	if (enable_debugging) {
++		mono_aot_use_loaded_code (TRUE);
+ 		mono_debug_init (domain, MONO_DEBUG_FORMAT_MONO);
++        }
+ 
+ 	/* Parse gac loading options before loading assemblies. */
+ 	if (mono_compile_aot || action == DO_EXEC) {
+ 
+Index: mini/mini.h
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/mini.h,v
+retrieving revision 1.71
+diff -u -u -r1.71 mini.h
+--- mini/mini.h	20 May 2004 12:53:35 -0000	1.71
++++ mini/mini.h	26 May 2004 07:55:56 -0000
+@@ -698,6 +698,7 @@
+ void      mono_aot_init                     (void);
+ MonoJitInfo*  mono_aot_get_method           (MonoDomain *domain,
+ 											 MonoMethod *method);
++void      mono_aot_use_loaded_code          (gboolean use);
+ gboolean  mono_method_blittable             (MonoMethod *method);
+ gboolean  mono_method_same_domain           (MonoJitInfo *caller, MonoJitInfo *callee);
+ void      mono_register_opcode_emulation    (int opcode, const char* name, MonoMethodSignature *sig, gpointer func, gboolean no_throw);
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="006011.html">[Mono-devel-list] mono beta &amp; fedora core 2 &amp; mandrake 10
+</A></li>
+	<LI>Next message: <A HREF="006036.html">[Mono-devel-list] [patch] stabs debugging info on --aot code
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#5993">[ date ]</a>
+              <a href="thread.html#5993">[ thread ]</a>
+              <a href="subject.html#5993">[ subject ]</a>
+              <a href="author.html#5993">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

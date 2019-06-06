@@ -1,0 +1,195 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] COM Callable Wrapper Patch
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20COM%20Callable%20Wrapper%20Patch&In-Reply-To=17c2d80b0612041642p1088daeaueebd061ecfcf3d52%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="021636.html">
+   <LINK REL="Next"  HREF="021606.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] COM Callable Wrapper Patch</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20COM%20Callable%20Wrapper%20Patch&In-Reply-To=17c2d80b0612041642p1088daeaueebd061ecfcf3d52%40mail.gmail.com"
+       TITLE="[Mono-dev] COM Callable Wrapper Patch">lupus at ximian.com
+       </A><BR>
+    <I>Tue Dec  5 14:47:32 EST 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="021636.html">[Mono-dev] COM Callable Wrapper Patch
+</A></li>
+        <LI>Next message: <A HREF="021606.html">[Mono-dev] 1.2.2 Preview (Was: Re: Call for release notes in 1.2.2)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21655">[ date ]</a>
+              <a href="thread.html#21655">[ thread ]</a>
+              <a href="subject.html#21655">[ subject ]</a>
+              <a href="author.html#21655">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 12/04/06 Jon Chambers wrote:
+&gt;<i> &gt;You can't insert a managed object inside a GHashTable, since objects
+</I>&gt;<i> &gt;can move and the GC can't see inside GHashTable, you'll get a broken
+</I>&gt;<i> &gt;pointer and a crash. If the hash must not keep alive the object and you
+</I>&gt;<i> &gt;used a GHashTable as a way to implement weak references, you must use
+</I>&gt;<i> &gt;the runtime support for weak references instead. Also, remember that for
+</I>&gt;<i> &gt;object hashes you must use the mono_object_hash() function.
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> The object is not put in hashtable, but just used as the key in this case. I
+</I>&gt;<i> changed the hash table to use mono_object_hash() as the hash function where
+</I>&gt;<i> the object is the key. I've removed the MonoObject* field from the MonoCCW
+</I>&gt;<i> struct and just look it up using the gc_handle when needed instead.
+</I>
+The key can change if it is an object address, so you may end up not
+finding the value from a previous object or finding it for an object
+that wasn't registered yet.
+
+&gt;<i> &gt;Can you explain this MonoCCW data structure here? It has a pointer
+</I>&gt;<i> &gt;to a reference which isn't GC-tracked and so it's bad. It looks to be
+</I>&gt;<i> &gt;created with a 0 refcount and an handle is created for the object, so
+</I>&gt;<i> &gt;there doesn't seem to be any need to store also an object in it.
+</I>&gt;<i> &gt;Also, the reference count increase is done in a thread-unsafe way.
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> I've removed the object reference. I only allocate a weak handle and set the
+</I>&gt;<i> reference count to 0. If the unmanaged client code decides to addref and
+</I>&gt;<i> hold onto the CCW, I then allocate a strong handle. Once the reference count
+</I>&gt;<i> goes back to 0 I go back to a weak handle.
+</I>
+Ok, please add the description as a comment.
+
+&gt;<i> &gt;&gt; +     if (mono_marshal_free_ccw (o) &amp;&amp; !finalizer)
+</I>&gt;<i> &gt;&gt; +             return;
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;So what happens if the object has a finalizer and wants to use COM
+</I>&gt;<i> &gt;features in it? Is that not possible? We need a comment here.
+</I>&gt;<i> &gt;You may also want to check what happens with resurrection (ie the
+</I>&gt;<i> &gt;objects stores itself in a static field inside the finalizer).
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> Added better comment. If an object has a CCW associated with it and has no
+</I>&gt;<i> finalizer we can safely return after destroying the CCW since we are only
+</I>&gt;<i> being finalized since COM Interop registered the object for finalization to
+</I>&gt;<i> clean up the CCW. In all other cases we continue on (including the case you
+</I>&gt;<i> brought up where an object has a finalizer and has been exposed to unmanaged
+</I>&gt;<i> code via a CCW) to call the objects finalizer. I've added a FIXME for
+</I>&gt;<i> resurrection, and also if the user calls SuppressFinalize the CCW will leak
+</I>&gt;<i> currently. I see what is done for delegates in that case, but this is a bit
+</I>&gt;<i> different. I currently have no way to determine that an object with a
+</I>&gt;<i> finalizer needs it's CCW destroyed but don't need it's finalizer run.
+</I>
+For delegates we just check and return in SuppressFinalize.
+You could add a similar check there with the usual fast path for when no
+com support has been used.
+
+&gt;<i> Also, there are some places I know I need to make threadsafe. Should I
+</I>&gt;<i> create a new critical section, or just use the marshal one?
+</I>
+Yes, please.
+
+&gt;<i> Index: mono/mono/metadata/marshal.c
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- mono/mono/metadata/marshal.c	(revision 68977)
+</I>&gt;<i> +++ mono/mono/metadata/marshal.c	(working copy)
+</I>&gt;<i> @@ -1823,18 +1904,31 @@
+</I>&gt;<i> @@ -2102,20 +2196,20 @@
+</I>&gt;<i>  	case MONO_MARSHAL_CONV_OBJECT_INTERFACE:
+</I>&gt;<i>  	case MONO_MARSHAL_CONV_OBJECT_IDISPATCH:
+</I>&gt;<i>  	case MONO_MARSHAL_CONV_OBJECT_IUNKNOWN: {
+</I>&gt;<i> -		guint32 pos_failed = 0, pos_rcw = 0;
+</I>&gt;<i> -		char * msg;
+</I>&gt;<i> +		guint32 pos_null = 0, pos_rcw = 0, pos_end = 0;
+</I>&gt;<i>  
+</I>&gt;<i> +		/* COM types are initialized lazily */
+</I>&gt;<i> +		mono_init_com_types ();
+</I>&gt;<i> +
+</I>&gt;<i>  		mono_mb_emit_ldloc (mb, 1);
+</I>&gt;<i> -		//mono_mb_emit_ldloc (mb, 0);
+</I>&gt;<i> -		mono_mb_emit_ptr (mb, 0);
+</I>&gt;<i> -		//mono_mb_emit_byte (mb, CEE_LDIND_U1);
+</I>&gt;<i> +		mono_mb_emit_byte (mb, CEE_LDNULL);
+</I>&gt;<i>  		mono_mb_emit_byte (mb, CEE_STIND_I);
+</I>
+ldnull loads an object and an object can't be stored with stind.i: if
+you really need to store a NULL pointer (and not a null reference), load
+a 0 constant and convert it with conv.u. Otherwise use stind.ref to
+store a reference.
+
+&gt;<i> @@ -3295,6 +3413,20 @@
+</I>&gt;<i>  	return res;
+</I>&gt;<i>  }
+</I>&gt;<i>  
+</I>&gt;<i> +/* Maps a managed object to its unmanaged representation 
+</I>&gt;<i> + * i.e. it's COM Callable Wrapper (CCW). 
+</I>&gt;<i> + * Key: MonoObject*
+</I>&gt;<i> + * Value: MonoCCW*
+</I>&gt;<i> + */
+</I>&gt;<i> +static GHashTable* ccw_hash = NULL;
+</I>
+As explained above, you can't really use an object address as the key,
+since it changes over time. One possible implementation idea: use
+mono_object_hash() as the key and a list as the value: you then walk the
+list and get the object to compare from the GC handle. There may be also
+faster ways for sure and if this is accessed during finalizations we
+should check that the Boehm GC doesn't null the weak refs before running
+the finalizers (but I guess that if you find a null target in the gc
+handle you can free the ccw struct right away...)
+
+&gt;<i> +	if (!ccw_entry) {
+</I>&gt;<i> +		int vtable_index = method_count-1+start_slot;
+</I>&gt;<i> +		mono_loader_lock ();
+</I>&gt;<i> +		vtable = mono_mempool_alloc0 (klass-&gt;image-&gt;mempool, sizeof (gpointer)*(method_count+start_slot));
+</I>&gt;<i> +		mono_loader_unlock ();
+</I>&gt;<i> +		memcpy(vtable, iunknown, sizeof(iunknown));
+</I>&gt;<i> +		if (start_slot == 7)
+</I>&gt;<i> +			memcpy(vtable+3, idispatch, sizeof(idispatch));
+</I>
+Put a space before the opening parenthesis of a function call.
+
+&gt;<i> +static gboolean
+</I>&gt;<i> +cominterop_class_guid_equal (gpointer guid, MonoClass* klass)
+</I>&gt;<i> +{
+</I>&gt;<i> +	static MonoClass *GuidAttribute = NULL;
+</I>&gt;<i> +	MonoCustomAttrInfo *cinfo;
+</I>&gt;<i> +	MonoReflectionGuidAttribute *attr;
+</I>&gt;<i> +	MonoString *guid_string = mono_string_new (mono_domain_get (), mono_guid_to_string ((guint8*)guid));
+</I>
+If guid is a guint8*, change the type from gpointer to it wherever it is
+used.
+
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="021636.html">[Mono-dev] COM Callable Wrapper Patch
+</A></li>
+	<LI>Next message: <A HREF="021606.html">[Mono-dev] 1.2.2 Preview (Was: Re: Call for release notes in 1.2.2)
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21655">[ date ]</a>
+              <a href="thread.html#21655">[ thread ]</a>
+              <a href="subject.html#21655">[ subject ]</a>
+              <a href="author.html#21655">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

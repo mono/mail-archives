@@ -1,0 +1,467 @@
+Index: metadata/reflection.h
+===================================================================
+--- metadata/reflection.h	(revision 40693)
++++ metadata/reflection.h	(working copy)
+@@ -122,9 +122,9 @@
+ } MonoDeclSecurityActions;
+ 
+ MonoBoolean mono_declsec_get_demands (MonoMethod *callee, MonoDeclSecurityActions* demands);
+-MonoBoolean mono_declsec_get_linkdemands (MonoMethod *callee, MonoDeclSecurityActions* klass, MonoDeclSecurityActions* method);
+-MonoBoolean mono_declsec_get_inheritdemands_class (MonoMethod *callee, MonoDeclSecurityActions* klass);
+-MonoBoolean mono_declsec_get_inheritdemands_method (MonoMethod *callee, MonoDeclSecurityActions* cmethod);
++MonoBoolean mono_declsec_get_linkdemands (MonoMethod *callee, MonoDeclSecurityActions* klass, MonoDeclSecurityActions* cmethod);
++MonoBoolean mono_declsec_get_inheritdemands_class (MonoClass *klass, MonoDeclSecurityActions* demands);
++MonoBoolean mono_declsec_get_inheritdemands_method (MonoMethod *callee, MonoDeclSecurityActions* demands);
+ 
+ MonoBoolean mono_declsec_get_method_action (MonoMethod *method, guint32 action, MonoDeclSecurityEntry *entry);
+ MonoBoolean mono_declsec_get_class_action (MonoClass *klass, guint32 action, MonoDeclSecurityEntry *entry);
+Index: metadata/class.c
+===================================================================
+--- metadata/class.c	(revision 40693)
++++ metadata/class.c	(working copy)
+@@ -33,6 +33,7 @@
+ #include <mono/metadata/debug-helpers.h>
+ #include <mono/metadata/reflection.h>
+ #include <mono/metadata/mono-debug-debugger.h>
++#include <mono/metadata/security-manager.h>
+ #include <mono/os/gc_wrapper.h>
+ 
+ MonoStats mono_stats;
+@@ -1225,6 +1226,12 @@
+ 							continue;
+ 						if (!strcmp(cm->name, im->name) && 
+ 						    mono_metadata_signature_equal (mono_method_signature (cm), mono_method_signature (im))) {
++
++							/* CAS - SecurityAction.InheritanceDemand on interface */
++							if (mono_is_security_manager_active () && (im->flags & METHOD_ATTRIBUTE_HAS_SECURITY)) {
++								mono_secman_inheritancedemand_method (cm, im);
++							}
++
+ 							g_assert (io + l <= max_vtsize);
+ 							vtable [io + l] = cm;
+ 						}
+@@ -1255,6 +1262,12 @@
+ 						
+ 						if (!strcmp(cm->name, im->name) && 
+ 						    mono_metadata_signature_equal (mono_method_signature (cm), mono_method_signature (im))) {
++
++							/* CAS - SecurityAction.InheritanceDemand on interface */
++							if (mono_is_security_manager_active () && (im->flags & METHOD_ATTRIBUTE_HAS_SECURITY)) {
++								mono_secman_inheritancedemand_method (cm, im);
++							}
++
+ 							g_assert (io + l <= max_vtsize);
+ 							vtable [io + l] = cm;
+ 							break;
+@@ -1299,6 +1312,12 @@
+ 					
+ 						if (((fqname && !strcmp (cm->name, fqname)) || !strcmp (cm->name, qname)) &&
+ 						    mono_metadata_signature_equal (mono_method_signature (cm), mono_method_signature (im))) {
++
++							/* CAS - SecurityAction.InheritanceDemand on interface */
++							if (mono_is_security_manager_active () && (im->flags & METHOD_ATTRIBUTE_HAS_SECURITY)) {
++								mono_secman_inheritancedemand_method (cm, im);
++							}
++
+ 							g_assert (io + l <= max_vtsize);
+ 							vtable [io + l] = cm;
+ 							break;
+@@ -1396,6 +1415,12 @@
+ 						continue;
+ 					if (!strcmp(cm->name, m1->name) && 
+ 					    mono_metadata_signature_equal (mono_method_signature (cm), mono_method_signature (m1))) {
++
++						/* CAS - SecurityAction.InheritanceDemand */
++						if (mono_is_security_manager_active () && (m1->flags & METHOD_ATTRIBUTE_HAS_SECURITY)) {
++							mono_secman_inheritancedemand_method (cm, m1);
++						}
++
+ 						slot = k->methods [j]->slot;
+ 						g_assert (cm->slot < max_vtsize);
+ 						if (!override_map)
+@@ -1544,6 +1569,11 @@
+ 
+ 	class->init_pending = 1;
+ 
++	/* CAS - SecurityAction.InheritanceDemand */
++	if (mono_is_security_manager_active () && class->parent && (class->parent->flags & TYPE_ATTRIBUTE_HAS_SECURITY)) {
++		mono_secman_inheritancedemand_class (class, class->parent);
++	}
++
+ 	if (mono_debugger_start_class_init_func)
+ 		mono_debugger_start_class_init_func (class);
+ 
+Index: metadata/security-manager.c
+===================================================================
+--- metadata/security-manager.c	(revision 40693)
++++ metadata/security-manager.c	(working copy)
+@@ -17,7 +17,11 @@
+ static MonoBoolean mono_security_manager_enabled = TRUE;
+ static MonoBoolean mono_security_manager_execution = TRUE;
+ 
++/* defined in metadata/class.c */
++extern void (*mono_inheritancedemand_class) (MonoClass *klass, MonoClass *parent);
++extern void (*mono_inheritancedemand_method) (MonoMethod *override, MonoMethod *base);
+ 
++
+ /* Public stuff */
+ 
+ MonoSecurityManager*
+@@ -39,9 +43,13 @@
+ 	g_assert (secman.demand);
+ 
+ 	secman.inheritancedemand = mono_class_get_method_from_name (secman.securitymanager,
+-		"InheritanceDemand", 3);	
++		"InheritanceDemand", 2);	
+ 	g_assert (secman.inheritancedemand);
+ 
++	secman.inheritsecurityexception = mono_class_get_method_from_name (secman.securitymanager,
++		"InheritanceDemandSecurityException", 4);	
++	g_assert (secman.inheritsecurityexception);
++
+ 	secman.linkdemand = mono_class_get_method_from_name (secman.securitymanager,
+ 		"LinkDemand", 3);
+ 	g_assert (secman.linkdemand);
+@@ -65,6 +73,82 @@
+ 	return &secman;
+ }
+ 
++static gboolean
++mono_secman_inheritance_check (MonoClass *klass, MonoDeclSecurityActions *demands)
++{
++	MonoSecurityManager* secman = mono_security_manager_get_methods ();
++	MonoDomain *domain = mono_domain_get ();
++	MonoAssembly *assembly = mono_image_get_assembly (klass->image);
++	MonoReflectionAssembly *refass = (MonoReflectionAssembly*) mono_assembly_get_object (domain, assembly);
++	MonoObject *res;
++	gpointer args [2];
++
++	args [0] = refass;
++	args [1] = demands;
++
++	res = mono_runtime_invoke (secman->inheritancedemand, NULL, args, NULL);
++	return (*(MonoBoolean *) mono_object_unbox (res));
++}
++
++void
++mono_secman_inheritancedemand_class (MonoClass *klass, MonoClass *parent)
++{
++	MonoDeclSecurityActions demands;
++
++	/* don't hide previous results -and- don't calc everything for nothing */
++	if (klass->exception_type != 0)
++		return;
++
++	/* Check if there are an InheritanceDemand on the parent class */
++	if (mono_declsec_get_inheritdemands_class (parent, &demands)) {
++		/* If so check the demands on the klass (inheritor) */
++		if (!mono_secman_inheritance_check (klass, &demands)) {
++			/* Keep flags in MonoClass to be able to throw a SecurityException later (if required) */
++			klass->exception_type = 1;
++			klass->exception_data = MONO_METADATA_INHERITANCEDEMAND_CLASS;
++			klass->exception_method = NULL;
++		}
++	}
++}
++
++void
++mono_secman_inheritancedemand_method (MonoMethod *override, MonoMethod *base)
++{
++	MonoDeclSecurityActions demands;
++
++	/* don't hide previous results -and- don't calc everything for nothing */
++	if (override->klass->exception_type != 0)
++		return;
++
++	/* Check if there are an InheritanceDemand on the base (virtual) method */
++	if (mono_declsec_get_inheritdemands_method (base, &demands)) {
++		/* If so check the demands on the overriding method */
++		if (!mono_secman_inheritance_check (override->klass, &demands)) {
++			/* Keep flags in MonoClass to be able to throw a SecurityException later (if required) */
++			override->klass->exception_type = 1;
++			override->klass->exception_data = MONO_METADATA_INHERITANCEDEMAND_METHOD;
++			override->klass->exception_method = base;
++		}
++	}
++}
++
++void
++mono_secman_inheritancedemand_exception (guint32 data, MonoDomain *domain, MonoClass *klass, MonoMethod *method)
++{
++	MonoSecurityManager* secman = mono_security_manager_get_methods ();
++	MonoObject *exc = NULL;
++	gpointer args [4];
++
++	args [0] = &data;
++	args [1] = mono_assembly_get_object (domain, mono_image_get_assembly (klass->image));
++	args [2] = mono_type_get_object (domain, &klass->byval_arg);
++	args [3] = (method) ? mono_method_get_object (domain, method, NULL) : NULL;
++
++	mono_runtime_invoke (secman->inheritsecurityexception, NULL, args, &exc);
++	mono_raise_exception ((MonoException*)exc);
++}
++
++
+ /*
+  * Note: The security manager is activate once when executing the Mono. This 
+  * is not meant to be a turn on/off runtime switch.
+Index: metadata/security-manager.h
+===================================================================
+--- metadata/security-manager.h	(revision 40693)
++++ metadata/security-manager.h	(working copy)
+@@ -18,13 +18,20 @@
+ #include "threads.h"
+ #include "marshal.h"
+ #include "image.h"
++#include "reflection.h"
+ 
+ 
+ /* Definitions */
+ 
+ #define MONO_ECMA_KEY_LENGTH			16
+ 
++enum {
++	MONO_METADATA_SECURITY_OK		= 0x00,
++	MONO_METADATA_INHERITANCEDEMAND_CLASS	= 0x01,
++	MONO_METADATA_INHERITANCEDEMAND_METHOD	= 0x02
++};
+ 
++
+ /* Structures */
+ 
+ typedef struct {
+@@ -35,6 +42,7 @@
+ 	MonoMethod *deny;			/* SecurityManager.InternalDeny */
+ 	MonoMethod *permitonly;			/* SecurityManager.InternalPermitOnly */
+ 	MonoMethod *inheritancedemand;		/* SecurityManager.InheritanceDemand */
++	MonoMethod *inheritsecurityexception;	/* SecurityManager.InheritanceDemandSecurityException */
+ 	MonoMethod *linkdemand;			/* SecurityManager.LinkDemand */
+ 	MonoMethod *linkdemandfulltrust;	/* SecurityManager.LinkDemandFullTrust */
+ 	MonoMethod *linkdemandunmanaged;	/* SecurityManager.LinkDemandUnmanaged */
+@@ -49,7 +57,11 @@
+ MonoSecurityManager* mono_security_manager_get_methods (void);
+ gboolean mono_is_ecma_key (const char *publickey, int size);
+ 
++void mono_secman_inheritancedemand_class (MonoClass *klass, MonoClass *parent);
++void mono_secman_inheritancedemand_method (MonoMethod *override, MonoMethod *base);
++void mono_secman_inheritancedemand_exception (guint32 data, MonoDomain *domain, MonoClass *klass, MonoMethod *method);
+ 
++
+ /* internal calls */
+ MonoBoolean ves_icall_System_Security_SecurityManager_get_SecurityEnabled (void);
+ void ves_icall_System_Security_SecurityManager_set_SecurityEnabled (MonoBoolean value);
+Index: metadata/ChangeLog
+===================================================================
+--- metadata/ChangeLog	(revision 40693)
++++ metadata/ChangeLog	(working copy)
+@@ -1,4 +1,18 @@
++2005-02-15  Sebastien Pouliot  <sebastien@ximian.com>
+ 
++	* class.c: Added inheritance check when a method is overloaded (from a
++	virtual method or when implementing an interface) and when a class is
++	inherited.
++	* class-internals.h: Added fields to MonoClass to keep the exception
++	information status for inheritance (or other exceptions) to be thrown
++	later (i.e. not at load time).
++	* object.c: Throw the inheritance SecurityException when a type is to 
++	be created with either class or method inheritance violations.
++	* reflection.c|h: Fix when getting declsec from a class. Removed 
++	unrequired code for class. Improved sanity in parameter naming.
++	* security-manager.c|h: Added functions to check for class and method
++	inheritance and to throw a SecurityException for inheritance failures.
++
+ Tue Feb 15 11:01:09 CET 2005 Paolo Molaro <lupus@ximian.com>
+ 
+ 	* threads.c: cleaned up the code a little.
+Index: metadata/object.c
+===================================================================
+--- metadata/object.c	(revision 40693)
++++ metadata/object.c	(working copy)
+@@ -31,6 +31,7 @@
+ #include <mono/metadata/threads-types.h>
+ #include <mono/metadata/environment.h>
+ #include "mono/metadata/profiler-private.h"
++#include "mono/metadata/security-manager.h"
+ #include <mono/os/gc_wrapper.h>
+ #include <mono/utils/strenc.h>
+ 
+@@ -760,6 +761,12 @@
+ 
+ 	mono_domain_unlock (domain);
+ 
++	/* Initialization is now complete, we can throw if the 
++	   InheritanceDemand aren't satisfied */
++	if (mono_is_security_manager_active () && (class->exception_type == MONO_EXCEPTION_SECURITY)) {
++		mono_secman_inheritancedemand_exception (class->exception_data, domain, class, class->exception_method);
++	}
++
+ 	/* make sure the the parent is initialized */
+ 	if (class->parent)
+ 		mono_class_vtable (domain, class->parent);
+Index: metadata/class-internals.h
+===================================================================
+--- metadata/class-internals.h	(revision 40693)
++++ metadata/class-internals.h	(working copy)
+@@ -179,6 +179,13 @@
+ 	guint32 attrs;
+ };
+ 
++/* type of exception being "on hold" for later processing (see exception_type) */
++enum {
++	MONO_EXCEPTION_NONE = 0,
++	MONO_EXCEPTION_SECURITY = 1
++	/* add other exception type */
++};
++
+ struct _MonoClass {
+ 	MonoImage *image;
+ 
+@@ -225,7 +232,10 @@
+ 	guint has_references  : 1; /* it has GC-tracked references in the instance */
+ 	guint has_static_refs : 1; /* it has static fields that are GC-tracked */
+ 
+-	guint32 declsec_flags;     /* declarative security attributes flags */
++	guint32    declsec_flags;	/* declarative security attributes flags */
++	guint32    exception_type;	/* MONO_EXCEPTION_* */
++	guint32    exception_data;	/* Additional information about the exception */
++	MonoMethod *exception_method;	/* If non-NULL the method responsible for throwing the exception */
+ 
+ 	MonoClass  *parent;
+ 	MonoClass  *nested_in;
+Index: metadata/reflection.c
+===================================================================
+--- metadata/reflection.c	(revision 40693)
++++ metadata/reflection.c	(working copy)
+@@ -9093,13 +9093,13 @@
+ }
+ 
+ static MonoBoolean
+-mono_declsec_get_class_demands_params (MonoMethod *method, MonoDeclSecurityActions* demands, 
++mono_declsec_get_class_demands_params (MonoClass *klass, MonoDeclSecurityActions* demands, 
+ 	guint32 id_std, guint32 id_noncas, guint32 id_choice)
+ {
+-	guint32 idx = mono_metadata_token_index (method->klass->type_token);
++	guint32 idx = mono_metadata_token_index (klass->type_token);
+ 	idx <<= MONO_HAS_DECL_SECURITY_BITS;
+ 	idx |= MONO_HAS_DECL_SECURITY_TYPEDEF;
+-	return fill_actions_from_index (method->klass->image, idx, demands, id_std, id_noncas, id_choice);
++	return fill_actions_from_index (klass->image, idx, demands, id_std, id_noncas, id_choice);
+ }
+ 
+ static MonoBoolean
+@@ -9152,7 +9152,7 @@
+ 			mono_class_init (method->klass);
+ 			memset (demands, 0, sizeof (MonoDeclSecurityActions));
+ 		}
+-		result |= mono_declsec_get_class_demands_params (method, demands, 
++		result |= mono_declsec_get_class_demands_params (method->klass, demands, 
+ 			SECURITY_ACTION_DEMAND, SECURITY_ACTION_NONCASDEMAND, SECURITY_ACTION_DEMANDCHOICE);
+ 	}
+ 
+@@ -9201,7 +9201,7 @@
+ 	if (flags & (MONO_DECLSEC_FLAG_LINKDEMAND | MONO_DECLSEC_FLAG_NONCAS_LINKDEMAND | MONO_DECLSEC_FLAG_LINKDEMAND_CHOICE)) {
+ 		mono_class_init (method->klass);
+ 
+-		result |= mono_declsec_get_class_demands_params (method, klass, 
++		result |= mono_declsec_get_class_demands_params (method->klass, klass, 
+ 			SECURITY_ACTION_LINKDEMAND, SECURITY_ACTION_NONCASLINKDEMAND, SECURITY_ACTION_LINKDEMANDCHOICE);
+ 	}
+ 
+@@ -9211,33 +9211,30 @@
+ /*
+  * Collect all Inherit actions: InheritanceDemand, NonCasInheritanceDemand and InheritanceDemandChoice (2.0).
+  *
++ * @klass	The inherited class - this is the class that provides the security check (attributes)
++ * @demans	
++ * return TRUE if inheritance demands (any kind) are present, FALSE otherwise.
++ * 
+  * Note: Don't use the content of actions if the function return FALSE.
+  */
+ MonoBoolean
+-mono_declsec_get_inheritdemands_class (MonoMethod *method, MonoDeclSecurityActions* klass)
++mono_declsec_get_inheritdemands_class (MonoClass *klass, MonoDeclSecurityActions* demands)
+ {
+ 	MonoBoolean result = FALSE;
+ 	guint32 flags;
+ 
+ 	/* quick exit if no declarative security is present in the metadata */
+-	if (!method->klass->image->tables [MONO_TABLE_DECLSECURITY].rows)
++	if (!klass->image->tables [MONO_TABLE_DECLSECURITY].rows)
+ 		return FALSE;
+ 
+-	/* we want the original as the wrapper is "free" of the security informations */
+-	if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
+-		method = mono_marshal_method_from_wrapper (method);
+-		if (!method)
+-			return FALSE;
+-	}
+-
+ 	/* Here we use (or create) the class declarative cache to look for demands */
+-	flags = mono_declsec_flags_from_class (method->klass);
++	flags = mono_declsec_flags_from_class (klass);
+ 	if (flags & (MONO_DECLSEC_FLAG_INHERITANCEDEMAND | MONO_DECLSEC_FLAG_NONCAS_INHERITANCEDEMAND | MONO_DECLSEC_FLAG_INHERITANCEDEMAND_CHOICE)) {
+-		mono_class_init (method->klass);
+-		memset (klass, 0, sizeof (MonoDeclSecurityActions));
++		mono_class_init (klass);
++		memset (demands, 0, sizeof (MonoDeclSecurityActions));
+ 
+-		result |= mono_declsec_get_class_demands_params (method, klass, 
+-			SECURITY_ACTION_INHERITDEMAND, SECURITY_ACTION_NONCASDEMAND, SECURITY_ACTION_INHERITDEMANDCHOICE);
++		result |= mono_declsec_get_class_demands_params (klass, demands, 
++			SECURITY_ACTION_INHERITDEMAND, SECURITY_ACTION_NONCASINHERITANCE, SECURITY_ACTION_INHERITDEMANDCHOICE);
+ 	}
+ 
+ 	return result;
+@@ -9249,7 +9246,7 @@
+  * Note: Don't use the content of actions if the function return FALSE.
+  */
+ MonoBoolean
+-mono_declsec_get_inheritdemands_method (MonoMethod *method, MonoDeclSecurityActions* cmethod)
++mono_declsec_get_inheritdemands_method (MonoMethod *method, MonoDeclSecurityActions* demands)
+ {
+ 	/* quick exit if no declarative security is present in the metadata */
+ 	if (!method->klass->image->tables [MONO_TABLE_DECLSECURITY].rows)
+@@ -9264,10 +9261,10 @@
+ 
+ 	if (method->flags & METHOD_ATTRIBUTE_HAS_SECURITY) {
+ 		mono_class_init (method->klass);
+-		memset (cmethod, 0, sizeof (MonoDeclSecurityActions));
++		memset (demands, 0, sizeof (MonoDeclSecurityActions));
+ 
+-		return mono_declsec_get_method_demands_params (method, cmethod, 
+-			SECURITY_ACTION_INHERITDEMAND, SECURITY_ACTION_NONCASDEMAND, SECURITY_ACTION_INHERITDEMANDCHOICE);
++		return mono_declsec_get_method_demands_params (method, demands, 
++			SECURITY_ACTION_INHERITDEMAND, SECURITY_ACTION_NONCASINHERITANCE, SECURITY_ACTION_INHERITDEMANDCHOICE);
+ 	}
+ 	return FALSE;
+ }
+Index: mini/mini.h
+===================================================================
+--- mini/mini.h	(revision 40693)
++++ mini/mini.h	(working copy)
+@@ -500,12 +500,6 @@
+ 
+ #define MONO_BBLOCK_IS_IN_REGION(bblock, regtype) (((bblock)->region & (0xf << 4)) == (regtype))
+ 
+-enum {
+-	MONO_EXCEPTION_NONE = 0,
+-	MONO_EXCEPTION_SECURITY = 1
+-	/* add other exception type */
+-};
+-
+ /*
+  * Control Flow Graph and compilation unit information
+  */
+Index: mini/ChangeLog
+===================================================================
+--- mini/ChangeLog	(revision 40697)
++++ mini/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2005-02-15  Sebastien Pouliot  <sebastien@ximian.com> 
++ 
++	* mini.h: Moved MONO_EXCEPTION_* enum to metadata/class-internals.h so
++	it can be reused for MonoClass.
++
+ 2005-02-15  Sebastien Pouliot  <sebastien@ximian.com>
+ 
+ 	* mini.c: Fixed 2 cases where I sent a MonoMethod to managed code 

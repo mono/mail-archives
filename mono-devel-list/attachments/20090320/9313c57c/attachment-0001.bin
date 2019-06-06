@@ -1,0 +1,277 @@
+Index: security-core-clr.c
+===================================================================
+--- security-core-clr.c	(revision 129866)
++++ security-core-clr.c	(working copy)
+@@ -12,6 +12,8 @@
+ #include <mono/metadata/assembly.h>
+ #include <mono/metadata/appdomain.h>
+ #include <mono/metadata/verify-internals.h>
++#include <mono/metadata/object.h>
++#include <mono/metadata/exception.h>
+ 
+ #include "security-core-clr.h"
+ 
+@@ -43,6 +45,109 @@
+ 	return class;
+ }
+ 
++static gboolean
++get_caller_no_reflection_related (MonoMethod *m, gint32 no, gint32 ilo, gboolean managed, gpointer data)
++{
++	MonoMethod **dest = data;
++	const char *ns;
++
++	/* skip unmanaged frames */
++	if (!managed)
++		return FALSE;
++
++	if (m->wrapper_type != MONO_WRAPPER_NONE)
++		return FALSE;
++
++	/* quick out (any namespace not starting with an 'S' */
++	ns = m->klass->name_space;
++	if (!ns || (*ns != 'S')) {
++		*dest = m;
++		return TRUE;
++	}
++
++	/* stop if the method is not part of platform code */
++	if (!mono_security_core_clr_is_platform_image (m->klass->image)) {
++		*dest = m;
++		return TRUE;
++	}
++
++	/* any number of calls inside System.Reflection are allowed */
++	if (strcmp (ns, "System.Reflection") == 0)
++		return FALSE;
++
++	/* any number of calls inside System.Reflection are allowed */
++	if (strcmp (ns, "System.Reflection.Emit") == 0)
++		return FALSE;
++
++	/* calls from System.Delegate are also possible and allowed */
++	if (strcmp (ns, "System") == 0) {
++		const char *kname = m->klass->name;
++		if ((*kname == 'D') && (strcmp (kname, "Delegate") == 0))
++			return FALSE;
++		if ((*kname == 'M') && (strcmp (kname, "MulticastDelegate")) == 0)
++			return FALSE;
++		if ((*kname == 'A') && (strcmp (kname, "Activator") == 0))
++			return FALSE;
++	}
++
++	if (m == *dest) {
++		*dest = NULL;
++		return FALSE;
++	}
++
++	*dest = m;
++	return TRUE;
++}
++
++/* walk to the first managed method outside:
++ *  - System.Reflection* namespaces
++ *  - System.[MulticastDelegate]Delegate or Activator type
++ *  - platform code
++ *  and return its value, since CoreCLR checks needs to be done on this "real" caller.
++ */
++static MonoMethod*
++get_reflection_caller (void)
++{
++	MonoMethod *m = mono_method_get_last_managed ();
++	mono_stack_walk_no_il (get_caller_no_reflection_related, &m);
++	return m;
++}
++
++void
++mono_security_core_clr_ensure_reflection_access_field (MonoClassField *field)
++{
++	MonoClass *klass = mono_field_get_parent (field);
++
++	/* under CoreCLR you cannot use the value (get/set) of the reflected field: */
++	MonoMethod *caller = get_reflection_caller ();
++
++	/* (a) of a Critical type when called from a Transparent caller */
++	if (mono_security_core_clr_class_level (klass) == MONO_SECURITY_CORE_CLR_CRITICAL) {
++		if (mono_security_core_clr_method_level (caller, TRUE) == MONO_SECURITY_CORE_CLR_TRANSPARENT)
++			mono_raise_exception (mono_get_exception_field_access ());
++	}
++	/* (b) that are not accessible from the caller pov */
++	if (!mono_method_can_access_field_full (caller, field, klass))
++		mono_raise_exception (mono_get_exception_field_access ());
++}
++
++void
++mono_security_core_clr_ensure_reflection_access_method (MonoMethod *method)
++{
++	MonoMethod *caller = get_reflection_caller ();
++	/* CoreCLR restrictions applies to Transparent code/caller */
++	if (mono_security_core_clr_method_level (caller, TRUE) != MONO_SECURITY_CORE_CLR_TRANSPARENT)
++		return;
++
++	/* Transparent code cannot invoke, even using reflection, Critical code */
++	if (mono_security_core_clr_method_level (method, TRUE) == MONO_SECURITY_CORE_CLR_CRITICAL)
++		mono_raise_exception (mono_get_exception_method_access ());
++
++	/* also it cannot invoke a method that is not visible from it's (caller) point of view */
++	if (!mono_method_can_access_method_full (caller, method, (method->flags & METHOD_ATTRIBUTE_STATIC) ? NULL : method->klass))
++		mono_raise_exception (mono_get_exception_method_access ());
++}
++
+ static MonoSecurityCoreCLRLevel
+ mono_security_core_clr_level_from_cinfo (MonoCustomAttrInfo *cinfo, MonoImage *image)
+ {
+Index: security-core-clr.h
+===================================================================
+--- security-core-clr.h	(revision 129866)
++++ security-core-clr.h	(working copy)
+@@ -22,6 +22,9 @@
+ 
+ extern gboolean mono_security_core_clr_test;
+ 
++extern void mono_security_core_clr_ensure_reflection_access_field (MonoClassField *field) MONO_INTERNAL;
++extern void mono_security_core_clr_ensure_reflection_access_method (MonoMethod *method) MONO_INTERNAL;
++
+ extern MonoSecurityCoreCLRLevel mono_security_core_clr_class_level (MonoClass *class) MONO_INTERNAL;
+ extern MonoSecurityCoreCLRLevel mono_security_core_clr_method_level (MonoMethod *method, gboolean with_class_level) MONO_INTERNAL;
+ 
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 129880)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,13 @@
++2009-03-20  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* exception.c|h: Add helpers to create [Field|Method]AccessException
++	* icall.c: Add required coreclr check calls for field reflection.
++	Move the existing (method) check logic into security-core-clr.c
++	* security-core-clr.c: Add functions to check if the access of a
++	field or method is allowed when reflecting under coreclr. This is
++	mostly done using a stack walk to find the "real" caller: i.e. the
++	code that is calling the reflection
++
+ 2009-03-20  Sebastien Pouliot  <sebastien@ximian.com> 
+ 
+ 	* class.c: Simplification to coreclr checks for overrides that
+Index: exception.c
+===================================================================
+--- exception.c	(revision 129865)
++++ exception.c	(working copy)
+@@ -668,6 +668,28 @@
+ }
+ 
+ /**
++ * mono_get_exception_field_access:
++ *
++ * Returns: a new instance of the System.FieldAccessException
++ */
++MonoException *
++mono_get_exception_field_access (void)
++{
++	return mono_exception_from_name (mono_get_corlib (), "System", "FieldAccessException");
++}
++
++/**
++ * mono_get_exception_method_access:
++ *
++ * Returns: a new instance of the System.MethodAccessException
++ */
++MonoException *
++mono_get_exception_method_access (void)
++{
++	return mono_exception_from_name (mono_get_corlib (), "System", "MethodAccessException");
++}
++
++/**
+  * mono_get_exception_reflection_type_load:
+  * @types: an array of types that were defined in the moduled loaded.
+  * @exceptions: an array of exceptions that were thrown during the type loading.
+Index: exception.h
+===================================================================
+--- exception.h	(revision 129865)
++++ exception.h	(working copy)
+@@ -134,6 +134,12 @@
+ mono_get_exception_out_of_memory (void);
+ 
+ MonoException *
++mono_get_exception_field_access (void);
++
++MonoException *
++mono_get_exception_method_access (void);
++
++MonoException *
+ mono_get_exception_reflection_type_load (MonoArray *types, MonoArray *exceptions);
+ 
+ G_END_DECLS
+Index: icall.c
+===================================================================
+--- icall.c	(revision 129865)
++++ icall.c	(working copy)
+@@ -1702,6 +1702,9 @@
+ 		mono_raise_exception (mono_get_exception_invalid_operation (
+ 					"It is illegal to get the value on a field on a type loaded using the ReflectionOnly methods."));
+ 	
++	if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
++		mono_security_core_clr_ensure_reflection_access_field (cf);
++
+ 	mono_class_init (field->klass);
+ 
+ 	if (cf->type->attrs & FIELD_ATTRIBUTE_STATIC)
+@@ -1820,6 +1823,9 @@
+ 		mono_raise_exception (mono_get_exception_invalid_operation (
+ 					"It is illegal to set the value on a field on a type loaded using the ReflectionOnly methods."));
+ 
++	if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
++		mono_security_core_clr_ensure_reflection_access_field (cf);
++
+ 	v = (gchar *) value;
+ 	if (!cf->type->byref) {
+ 		switch (cf->type->type) {
+@@ -3050,35 +3056,6 @@
+ 	return res;
+ }
+ 
+-static void
+-ensure_reflection_security (void)
+-{
+-	MonoMethod *m = mono_method_get_last_managed ();
+-
+-	while (m) {
+-		/*
+-		g_print ("method %s.%s.%s in image %s\n",
+-			m->klass->name_space, m->klass->name, m->name, m->klass->image->name);
+-		*/
+-
+-		/* We stop at the first method which is not in
+-		   System.Reflection or which is not in a platform
+-		   image. */
+-		if (strcmp (m->klass->name_space, "System.Reflection") != 0 ||
+-				!mono_security_core_clr_is_platform_image (m->klass->image)) {
+-			/* If the method is transparent we throw an exception. */
+-			if (mono_security_core_clr_method_level (m, TRUE) == MONO_SECURITY_CORE_CLR_TRANSPARENT ) {
+-				MonoException *ex = mono_exception_from_name_msg (mono_defaults.corlib, "System", "MethodAccessException", "Reflection called from transparent code");
+-
+-				mono_raise_exception (ex);
+-			}
+-			return;
+-		}
+-
+-		mono_stack_walk_no_il (get_caller, &m);
+-	}
+-}
+-
+ static MonoObject *
+ ves_icall_InternalInvoke (MonoReflectionMethod *method, MonoObject *this, MonoArray *params, MonoException **exc) 
+ {
+@@ -3095,9 +3072,8 @@
+ 
+ 	*exc = NULL;
+ 
+-	if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR &&
+-			mono_security_core_clr_method_level (m, TRUE) == MONO_SECURITY_CORE_CLR_CRITICAL)
+-		ensure_reflection_security ();
++	if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR)
++		mono_security_core_clr_ensure_reflection_access_method (m);
+ 
+ 	if (!(m->flags & METHOD_ATTRIBUTE_STATIC)) {
+ 		if (this) {

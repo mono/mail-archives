@@ -1,0 +1,2313 @@
+Index: docs/remoting
+===================================================================
+RCS file: /cvs/public/mono/docs/remoting,v
+retrieving revision 1.1
+diff -u -r1.1 remoting
+--- docs/remoting	2 Aug 2002 15:27:26 -0000	1.1
++++ docs/remoting	26 Oct 2004 11:09:13 -0000
+@@ -23,4 +23,231 @@
+ to convert LDFLD/STFLD operations into messages and then call
+ RealProxy::Invoke(): mono_store_remote_field() and mono_load_remote_field().
+ 
++Cross app domain optimizations
++==============================
++
++The new implementation of the cross app domain channel makes a minimal use of
++the remoting infrastructure. The idea is to create remoting wrappers specific
++for cross app domain calls, which take the input paramers, switch the domain
++and dispatch the call in the new domain.
++
++When an vtable for a proxy needs to be created, the runtime checks if the proxy
++is referencing an object that belongs to another domain in the same process.
++In such case, the fast xdomain wrapper is returned instead of the regular one.
++
++The xdomain wrapper will have a different structure depending on the signature
++of the method it wraps, since different types have different marshalling needs.
++There are four types of marshalling, the first one is the fastest, the last one
++is the slowest:
++
++1) No marshalling at all: this is for primitive types.
++
++2) Internal copy of the object in the new domain: some system types can
++   be copied from one domain to the other by the runtime. This currently
++   applies to arrays of primitive types (or arrays of values that can be
++   internally copied), String and StringBuilder. We can add more types in
++   the future.
++   
++3) Internal copy for Out parameters. It is a specific case of the previous
++   type, when an input parameter has the [Out] attribute, which means that the
++   content of the object that is marshalled into the new domain, needs to be
++   copied over the instance of the original object. This applies to arrays
++   of primitive types and StringBuilder. This is used, for example, to be able
++   to call methods such as Stream.Read ([Out]buffer, pos, lengh) across domains.
++   
++4) Serialization. The value is serialized in one domain and deserialized in the
++   other one.
++   
++The xdomain wrapper will be generated according to the marshalling needs of
++each parameter.
++
++The cross domain wrapper is divided in two methods. The first method (the
++wrapper itself) takes the input parameters and serializes those that need to
++be serialized. After that, sets the new domain and calls to a second method
++in the new domain, which deserializes the parameters, makes a local copy of
++those that don't need serialization, and dispatches the call to the real
++object. Then, the inverse sequence is followed: return values are serialized,
++flow returns to the first method, which changes the domain again and
++deserializes the values.
++
++Sample wrapper
++--------------
++
++This are examples of cross domain wrappers in pseudo-C# code.
++The first example is for a method with the following signature:
++
++	ArrayList Test (int a, string b, ArrayList c, ref ArrayList d, ref string e, ref int f)
++
++Of course, the wrapper has the same signature:
++
++	ArrayList Test_xdomain_invoke (int a, string b, ArrayList c, ref ArrayList d, ref string e, ref int f)
++	{
++		int loc_new_domainid, loc_old_domainid;
++		ArrayList loc_return;
++		byte[] loc_serialized_array;
++		
++		// Save thread domain data
++		Context loc_context = Thread.CurrentContext;
++		if (loc_context.IsDefaultContext) {
++			return Test_remoting_invoke (a, b, c, ref d, ref e, ref f);
++		}
++		object loc_datastore = Thread.ResetDataStoreStatus ();
++		
++		// Create the array that will hold the parameters to be serialized
++		object[] loc_array = new object [3];	// +1 to store the return value
++		loc_array [0] = c;
++		loc_array [1] = d;
++	
++		// Serialize parameters
++		loc_serialized_array = RemotingServices.SerializeCallData (loc_Array);
++	
++		// Get the target domain id and change the domain
++		RealProxy loc_real_proxy = ((TransparentProxy)this).rp;
++		loc_new_domainid = loc_real_proxy->target_domain_id;
++		
++		loc_old_domainid = mono_remoting_set_domain_by_id (loc_new_domainid);
++	
++		string e_copy = e;
++		/* The following is an indirect call made into the target domain */
++		Test_xdomain_dispatch (rp, ref loc_serialized_array, out loc_serialized_exc, a, b, ref e_copy, ref f);
++		
++		// Switch context
++		mono_remoting_set_domain_by_id (loc_old_domainid);
++		
++		// Restore thread domain data
++		mono_context_set (loc_context);
++		Thread.RestoreDataStoreStatus (loc_datastore);
++		
++		if (loc_serialized_exc != null) {
++			Exception ex = (Exception) RemotingServices.DeserializeCallData (loc_serialized_exc);
++			ex.FixRemotingException ();
++			throw ex;
++		}
++		
++		// copy back non-serialized output parametars
++		e = mono_marshal_xdomain_copy_value (e_copy);
++		
++		// Deserialize out parameters
++		loc_serialized_array = mono_marshal_xdomain_copy_value (loc_serialized_array);
++		loc_array = RemotingServices.DeserializeObject (loc_serialized_array);
++		d = loc_array [1];
++		mono_thread_force_interruption_checkpoint ();
++		return loc_array [2];
++	}
++	
++	void Test_xdomain_dispatch (RealProxy rp, ref byte[] loc_call_data, out byte[] loc_exc_data, int a, string b, ref string e, ref int f)
++	{
++		// Deserialize parameters
++		try {
++			// Clean the call context
++			CallContext.SetCurrentCallContext (null);
++			
++			// Deserialize call data
++			if (loc_call_data != null) {
++				loc_call_data = mono_marshal_xdomain_copy_value (loc_call_data);
++				loc_array = RemotingServices.DeserializeCallData (loc_call_data);
++			}
++			
++			// Get the target object
++			object target = rp.GetAppDomainTarget ();
++		
++			// Load the arguments
++			b = mono_marshal_xdomain_copy_value (b);
++		
++			// Make the call to the real object
++			mono_thread_force_interruption_checkpoint ();
++			loc_return = target.Test (a, b, loc_array[0], ref loc_array[1], ref e, ref f);
++			
++			// Serialize the return values
++			// Reset parameters in the array that don't need to be serialized back
++			loc_array [0] = null;
++			// Add the return value to the array
++			loc_array [2] = loc_return;
++			// Serialize
++			loc_call_data = RemotingServices.SerializeCallData (loc_array);
++			loc_exc_data = null;
++		}
++		catch (Exception ex) {
++			loc_exc_data = RemotingServices.SerializeExceptionData (ex);
++		}
++	}
++
++
++Another example
++---------------
++
++This is another example of a method with more simple parameters:
++
++	int SimpleTest_xdomain_invoke (int a)
++	{
++		int loc_new_domainid, loc_old_domainid;
++		int loc_return;
++		byte[] loc_serialized_array;
++		
++		// Save thread domain data
++		Context loc_context = Thread.CurrentContext;
++		if (loc_context.IsDefaultContext) {
++			return SimpleTest_remoting_invoke (a, b, c, ref d, ref e, ref f);
++		}
++		object loc_datastore = Thread.ResetDataStoreStatus ();
++		
++		// Serialize parameters. This will only serialize LogicalContext data if needed.
++		loc_serialized_array = RemotingServices.SerializeCallData (null);
++	
++		// Get the target domain id and change the domain
++		RealProxy loc_real_proxy = ((TransparentProxy)this).rp;
++		loc_new_domainid = loc_real_proxy->target_domain_id;
++		
++		loc_old_domainid = mono_remoting_set_domain_by_id (loc_new_domainid);
++	
++		/* The following is an indirect call made into the target domain */
++		loc_return = SimpleTest_xdomain_dispatch (rp, ref loc_serialized_array, out loc_serialized_exc, a);
++		
++		// Switch domain
++		mono_remoting_set_domain_by_id (loc_old_domainid);
++		
++		// Restore thread domain data
++		mono_context_set (loc_context);
++		Thread.RestoreDataStoreStatus (loc_datastore);
++		
++		if (loc_serialized_exc != null) {
++			Exception ex = (Exception) RemotingServices.DeserializeCallData (loc_serialized_exc);
++			ex.FixRemotingException ();
++			throw ex;
++		}
++		
++		RemotingServices.DeserializeCallData (loc_serialized_array);
++		return loc_return [2];
++	}
++	
++
++	int SimpleTest_xdomain_dispatch (RealProxy rp, ref byte[] loc_call_data, out byte[] loc_exc_data, int a)
++	{
++		int loc_return;
++		
++		// Deserialize parameters
++		try {
++			// Clean the call context
++			CallContext.SetCurrentCallContext (null);
++			
++			// Deserialize call data
++			if (loc_call_data != null) {
++				loc_call_data = mono_marshal_xdomain_copy_value (loc_call_data);
++				RemotingServices.DeserializeCallData (loc_call_data);
++			}
++			
++			// Get the target object
++			object target = rp.GetAppDomainTarget ();
++		
++			// Make the call to the real object
++			loc_return = target.Test (a);
++			
++			loc_call_data = RemotingServices.SerializeCallData (loc_Array);
++			loc_exc_data = null;
++		}
++		catch (Exception ex) {
++			loc_exc_data = RemotingServices.SerializeExceptionData (ex);
++		}
++		return loc_return;
++	}
+ 
+Index: mono/interpreter/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/interpreter/ChangeLog,v
+retrieving revision 1.255
+diff -u -r1.255 ChangeLog
+--- mono/interpreter/ChangeLog	22 Sep 2004 15:53:43 -0000	1.255
++++ mono/interpreter/ChangeLog	26 Oct 2004 11:09:15 -0000
+@@ -1,3 +1,7 @@
++2004-10-15  Lluis Sanchez Gual  <lluis@novell.com>
++
++	* interp.c: Added MonoRemotingTarget parameter to signature
++	interp_create_remoting_trampoline.
+ 
+ Wed Sep 22 19:06:02 CEST 2004 Paolo Molaro <lupus@ximian.com>
+ 
+Index: mono/interpreter/interp.c
+===================================================================
+RCS file: /cvs/public/mono/mono/interpreter/interp.c,v
+retrieving revision 1.304
+diff -u -r1.304 interp.c
+--- mono/interpreter/interp.c	22 Sep 2004 15:53:43 -0000	1.304
++++ mono/interpreter/interp.c	26 Oct 2004 11:09:17 -0000
+@@ -250,9 +250,9 @@
+ 	} while (0);
+ 
+ static gpointer
+-interp_create_remoting_trampoline (MonoMethod *method)
++interp_create_remoting_trampoline (MonoMethod *method, MonoRemotingTarget target)
+ {
+-	return mono_interp_get_runtime_method (mono_marshal_get_remoting_invoke (method));
++	return mono_interp_get_runtime_method (mono_marshal_get_remoting_invoke_for_target (method, target));
+ }
+ 
+ static CRITICAL_SECTION runtime_method_lookup_section;
+Index: mono/metadata/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/ChangeLog,v
+retrieving revision 1.1963
+diff -u -r1.1963 ChangeLog
+--- mono/metadata/ChangeLog	25 Oct 2004 20:09:15 -0000	1.1963
++++ mono/metadata/ChangeLog	26 Oct 2004 11:09:27 -0000
+@@ -1,3 +1,51 @@
++2004-10-26  Lluis Sanchez Gual  <lluis@novell.com>
++
++	* appdomain.c: Removed look_for_method_by_name(). Use the new method
++	mono_class_get_method_from_name() instead.
++	
++	* class-internals.h: Added two new types of wrappers. 
++	Added MonoRemotingTarget enum. Added new trampoline function type, which
++	takes an additional MonoRemotingTarget value as parameter, so it is
++	possible to request a trampoline for a specific target.
++	
++	* class.c: Added new mono_class_get_method_from_name() method.
++	
++	* class.h: In MonoRemoteClass, we can have now to vtables, one for
++	general remoting sinks and one specific for cross domain calls.
++	
++	* debug-helpers.c: Added new wrapper names.
++	
++	* icall.c: Use the new method mono_remote_class_vtable() to get the vtable
++	of a remote class.
++	
++	* image.c: Porperly delete value objects form the remoting invoke hashtable.
++	
++	* marshal.c: Added mono_marshal_get_xappdomain_invoke(), which together
++	with several other methods (mono_marshal_get_xappdomain_dispatch,
++	mono_marshal_get_xappdomain_target, mono_marshal_get_serialize_exception,
++	and others) can generate a fast remoting wrapper for cross domain calls.
++	More information can be found in docs/remoting.
++	Other changes: Removed mono_find_method_by_name, and used
++	mono_class_get_method_from_name instead.
++	Remoting wrappers are now stored in a MonoRemotingMethods struct, which
++	is stored in the remoting invoke hashtable.
++	
++	* marshal.h: published the new method for getting the xdomain wrapper,
++	and also added a method for getting the adequate wrapper for a given
++	method and target.
++	
++	* object-internals.h, object.c: Added a couple of methods for capying and
++	cloning arrays.
++	Modified mono_install_remoting_trampoline, which takes the new remoting
++	trampoline that has a remoting target as parameter.
++	mono_class_proxy_vtable now also takes a remoting target as parameter, and
++	will return the most suitable vtable for the target.
++	Added mono_remote_class_vtable, which returns the vtable of a remote class
++	(which can be the normal remoting vtable or the xdomain vtable).
++	
++	* threads.c: the xdomain invoke and dispatch wrappers must also be
++	protected against interruptions.
++
+ 2004-10-25  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* image.c: Avoid overwriting values in the loaded_images_hash when an
+Index: mono/metadata/appdomain.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/appdomain.c,v
+retrieving revision 1.170
+diff -u -r1.170 appdomain.c
+--- mono/metadata/appdomain.c	25 Oct 2004 14:49:15 -0000	1.170
++++ mono/metadata/appdomain.c	26 Oct 2004 11:09:28 -0000
+@@ -51,9 +51,6 @@
+ static void
+ add_assemblies_to_domain (MonoDomain *domain, MonoAssembly *ass);
+ 
+-static MonoMethod *
+-look_for_method_by_name (MonoClass *klass, const gchar *name);
+-
+ static void
+ mono_domain_unload (MonoDomain *domain);
+ 
+@@ -240,7 +237,7 @@
+ 		klass = domain->domain->mbr.obj.vtable->klass;
+ 		g_assert (klass);
+ 
+-		method = look_for_method_by_name (klass, "DoTypeResolve");
++		method = mono_class_get_method_from_name (klass, "DoTypeResolve", -1);
+ 		if (method == NULL) {
+ 			g_warning ("Method AppDomain.DoTypeResolve not found.\n");
+ 			return NULL;
+@@ -457,25 +454,6 @@
+ 	return res;
+ }
+ 
+-/*
+- * Used to find methods in AppDomain class.
+- * It only works if there are no multiple signatures for any given method name
+- */
+-static MonoMethod *
+-look_for_method_by_name (MonoClass *klass, const gchar *name)
+-{
+-	gint i;
+-	MonoMethod *method;
+-
+-	for (i = 0; i < klass->method.count; i++) {
+-		method = klass->methods [i];
+-		if (!strcmp (method->name, name))
+-			return method;
+-	}
+-
+-	return NULL;
+-}
+-
+ static MonoReflectionAssembly *
+ try_assembly_resolve (MonoDomain *domain, MonoString *fname)
+ {
+@@ -488,7 +466,7 @@
+ 	klass = domain->domain->mbr.obj.vtable->klass;
+ 	g_assert (klass);
+ 	
+-	method = look_for_method_by_name (klass, "DoAssemblyResolve");
++	method = mono_class_get_method_from_name (klass, "DoAssemblyResolve", -1);
+ 	if (method == NULL) {
+ 		g_warning ("Method AppDomain.DoAssemblyResolve not found.\n");
+ 		return NULL;
+@@ -533,7 +511,7 @@
+ 
+ 	klass = domain->domain->mbr.obj.vtable->klass;
+ 
+-	method = look_for_method_by_name (klass, "DoAssemblyLoad");
++	method = mono_class_get_method_from_name (klass, "DoAssemblyLoad", -1);
+ 	if (method == NULL) {
+ 		g_warning ("Method AppDomain.DoAssemblyLoad not found.\n");
+ 		return;
+@@ -1303,7 +1281,7 @@
+ 
+ 	mono_domain_set (domain, FALSE);
+ 	/* Notify OnDomainUnload listeners */
+-	method = look_for_method_by_name (domain->domain->mbr.obj.vtable->klass, "DoDomainUnload");	
++	method = mono_class_get_method_from_name (domain->domain->mbr.obj.vtable->klass, "DoDomainUnload", -1);	
+ 	g_assert (method);
+ 
+ 	exc = NULL;
+Index: mono/metadata/class-internals.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/class-internals.h,v
+retrieving revision 1.14
+diff -u -r1.14 class-internals.h
+--- mono/metadata/class-internals.h	11 Oct 2004 19:52:26 -0000	1.14
++++ mono/metadata/class-internals.h	26 Oct 2004 11:09:29 -0000
+@@ -27,6 +27,8 @@
+ 	MONO_WRAPPER_MANAGED_TO_NATIVE,
+ 	MONO_WRAPPER_REMOTING_INVOKE,
+ 	MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK,
++	MONO_WRAPPER_XDOMAIN_INVOKE,
++	MONO_WRAPPER_XDOMAIN_DISPATCH,
+ 	MONO_WRAPPER_LDFLD,
+ 	MONO_WRAPPER_STFLD,
+ 	MONO_WRAPPER_SYNCHRONIZED,
+@@ -38,6 +40,11 @@
+ 	MONO_WRAPPER_UNKNOWN
+ } MonoWrapperType;
+ 
++typedef enum {
++	MONO_REMOTING_TARGET_UNKNOWN,
++	MONO_REMOTING_TARGET_APPDOMAIN
++} MonoRemotingTarget;
++
+ struct _MonoMethod {
+ 	guint16 flags;  /* method flags */
+ 	guint16 iflags; /* method implementation flags */
+@@ -384,6 +391,7 @@
+ extern MonoStats mono_stats;
+ 
+ typedef gpointer (*MonoTrampoline)       (MonoMethod *method);
++typedef gpointer (*MonoRemotingTrampoline)       (MonoMethod *method, MonoRemotingTarget target);
+ 
+ typedef gpointer (*MonoLookupDynamicToken) (MonoImage *image, guint32 token);
+ 
+@@ -421,7 +429,7 @@
+ mono_install_trampoline (MonoTrampoline func);
+ 
+ void
+-mono_install_remoting_trampoline (MonoTrampoline func);
++mono_install_remoting_trampoline (MonoRemotingTrampoline func);
+ 
+ gpointer
+ mono_lookup_dynamic_token (MonoImage *image, guint32 token);
+Index: mono/metadata/class.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/class.c,v
+retrieving revision 1.305
+diff -u -r1.305 class.c
+--- mono/metadata/class.c	12 Oct 2004 03:11:32 -0000	1.305
++++ mono/metadata/class.c	26 Oct 2004 11:09:31 -0000
+@@ -3684,3 +3684,30 @@
+ 	return event->attrs;
+ }
+ 
++/**
++ * mono_find_method_by_name:
++ * @klass: where to look for the method
++ * @name_space: name of the method
++ * @param_count: number of parameters. -1 for any number.
++ *
++ * Obtains a MonoMethod with a given name and number of parameters.
++ * It only works if there are no multiple signatures for any given method name.
++ */
++MonoMethod *
++mono_class_get_method_from_name (MonoClass *klass, const char *name, int param_count)
++{
++	MonoMethod *res = NULL;
++	int i;
++
++	mono_class_init (klass);
++
++	for (i = 0; i < klass->method.count; ++i) {
++		if (klass->methods [i]->name[0] == name [0] && 
++		    !strcmp (name, klass->methods [i]->name) &&
++		    (param_count == -1 || klass->methods [i]->signature->param_count == param_count)) {
++			res = klass->methods [i];
++			break;
++		}
++	}
++	return res;
++}
+Index: mono/metadata/class.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/class.h,v
+retrieving revision 1.146
+diff -u -r1.146 class.h
+--- mono/metadata/class.h	19 Sep 2004 14:29:49 -0000	1.146
++++ mono/metadata/class.h	26 Oct 2004 11:09:31 -0000
+@@ -12,7 +12,8 @@
+ typedef struct _MonoEvent MonoEvent;
+ 
+ typedef struct {
+-	MonoVTable *vtable;
++	MonoVTable *default_vtable;
++	MonoVTable *xdomain_vtable;
+ 	MonoClass *proxy_class;
+ 	guint interface_count;
+ 	MonoClass **interfaces;
+@@ -243,5 +244,7 @@
+ guint32
+ mono_event_get_flags         (MonoEvent *event);
+ 
++MonoMethod *
++mono_class_get_method_from_name (MonoClass *klass, const char *name, int param_count);
+ 
+ #endif /* _MONO_CLI_CLASS_H_ */
+Index: mono/metadata/debug-helpers.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/debug-helpers.c,v
+retrieving revision 1.31
+diff -u -r1.31 debug-helpers.c
+--- mono/metadata/debug-helpers.c	22 Oct 2004 04:31:26 -0000	1.31
++++ mono/metadata/debug-helpers.c	26 Oct 2004 11:09:31 -0000
+@@ -25,6 +25,8 @@
+ 	"managed-to-native",
+ 	"remoting-invoke",
+ 	"remoting-invoke-with-check",
++	"xdomain-invoke",
++	"xdomain-dispatch",
+ 	"ldfld",
+ 	"stfld",
+ 	"synchronized",
+Index: mono/metadata/icall.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/icall.c,v
+retrieving revision 1.568
+diff -u -r1.568 icall.c
+--- mono/metadata/icall.c	25 Oct 2004 13:49:42 -0000	1.568
++++ mono/metadata/icall.c	26 Oct 2004 11:09:34 -0000
+@@ -4873,8 +4873,8 @@
+ 
+ 	tp->custom_type_info = (mono_object_isinst (this, mono_defaults.iremotingtypeinfo_class) != NULL);
+ 	tp->remote_class = mono_remote_class (domain, class_name, klass);
+-	res->vtable = tp->remote_class->vtable;
+ 
++	res->vtable = mono_remote_class_vtable (domain, tp->remote_class, rp);
+ 	return res;
+ }
+ 
+Index: mono/metadata/image.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/image.c,v
+retrieving revision 1.95
+diff -u -r1.95 image.c
+--- mono/metadata/image.c	25 Oct 2004 20:09:15 -0000	1.95
++++ mono/metadata/image.c	26 Oct 2004 11:09:36 -0000
+@@ -945,6 +945,12 @@
+ 	mono_metadata_free_method_signature ((MonoMethodSignature*)val);
+ }
+ 
++static void
++free_remoting_wrappers (gpointer key, gpointer val, gpointer user_data)
++{
++	g_free (val);
++}
++
+ /**
+  * mono_image_addref:
+  * @image: The image file we wish to add a reference to
+@@ -1020,6 +1026,7 @@
+ 	g_hash_table_destroy (image->delegate_begin_invoke_cache);
+ 	g_hash_table_destroy (image->delegate_end_invoke_cache);
+ 	g_hash_table_destroy (image->delegate_invoke_cache);
++	g_hash_table_foreach (image->remoting_invoke_cache, free_remoting_wrappers, NULL);
+ 	g_hash_table_destroy (image->remoting_invoke_cache);
+ 	g_hash_table_destroy (image->runtime_invoke_cache);
+ 	g_hash_table_destroy (image->typespec_cache);
+Index: mono/metadata/marshal.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/marshal.c,v
+retrieving revision 1.210
+diff -u -r1.210 marshal.c
+--- mono/metadata/marshal.c	20 Oct 2004 01:01:56 -0000	1.210
++++ mono/metadata/marshal.c	26 Oct 2004 11:09:39 -0000
+@@ -32,6 +32,13 @@
+ #define OPDEF(a,b,c,d,e,f,g,h,i,j) \
+ 	a = i,
+ 
++typedef enum {
++	MONO_MARSHAL_NONE,			/* No marshalling needed */
++	MONO_MARSHAL_COPY,			/* Can be copied by value to the new domain */
++	MONO_MARSHAL_COPY_OUT,		/* out parameter that needs to be copied back to the original instance */
++	MONO_MARSHAL_SERIALIZE		/* Value needs to be serialized into the new domain */
++} MonoXDomainMarshalType;
++
+ enum {
+ #include "mono/cil/opcode.def"
+ 	LAST = 0xff
+@@ -46,31 +53,21 @@
+ 	unsigned char *code;
+ };
+ 
++struct _MonoRemotingMethods {
++	MonoMethod *invoke;
++	MonoMethod *invoke_with_check;
++	MonoMethod *xdomain_invoke;
++	MonoMethod *xdomain_dispatch;
++};
++
++typedef struct _MonoRemotingMethods MonoRemotingMethods;
++
+ static void
+ delegate_hash_table_add (MonoDelegate *d);
+ 
+ static void
+ emit_struct_conv (MonoMethodBuilder *mb, MonoClass *klass, gboolean to_object);
+ 
+-static MonoMethod *
+-mono_find_method_by_name (MonoClass *klass, const char *name, int param_count)
+-{
+-	MonoMethod *res = NULL;
+-	int i;
+-
+-	mono_class_init (klass);
+-
+-	for (i = 0; i < klass->method.count; ++i) {
+-		if (klass->methods [i]->name[0] == name [0] && 
+-		    !strcmp (name, klass->methods [i]->name) &&
+-		    klass->methods [i]->signature->param_count == param_count) {
+-			res = klass->methods [i];
+-			break;
+-		}
+-	}
+-	return res;
+-}
+-
+ #ifdef DEBUG_RUNTIME_CODE
+ static char*
+ indenter (MonoDisHelper *dh, MonoMethod *method, guint32 ip_offset)
+@@ -150,6 +147,48 @@
+ 	}
+ }
+ 
++
++MonoClass *byte_array_class;
++static MonoMethod *method_rs_serialize, *method_rs_deserialize, *method_exc_fixexc, *method_rs_appdomain_target;
++static MonoMethod *method_set_context, *method_get_context, *method_reset_datastore, *method_restore_datastore;
++static MonoMethod *method_set_call_context, *method_needs_context_sink, *method_rs_serialize_exc;
++
++static void
++mono_remoting_marshal_init (void)
++{
++	MonoClass *klass;
++
++	static gboolean module_initialized = FALSE;
++
++	if (!module_initialized) {
++		klass = mono_class_from_name (mono_defaults.corlib, "System.Runtime.Remoting", "RemotingServices");
++		method_rs_serialize = mono_class_get_method_from_name (klass, "SerializeCallData", -1);
++		method_rs_deserialize = mono_class_get_method_from_name (klass, "DeserializeCallData", -1);
++		method_rs_serialize_exc = mono_class_get_method_from_name (klass, "SerializeExceptionData", -1);
++	
++		klass = mono_class_from_name (mono_defaults.corlib, "System.Runtime.Remoting.Proxies", "RealProxy");
++		method_rs_appdomain_target = mono_class_get_method_from_name (klass, "GetAppDomainTarget", -1);
++	
++		klass = mono_class_from_name (mono_defaults.corlib, "System", "Exception");
++		method_exc_fixexc = mono_class_get_method_from_name (klass, "FixRemotingException", -1);
++	
++		klass = mono_class_from_name (mono_defaults.corlib, "System.Threading", "Thread");
++		method_reset_datastore = mono_class_get_method_from_name (klass, "ResetDataStoreStatus", -1);
++		method_restore_datastore = mono_class_get_method_from_name (klass, "RestoreDataStoreStatus", -1);
++		method_get_context = mono_class_get_method_from_name (klass, "get_CurrentContext", -1);
++	
++		klass = mono_class_from_name (mono_defaults.corlib, "System", "AppDomain");
++		method_set_context = mono_class_get_method_from_name (klass, "InternalSetContext", -1);
++		byte_array_class = mono_array_class_get (mono_defaults.byte_class, 1);
++	
++		klass = mono_class_from_name (mono_defaults.corlib, "System.Runtime.Remoting.Messaging", "CallContext");
++		method_set_call_context = mono_class_get_method_from_name (klass, "SetCurrentCallContext", -1);
++	
++		klass = mono_class_from_name (mono_defaults.corlib, "System.Runtime.Remoting.Contexts", "Context");
++		method_needs_context_sink = mono_class_get_method_from_name (klass, "get_NeedsContextSink", -1);
++	}
++}
++
+ gpointer
+ mono_delegate_to_ftnptr (MonoDelegate *delegate)
+ {
+@@ -168,7 +207,7 @@
+ 	g_assert (klass->delegate);
+ 
+ 	method = delegate->method_info->method;
+-	invoke = mono_find_method_by_name (klass, "Invoke", method->signature->param_count);
++	invoke = mono_class_get_method_from_name (klass, "Invoke", method->signature->param_count);
+ 
+ 	mspecs = g_new (MonoMarshalSpec*, invoke->signature->param_count + 1);
+ 	mono_method_get_marshal_info (invoke, mspecs);
+@@ -588,6 +627,21 @@
+ 	return pos;
+ }
+ 
++static int
++mono_mb_emit_xdomain_check (MonoMethodBuilder *mb, int branch_code)
++{
++	int pos;
++	mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++	mono_mb_emit_byte (mb, CEE_LDIND_REF);
++	mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoRealProxy, target_domain_id));
++	mono_mb_emit_byte (mb, CEE_LDIND_I4);
++	mono_mb_emit_icon (mb, -1);
++	mono_mb_emit_byte (mb, branch_code);
++	pos = mb->pos;
++	mono_mb_emit_i4 (mb, 0);
++	return pos;
++}
++
+ void
+ mono_mb_emit_i4 (MonoMethodBuilder *mb, gint32 data)
+ {
+@@ -1607,6 +1661,66 @@
+ 	return res;
+ }		
+ 
++
++static inline MonoMethod*
++mono_marshal_remoting_find_in_cache (MonoMethod *method, int wrapper_type)
++{
++	MonoMethod *res = NULL;
++	MonoRemotingMethods *wrps;
++
++	EnterCriticalSection (&marshal_mutex);
++	wrps = (MonoRemotingMethods*) g_hash_table_lookup (method->klass->image->remoting_invoke_cache, method);
++
++	if (wrps) {
++		switch (wrapper_type) {
++		case MONO_WRAPPER_REMOTING_INVOKE: res = wrps->invoke; break;
++		case MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK: res = wrps->invoke_with_check; break;
++		case MONO_WRAPPER_XDOMAIN_INVOKE: res = wrps->xdomain_invoke; break;
++		case MONO_WRAPPER_XDOMAIN_DISPATCH: res = wrps->xdomain_dispatch; break;
++		}
++	}
++
++	LeaveCriticalSection (&marshal_mutex);
++	return res;
++}
++
++/* Create the method from the builder and place it in the cache */
++static inline MonoMethod*
++mono_remoting_mb_create_and_cache (MonoMethod *key, MonoMethodBuilder *mb, 
++								MonoMethodSignature *sig, int max_stack)
++{
++	MonoMethod **res = NULL;
++	MonoRemotingMethods *wrps;
++	GHashTable *cache = key->klass->image->remoting_invoke_cache;
++
++	EnterCriticalSection (&marshal_mutex);
++	wrps = (MonoRemotingMethods*) g_hash_table_lookup (cache, key);
++	if (!wrps) {
++		wrps = g_new0 (MonoRemotingMethods, 1);
++		g_hash_table_insert (cache, key, wrps);
++	}
++
++	switch (mb->method->wrapper_type) {
++	case MONO_WRAPPER_REMOTING_INVOKE: res = &wrps->invoke; break;
++	case MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK: res = &wrps->invoke_with_check; break;
++	case MONO_WRAPPER_XDOMAIN_INVOKE: res = &wrps->xdomain_invoke; break;
++	case MONO_WRAPPER_XDOMAIN_DISPATCH: res = &wrps->xdomain_dispatch; break;
++	default: g_assert_not_reached (); break;
++	}
++	
++	if (*res == NULL) {
++		/* This does not acquire any locks */
++		*res = mono_mb_create_method (mb, sig, max_stack);
++		mono_g_hash_table_insert (wrapper_hash, *res, key);
++	}
++	else
++		/* Somebody created it before us */
++		;
++	LeaveCriticalSection (&marshal_mutex);
++
++	return *res;
++}		
++
+ MonoMethod *
+ mono_marshal_method_from_wrapper (MonoMethod *wrapper)
+ {
+@@ -1945,22 +2059,20 @@
+ 	static MonoMethodSignature *csig = NULL;
+ 	MonoMethodBuilder *mb;
+ 	MonoMethod *res;
+-	GHashTable *cache;
+ 	int params_var;
+ 
+ 	g_assert (method);
+ 
+-	if (method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE)
++	if (method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE || method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE)
+ 		return method;
+-
++	
+ 	sig = method->signature;
+ 
+ 	/* we cant remote methods without this pointer */
+ 	if (!sig->hasthis)
+ 		return method;
+ 
+-	cache = method->klass->image->remoting_invoke_cache;
+-	if ((res = mono_marshal_find_in_cache (cache, method)))
++	if ((res = mono_marshal_remoting_find_in_cache (method, MONO_WRAPPER_REMOTING_INVOKE)))
+ 		return res;
+ 
+ 	if (!csig) {
+@@ -1990,20 +2102,914 @@
+ 		 mono_mb_emit_restore_result (mb, sig->ret);
+ 	}
+ 
+-	res = mono_mb_create_and_cache (cache, method, mb, sig, sig->param_count + 16);
++	res = mono_remoting_mb_create_and_cache (method, mb, sig, sig->param_count + 16);
++	mono_mb_free (mb);
++
++	return res;
++}
++
++/* mono_get_xdomain_marshal_type()
++ * Returns the kind of marshalling that a type needs for cross domain calls.
++ */
++static MonoXDomainMarshalType
++mono_get_xdomain_marshal_type (MonoType *t)
++{
++	switch (t->type) {
++	case MONO_TYPE_VOID:
++		g_assert_not_reached ();
++		break;
++	case MONO_TYPE_U1:
++	case MONO_TYPE_I1:
++	case MONO_TYPE_BOOLEAN:
++	case MONO_TYPE_U2:
++	case MONO_TYPE_I2:
++	case MONO_TYPE_CHAR:
++	case MONO_TYPE_U4:
++	case MONO_TYPE_I4:
++	case MONO_TYPE_I8:
++	case MONO_TYPE_U8:
++	case MONO_TYPE_R4:
++	case MONO_TYPE_R8:
++		return MONO_MARSHAL_NONE;
++	case MONO_TYPE_STRING:
++		return MONO_MARSHAL_COPY;
++	case MONO_TYPE_ARRAY:
++	case MONO_TYPE_SZARRAY: {
++		MonoClass *elem_class = mono_class_from_mono_type (t)->element_class;
++		if (mono_get_xdomain_marshal_type (&(elem_class->byval_arg)) != MONO_MARSHAL_SERIALIZE)
++			return MONO_MARSHAL_COPY;
++		break;
++	}
++	}
++
++	if (mono_class_from_mono_type (t) == mono_defaults.stringbuilder_class)
++		return MONO_MARSHAL_COPY;
++	
++	return MONO_MARSHAL_SERIALIZE;
++}
++
++
++/* mono_marshal_xdomain_copy_value
++ * Makes a copy of "val" suitable for the current domain.
++ */
++static MonoObject *
++mono_marshal_xdomain_copy_value (MonoObject *val)
++{
++	MonoDomain *domain;
++	if (val == NULL) return NULL;
++
++	domain = mono_domain_get ();
++
++	switch (mono_object_class (val)->byval_arg.type) {
++	case MONO_TYPE_VOID:
++		g_assert_not_reached ();
++		break;
++	case MONO_TYPE_U1:
++	case MONO_TYPE_I1:
++	case MONO_TYPE_BOOLEAN:
++	case MONO_TYPE_U2:
++	case MONO_TYPE_I2:
++	case MONO_TYPE_CHAR:
++	case MONO_TYPE_U4:
++	case MONO_TYPE_I4:
++	case MONO_TYPE_I8:
++	case MONO_TYPE_U8:
++	case MONO_TYPE_R4:
++	case MONO_TYPE_R8: {
++		return mono_value_box (domain, mono_object_class (val), ((char*)val) + sizeof(MonoObject));
++	}
++	case MONO_TYPE_STRING: {
++		MonoString *str = (MonoString *) val;
++		return (MonoObject *) mono_string_new_utf16 (domain, mono_string_chars (str), mono_string_length (str));
++	}
++	case MONO_TYPE_ARRAY:
++	case MONO_TYPE_SZARRAY: {
++		MonoArray *acopy;
++		MonoXDomainMarshalType mt = mono_get_xdomain_marshal_type (&(mono_object_class (val)->element_class->byval_arg));
++		if (mt == MONO_MARSHAL_SERIALIZE) return NULL;
++		acopy = mono_array_clone_in_domain (domain, (MonoArray *) val);
++		if (mt == MONO_MARSHAL_COPY) {
++			int i, len = mono_array_length (acopy);
++			for (i = 0; i < len; i++) {
++				MonoObject *item = mono_array_get (acopy, gpointer, i);
++				mono_array_set (acopy, gpointer, i, mono_marshal_xdomain_copy_value (item));
++			}
++		}
++		return (MonoObject *) acopy;
++	}
++	}
++
++	if (mono_object_class (val) == mono_defaults.stringbuilder_class) {
++		MonoStringBuilder *oldsb = (MonoStringBuilder *) val;
++		MonoStringBuilder *newsb = (MonoStringBuilder *) mono_object_new (domain, mono_defaults.stringbuilder_class);
++		newsb->str = mono_string_new_utf16 (domain, mono_string_chars (oldsb->str), mono_string_length (oldsb->str));
++		newsb->length = oldsb->length;
++		return (MonoObject *) newsb;
++	}
++	return NULL;
++}
++
++/* mono_marshal_xdomain_copy_out_value()
++ * Copies the contents of the src instance into the dst instance. src and dst
++ * must have the same type, and if they are arrays, the same size.
++ */
++static void
++mono_marshal_xdomain_copy_out_value (MonoObject *src, MonoObject *dst)
++{
++	if (src == NULL || dst == NULL) return;
++	
++	g_assert (mono_object_class (src) == mono_object_class (dst));
++
++	switch (mono_object_class (src)->byval_arg.type) {
++	case MONO_TYPE_ARRAY:
++	case MONO_TYPE_SZARRAY: {
++		int mt = mono_get_xdomain_marshal_type (&(mono_object_class (src)->element_class->byval_arg));
++		if (mt == MONO_MARSHAL_SERIALIZE) return;
++		if (mt == MONO_MARSHAL_COPY) {
++			int i, len = mono_array_length ((MonoArray *)dst);
++			for (i = 0; i < len; i++) {
++				MonoObject *item = mono_array_get ((MonoArray *)src, gpointer, i);
++				mono_array_set ((MonoArray *)dst, gpointer, i, mono_marshal_xdomain_copy_value (item));
++			}
++		} else {
++			mono_array_full_copy ((MonoArray *)src, (MonoArray *)dst);
++		}
++		return;
++	}
++	}
++
++	if (mono_object_class (src) == mono_defaults.stringbuilder_class) {
++		MonoStringBuilder *src_sb = (MonoStringBuilder *) src;
++		MonoStringBuilder *dst_sb = (MonoStringBuilder *) dst;
++	
++		dst_sb->str = mono_string_new_utf16 (mono_object_domain (dst), mono_string_chars (src_sb->str), mono_string_length (src_sb->str));
++		dst_sb->length = src_sb->length;
++	}
++}
++
++static void
++mono_marshal_emit_xdomain_copy_value (MonoMethodBuilder *mb, MonoClass *pclass)
++{
++	static MonoMethodSignature *csig = NULL;
++	if (!csig) {
++		csig = mono_metadata_signature_alloc (mono_defaults.corlib, 1);
++		csig->params [0] = &mono_defaults.object_class->byval_arg;
++		csig->ret = &mono_defaults.object_class->byval_arg;
++		csig->pinvoke = 1;
++	}
++
++	mono_mb_emit_native_call (mb, csig, mono_marshal_xdomain_copy_value);
++	mono_mb_emit_byte (mb, CEE_CASTCLASS);
++	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++}
++
++static void
++mono_marshal_emit_xdomain_copy_out_value (MonoMethodBuilder *mb, MonoClass *pclass)
++{
++	static MonoMethodSignature *csig = NULL;
++	if (!csig) {
++		csig = mono_metadata_signature_alloc (mono_defaults.corlib, 2);
++		csig->params [0] = &mono_defaults.object_class->byval_arg;
++		csig->params [1] = &mono_defaults.object_class->byval_arg;
++		csig->ret = &mono_defaults.void_class->byval_arg;
++		csig->pinvoke = 1;
++	}
++
++	mono_mb_emit_native_call (mb, csig, mono_marshal_xdomain_copy_out_value);
++}
++
++/* mono_marshal_supports_fast_xdomain()
++ * Returns TRUE if the method can use the fast xdomain wrapper.
++ */
++static gboolean
++mono_marshal_supports_fast_xdomain (MonoMethod *method)
++{
++	return !method->klass->contextbound &&
++		   !((method->flags & METHOD_ATTRIBUTE_SPECIAL_NAME) && (strcmp (".ctor", method->name) == 0));
++}
++
++static gint32
++mono_marshal_set_domain_by_id (gint32 id)
++{
++	MonoDomain *current_domain = mono_domain_get ();
++	MonoDomain *domain = mono_domain_get_by_id (id);
++
++	if (!domain || !mono_domain_set (domain, FALSE))	
++		mono_raise_exception (mono_get_exception_appdomain_unloaded ());
++
++	return current_domain->domain_id;
++}
++
++static void
++mono_marshal_emit_switch_domain (MonoMethodBuilder *mb)
++{
++	static MonoMethodSignature *csig = NULL;
++	if (!csig) {
++		csig = mono_metadata_signature_alloc (mono_defaults.corlib, 1);
++		csig->params [0] = &mono_defaults.int32_class->byval_arg;
++		csig->ret = &mono_defaults.int32_class->byval_arg;
++		csig->pinvoke = 1;
++	}
++
++	mono_mb_emit_native_call (mb, csig, mono_marshal_set_domain_by_id);
++}
++
++/* mono_marshal_emit_load_domain_method ()
++ * Loads into the stack a pointer to the code of the provided method for
++ * the current domain.
++ */
++static void
++mono_marshal_emit_load_domain_method (MonoMethodBuilder *mb, MonoMethod *method)
++{
++	static MonoMethodSignature *csig = NULL;
++	if (!csig) {
++		csig = mono_metadata_signature_alloc (mono_defaults.corlib, 1);
++		csig->params [0] = &mono_defaults.int_class->byval_arg;
++		csig->ret = &mono_defaults.int_class->byval_arg;
++		csig->pinvoke = 1;
++	}
++
++	mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
++	mono_mb_emit_byte (mb, CEE_MONO_LDPTR);
++	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, method));
++	mono_mb_emit_native_call (mb, csig, mono_compile_method);
++}
++
++/*static int numet = 0;
++static int totby = 0;
++*/
++
++/* mono_marshal_get_xappdomain_dispatch ()
++ * Generates a method that dispatches a method call from another domain into
++ * the current domain.
++ */
++static MonoMethod *
++mono_marshal_get_xappdomain_dispatch (MonoMethod *method, int *marshal_types, int complex_count, int complex_out_count, int ret_marshal_type)
++{
++	MonoMethodSignature *sig, *csig;
++	MonoMethodBuilder *mb;
++	MonoMethod *res;
++	int i, j, param_index, copy_locals_base;
++	MonoClass *ret_class = NULL;
++	int loc_array=0, loc_return=0, loc_serialized_exc=0;
++	MonoExceptionClause *main_clause;
++	MonoMethodHeader *header;
++	int pos, pos_leave;
++	gboolean copy_return;
++
++	if ((res = mono_marshal_remoting_find_in_cache (method, MONO_WRAPPER_XDOMAIN_DISPATCH)))
++		return res;
++
++	sig = method->signature;
++	copy_return = (sig->ret->type != MONO_TYPE_VOID && ret_marshal_type != MONO_MARSHAL_SERIALIZE);
++
++	j = 0;
++	csig = mono_metadata_signature_alloc (mono_defaults.corlib, 3 + sig->param_count - complex_count);
++	csig->params [j++] = &mono_defaults.object_class->byval_arg;
++	csig->params [j++] = &byte_array_class->this_arg;
++	csig->params [j++] = &byte_array_class->this_arg;
++	for (i = 0; i < sig->param_count; i++)
++		if (marshal_types [i] != MONO_MARSHAL_SERIALIZE)
++			csig->params [j++] = sig->params [i];
++	if (copy_return)
++		csig->ret = sig->ret;
++	else
++		csig->ret = &mono_defaults.void_class->byval_arg;
++	csig->pinvoke = 1;
++	csig->hasthis = FALSE;
++
++	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_XDOMAIN_DISPATCH);
++	mb->method->save_lmf = 1;
++
++	/* Locals */
++
++	loc_serialized_exc = mono_mb_add_local (mb, &byte_array_class->byval_arg);
++	if (complex_count > 0)
++		loc_array = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
++	if (sig->ret->type != MONO_TYPE_VOID) {
++		loc_return = mono_mb_add_local (mb, sig->ret);
++		ret_class = mono_class_from_mono_type (sig->ret);
++	}
++
++	/* try */
++
++	main_clause = g_new0 (MonoExceptionClause, 1);
++	main_clause->try_offset = mb->pos;
++
++	/* Clean the call context */
++
++	mono_mb_emit_byte (mb, CEE_LDNULL);
++	mono_mb_emit_managed_call (mb, method_set_call_context, NULL);
++	mono_mb_emit_byte (mb, CEE_POP);
++
++	/* Deserialize call data */
++
++	mono_mb_emit_ldarg (mb, 1);
++	mono_mb_emit_byte (mb, CEE_LDIND_REF);
++	mono_mb_emit_byte (mb, CEE_DUP);
++	mono_mb_emit_byte (mb, CEE_BRFALSE_S);
++	pos = mb->pos;
++	mono_mb_emit_byte (mb, 0);
++	
++	mono_marshal_emit_xdomain_copy_value (mb, byte_array_class);
++	mono_mb_emit_managed_call (mb, method_rs_deserialize, NULL);
++	
++	if (complex_count > 0)
++		mono_mb_emit_stloc (mb, loc_array);
++	else
++		mono_mb_emit_byte (mb, CEE_POP);
++
++	mono_mb_patch_addr_s (mb, pos, mb->pos - (pos + 1));
++
++	/* Get the target object */
++	
++	mono_mb_emit_ldarg (mb, 0);
++	mono_mb_emit_managed_call (mb, method_rs_appdomain_target, NULL);
++
++	/* Load the arguments */
++	
++	copy_locals_base = mb->locals;
++	param_index = 3;	// Index of the first non-serialized parameter of this wrapper
++	j = 0;
++	for (i = 0; i < sig->param_count; i++) {
++		MonoType *pt = sig->params [i];
++		MonoClass *pclass = mono_class_from_mono_type (pt);
++		switch (marshal_types [i]) {
++		case MONO_MARSHAL_SERIALIZE: {
++			/* take the value from the serialized array */
++			mono_mb_emit_ldloc (mb, loc_array);
++			mono_mb_emit_icon (mb, j++);
++			if (pt->byref) {
++				if (pclass->valuetype) {
++					mono_mb_emit_byte (mb, CEE_LDELEM_REF);
++					mono_mb_emit_byte (mb, CEE_UNBOX);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++				} else {
++					mono_mb_emit_byte (mb, CEE_LDELEMA);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++				}
++			} else {
++				if (pclass->valuetype) {
++					mono_mb_emit_byte (mb, CEE_LDELEM_REF);
++					mono_mb_emit_byte (mb, CEE_UNBOX);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++					mono_mb_emit_byte (mb, CEE_LDOBJ);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++				} else {
++					mono_mb_emit_byte (mb, CEE_LDELEM_REF);
++					if (pclass != mono_defaults.object_class) {
++						mono_mb_emit_byte (mb, CEE_CASTCLASS);
++						mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++					}
++				}
++			}
++			break;
++		}
++		case MONO_MARSHAL_COPY_OUT: {
++			/* Keep a local copy of the value since we need to copy it back after the call */
++			int copy_local = mono_mb_add_local (mb, &(pclass->byval_arg));
++			mono_mb_emit_ldarg (mb, param_index++);
++			mono_marshal_emit_xdomain_copy_value (mb, pclass);
++			mono_mb_emit_byte (mb, CEE_DUP);
++			mono_mb_emit_stloc (mb, copy_local);
++			break;
++		}
++		case MONO_MARSHAL_COPY: {
++			mono_mb_emit_ldarg (mb, param_index);
++			if (pt->byref) {
++				mono_mb_emit_byte (mb, CEE_DUP);
++				mono_mb_emit_byte (mb, CEE_DUP);
++				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++				mono_marshal_emit_xdomain_copy_value (mb, pclass);
++				mono_mb_emit_byte (mb, CEE_STIND_REF);
++			} else {
++				mono_marshal_emit_xdomain_copy_value (mb, pclass);
++			}
++			param_index++;
++			break;
++		}
++		case MONO_MARSHAL_NONE:
++			mono_mb_emit_ldarg (mb, param_index++);
++			break;
++		}
++	}
++
++	/* Make the call to the real object */
++
++	emit_thread_force_interrupt_checkpoint (mb);
++	mono_mb_emit_managed_call (mb, method, NULL);
++
++	if (sig->ret->type != MONO_TYPE_VOID)
++		mono_mb_emit_stloc (mb, loc_return);
++
++	/* copy back MONO_MARSHAL_COPY_OUT parameters */
++
++	j = 0;
++	param_index = 3;
++	for (i = 0; i < sig->param_count; i++) {
++		if (marshal_types [i] == MONO_MARSHAL_SERIALIZE) continue;
++		if (marshal_types [i] == MONO_MARSHAL_COPY_OUT) {
++			mono_mb_emit_ldloc (mb, copy_locals_base + (j++));
++			mono_mb_emit_ldarg (mb, param_index);
++			mono_marshal_emit_xdomain_copy_out_value (mb, mono_class_from_mono_type (sig->params [i]));
++		}
++		param_index++;
++	}
++
++	/* Serialize the return values */
++	
++	if (complex_out_count > 0) {
++		/* Reset parameters in the array that don't need to be serialized back */
++		j = 0;
++		for (i = 0; i < sig->param_count; i++) {
++			if (marshal_types[i] != MONO_MARSHAL_SERIALIZE) continue;
++			if (!sig->params [i]->byref) {
++				mono_mb_emit_ldloc (mb, loc_array);
++				mono_mb_emit_icon (mb, j);
++				mono_mb_emit_byte (mb, CEE_LDNULL);
++				mono_mb_emit_byte (mb, CEE_STELEM_REF);
++			}
++			j++;
++		}
++	
++		/* Add the return value to the array */
++	
++		if (ret_marshal_type == MONO_MARSHAL_SERIALIZE) {
++			mono_mb_emit_ldloc (mb, loc_array);
++			mono_mb_emit_icon (mb, complex_count);	/* The array has an additional slot to hold the ret value */
++			mono_mb_emit_ldloc (mb, loc_return);
++			if (ret_class->valuetype) {
++				mono_mb_emit_byte (mb, CEE_BOX);
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, ret_class));
++			}
++			mono_mb_emit_byte (mb, CEE_STELEM_REF);
++		}
++	
++		/* Serialize */
++	
++		mono_mb_emit_ldarg (mb, 1);
++		mono_mb_emit_ldloc (mb, loc_array);
++		mono_mb_emit_managed_call (mb, method_rs_serialize, NULL);
++		mono_mb_emit_byte (mb, CEE_STIND_REF);
++	} else if (ret_marshal_type == MONO_MARSHAL_SERIALIZE) {
++		mono_mb_emit_ldarg (mb, 1);
++		mono_mb_emit_ldloc (mb, loc_return);
++		if (ret_class->valuetype) {
++			mono_mb_emit_byte (mb, CEE_BOX);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, ret_class));
++		}
++		mono_mb_emit_managed_call (mb, method_rs_serialize, NULL);
++		mono_mb_emit_byte (mb, CEE_STIND_REF);
++	} else {
++		mono_mb_emit_ldarg (mb, 1);
++		mono_mb_emit_byte (mb, CEE_LDNULL);
++		mono_mb_emit_managed_call (mb, method_rs_serialize, NULL);
++		mono_mb_emit_byte (mb, CEE_STIND_REF);
++	}
++
++	mono_mb_emit_ldarg (mb, 2);
++	mono_mb_emit_byte (mb, CEE_LDNULL);
++	mono_mb_emit_byte (mb, CEE_STIND_REF);
++	mono_mb_emit_byte (mb, CEE_LEAVE);
++	pos_leave = mb->pos;
++	mono_mb_emit_i4 (mb, 0);
++
++	/* Main exception catch */
++	main_clause->flags = MONO_EXCEPTION_CLAUSE_FILTER;
++	main_clause->try_len = mb->pos - main_clause->try_offset;
++	main_clause->token_or_filter = mb->pos;
++	/* filter code */
++	mono_mb_emit_byte (mb, CEE_POP);
++	mono_mb_emit_byte (mb, CEE_LDC_I4_1);
++	mono_mb_emit_byte (mb, CEE_PREFIX1);
++	mono_mb_emit_byte (mb, CEE_ENDFILTER);
++	
++	/* handler code */
++	main_clause->handler_offset = mb->pos;
++	mono_mb_emit_managed_call (mb, method_rs_serialize_exc, NULL);
++	mono_mb_emit_stloc (mb, loc_serialized_exc);
++	mono_mb_emit_ldarg (mb, 2);
++	mono_mb_emit_ldloc (mb, loc_serialized_exc);
++	mono_mb_emit_byte (mb, CEE_STIND_REF);
++	mono_mb_emit_byte (mb, CEE_LEAVE);
++	mono_mb_emit_i4 (mb, 0);
++	main_clause->handler_len = mb->pos - main_clause->handler_offset;
++	/* end catch */
++
++	mono_mb_patch_addr (mb, pos_leave, mb->pos - (pos_leave + 4));
++	
++	if (copy_return)
++		mono_mb_emit_ldloc (mb, loc_return);
++
++	mono_mb_emit_byte (mb, CEE_RET);
++
++/*	totby += mb->pos;
++	printf ("MET F2 %s size %d\n", method->name, mb->pos);
++*/
++	res = mono_remoting_mb_create_and_cache (method, mb, csig, csig->param_count + 16);
++	mono_mb_free (mb);
++
++	header = ((MonoMethodNormal *)res)->header;
++	header->num_clauses = 1;
++	header->clauses = main_clause;
++
++	return res;
++}
++
++/* mono_marshal_get_xappdomain_invoke ()
++ * Generates a fast remoting wrapper for cross app domain calls.
++ */
++MonoMethod *
++mono_marshal_get_xappdomain_invoke (MonoMethod *method)
++{
++	MonoMethodSignature *sig;
++	static MonoMethodSignature *sig_context_get;
++	static MonoMethodSignature *sig_context_set;
++	MonoMethodBuilder *mb;
++	MonoMethod *res;
++	int i, j, complex_count, complex_out_count, copy_locals_base;
++	int *marshal_types;
++	MonoClass *ret_class = NULL;
++	MonoMethod *xdomain_method;
++	int ret_marshal_type = MONO_MARSHAL_NONE;
++	int loc_array=0, loc_serialized_data=-1, loc_real_proxy;
++	int loc_old_domainid, loc_return=0, loc_serialized_exc=0, loc_context, loc_datastore;
++	int pos, pos_noex;
++	gboolean copy_return = FALSE;
++
++	g_assert (method);
++	
++	if (method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE || method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE)
++		return method;
++
++	if (!mono_marshal_supports_fast_xdomain (method))
++		return mono_marshal_get_remoting_invoke (method);
++	
++	mono_remoting_marshal_init ();
++	sig = method->signature;
++
++	/* we cant remote methods without this pointer */
++	if (!sig->hasthis)
++		return method;
++
++	if ((res = mono_marshal_remoting_find_in_cache (method, MONO_WRAPPER_XDOMAIN_INVOKE)))
++		return res;
++	
++	if (sig_context_set == NULL) {
++		sig_context_set = mono_metadata_signature_alloc (mono_defaults.corlib, 1);
++		sig_context_set->params [0] = &mono_defaults.object_class->byval_arg;
++		sig_context_set->ret = &mono_defaults.void_class->byval_arg;
++		sig_context_set->pinvoke = 1;
++	
++		sig_context_get = mono_metadata_signature_alloc (mono_defaults.corlib, 0);
++		sig_context_get->ret = &mono_defaults.object_class->byval_arg;
++		sig_context_get->pinvoke = 1;
++	}
++
++	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_XDOMAIN_INVOKE);
++	mb->method->save_lmf = 1;
++
++	/* Count the number of parameters that need to be serialized */
++
++	marshal_types = alloca (sizeof (int) * sig->param_count);
++	complex_count = complex_out_count = 0;
++	for (i = 0; i < sig->param_count; i++) {
++		MonoType *ptype = sig->params[i];
++		int mt = mono_get_xdomain_marshal_type (ptype);
++		
++		/* If the [Out] attribute is applied to a parameter that can be internally copied,
++		 * the copy will be made by reusing the original object instance
++		 */
++		if ((ptype->attrs & PARAM_ATTRIBUTE_OUT) != 0 && mt == MONO_MARSHAL_COPY && !ptype->byref)
++			mt = MONO_MARSHAL_COPY_OUT;
++		else if (mt == MONO_MARSHAL_SERIALIZE) {
++			complex_count++;
++			if (ptype->byref) complex_out_count++;
++		}
++		marshal_types [i] = mt;
++	}
++
++	if (sig->ret->type != MONO_TYPE_VOID) {
++		ret_marshal_type = mono_get_xdomain_marshal_type (sig->ret);
++		ret_class = mono_class_from_mono_type (sig->ret);
++		copy_return = ret_marshal_type != MONO_MARSHAL_SERIALIZE;
++	}
++	
++	/* Locals */
++
++	if (complex_count > 0)
++		loc_array = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
++	loc_serialized_data = mono_mb_add_local (mb, &byte_array_class->byval_arg);
++	loc_real_proxy = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
++	if (copy_return)
++		loc_return = mono_mb_add_local (mb, sig->ret);
++	loc_old_domainid = mono_mb_add_local (mb, &mono_defaults.int32_class->byval_arg);
++	loc_serialized_exc = mono_mb_add_local (mb, &byte_array_class->byval_arg);
++	loc_context = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
++	loc_datastore = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
++
++	/* Save thread domain data */
++
++	mono_mb_emit_native_call (mb, sig_context_get, mono_context_get);
++	mono_mb_emit_byte (mb, CEE_DUP);
++	mono_mb_emit_stloc (mb, loc_context);
++
++	/* If the thread is not running in the default context, it needs to go
++	 * through the whole remoting sink, since the context is going to change
++	 */
++	mono_mb_emit_managed_call (mb, method_needs_context_sink, NULL);
++	mono_mb_emit_byte (mb, CEE_BRFALSE_S);
++	pos = mb->pos;
++	mono_mb_emit_byte (mb, 0);
++	
++	mono_mb_emit_ldarg (mb, 0);
++	for (i = 0; i < sig->param_count; i++)
++		mono_mb_emit_ldarg (mb, i + 1);
++	
++	mono_mb_emit_managed_call (mb, mono_marshal_get_remoting_invoke (method), NULL);
++	mono_mb_emit_byte (mb, CEE_RET);
++	mono_mb_patch_addr_s (mb, pos, mb->pos - pos - 1);
++
++	mono_mb_emit_managed_call (mb, method_reset_datastore, NULL);
++	mono_mb_emit_stloc (mb, loc_datastore);
++	
++	/* Create the array that will hold the parameters to be serialized */
++
++	if (complex_count > 0) {
++		mono_mb_emit_icon (mb, (ret_marshal_type == MONO_MARSHAL_SERIALIZE && complex_out_count > 0) ? complex_count + 1 : complex_count);	/* +1 for the return type */
++		mono_mb_emit_byte (mb, CEE_NEWARR);
++		mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_defaults.object_class));
++	
++		j = 0;
++		for (i = 0; i < sig->param_count; i++) {
++			if (marshal_types [i] != MONO_MARSHAL_SERIALIZE) continue;
++			MonoClass *pclass = mono_class_from_mono_type (sig->params[i]);
++			mono_mb_emit_byte (mb, CEE_DUP);
++			mono_mb_emit_icon (mb, j);
++			mono_mb_emit_ldarg (mb, i + 1);		/* 0=this */
++			if (sig->params[i]->byref) {
++				if (pclass->valuetype) {
++					mono_mb_emit_byte (mb, CEE_LDOBJ);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++				} else {
++					mono_mb_emit_byte (mb, CEE_LDIND_REF);
++				}
++			}
++			if (pclass->valuetype) {
++				mono_mb_emit_byte (mb, CEE_BOX);
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++			}
++			mono_mb_emit_byte (mb, CEE_STELEM_REF);
++			j++;
++		}
++		mono_mb_emit_stloc (mb, loc_array);
++
++		/* Serialize parameters */
++	
++		mono_mb_emit_ldloc (mb, loc_array);
++		mono_mb_emit_managed_call (mb, method_rs_serialize, NULL);
++		mono_mb_emit_stloc (mb, loc_serialized_data);
++	} else {
++		mono_mb_emit_byte (mb, CEE_LDNULL);
++		mono_mb_emit_managed_call (mb, method_rs_serialize, NULL);
++		mono_mb_emit_stloc (mb, loc_serialized_data);
++	}
++
++	/* Get the target domain id */
++
++	mono_mb_emit_ldarg (mb, 0);
++	mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++	mono_mb_emit_byte (mb, CEE_LDIND_REF);
++	mono_mb_emit_byte (mb, CEE_DUP);
++	mono_mb_emit_stloc (mb, loc_real_proxy);
++
++	mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoRealProxy, target_domain_id));
++	mono_mb_emit_byte (mb, CEE_LDIND_I4);
++
++	/* switch domain */
++
++	mono_marshal_emit_switch_domain (mb);
++	mono_mb_emit_stloc (mb, loc_old_domainid);
++
++	/* Load the arguments */
++	
++	mono_mb_emit_ldloc (mb, loc_real_proxy);
++	mono_mb_emit_ldloc_addr (mb, loc_serialized_data);
++	mono_mb_emit_ldloc_addr (mb, loc_serialized_exc);
++
++	copy_locals_base = mb->locals;
++	for (i = 0; i < sig->param_count; i++) {
++		switch (marshal_types [i]) {
++		case MONO_MARSHAL_SERIALIZE:
++			continue;
++		case MONO_MARSHAL_COPY: {
++			mono_mb_emit_ldarg (mb, i+1);
++			if (sig->params [i]->byref) {
++				/* make a local copy of the byref parameter. The real parameter
++				 * will be updated after the xdomain call
++				 */
++				MonoClass *pclass = mono_class_from_mono_type (sig->params [i]);
++				int copy_local = mono_mb_add_local (mb, &(pclass->byval_arg));
++				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++				mono_mb_emit_stloc (mb, copy_local);
++				mono_mb_emit_ldloc_addr (mb, copy_local);
++			}
++			break;
++		}
++		case MONO_MARSHAL_COPY_OUT:
++		case MONO_MARSHAL_NONE:
++			mono_mb_emit_ldarg (mb, i+1);
++			break;
++		}
++	}
++
++	/* Make the call to the invoke wrapper in the target domain */
++
++	xdomain_method = mono_marshal_get_xappdomain_dispatch (method, marshal_types, complex_count, complex_out_count, ret_marshal_type);
++	mono_marshal_emit_load_domain_method (mb, xdomain_method);
++	mono_mb_emit_calli (mb, xdomain_method->signature);
++
++	if (copy_return)
++		mono_mb_emit_stloc (mb, loc_return);
++
++	/* Switch domain */
++
++	mono_mb_emit_ldloc (mb, loc_old_domainid);
++	mono_marshal_emit_switch_domain (mb);
++	mono_mb_emit_byte (mb, CEE_POP);
++	
++	/* Restore thread domain data */
++	
++	mono_mb_emit_ldloc (mb, loc_context);
++	mono_mb_emit_native_call (mb, sig_context_set, mono_context_set);
++	mono_mb_emit_ldloc (mb, loc_datastore);
++	mono_mb_emit_managed_call (mb, method_restore_datastore, NULL);
++	
++	/* if (loc_serialized_exc != null) ... */
++
++	mono_mb_emit_ldloc (mb, loc_serialized_exc);
++	mono_mb_emit_byte (mb, CEE_BRFALSE_S);
++	pos_noex = mb->pos;
++	mono_mb_emit_byte (mb, 0);
++
++	mono_mb_emit_ldloc (mb, loc_serialized_exc);
++	mono_marshal_emit_xdomain_copy_value (mb, byte_array_class);
++	mono_mb_emit_managed_call (mb, method_rs_deserialize, NULL);
++	mono_mb_emit_byte (mb, CEE_CASTCLASS);
++	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_defaults.exception_class));
++	mono_mb_emit_managed_call (mb, method_exc_fixexc, NULL);
++	mono_mb_emit_byte (mb, CEE_THROW);
++	mono_mb_patch_addr_s (mb, pos_noex, mb->pos - pos_noex - 1);
++
++	/* copy back non-serialized output parameters */
++
++	j = 0;
++	for (i = 0; i < sig->param_count; i++) {
++		if (!sig->params [i]->byref || marshal_types [i] != MONO_MARSHAL_COPY) continue;
++		mono_mb_emit_ldarg (mb, i + 1);
++		mono_mb_emit_ldloc (mb, copy_locals_base + (j++));
++		mono_marshal_emit_xdomain_copy_value (mb, mono_class_from_mono_type (sig->params [i]));
++		mono_mb_emit_byte (mb, CEE_STIND_REF);
++	}
++
++	/* Deserialize out parameters */
++
++	if (complex_out_count > 0) {
++		mono_mb_emit_ldloc (mb, loc_serialized_data);
++		mono_marshal_emit_xdomain_copy_value (mb, byte_array_class);
++		mono_mb_emit_managed_call (mb, method_rs_deserialize, NULL);
++		mono_mb_emit_stloc (mb, loc_array);
++	
++		/* Copy back output parameters and return type */
++		
++		j = 0;
++		for (i = 0; i < sig->param_count; i++) {
++			if (marshal_types [i] != MONO_MARSHAL_SERIALIZE) continue;
++			if (sig->params[i]->byref) {
++				MonoClass *pclass = mono_class_from_mono_type (sig->params [i]);
++				mono_mb_emit_ldarg (mb, i + 1);
++				mono_mb_emit_ldloc (mb, loc_array);
++				mono_mb_emit_icon (mb, j);
++				mono_mb_emit_byte (mb, CEE_LDELEM_REF);
++				if (pclass->valuetype) {
++					mono_mb_emit_byte (mb, CEE_UNBOX);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++					mono_mb_emit_byte (mb, CEE_LDOBJ);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++					mono_mb_emit_byte (mb, CEE_STOBJ);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++				} else {
++					if (pclass != mono_defaults.object_class) {
++						mono_mb_emit_byte (mb, CEE_CASTCLASS);
++						mono_mb_emit_i4 (mb, mono_mb_add_data (mb, pclass));
++					}
++					mono_mb_emit_byte (mb, CEE_STIND_REF);
++				}
++			}
++			j++;
++		}
++	
++		if (ret_marshal_type == MONO_MARSHAL_SERIALIZE) {
++			mono_mb_emit_ldloc (mb, loc_array);
++			mono_mb_emit_icon (mb, complex_count);
++			mono_mb_emit_byte (mb, CEE_LDELEM_REF);
++			if (ret_class->valuetype) {
++				mono_mb_emit_byte (mb, CEE_UNBOX);
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, ret_class));
++				mono_mb_emit_byte (mb, CEE_LDOBJ);
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, ret_class));
++			}
++		}
++	} else if (ret_marshal_type == MONO_MARSHAL_SERIALIZE) {
++		mono_mb_emit_ldloc (mb, loc_serialized_data);
++		mono_marshal_emit_xdomain_copy_value (mb, byte_array_class);
++		mono_mb_emit_managed_call (mb, method_rs_deserialize, NULL);
++		if (ret_class->valuetype) {
++			mono_mb_emit_byte (mb, CEE_UNBOX);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, ret_class));
++			mono_mb_emit_byte (mb, CEE_LDOBJ);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, ret_class));
++		} else if (ret_class != mono_defaults.object_class) {
++			mono_mb_emit_byte (mb, CEE_CASTCLASS);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, ret_class));
++		}
++	} else {
++		mono_mb_emit_ldloc (mb, loc_serialized_data);
++		mono_mb_emit_byte (mb, CEE_DUP);
++		mono_mb_emit_byte (mb, CEE_BRFALSE_S);
++		pos = mb->pos;
++		mono_mb_emit_byte (mb, 0);
++		mono_marshal_emit_xdomain_copy_value (mb, byte_array_class);
++	
++		mono_mb_patch_addr_s (mb, pos, mb->pos - (pos + 1));
++		mono_mb_emit_managed_call (mb, method_rs_deserialize, NULL);
++		mono_mb_emit_byte (mb, CEE_POP);
++	}
++
++	if (copy_return) {
++		mono_mb_emit_ldloc (mb, loc_return);
++		if (ret_marshal_type == MONO_MARSHAL_COPY)
++			mono_marshal_emit_xdomain_copy_value (mb, ret_class);
++	}
++
++	mono_mb_emit_byte (mb, CEE_RET);
++
++/*	numet++;
++	totby += mb->pos;
++	printf ("MET MA %s size %d\n", method->name, mb->pos);
++	printf ("TOT num %d size %d avg %d\n", numet, totby, totby / numet);
++*/
++	res = mono_remoting_mb_create_and_cache (method, mb, sig, sig->param_count + 16);
+ 	mono_mb_free (mb);
+ 
+ 	return res;
+ }
+ 
+ MonoMethod *
++mono_marshal_get_remoting_invoke_for_target (MonoMethod *method, MonoRemotingTarget target_type)
++{
++	if (target_type == MONO_REMOTING_TARGET_APPDOMAIN)
++		return mono_marshal_get_xappdomain_invoke (method);
++	else
++		return mono_marshal_get_remoting_invoke (method);
++}
++
++static gpointer
++mono_marshal_load_remoting_wrapper (MonoRealProxy *rp, MonoMethod *method)
++{
++	if (rp->target_domain_id != -1)
++		return mono_compile_method (mono_marshal_get_xappdomain_invoke (method));
++	else
++		return mono_compile_method (mono_marshal_get_remoting_invoke (method));
++}
++
++static void
++mono_marshal_emit_load_remoting_wrapper (MonoMethodBuilder *mb, MonoMethod *method)
++{
++	static MonoMethodSignature *csig = NULL;
++	if (!csig) {
++		csig = mono_metadata_signature_alloc (mono_defaults.corlib, 2);
++		csig->params [0] = &mono_defaults.object_class->byval_arg;
++		csig->params [1] = &mono_defaults.int_class->byval_arg;
++		csig->ret = &mono_defaults.int_class->byval_arg;
++		csig->hasthis = FALSE;
++		csig->pinvoke = 1;
++	}
++
++	mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
++	mono_mb_emit_byte (mb, CEE_MONO_LDPTR);
++	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, method));
++	mono_mb_emit_native_call (mb, csig, mono_marshal_load_remoting_wrapper);
++}
++
++
++MonoMethod *
+ mono_marshal_get_remoting_invoke_with_check (MonoMethod *method)
+ {
+ 	MonoMethodSignature *sig;
+ 	MonoMethodBuilder *mb;
+ 	MonoMethod *res, *native;
+-	GHashTable *cache;
+-	int i, pos;
++	int i, pos, pos_rem;
+ 
+ 	g_assert (method);
+ 
+@@ -2015,33 +3021,39 @@
+ 	/* we cant remote methods without this pointer */
+ 	g_assert (sig->hasthis);
+ 
+-	cache = method->klass->image->remoting_invoke_cache;
+-	if ((res = mono_marshal_find_in_cache (cache, (char *)method + 1)))
++	if ((res = mono_marshal_remoting_find_in_cache (method, MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK)))
+ 		return res;
+ 
+ 	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK);
+ 
++	for (i = 0; i <= sig->param_count; i++)
++		mono_mb_emit_ldarg (mb, i);
++	
+ 	mono_mb_emit_ldarg (mb, 0);
+ 	pos = mono_mb_emit_proxy_check (mb, CEE_BNE_UN);
+ 
++	if (mono_marshal_supports_fast_xdomain (method)) {
++		mono_mb_emit_ldarg (mb, 0);
++		pos_rem = mono_mb_emit_xdomain_check (mb, CEE_BEQ);
++		
++		/* wrapper for cross app domain calls */
++		native = mono_marshal_get_xappdomain_invoke (method);
++		mono_mb_emit_managed_call (mb, native, native->signature);
++		mono_mb_emit_byte (mb, CEE_RET);
++		
++		mono_mb_patch_addr (mb, pos_rem, mb->pos - (pos_rem + 4));
++	}
++	/* wrapper for normal remote calls */
+ 	native = mono_marshal_get_remoting_invoke (method);
+-
+-	for (i = 0; i <= sig->param_count; i++)
+-		mono_mb_emit_ldarg (mb, i);
+-	
+ 	mono_mb_emit_managed_call (mb, native, native->signature);
+ 	mono_mb_emit_byte (mb, CEE_RET);
+ 
++	/* not a proxy */
+ 	mono_mb_patch_addr (mb, pos, mb->pos - (pos + 4));
+-
+-	for (i = 0; i <= sig->param_count; i++)
+-		mono_mb_emit_ldarg (mb, i);
+-		
+ 	mono_mb_emit_managed_call (mb, method, method->signature);
+ 	mono_mb_emit_byte (mb, CEE_RET);
+ 
+-	res = mono_mb_create_and_cache (cache, (char*)method + 1,
+-										 mb, sig, sig->param_count + 16);
++	res = mono_remoting_mb_create_and_cache (method, mb, sig, sig->param_count + 16);
+ 	mono_mb_free (mb);
+ 
+ 	return res;
+@@ -2471,7 +3483,7 @@
+ 	/* Check for the abort exception */
+ 	mono_mb_emit_ldloc (mb, 1);
+ 	mono_mb_emit_byte (mb, CEE_ISINST);
+-	mono_mb_emit_i4 (mb, mono_defaults.threadabortexception_class->type_token);
++	mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_defaults.threadabortexception_class));
+ 	mono_mb_emit_byte (mb, CEE_BRFALSE_S);
+ 	posna = mb->pos;
+ 	mono_mb_emit_byte (mb, 0);
+@@ -2626,9 +3638,9 @@
+ 			mklass = mono_class_from_mono_type (mtype);
+ 			g_assert (mklass != NULL);
+ 
+-			marshal_native_to_managed = mono_find_method_by_name (mklass, "MarshalNativeToManaged", 1);
++			marshal_native_to_managed = mono_class_get_method_from_name (mklass, "MarshalNativeToManaged", 1);
+ 			g_assert (marshal_native_to_managed);
+-			get_instance = mono_find_method_by_name (mklass, "GetInstance", 1);
++			get_instance = mono_class_get_method_from_name (mklass, "GetInstance", 1);
+ 			g_assert (get_instance);
+ 			
+ 			switch (t->type) {
+@@ -2908,17 +3920,17 @@
+ 
+ 			mono_mb_emit_ldstr (mb, g_strdup (spec->data.custom_data.cookie));
+ 			mono_mb_emit_byte (mb, CEE_CALL);
+-			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_find_method_by_name (mklass, "GetInstance", 1)));
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_class_get_method_from_name (mklass, "GetInstance", 1)));
+ 			mono_mb_emit_byte (mb, CEE_DUP);
+ 
+ 			mono_mb_emit_byte (mb, CEE_LDLOC_3);
+ 			mono_mb_emit_byte (mb, CEE_CALLVIRT);
+-			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_find_method_by_name (mklass, "MarshalManagedToNative", 1)));
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_class_get_method_from_name (mklass, "MarshalManagedToNative", 1)));
+ 			mono_mb_emit_byte (mb, CEE_STLOC_3);
+ 
+ 			mono_mb_emit_ldloc (mb, loc1);
+ 			mono_mb_emit_byte (mb, CEE_CALLVIRT);
+-			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_find_method_by_name (mklass, "CleanUpManagedData", 1)));
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_class_get_method_from_name (mklass, "CleanUpManagedData", 1)));
+ 
+ 			break;
+ 		default:
+@@ -3051,9 +4063,9 @@
+ 			mklass = mono_class_from_mono_type (mtype);
+ 			g_assert (mklass != NULL);
+ 
+-			get_instance = mono_find_method_by_name (mklass, "GetInstance", 1);
++			get_instance = mono_class_get_method_from_name (mklass, "GetInstance", 1);
+ 			g_assert (get_instance);
+-			cleanup_managed = mono_find_method_by_name (mklass, "CleanUpManagedData", 1);
++			cleanup_managed = mono_class_get_method_from_name (mklass, "CleanUpManagedData", 1);
+ 			g_assert (cleanup_managed);
+ 
+ 			switch (t->type) {
+@@ -3568,13 +4580,13 @@
+ 	mklass = mono_class_from_mono_type (mtype);
+ 	g_assert (mklass != NULL);
+ 
+-	get_instance = mono_find_method_by_name (mklass, "GetInstance", 1);
++	get_instance = mono_class_get_method_from_name (mklass, "GetInstance", 1);
+ 	g_assert (get_instance);
+-	cleanup_native = mono_find_method_by_name (mklass, "CleanUpNativeData", 1);
++	cleanup_native = mono_class_get_method_from_name (mklass, "CleanUpNativeData", 1);
+ 	g_assert (cleanup_native);
+-	marshal_managed_to_native = mono_find_method_by_name (mklass, "MarshalManagedToNative", 1);
++	marshal_managed_to_native = mono_class_get_method_from_name (mklass, "MarshalManagedToNative", 1);
+ 	g_assert (marshal_managed_to_native);
+-	marshal_native_to_managed = mono_find_method_by_name (mklass, "MarshalNativeToManaged", 1);
++	marshal_native_to_managed = mono_class_get_method_from_name (mklass, "MarshalNativeToManaged", 1);
+ 	g_assert (marshal_native_to_managed);
+ 
+ 	switch (action) {
+@@ -5192,9 +6204,10 @@
+ mono_upgrade_remote_class_wrapper (MonoReflectionType *rtype, MonoTransparentProxy *tproxy)
+ {
+ 	MonoClass *klass;
++	MonoDomain *domain = ((MonoObject*)tproxy)->vtable->domain;
+ 	klass = mono_class_from_mono_type (rtype->type);
+-	mono_upgrade_remote_class (((MonoObject*)tproxy)->vtable->domain, tproxy->remote_class, klass);
+-	((MonoObject*)tproxy)->vtable = tproxy->remote_class->vtable;
++	mono_upgrade_remote_class (domain, tproxy->remote_class, klass);
++	((MonoObject*)tproxy)->vtable = mono_remote_class_vtable (domain, tproxy->remote_class, tproxy->rp);
+ }
+ 
+ /**
+@@ -5216,7 +6229,7 @@
+ 		return klass->str_to_ptr;
+ 
+ 	if (!stoptr) 
+-		stoptr = mono_find_method_by_name (mono_defaults.marshal_class, "StructureToPtr", 3);
++		stoptr = mono_class_get_method_from_name (mono_defaults.marshal_class, "StructureToPtr", 3);
+ 	g_assert (stoptr);
+ 
+ 	mb = mono_mb_new (klass, stoptr->name, MONO_WRAPPER_UNKNOWN);
+@@ -5279,7 +6292,7 @@
+ 		return klass->ptr_to_str;
+ 
+ 	if (!ptostr) 
+-		ptostr = mono_find_method_by_name (mono_defaults.marshal_class, "PtrToStructure", 2);
++		ptostr = mono_class_get_method_from_name (mono_defaults.marshal_class, "PtrToStructure", 2);
+ 	g_assert (ptostr);
+ 
+ 	mb = mono_mb_new (klass, ptostr->name, MONO_WRAPPER_UNKNOWN);
+Index: mono/metadata/marshal.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/marshal.h,v
+retrieving revision 1.42
+diff -u -r1.42 marshal.h
+--- mono/metadata/marshal.h	30 Sep 2004 10:28:34 -0000	1.42
++++ mono/metadata/marshal.h	26 Oct 2004 11:09:39 -0000
+@@ -165,6 +165,12 @@
+ mono_marshal_get_remoting_invoke (MonoMethod *method);
+ 
+ MonoMethod *
++mono_marshal_get_xappdomain_invoke (MonoMethod *method);
++
++MonoMethod *
++mono_marshal_get_remoting_invoke_for_target (MonoMethod *method, MonoRemotingTarget target_type);
++
++MonoMethod *
+ mono_marshal_get_remoting_invoke_with_check (MonoMethod *method);
+ 
+ MonoMethod *
+Index: mono/metadata/object-internals.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/object-internals.h,v
+retrieving revision 1.21
+diff -u -r1.21 object-internals.h
+--- mono/metadata/object-internals.h	12 Oct 2004 03:11:32 -0000	1.21
++++ mono/metadata/object-internals.h	26 Oct 2004 11:09:41 -0000
+@@ -177,6 +177,8 @@
+ 	MonoReflectionType *class_to_proxy;	
+ 	MonoObject *context;
+ 	MonoObject *unwrapped_server;
++	gint32      target_domain_id;
++	MonoString *target_uri;
+ } MonoRealProxy;
+ 
+ typedef struct {
+@@ -961,6 +963,15 @@
+ 
+ void
+ mono_release_type_locks (MonoThread *thread);
++
++MonoArray*
++mono_array_clone_in_domain (MonoDomain *domain, MonoArray *array);
++
++void
++mono_array_full_copy (MonoArray *src, MonoArray *dest);
++
++gpointer
++mono_remote_class_vtable (MonoDomain *domain, MonoRemoteClass *remote_class, MonoRealProxy *real_proxy);
+ 
+ #endif /* __MONO_OBJECT_INTERNALS_H__ */
+ 
+Index: mono/metadata/object.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/object.c,v
+retrieving revision 1.238
+diff -u -r1.238 object.c
+--- mono/metadata/object.c	28 Sep 2004 15:16:05 -0000	1.238
++++ mono/metadata/object.c	26 Oct 2004 11:09:41 -0000
+@@ -297,14 +297,14 @@
+ }
+ 
+ static gpointer
+-default_remoting_trampoline (MonoMethod *method)
++default_remoting_trampoline (MonoMethod *method, MonoRemotingTarget target)
+ {
+ 	g_error ("remoting not installed");
+ 	return NULL;
+ }
+ 
+ static MonoTrampoline arch_create_jit_trampoline = default_trampoline;
+-static MonoTrampoline arch_create_remoting_trampoline = default_remoting_trampoline;
++static MonoRemotingTrampoline arch_create_remoting_trampoline = default_remoting_trampoline;
+ 
+ void
+ mono_install_trampoline (MonoTrampoline func) 
+@@ -313,7 +313,7 @@
+ }
+ 
+ void
+-mono_install_remoting_trampoline (MonoTrampoline func) 
++mono_install_remoting_trampoline (MonoRemotingTrampoline func) 
+ {
+ 	arch_create_remoting_trampoline = func? func: default_remoting_trampoline;
+ }
+@@ -718,7 +718,7 @@
+  * vtable->klass points to the transparent proxy class, and not to @class.
+  */
+ static MonoVTable *
+-mono_class_proxy_vtable (MonoDomain *domain, MonoRemoteClass *remote_class)
++mono_class_proxy_vtable (MonoDomain *domain, MonoRemoteClass *remote_class, MonoRemotingTarget target_type)
+ {
+ 	MonoVTable *vt, *pvt;
+ 	int i, j, vtsize, max_interface_id, extra_interface_vtsize = 0;
+@@ -757,7 +757,7 @@
+ 		MonoMethod *cm;
+ 		    
+ 		if ((cm = class->vtable [i]))
+-			pvt->vtable [i] = arch_create_remoting_trampoline (cm);
++			pvt->vtable [i] = arch_create_remoting_trampoline (cm, target_type);
+ 	}
+ 
+ 	if (class->flags & TYPE_ATTRIBUTE_ABSTRACT)
+@@ -767,7 +767,7 @@
+ 			for (i = 0; i < k->method.count; i++) {
+ 				int slot = k->methods [i]->slot;
+ 				if (!pvt->vtable [slot]) 
+-					pvt->vtable [slot] = arch_create_remoting_trampoline (k->methods[i]);
++					pvt->vtable [slot] = arch_create_remoting_trampoline (k->methods[i], target_type);
+ 			}
+ 		}
+ 	}
+@@ -804,7 +804,7 @@
+ 	
+ 				for (j = 0; j < interf->method.count; ++j) {
+ 					MonoMethod *cm = interf->methods [j];
+-					pvt->vtable [slot + j] = arch_create_remoting_trampoline (cm);
++					pvt->vtable [slot + j] = arch_create_remoting_trampoline (cm, target_type);
+ 				}
+ 				slot += interf->method.count;
+ 				if (++i < iclass->interface_count) interf = iclass->interfaces[i];
+@@ -839,7 +839,8 @@
+ 	}
+ 
+ 	rc = mono_mempool_alloc (domain->mp, sizeof(MonoRemoteClass));
+-	rc->vtable = NULL;
++	rc->default_vtable = NULL;
++	rc->xdomain_vtable = NULL;
+ 	rc->interface_count = 0;
+ 	rc->interfaces = NULL;
+ 	rc->proxy_class = mono_defaults.marshalbyrefobject_class;
+@@ -848,9 +849,6 @@
+ 	mono_g_hash_table_insert (domain->proxy_vtable_hash, class_name, rc);
+ 	mono_upgrade_remote_class (domain, rc, proxy_class);
+ 
+-	if (rc->vtable == NULL)
+-		rc->vtable = mono_class_proxy_vtable (domain, rc);
+-
+ 	mono_domain_unlock (domain);
+ 
+ 	return rc;
+@@ -876,6 +874,20 @@
+ 	}
+ }
+ 
++gpointer
++mono_remote_class_vtable (MonoDomain *domain, MonoRemoteClass *remote_class, MonoRealProxy *rp)
++{
++	if (rp->target_domain_id != -1) {
++		if (remote_class->xdomain_vtable == NULL)
++			remote_class->xdomain_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_APPDOMAIN);
++		return remote_class->xdomain_vtable;
++	}
++	if (remote_class->default_vtable == NULL)
++		remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_UNKNOWN);
++	
++	return remote_class->default_vtable;
++}
++
+ 
+ /**
+  * mono_upgrade_remote_class:
+@@ -909,8 +921,10 @@
+ 		remote_class->proxy_class = klass;
+ 	}
+ 
+-	if (redo_vtable)
+-		remote_class->vtable = mono_class_proxy_vtable (domain, remote_class);
++	if (redo_vtable) {
++		remote_class->default_vtable = NULL;
++		remote_class->xdomain_vtable = NULL;
++	}
+ /*
+ 	int n;
+ 	printf ("remote class upgrade - class:%s num-interfaces:%d\n", remote_class->proxy_class_name, remote_class->interface_count);
+@@ -1916,14 +1930,38 @@
+ 	return o;
+ }
+ 
+-/**
+- * mono_array_clone:
+- * @array: the array to clone
+- *
+- * Returns: A newly created array who is a shallow copy of @array
++/** 
++ * mono_array_full_copy
++ * Copies the content of one array to another with exactly the same type and size.
+  */
++void
++mono_array_full_copy (MonoArray *src, MonoArray *dest)
++{
++	int size, i;
++	MonoClass *klass = src->obj.vtable->klass;
++
++	MONO_ARCH_SAVE_REGS;
++
++	g_assert (klass == dest->obj.vtable->klass);
++
++	if (src->bounds == NULL) {
++		size = mono_array_length (src);
++		g_assert (size == mono_array_length (dest));
++		size *= mono_array_element_size (klass);
++		memcpy (&dest->vector, &src->vector, size);
++		return;
++	}
++	
++	size = mono_array_element_size (klass);
++	for (i = 0; i < klass->rank; ++i) {
++		g_assert (src->bounds [i].length == dest->bounds [i].length);
++		size *= src->bounds [i].length;
++	}
++	memcpy (&dest->vector, &src->vector, size);
++}
++
+ MonoArray*
+-mono_array_clone (MonoArray *array)
++mono_array_clone_in_domain (MonoDomain *domain, MonoArray *array)
+ {
+ 	MonoArray *o;
+ 	int size, i;
+@@ -1934,12 +1972,10 @@
+ 
+ 	if (array->bounds == NULL) {
+ 		size = mono_array_length (array);
+-		o = mono_array_new_full (((MonoObject *)array)->vtable->domain,
+-					 klass, &size, NULL);
++		o = mono_array_new_full (domain, klass, &size, NULL);
+ 
+ 		size *= mono_array_element_size (klass);
+-		memcpy (o, array, sizeof (MonoArray) + size);
+-
++		memcpy (&o->vector, &array->vector, size);
+ 		return o;
+ 	}
+ 	
+@@ -1950,13 +1986,24 @@
+ 		size *= array->bounds [i].length;
+ 		sizes [i + klass->rank] = array->bounds [i].lower_bound;
+ 	}
+-	o = mono_array_new_full (((MonoObject *)array)->vtable->domain, 
+-				 klass, sizes, sizes + klass->rank);
+-	memcpy (o, array, sizeof(MonoArray) + size);
++	o = mono_array_new_full (domain, klass, sizes, sizes + klass->rank);
++	memcpy (&o->vector, &array->vector, size);
+ 
+ 	return o;
+ }
+ 
++/**
++ * mono_array_clone:
++ * @array: the array to clone
++ *
++ * Returns: A newly created array who is a shallow copy of @array
++ */
++MonoArray*
++mono_array_clone (MonoArray *array)
++{
++	return mono_array_clone_in_domain (((MonoObject *)array)->vtable->domain, array);
++}
++
+ /* helper macros to check for overflow when calculating the size of arrays */
+ #define MYGUINT32_MAX 4294967295U
+ #define CHECK_ADD_OVERFLOW_UN(a,b) \
+@@ -2398,7 +2445,7 @@
+ 		if (*(MonoBoolean *) mono_object_unbox(res)) {
+ 			/* Update the vtable of the remote type, so it can safely cast to this new type */
+ 			mono_upgrade_remote_class (domain, ((MonoTransparentProxy *)obj)->remote_class, klass);
+-			obj->vtable = ((MonoTransparentProxy *)obj)->remote_class->vtable;
++			obj->vtable = mono_remote_class_vtable (domain, ((MonoTransparentProxy *)obj)->remote_class, (MonoRealProxy *)rp);
+ 			return obj;
+ 		}
+ 	}
+Index: mono/metadata/threads.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/threads.c,v
+retrieving revision 1.119
+diff -u -r1.119 threads.c
+--- mono/metadata/threads.c	7 Oct 2004 17:01:21 -0000	1.119
++++ mono/metadata/threads.c	26 Oct 2004 11:09:42 -0000
+@@ -1166,7 +1166,10 @@
+ 	if (managed)
+ 		return TRUE;
+ 
+-	if (m->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE) {
++	if (m->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
++		m->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++		m->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH) 
++	{
+ 		*((gboolean*)data) = TRUE;
+ 		return TRUE;
+ 	}
+Index: mono/mini/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/ChangeLog,v
+retrieving revision 1.805
+diff -u -r1.805 ChangeLog
+--- mono/mini/ChangeLog	26 Oct 2004 10:08:50 -0000	1.805
++++ mono/mini/ChangeLog	26 Oct 2004 11:09:45 -0000
+@@ -1,3 +1,12 @@
++2004-10-26  Lluis Sanchez Gual  <lluis@novell.com>
++
++	* exceptions-ppc.c, exceptions-s390.c, exceptions-s390x.c,
++	mini-exceptions.c: handle the new wrapper types.
++	* mini.c: The CEE_ISINST and CEE_CASTCLASS opcodes now take the
++	token value as a MonoClass* when compiling a wrapper.
++	mono_jit_create_remoting_trampoline now takes an additional
++	MonoRemotingTarget parameter.
++	
+ 2004-10-26  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* driver.c (mono_main): Applied patch from Willibald Krenn <willibald.krenn@gmx.at>. Make --graph work for icalls and pinvoke methods.
+Index: mono/mini/exceptions-ppc.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/exceptions-ppc.c,v
+retrieving revision 1.31
+diff -u -r1.31 exceptions-ppc.c
+--- mono/mini/exceptions-ppc.c	22 Sep 2004 15:53:29 -0000	1.31
++++ mono/mini/exceptions-ppc.c	26 Oct 2004 11:09:46 -0000
+@@ -734,6 +734,8 @@
+ 		/* skip all wrappers ??*/
+ 		if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
+ 		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
+ 		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE)
+ 			continue;
+ 
+Index: mono/mini/exceptions-s390.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/exceptions-s390.c,v
+retrieving revision 1.14
+diff -u -r1.14 exceptions-s390.c
+--- mono/mini/exceptions-s390.c	22 Sep 2004 15:53:29 -0000	1.14
++++ mono/mini/exceptions-s390.c	26 Oct 2004 11:09:47 -0000
+@@ -950,6 +950,8 @@
+ 
+ 		/* skip all wrappers ??*/
+ 		if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
+ 		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
+ 		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE)
+ 			continue;
+Index: mono/mini/exceptions-s390x.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/exceptions-s390x.c,v
+retrieving revision 1.3
+diff -u -r1.3 exceptions-s390x.c
+--- mono/mini/exceptions-s390x.c	22 Sep 2004 15:53:29 -0000	1.3
++++ mono/mini/exceptions-s390x.c	26 Oct 2004 11:09:47 -0000
+@@ -930,6 +930,8 @@
+ 
+ 		/* skip all wrappers ??*/
+ 		if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
+ 		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
+ 		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE)
+ 			continue;
+Index: mono/mini/mini-exceptions.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/mini-exceptions.c,v
+retrieving revision 1.11
+diff -u -r1.11 mini-exceptions.c
+--- mono/mini/mini-exceptions.c	21 Oct 2004 22:24:20 -0000	1.11
++++ mono/mini/mini-exceptions.c	26 Oct 2004 11:09:48 -0000
+@@ -216,6 +216,8 @@
+ 
+ 		/* skip all wrappers ??*/
+ 		if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
+ 		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
+ 		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE)
+ 			continue;
+Index: mono/mini/mini.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/mini.c,v
+retrieving revision 1.301
+diff -u -r1.301 mini.c
+--- mono/mini/mini.c	26 Oct 2004 00:50:32 -0000	1.301
++++ mono/mini/mini.c	26 Oct 2004 11:09:52 -0000
+@@ -4152,7 +4152,11 @@
+ 			CHECK_STACK (1);
+ 			--sp;
+ 			CHECK_OPSIZE (5);
+-			klass = mono_class_get_full (image, read32 (ip + 1), generic_context);
++			token = read32 (ip + 1);
++			if (method->wrapper_type != MONO_WRAPPER_NONE)
++				klass = mono_method_get_wrapper_data (method, token);
++			else
++				klass = mono_class_get_full (image, token, generic_context);
+ 			mono_class_init (klass);
+ 		
+ 			if (klass->marshalbyref || klass->flags & TYPE_ATTRIBUTE_INTERFACE) {
+@@ -4326,7 +4330,11 @@
+ 			CHECK_STACK (1);
+ 			--sp;
+ 			CHECK_OPSIZE (5);
+-			klass = mono_class_get_full (image, read32 (ip + 1), generic_context);
++			token = read32 (ip + 1);
++			if (method->wrapper_type != MONO_WRAPPER_NONE)
++				klass = mono_method_get_wrapper_data (method, token);
++			else
++				klass = mono_class_get_full (image, token, generic_context);
+ 			mono_class_init (klass);
+ 		
+ 			if (klass->marshalbyref || klass->flags & TYPE_ATTRIBUTE_INTERFACE) {
+@@ -8329,14 +8337,14 @@
+  * Returns: a pointer to the newly created code 
+  */
+ static gpointer
+-mono_jit_create_remoting_trampoline (MonoMethod *method)
++mono_jit_create_remoting_trampoline (MonoMethod *method, MonoRemotingTarget target)
+ {
+ 	MonoMethod *nm;
+ 	guint8 *addr = NULL;
+ 
+ 	if ((method->flags & METHOD_ATTRIBUTE_ABSTRACT) || 
+ 	    (method->signature->hasthis && (method->klass->marshalbyref || method->klass == mono_defaults.object_class))) {
+-		nm = mono_marshal_get_remoting_invoke (method);
++		nm = mono_marshal_get_remoting_invoke_for_target (method, target);
+ 		addr = mono_compile_method (nm);
+ 	} else {
+ 		addr = mono_compile_method (method);

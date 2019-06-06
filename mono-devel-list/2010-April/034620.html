@@ -1,0 +1,311 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH v4 3/7] Handle lack of SA_SIGINFO
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%20v4%203/7%5D%20Handle%20lack%20of%20SA_SIGINFO&In-Reply-To=1270314176-4109-3-git-send-email-andreas.faerber%40web.de">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="034613.html">
+   <LINK REL="Next"  HREF="034621.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH v4 3/7] Handle lack of SA_SIGINFO</H1>
+    <B>Andreas F&#228;rber</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%20v4%203/7%5D%20Handle%20lack%20of%20SA_SIGINFO&In-Reply-To=1270314176-4109-3-git-send-email-andreas.faerber%40web.de"
+       TITLE="[Mono-dev] [PATCH v4 3/7] Handle lack of SA_SIGINFO">andreas.faerber at web.de
+       </A><BR>
+    <I>Sat Apr  3 13:02:52 EDT 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="034613.html">[Mono-dev] [PATCH v2 2/7] mini: Disable soft debugger when not	using sigaction
+</A></li>
+        <LI>Next message: <A HREF="034621.html">[Mono-dev] [PATCH v2 2/7] mini: Disable soft debugger when not	using sigaction
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34620">[ date ]</a>
+              <a href="thread.html#34620">[ thread ]</a>
+              <a href="subject.html#34620">[ subject ]</a>
+              <a href="author.html#34620">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>SA_SIGINFO-style signals are part of the optional POSIX XSI (formerly
+Real Time Signals, RTS) feature. Haiku does not implement it (yet) and
+goes so far as to not define SA_SIGINFO to indicate lack thereof.
+
+In mini, there's MONO_ARCH_USE_SIGACTION as indicator but it doesn't cover
+all uses of SA_SIGINFO. Deal with the theoretical case of SA_SIGINFO being
+defined but MONO_ARCH_USE_SIGACTION undefined. Fix typo in comment.
+
+In console-unix, don't assume SA_SIGINFO signal handler parameters or
+chained SA_SIGINFO signal handlers. To cope with SA_SIGINFO chaining,
+request SA_SIGINFO semantics if available. Handle both types of chained
+signal handlers.
+
+v3 -&gt; v4:
+* Replace macro with inline function, requested by Miguel de Icaza.
+* Don't assume SA_SIGINFO, request it explicitly, if possible.
+
+v2 -&gt; v3:
+* Rework signature macros to match mini.
+
+v1 -&gt; v2:
+* Introduce helper macros, suggested by Paolo Molaro.
+
+This commit is licensed under the MIT X11 license.
+---
+ mono/metadata/ChangeLog      |    7 ++++
+ mono/metadata/console-unix.c |   67 +++++++++++++++++++++++++++++++++++------
+ mono/mini/ChangeLog          |    6 ++++
+ mono/mini/mini-posix.c       |   15 ++++++++-
+ 4 files changed, 83 insertions(+), 12 deletions(-)
+
+diff --git a/mono/metadata/ChangeLog b/mono/metadata/ChangeLog
+index b60ef19..c621965 100644
+--- a/mono/metadata/ChangeLog
++++ b/mono/metadata/ChangeLog
+@@ -1,3 +1,10 @@
++2010-04-03  Andreas F&#195;&#164;rber  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">andreas.faerber at web.de</A>&gt;
++
++	* console-unix.c (sigcont_handler, sigwinch_handler): Don't assume
++	SA_SIGINFO-style signals, fix the build on platforms without (Haiku).
++
++	Code is contributed under MIT/X11 license.
++
+ 2010-04-03  Marek Habersack  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">mhabersack at novell.com</A>&gt;
+ 
+ 	* process.c: when cross-compiling with MinGW, force GetProcessId
+diff --git a/mono/metadata/console-unix.c b/mono/metadata/console-unix.c
+index 0845c64..1771d5c 100644
+--- a/mono/metadata/console-unix.c
++++ b/mono/metadata/console-unix.c
+@@ -246,6 +246,45 @@ do_console_cancel_event (void)
+ 	mono_thread_pool_add ((MonoObject *) load_value, msg, NULL, NULL);
+ }
+ 
++
++#define SIGHANDLER_SIGNATURE_SIGACTION	int signo, void *the_siginfo, void *data
++#define SIGHANDLER_SIGNATURE_HANDLER	int signo
++#define SIGHANDLER_PARAMS_SIGACTION	signo, the_siginfo, data
++#define SIGHANDLER_PARAMS_HANDLER	signo
++#ifdef SA_SIGINFO
++#define SIGHANDLER_SIGNATURE SIGHANDLER_SIGNATURE_SIGACTION
++#define SIG_HANDLER_PARAMS SIGHANDLER_PARAMS_SIGACTION
++#else
++#define SIGHANDLER_SIGNATURE SIGHANDLER_SIGNATURE_HANDLER
++#define SIG_HANDLER_PARAMS SIGHANDLER_PARAMS_HANDLER
++#endif
++#define SIG_HANDLER_SIGNATURE(ftn) ftn (SIGHANDLER_SIGNATURE)
++
++static inline gboolean
++is_sighandler_valid (void *sigh)
++{
++	return sigh != NULL &amp;&amp;
++		sigh != (void *)SIG_DFL &amp;&amp;
++		sigh != (void *)SIG_IGN;
++}
++
++static inline void
++invoke_sighandler_if_valid (struct sigaction *siga, SIGHANDLER_SIGNATURE)
++{
++#ifdef SA_SIGINFO
++	if (siga-&gt;sa_flags &amp; SA_SIGINFO) {
++		if (is_sighandler_valid (siga-&gt;sa_sigaction))
++			(*siga-&gt;sa_sigaction) (SIGHANDLER_PARAMS_SIGACTION);
++	} else
++#endif
++	if (is_sighandler_valid (siga-&gt;sa_handler))
++		(*siga-&gt;sa_handler) (SIGHANDLER_PARAMS_HANDLER);
++}
++
++#define INVOKE_SIGHANDLER_IF_VALID(siga) \
++	invoke_sighandler_if_valid (&amp;(siga), SIG_HANDLER_PARAMS)
++
++
+ static gboolean in_sigint;
+ static void
+ sigint_handler (int signo)
+@@ -263,7 +302,7 @@ sigint_handler (int signo)
+ static struct sigaction save_sigcont, save_sigint, save_sigwinch;
+ 
+ static void
+-sigcont_handler (int signo, void *the_siginfo, void *data)
++SIG_HANDLER_SIGNATURE (sigcont_handler)
+ {
+ 	// Ignore error, there is not much we can do in the sigcont handler.
+ 	tcsetattr (STDIN_FILENO, TCSANOW, &amp;mono_attr);
+@@ -272,26 +311,24 @@ sigcont_handler (int signo, void *the_siginfo, void *data)
+ 		write (STDOUT_FILENO, keypad_xmit_str, strlen (keypad_xmit_str));
+ 
+ 	// Call previous handler
+-	if (save_sigcont.sa_sigaction != NULL &amp;&amp;
+-	    save_sigcont.sa_sigaction != (void *)SIG_DFL &amp;&amp;
+-	    save_sigcont.sa_sigaction != (void *)SIG_IGN)
+-		(*save_sigcont.sa_sigaction) (signo, the_siginfo, data);
++	INVOKE_SIGHANDLER_IF_VALID (save_sigcont);
+ }
+ 
+ static void
+-sigwinch_handler (int signo, void *the_siginfo, void *data)
++SIG_HANDLER_SIGNATURE (sigwinch_handler)
+ {
+ 	int dims = terminal_get_dimensions ();
+ 	if (dims != -1)
+ 		cols_and_lines = dims;
+ 	
+ 	// Call previous handler
+-	if (save_sigwinch.sa_sigaction != NULL &amp;&amp;
+-	    save_sigwinch.sa_sigaction != (void *)SIG_DFL &amp;&amp;
+-	    save_sigwinch.sa_sigaction != (void *)SIG_IGN)
+-		(*save_sigwinch.sa_sigaction) (signo, the_siginfo, data);
++	INVOKE_SIGHANDLER_IF_VALID (save_sigwinch);
+ }
+ 
++#if defined(SA_SIGINFO)
++#define MONO_ARCH_USE_SIGACTION
++#endif
++
+ void
+ console_set_signal_handlers ()
+ {
+@@ -302,8 +339,13 @@ console_set_signal_handlers ()
+ 	memset (&amp;sigwinch, 0, sizeof (struct sigaction));
+ 	
+ 	// Continuing
++#ifdef MONO_ARCH_USE_SIGACTION
++	sigcont.sa_sigaction = (void *) sigcont_handler;
++	sigcont.sa_flags = SA_SIGINFO;
++#else
+ 	sigcont.sa_handler = (void *) sigcont_handler;
+ 	sigcont.sa_flags = 0;
++#endif
+ 	sigemptyset (&amp;sigcont.sa_mask);
+ 	sigaction (SIGCONT, &amp;sigcont, &amp;save_sigcont);
+ 	
+@@ -314,8 +356,13 @@ console_set_signal_handlers ()
+ 	sigaction (SIGINT, &amp;sigint, &amp;save_sigint);
+ 
+ 	// Window size changed
++#ifdef MONO_ARCH_USE_SIGACTION
++	sigwinch.sa_sigaction = (void *) sigwinch_handler;
++	sigwinch.sa_flags = SA_SIGINFO;
++#else
+ 	sigwinch.sa_handler = (void *) sigwinch_handler;
+ 	sigwinch.sa_flags = 0;
++#endif
+ 	sigemptyset (&amp;sigwinch.sa_mask);
+ 	sigaction (SIGWINCH, &amp;sigwinch, &amp;save_sigwinch);
+ }
+diff --git a/mono/mini/ChangeLog b/mono/mini/ChangeLog
+index 7e0e1ad..c5cf102 100755
+--- a/mono/mini/ChangeLog
++++ b/mono/mini/ChangeLog
+@@ -1,5 +1,11 @@
+ 2010-04-03  Andreas Faerber  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">andreas.faerber at web.de</A>&gt;
+ 
++	* mini-posix.c: Fix the build on platforms without SA_SIGINFO (Haiku).
++
++	Code is contributed under MIT/X11 license.
++
++2010-04-03  Andreas Faerber  &lt;<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">andreas.faerber at web.de</A>&gt;
++
+ 	* mini-x86.h: Only enable soft debugger when using sigaction.
+ 	Fixes build on Haiku (lacks siginfo_t).
+ 
+diff --git a/mono/mini/mini-posix.c b/mono/mini/mini-posix.c
+index 2fcc52d..1eddef9 100644
+--- a/mono/mini/mini-posix.c
++++ b/mono/mini/mini-posix.c
+@@ -82,13 +82,17 @@ save_old_signal_handler (int signo, struct sigaction *old_action)
+ 	mono_trace (G_LOG_LEVEL_DEBUG, MONO_TRACE_CONFIG,
+ 				&quot;Saving old signal handler for signal %d.&quot;, signo);
+ 
++#ifdef SA_SIGINFO
+ 	if (! (old_action-&gt;sa_flags &amp; SA_SIGINFO)) {
++#endif
+ 		handler_to_save-&gt;sa_handler = old_action-&gt;sa_handler;
++#ifdef SA_SIGINFO
+ 	} else {
+ #ifdef MONO_ARCH_USE_SIGACTION
+ 		handler_to_save-&gt;sa_sigaction = old_action-&gt;sa_sigaction;
+ #endif /* MONO_ARCH_USE_SIGACTION */
+ 	}
++#endif
+ 	handler_to_save-&gt;sa_mask = old_action-&gt;sa_mask;
+ 	handler_to_save-&gt;sa_flags = old_action-&gt;sa_flags;
+ 	
+@@ -129,13 +133,17 @@ SIG_HANDLER_SIGNATURE (mono_chain_signal)
+ 	GET_CONTEXT;
+ 
+ 	if (saved_handler) {
++#ifdef SA_SIGINFO
+ 		if (!(saved_handler-&gt;sa_flags &amp; SA_SIGINFO)) {
++#endif
+ 			saved_handler-&gt;sa_handler (signal);
++#ifdef SA_SIGINFO
+ 		} else {
+ #ifdef MONO_ARCH_USE_SIGACTION
+ 			saved_handler-&gt;sa_sigaction (signal, info, ctx);
+ #endif /* MONO_ARCH_USE_SIGACTION */
+ 		}
++#endif
+ 		return TRUE;
+ 	}
+ 	return FALSE;
+@@ -400,9 +408,12 @@ add_signal_handler (int signo, gpointer handler)
+ 	g_assert (sigaction (signo, &amp;sa, &amp;previous_sa) != -1);
+ 
+ 	/* if there was already a handler in place for this signal, store it */
+-	if (! (previous_sa.sa_flags &amp; SA_SIGINFO) &amp;&amp;
++	if (
++#ifdef SA_SIGINFO
++		! (previous_sa.sa_flags &amp; SA_SIGINFO) &amp;&amp;
++#endif
+ 			(SIG_DFL == previous_sa.sa_handler)) { 
+-		/* it there is no sa_sigaction function and the sa_handler is default, we can safely ignore this */
++		/* if there is no sa_sigaction function and the sa_handler is default, we can safely ignore this */
+ 	} else {
+ 		if (mono_do_signal_chaining)
+ 			save_old_signal_handler (signo, &amp;previous_sa);
+-- 
+1.7.0.4
+
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="034613.html">[Mono-dev] [PATCH v2 2/7] mini: Disable soft debugger when not	using sigaction
+</A></li>
+	<LI>Next message: <A HREF="034621.html">[Mono-dev] [PATCH v2 2/7] mini: Disable soft debugger when not	using sigaction
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#34620">[ date ]</a>
+              <a href="thread.html#34620">[ thread ]</a>
+              <a href="subject.html#34620">[ subject ]</a>
+              <a href="author.html#34620">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

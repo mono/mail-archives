@@ -1,0 +1,235 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Again on alias analysis
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Again%20on%20alias%20analysis&In-Reply-To=1108744206.24245.128.camel%40matrix">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="010541.html">
+   <LINK REL="Next"  HREF="010543.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Again on alias analysis</H1>
+    <B>Ben Maurer</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Again%20on%20alias%20analysis&In-Reply-To=1108744206.24245.128.camel%40matrix"
+       TITLE="[Mono-devel-list] Again on alias analysis">bmaurer at ximian.com
+       </A><BR>
+    <I>Fri Feb 18 12:02:23 EST 2005</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="010541.html">[Mono-devel-list] Again on alias analysis
+</A></li>
+        <LI>Next message: <A HREF="010543.html">[Mono-devel-list] New version of my svn grabber and builder script
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10542">[ date ]</a>
+              <a href="thread.html#10542">[ thread ]</a>
+              <a href="subject.html#10542">[ subject ]</a>
+              <a href="author.html#10542">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On Fri, 2005-02-18 at 17:30 +0100, Massimiliano Mantione wrote:
+&gt;<i> Cases [1] to [4] look fairly easy, because the alias seems short
+</I>&gt;<i> lived, it is &quot;consumed&quot; by the following call instruction.
+</I>&gt;<i> So it is easy to consider that call as an use/redefinition of
+</I>&gt;<i> the local variable, and be OK with that.
+</I>&gt;<i> The problem is that this is true only if the alias is *really*
+</I>&gt;<i> short lived.
+</I>&gt;<i> What I mean is that in principle the called method could store
+</I>&gt;<i> the pointer in a location that outlives the call.
+</I>&gt;<i> Since we do not perform any interprocedural analysis, we don't
+</I>&gt;<i> know if the called method does this or not.
+</I>&gt;<i> The problem is that if this happens, then any subsequent call to
+</I>&gt;<i> any method could use/redefine our local variable (to be picky,
+</I>&gt;<i> any use of any pointer of which we don't know exactly the value
+</I>&gt;<i> could do it).
+</I>&gt;<i> If I understand the standard correctly, this can happen only if
+</I>&gt;<i> the parameter of the called method were a pointer (int*), and it
+</I>&gt;<i> cannot happen if it is an argument passed by reference (ref int).
+</I>&gt;<i> So it is important being able to relate each method argument to
+</I>&gt;<i> its declaration in the called method's signature, to know if it
+</I>&gt;<i> is a pointer passed by value (int*, like in C, which is unsafe
+</I>&gt;<i> and we cannot really control), or a local passed by reference
+</I>&gt;<i> (ref int or int&amp;, which we know will be used only in the called
+</I>&gt;<i> method).
+</I>&gt;<i> To verify this, I have written a small test program (attached).
+</I>&gt;<i> In that program, it is evident that &quot;(outarg (ldaddr local[0]))&quot;
+</I>&gt;<i> is used both for &quot;int*&quot; and &quot;int&amp;&quot; parameters, so it is obvious
+</I>&gt;<i> that to distinguish them we must look at the call signature.
+</I>&gt;<i> By the way, all of this actually matters only for case [1].
+</I>&gt;<i> In cases [2] to [4], the &quot;parameter&quot; is the &quot;this&quot; of a method
+</I>&gt;<i> call, so we can simply assume that the value is used/written.
+</I>
+For verifiable code, your assumption is correct that the value of a `ref
+int' will never be stored into a place where it outlives the method
+(IIRC, the verifiable code prevents you from storing an int&amp; anywhere
+other than in a local variable). However, for unverifiable code, I see
+no reason why somebody couldn't do that. For example, one could convert
+the int&amp; to an int*.
+
+
+Just did a test case. Consider this:
+
+using System;
+
+unsafe class X {
+	
+	static int* xx;
+	
+	static void Main ()
+	{
+		int foo = 0;
+		
+		Blah (ref foo);
+		
+		Console.WriteLine (&quot;foo = {0}&quot;, foo);
+		
+		foo = 0;
+	
+		*xx = 1;
+		
+		Console.WriteLine (&quot;foo = {0}&quot;, foo);
+	}
+	
+	static void Blah (ref int mptr)
+	{
+		xx = &amp;mptr;
+	}
+}
+
+Note how we just sent `foo' to `Blah' as a ref param. However, by doing
+this, it got its address taken. If you assume that the ldaddr in the
+method call to `Blah' is just a use/redef, this test case would print
+0/0. However, it prints 0/1
+
+This test case does not compile in csc. There is an mcs bug. However,
+you can write:
+
+		fixed (int* x = &amp;mptr) {
+				xx = x;
+		}
+
+(note that doing that does not work in mcs, because of the bug).
+
+This test case is 100% non-verifiable. However, I am not sure if it is
+legal as non-verifiable code. As suggested by csc, I need to fix the
+managed pointer when I take its address, because it could be the address
+of a field in the gc heap. However, if I know that it is already pinned,
+I am not sure if it is legal to un-pin the pointer.
+
+MSFT prints 0/1 here, but that may because they don't even attempt
+this...
+
+But it seems that once the ldaddr goes outside the methods, all bets are
+off.
+
+&gt;<i> I still have to look at how cases [5] and [6] work exactly, but
+</I>&gt;<i> my impression is that they do not generate any alias, they just
+</I>&gt;<i> change the local value overwriting its memory area.
+</I>
+It'd be nice if we could have the IR express these operations in such a
+way that they did not look like taking an address.
+
+&gt;<i> Case [7] is simple in principle, but problematic in practice
+</I>&gt;<i> (because without proper data flow analysis we cannot really know
+</I>&gt;<i> where the alias will be used).
+</I>&gt;<i> Since it is relatively rare (with respect to other cases), and
+</I>&gt;<i> since this seems the *only* case where the alias propagator
+</I>&gt;<i> should perform data flow analysis, in the beginning I'd propose
+</I>&gt;<i> to handle in conservatively, and just assume that the pointer is
+</I>&gt;<i> potentially everywhere, so any &quot;suspicious&quot; operation can affect
+</I>&gt;<i> that local variable.
+</I>&gt;<i> However, this should change in the future.
+</I>&gt;<i> Particularly, when we'll have the linear IR, I guess that many
+</I>&gt;<i> cases will become of this kind: we will not have instruction
+</I>&gt;<i> trees, so all the tree nodes will be virtual registers.
+</I>&gt;<i> Now, on the other hand, traversing a MonoInst tree is like
+</I>&gt;<i> performing a simple local data flow analysis, but this will be
+</I>&gt;<i> lost with the linear IR.
+</I>&gt;<i> To ease this problem, perhaps we could handle in a special way
+</I>&gt;<i> those virtual registers that happen to be defined and used only
+</I>&gt;<i> once (maybe recording explicitly those unique use and definition
+</I>&gt;<i> points in the virtual register data structure).
+</I>&gt;<i> Zoltan, as you are looking at this linear IR thing, do you have
+</I>&gt;<i> any comment?
+</I>
+Where do these operations happen? C# doesn't let you create an int&amp;
+local variable. Are these unsafe methods?
+
+&gt;<i> On case [8] I have a few doubts.
+</I>&gt;<i> First of all I'd like to know if the assumption that those cases
+</I>&gt;<i> correspond to field accesses is true.
+</I>
+Like cases [5] and [6], it'd be nice for the IR to express these ops in
+such a way that they didn't look like taking an address.
+
+&gt;<i> I have verified a few of them, and it seems so...
+</I>&gt;<i> Moreover mono_method_to_ir in fact translates field accesses that
+</I>&gt;<i> way (as displacements from the base value address, getting the
+</I>&gt;<i> offset from the metadata).
+</I>&gt;<i> If it were all like this, we could safely assume that those cases
+</I>&gt;<i> do not really generate aliasing (not until we want to take care of
+</I>&gt;<i> the value of struct fields individually).
+</I>&gt;<i> The point is that up to now we do not (yet) have the framework to
+</I>&gt;<i> track each field's value individually. In fact each field use seems
+</I>&gt;<i> just an operation to/from a calculated memory address.
+</I>&gt;<i> We can optimize the *calculation* of those addresses (SSAPRE
+</I>&gt;<i> already does it), but we still cannot assume anything on the
+</I>&gt;<i> values contained there.
+</I>&gt;<i> In any case, to analyze what happens when pointer arithmetic is
+</I>&gt;<i> related to field accesses, we should see where the result of the
+</I>&gt;<i> add is stored/used. We would then reconduct this analysis to the
+</I>&gt;<i> same categories we are examining now.
+</I>
+That sounds like scalar replacement.
+
+&gt;<i> The reason why I have doubts is that (like for method arguments)
+</I>&gt;<i> we do not really know if this pointer arithmetic is done to
+</I>&gt;<i> access a field, or instead because the code is playing with unsafe
+</I>&gt;<i> pointers.
+</I>&gt;<i> At least, we do not know it if we just look at the &quot;add&quot; instruction
+</I>&gt;<i> that applies the displacement. We could look at the MonoType of the
+</I>&gt;<i> local, and see if that displacement is &quot;compatible&quot; with the type
+</I>&gt;<i> declaration (it refers to a specific field). But this seems a bit
+</I>&gt;<i> tricky, and I wouldn't try it in the first development of the alias
+</I>&gt;<i> analyzer.
+</I>
+Rather than tracking this, it seems more logical to ensure that the IR
+contains the information logically. 
+
+&gt;<i> Last, in cases [9] and [10], I would just ignore the operation.
+</I>&gt;<i> Even if the address of a local is taken, it is used in such a way
+</I>&gt;<i> that no real aliasing can happen, so I think this should be safe.
+</I>
+Am interested in who is generating these. Maybe these are just field
+loads in a struct, but it is looks like ldaddr [1] + 0, and the jit is
+doing constant folding before you even see it?
+
+-- Ben
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="010541.html">[Mono-devel-list] Again on alias analysis
+</A></li>
+	<LI>Next message: <A HREF="010543.html">[Mono-devel-list] New version of my svn grabber and builder script
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#10542">[ date ]</a>
+              <a href="thread.html#10542">[ thread ]</a>
+              <a href="subject.html#10542">[ subject ]</a>
+              <a href="author.html#10542">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

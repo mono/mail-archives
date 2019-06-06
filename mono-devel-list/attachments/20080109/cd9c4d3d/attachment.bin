@@ -1,0 +1,114 @@
+Index: Stdlib.cs
+===================================================================
+--- Stdlib.cs	(revision 92060)
++++ Stdlib.cs	(working copy)
+@@ -31,6 +31,9 @@
+ using System.IO;
+ using System.Runtime.InteropServices;
+ using System.Text;
++using System.Threading;
++
++using Mono.Unix;
+ using Mono.Unix.Native;
+ 
+ namespace Mono.Unix.Native {
+@@ -359,7 +362,7 @@
+ 	//        This is the case for using NativeConvert, which will throw an
+ 	//        exception if an invalid/unsupported value is used.
+ 	//
+-	public class Stdlib
++	public unsafe class Stdlib
+ 	{
+ 		internal const string LIBC = "msvcrt";
+ 		internal const string MPH  = "MonoPosixHelper";
+@@ -445,24 +448,21 @@
+ 			registered_signals = new SignalHandler [(int) signals.GetValue (signals.Length-1)];
+ 		}
+ 
+-		[DllImport (LIBC, CallingConvention=CallingConvention.Cdecl,
+-				SetLastError=true, EntryPoint="signal")]
++		[DllImport (MPH, CallingConvention=CallingConvention.Cdecl,
++				SetLastError=true, EntryPoint="Mono_Posix_Stdlib_signal")]
+ 		private static extern IntPtr sys_signal (int signum, SignalHandler handler);
+ 
+-		[DllImport (LIBC, CallingConvention=CallingConvention.Cdecl,
+-				SetLastError=true, EntryPoint="signal")]
++		[DllImport (MPH, CallingConvention=CallingConvention.Cdecl,
++				SetLastError=true, EntryPoint="Mono_Posix_Stdlib_signal")]
+ 		private static extern IntPtr sys_signal (int signum, IntPtr handler);
+ 
+ 		[CLSCompliant (false)]
+ 		public static SignalHandler signal (Signum signum, SignalHandler handler)
+ 		{
++			InitSignalSupport ();
++
+ 			int _sig = NativeConvert.FromSignum (signum);
+ 
+-			Delegate[] handlers = handler.GetInvocationList ();
+-			for (int i = 0; i < handlers.Length; ++i) {
+-				Marshal.Prelink (handlers [i].Method);
+-			}
+-
+ 			lock (registered_signals) {
+ 				registered_signals [(int) signum] = handler;
+ 			}
+@@ -494,6 +494,45 @@
+ #endif
+ 		}
+ 
++		[DllImport (MPH, CallingConvention=CallingConvention.Cdecl,
++				SetLastError=true, EntryPoint="_mph_set_signal_write_fd")]
++		private static extern void set_signal_write_fd (int signum);
++
++		static object signal_dispatcher;
++		static int    signal_read_fd;
++
++		private static void InitSignalSupport ()
++		{
++			if (Path.DirectorySeparatorChar == '\\')
++				return;
++
++			if (signal_dispatcher == null) {
++				object c = new Thread (SignalDispatcher);
++				Thread.MemoryBarrier ();
++				while (Interlocked.CompareExchange (ref signal_dispatcher, c, null) == null) {
++					int writing;
++					if (Syscall.pipe (out signal_read_fd, out writing) < 0)
++						throw UnixMarshal.CreateExceptionForLastError ();
++					set_signal_write_fd (writing);
++					Thread _c = (Thread) c;
++					_c.IsBackground = true;
++					_c.Name = "Mono.Unix.Native Signal Dispatcher";
++					_c.Start ();
++				}
++				Thread.MemoryBarrier ();
++			}
++		}
++
++		private static unsafe void SignalDispatcher ()
++		{
++			byte c;
++			while (Syscall.read (signal_read_fd, &c, 1) >= 1) {
++				SignalHandler h = registered_signals [c];
++				if (h != null)
++					h (c);
++			}
++		}
++
+ 		[DllImport (LIBC, CallingConvention=CallingConvention.Cdecl, EntryPoint="raise")]
+ 		private static extern int sys_raise (int sig);
+ 
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 92274)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,9 @@
++2008-01-09  Jonathan Pryor  <jpryor@novell.com>
++
++	* Stdlib.cs: Update Stdlib.signal() so that it's safe; see also: 
++	  http://lists.ximian.com/pipermail/mono-devel-list/2008-January/026501.html
++	  http://lists.ximian.com/pipermail/mono-devel-list/2008-January/026503.html
++
+ 2008-01-05  Jonathan Pryor  <jonpryor@vt.edu>
+ 
+ 	* Syscall.cs: Add ST_NOEXEC, ST_REMOUNT, ST_BIND to MountFlags.  Patch from

@@ -1,0 +1,383 @@
+Index: browser/editing.cs
+===================================================================
+--- browser/editing.cs	(revision 48386)
++++ browser/editing.cs	(working copy)
+@@ -80,7 +80,7 @@
+ 				
+ 		}
+ 		
+-		public static void SaveChange (string url, RootTree tree, XmlNode node)
++		public static void SaveChange (string url, RootTree tree, XmlNode node, string node_url)
+ 		{
+ 			string [] uSplit = ParseEditUrl (url);
+ 		
+@@ -91,7 +91,7 @@
+ 				int prov = int.Parse (uSplit [0].Substring("monodoc://".Length));
+ 				HelpSource hs = tree.GetHelpSourceFromId (prov);
+ 				
+-				changes.AddChange (hs.Name, hs.GetRealPath (id), xp, node);
++				changes.AddChange (hs.Name, hs.GetRealPath (id), xp, node, node_url);
+ 				changes.Save ();
+ 			} else if (uSplit[0].StartsWith("file:")) {
+ 				uSplit[0] = uSplit[0].Substring(5);
+ 			
+@@ -265,11 +265,12 @@
+ 			}
+ 		}
+ 
+-		Change NewChange (string xpath, XmlNode new_node)
++		Change NewChange (string xpath, XmlNode new_node, string node_url)
+ 		{
+ 			Change new_change = new Change ();
+ 			new_change.XPath = xpath;
+ 			new_change.NewNode = new_node;
++			new_change.NodeUrl = node_url;
+ 
+ 			Console.WriteLine ("New serial:" + SettingsHandler.Settings.SerialNumber);
+ 			new_change.Serial = SettingsHandler.Settings.SerialNumber;
+@@ -277,10 +278,10 @@
+ 			return new_change;
+ 		}
+ 		
+-		public void AddChange (string doc_set, string real_file, string xpath, XmlNode new_node)
++		public void AddChange (string doc_set, string real_file, string xpath, XmlNode new_node, string node_url)
+ 		{
+ 			FileChangeset new_file_change_set;
+-			Change new_change = NewChange (xpath, new_node);
++			Change new_change = NewChange (xpath, new_node, node_url);
+ 			
+ 			if (real_file == null)
+ 				throw new Exception ("Could not find real_file. Please talk to Miguel or Ben about this");
+@@ -324,6 +325,20 @@
+ 			new_dcs.FileChangesets.Add (new_file_change_set);
+ 			DocSetChangesets.Add (new_dcs);
+ 		}
++		public void DelChange (Change del) {
++			for (int i = 0; i < DocSetChangesets.Count; i++) {
++				DocSetChangeset dscs = DocSetChangesets [i] as DocSetChangeset;
++				for (int j = 0; j < dscs.FileChangesets.Count; j++) {
++					FileChangeset fcs = dscs.FileChangesets [j] as FileChangeset;
++					fcs.Changes.Remove (del);
++					if (fcs.Changes.Count == 0)
++						dscs.FileChangesets.Remove (fcs);
++				}
++				if (dscs.FileChangesets.Count == 0)
++					DocSetChangesets.Remove (dscs);
++			}
++			Save ();
++		}
+ 
+ 		public GlobalChangeset GetFrom (int starting_serial_id)
+ 		{
+@@ -378,6 +393,9 @@
+ 			foreach (Change c in Changes){
+ 				if (c.Serial < starting_serial_id)
+ 					continue;
++				if (c.NodeUrl != null) //this prevents old contrib from not being uploaded
++					if (!c.Upload)
++						continue;
+ 				if (fcs == null){
+ 					fcs = new FileChangeset ();
+ 					fcs.RealFile = RealFile;
+@@ -391,6 +409,8 @@
+ 	public class Change {
+ 		[XmlAttribute] public string XPath;
+ 		[XmlAttribute] public int FromVersion = RootTree.MonodocVersion;
++		[XmlAttribute] public string NodeUrl;
++		[XmlAttribute] public bool Upload;
+ 		
+ 		public XmlNode NewNode;
+ 
+@@ -412,6 +432,7 @@
+ 			applied = value;
+ 		}
+ 	}
++	
+ #endregion
+ 	
+ 	public class EditMerger {
+Index: browser/provider.cs
+===================================================================
+--- browser/provider.cs	(revision 48618)
++++ browser/provider.cs	(working copy)
+@@ -1086,6 +1086,7 @@
+ 		return (HelpSource) help_sources [id];
+ 	}
+ 	
++	string home_cache;
+ 	/// <summary>
+ 	///    Allows every HelpSource to try to provide the content for this
+ 	///    URL.
+@@ -1095,12 +1096,82 @@
+ 		lastHelpSourceTime = DateTime.MinValue;
+ 		if (url == "root:") {
+ 			match_node = this;
+-			StringBuilder sb = new StringBuilder ("<table bgcolor=\"#b0c4de\" width=\"100%\" cellpadding=\"5\"><tr><td><h3>Mono Documentation Library</h3></td></tr></table>");
++
++			// look whether there are contribs
++			GlobalChangeset chgs = EditingUtils.changes;
++			StringBuilder con = new StringBuilder ();
++			
++			//add links to the contrib
++			int oldContrib = 0, contribs = 0;
++			con.Append ("<ul>");
++			foreach (DocSetChangeset dscs in chgs.DocSetChangesets) 
++				foreach (FileChangeset fcs in dscs.FileChangesets) 
++					foreach (Change c in fcs.Changes) {
++						if (c.NodeUrl == null) {
++							if (c.Serial == SettingsHandler.Settings.SerialNumber)
++								oldContrib++;
++						} else if (c.Serial == SettingsHandler.Settings.SerialNumber) {
++							contribs++;
++							con.Append (String.Format ("<li><a href=\"{0}\">{0}</a></li>", c.NodeUrl));
++						}
++					}
+ 			
+-			foreach (Node n in Nodes)
+-				sb.AppendFormat ("<a href='{0}'>{1}</a><br/>", n.Element, n.Caption);
++			string contrib = (oldContrib + contribs) == 1?"There is {0} contribution":"There are {0} contributions";
++			con.Insert (0, String.Format (contrib, oldContrib + contribs) + " for uploading <i>(File--&gt; Contributions--&gt; Upload)</i>", 1);
++			con.Append ("</ul>");
++			if (oldContrib == 1)
++				con.Append ("<i>You have 1 contribution that is not listed below and will be send the next time you upload contributions. Only contributions made from now on will be listed.</i>");
++			else if (oldContrib > 1)
++				con.Append ("<i>You have " + oldContrib + "contributions that are not listed below and will be send the next time you upload contributions. Only contributions made from now on will be listed.</i>");
++
++			//start the rendering
++			if (!HelpSource.use_css) {
++				StringBuilder sb = new StringBuilder ("<table bgcolor=\"#b0c4de\" width=\"100%\" cellpadding=\"5\"><tr><td><h3>Mono Documentation Library</h3></td></tr></table>");
+ 			
+-			return sb.ToString ();	
++				foreach (Node n in Nodes)
++					sb.AppendFormat ("<a href='{0}'>{1}</a><br/>", n.Element, n.Caption);
++			
++				//contributions
++				sb.Append ("<br><table bgcolor=\"#fff3f3\" width=\"100%\" cellpadding=\"5\"><tr><td>");
++				sb.Append ("<h5>Contributions</h5><br>");
++				if ((oldContrib + contribs) == 0) {
++					sb.Append ("<p><b>You don't have any contribution yet.</b></p>");
++					sb.Append ("<p>The Documentation of the libraries is not complete and your contributions would be greatly apreciated. The procedure is easy, browse to the part of the documentation you want to contribute and click on the <font color=\"blue\">[Edit]</font> link to start writing the documentation.</p>");
++					sb.Append ("<p>When you are happy with your changes, use the menu File--&gt; Contributions--&gt; Upload to upload your contributions to our server.</p></div>");
++				} else {
++					sb.Append (con.ToString ());
++				}
++				sb.Append ("</td></tr></table>");
++				return sb.ToString ();	
++			} else {
++				if (home_cache == null) {
++					System.Reflection.Assembly assembly = System.Reflection.Assembly.GetAssembly (typeof (HelpSource));
++					Stream hp_stream = assembly.GetManifestResourceStream ("home.html");
++					home_cache = (new StreamReader (hp_stream)).ReadToEnd ();
++				}
++				StringBuilder sb = new StringBuilder (home_cache);
++				// adjust fonts
++				sb.Replace ("@@FONT_FAMILY@@", SettingsHandler.Settings.preferred_font_family);
++				sb.Replace ("@@FONT_SIZE@@", SettingsHandler.Settings.preferred_font_size.ToString());
++				//contributions
++				if ((oldContrib + contribs) == 0) {
++					sb.Replace ("@@CONTRIB_DISP@@", "display: none;");
++				} else {
++					sb.Replace ("@@NO_CONTRIB_DISP@@", "display: none;");
++					sb.Replace ("@@CONTRIBS@@", con.ToString ());
++				}
++					
++				// load the url of nodes
++				String add_str;
++				StringBuilder urls = new StringBuilder ();
++				foreach (Node n in Nodes) {
++					add_str = String.Format ("<li><a href=\"{0}\">{1}</a></li>", n.Element, n.Caption);
++					urls.Append (add_str);
++				}
++				sb.Replace ("@@API_DOCS@@", urls.ToString ());
++						
++				return sb.ToString ();
++			}
+ 		} 
+ 		
+ 		if (url.StartsWith ("root:")) {
+Index: browser/ChangeLog
+===================================================================
+--- browser/ChangeLog	(revision 48618)
++++ browser/ChangeLog	(working copy)
+@@ -1,3 +1,15 @@
++2005-08-22 Mario Sopena Novales <mario.sopena@gmail.com>
++	* editing.cs: 
++		- Add a new Attribute NodeUrl to Change
++		- Add a new Attribute Upload to Change
++		- Add a new method DelChange to remove changes
++		- The GetFrom method of FileChangeset returns only the uploadable
++		changes (and all the old contribtuions)
++	* provider.cs: Render root with Css (use home.html as template) and contribution links
++	* home.html: added. Template for the root page
++	* ecma-provider.cs: new method GetNiceUrl to obtain "T:System.Object" urls
++	* Makefile.am: added the home.html file to the build process
++
+ 2005-08-17 Mario Sopena Novales <mario.sopena@gmail.com>
+ 	* provider.cs: The preferred_font_family and the preferred_font_size
+ 	are now handled by the settings object
+Index: browser/home.html
+===================================================================
+--- browser/home.html	(revision 0)
++++ browser/home.html	(revision 0)
+@@ -0,0 +1,77 @@
++<head>
++<style type="text/css">
++/* GENERAL */
++
++body, table {
++	font-family: @@FONT_FAMILY@@, sans-serif;
++	font-size: @@FONT_SIZE@@%;
++}
++
++#title {
++	width: 94%;
++	margin-left: 1%;
++	padding: 2%;
++	border: 2px solid black;
++	background: #b0c4de;
++	font-size: 140%;
++	font-weight: bold;
++	font-variant: small-caps;
++	text-align: center;
++	}
++
++/* ECMA BLOCK */
++#docs {
++	margin-bottom: 1em;
++}
++
++/* CONTRIBUTIONS */
++#contrib {
++	margin-top: 2em;
++	width: 98%;
++	margin-left: 1%;
++	color: black;
++	background: #fff3f3;
++	border: 1px solid #ffc9c9;
++	}
++#contribTitle {
++	text-align: left;
++	font-weight: bold;
++	padding: .4em;
++	font-size: 110%;
++}
++#contrib #content {
++	padding: .4em;
++}
++#some-contrib {
++	@@CONTRIB_DISP@@
++}
++#no-contrib {
++	@@NO_CONTRIB_DISP@@
++}
++#contrib p {
++	text-indent: 1em;
++	text-align: justify;
++	}
++</style>
++</head>
++
++<div id="title">Mono Documentation Library</div>
++
++<div id="docs">
++	<ul>
++	    @@API_DOCS@@
++	</ul>
++</div>
++
++<div id="contrib">
++	<div id="contribTitle">Contributions</div>
++	<div id="content">
++		<div id="some-contrib">
++			@@CONTRIBS@@
++		</div>
++		<div id="no-contrib">
++			<p><b>You don't have any contribution yet.</b></p>
++			<p>The Documentation of the libraries is not complete and your contributions would be greatly apreciated. The procedure is easy, browse to the part of the documentation you want to contribute and click on the <font color="blue">[Edit]</font> link to start writing the documentation.</p>
++			<p>When you are happy with your changes, use the menu File--&gt; Contributions--&gt; Upload to upload your contributions to our server.</p></div>
++	</div>
++</div>
+Index: browser/ecma-provider.cs
+===================================================================
+--- browser/ecma-provider.cs	(revision 48386)
++++ browser/ecma-provider.cs	(working copy)
+@@ -1332,6 +1332,54 @@
+ 	}
+ 	
+ 	//
++	// Obtain an URL of the type T:System.Object from the node
++	// 
++	public static string GetNiceUrl (Node node) {
++		if (node.Element.StartsWith("N:"))
++			return node.Element;
++		string name, full;
++		int bk_pos = node.Caption.IndexOf (' ');
++		// node from an overview
++		if (bk_pos != -1) {
++			name = node.Caption.Substring (0, bk_pos);
++			full = node.Parent.Caption + "." + name.Replace ('.', '+');
++			return "T:" + full;
++		}
++		// node that lists constructors, methods, fields, ...
++		if ((node.Caption == "Constructors") || (node.Caption == "Fields") || (node.Caption == "Events") 
++			|| (node.Caption == "Members") || (node.Caption == "Properties") || (node.Caption == "Methods")
++			|| (node.Caption == "Operators")) {
++			bk_pos = node.Parent.Caption.IndexOf (' ');
++			name = node.Parent.Caption.Substring (0, bk_pos);
++			full = node.Parent.Parent.Caption + "." + name.Replace ('.', '+');
++			return "T:" + full + "/" + node.Element; 
++		}
++		int pr_pos = node.Caption.IndexOf ('(');
++		// node from a constructor
++		if (node.Parent.Element == "C") {
++			name = node.Parent.Parent.Parent.Caption;
++			int idx = node.URL.IndexOf ('/');
++			return node.URL[idx+1] + ":" + name + "." + node.Caption.Replace ('.', '+');
++		// node from a method with one signature, field, property, operator
++		} else if (pr_pos == -1) {
++			bk_pos = node.Parent.Parent.Caption.IndexOf (' ');
++			name = node.Parent.Parent.Caption.Substring (0, bk_pos);
++			full = node.Parent.Parent.Parent.Caption + "." + name.Replace ('.', '+');
++			int idx = node.URL.IndexOf ('/');
++			return node.URL[idx+1] + ":" + full + "." + node.Caption;
++		// node from a method with several signatures
++		} else {
++			bk_pos = node.Parent.Parent.Parent.Caption.IndexOf (' ');
++			name = node.Parent.Parent.Parent.Caption.Substring (0, bk_pos);
++			full = node.Parent.Parent.Parent.Parent.Caption + "." + name.Replace ('.', '+');
++			int idx = node.URL.IndexOf ('/');
++			return node.URL[idx+1] + ":" + full + "." + node.Caption;
++		}
++		return "";
++
++	}
++				
++	//
+ 	// Populates the index.
+ 	//
+ 	public override void PopulateIndex (IndexMaker index_maker)
+Index: browser/Makefile.am
+===================================================================
+--- browser/Makefile.am	(revision 48386)
++++ browser/Makefile.am	(working copy)
+@@ -50,7 +50,8 @@
+ 	ecmaspec-html.xsl mod.cs		\
+ 	AssemblyInfo.cs.in $(cs2ecma_sources) \
+ 	ecmaspec-html-css.xsl ecmaspec.css \
+-	base.css mono-ecma-css.xsl mono-ecma.css
++	base.css mono-ecma-css.xsl mono-ecma.css \
++	home.html
+ 
+ monodoc_FILES = assembler.exe normalize.exe validate.exe cs2ecma.exe
+ 
+@@ -72,8 +73,8 @@
+ mono.pub: $(top_srcdir)/mono.pub
+ 	cp $(top_srcdir)/mono.pub .
+ 
+-monodoc.dll: $(monodoc_sources) mono-ecma.xsl mono.pub ecmaspec-html-css.xsl ecmaspec.css base.css mono-ecma-css.xsl mono-ecma.css
+-	$(CSC) -debug -out:monodoc.dll -target:library /resource:$(srcdir)/mono-ecma.xsl,mono-ecma.xsl /resource:$(srcdir)/ecmaspec-html.xsl,ecmaspec-html.xsl /resource:$(srcdir)/ecmaspec-html-css.xsl,ecmaspec-html-css.xsl /resource:$(srcdir)/base.css,base.css /resource:$(srcdir)/ecmaspec.css,ecmaspec.css /resource:$(srcdir)/mono-ecma-css.xsl,mono-ecma-css.xsl /resource:$(srcdir)/mono-ecma.css,mono-ecma.css $(monodoc_sources) -r:ICSharpCode.SharpZipLib.dll -r:System.Web -r:System.Web.Services
++monodoc.dll: $(monodoc_sources) mono-ecma.xsl mono.pub ecmaspec-html-css.xsl ecmaspec.css base.css mono-ecma-css.xsl mono-ecma.css home.html
++	$(CSC) -debug -out:monodoc.dll -target:library /resource:$(srcdir)/mono-ecma.xsl,mono-ecma.xsl /resource:$(srcdir)/ecmaspec-html.xsl,ecmaspec-html.xsl /resource:$(srcdir)/ecmaspec-html-css.xsl,ecmaspec-html-css.xsl /resource:$(srcdir)/base.css,base.css /resource:$(srcdir)/ecmaspec.css,ecmaspec.css /resource:$(srcdir)/mono-ecma-css.xsl,mono-ecma-css.xsl /resource:$(srcdir)/mono-ecma.css,mono-ecma.css /resource:$(srcdir)/home.html,home.html $(monodoc_sources) -r:ICSharpCode.SharpZipLib.dll -r:System.Web -r:System.Web.Services
+ 
+ monodoc.dll.config: $(srcdir)/monodoc.dll.config.in Makefile
+ 	if sed 's,@''monodoc_refdir@,$(monodoc_refdir),' $(srcdir)/monodoc.dll.config.in > $@t; then mv $@t $@; else rm -f $@t ; exit 1; fi

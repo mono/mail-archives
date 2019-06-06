@@ -1,0 +1,595 @@
+Index: mono/metadata/object.c
+===================================================================
+--- mono/metadata/object.c	(revision 78299)
++++ mono/metadata/object.c	(working copy)
+@@ -443,6 +443,8 @@
+ static MonoTrampoline arch_create_jit_trampoline = default_trampoline;
+ static MonoRemotingTrampoline arch_create_remoting_trampoline = default_remoting_trampoline;
+ static MonoDelegateTrampoline arch_create_delegate_trampoline = default_delegate_trampoline;
++static MonoImtSlotInitializer imt_slot_initializer = NULL;
++#define ARCH_USE_IMT (imt_slot_initializer != NULL)
+ 
+ void
+ mono_install_trampoline (MonoTrampoline func) 
+@@ -462,6 +464,11 @@
+ 	arch_create_delegate_trampoline = func? func: default_delegate_trampoline;
+ }
+ 
++void
++mono_install_imt_slot_initializer (MonoImtSlotInitializer func) {
++	imt_slot_initializer = func;
++}
++
+ static MonoCompileFunc default_mono_compile_method = NULL;
+ 
+ /**
+@@ -914,6 +921,134 @@
+ 	return SPECIAL_STATIC_NONE;
+ }
+ 
++#define rot(x,k) (((x)<<(k)) | ((x)>>(32-(k))))
++#define mix(a,b,c) { \
++	a -= c;  a ^= rot(c, 4);  c += b; \
++	b -= a;  b ^= rot(a, 6);  a += c; \
++	c -= b;  c ^= rot(b, 8);  b += a; \
++	a -= c;  a ^= rot(c,16);  c += b; \
++	b -= a;  b ^= rot(a,19);  a += c; \
++	c -= b;  c ^= rot(b, 4);  b += a; \
++}
++#define final(a,b,c) { \
++	c ^= b; c -= rot(b,14); \
++	a ^= c; a -= rot(c,11); \
++	b ^= a; b -= rot(a,25); \
++	c ^= b; c -= rot(b,16); \
++	a ^= c; a -= rot(c,4);  \
++	b ^= a; b -= rot(a,14); \
++	c ^= b; c -= rot(b,24); \
++}
++guint32
++mono_compute_imt_slot (MonoMethod *method) {
++	MonoMethodSignature *sig = mono_method_signature (method);
++	int hashes_count = sig->param_count + 4;
++	guint32 *hashes = alloca (hashes_count * sizeof (guint32));
++	guint32 a, b, c;
++	int i;
++	
++	//printf ("mono_compute_imt_slot: %s.%s.%s, sig->param_count = %d, hashes = %p, hashes_count = %d\n",
++	//		method->klass->name_space, method->klass->name,
++	//		method->name, sig->param_count, hashes, hashes_count);
++	
++	/* Initialize hashes */
++	hashes [0] = g_str_hash (method->klass->name);
++	hashes [1] = g_str_hash (method->klass->name_space);
++	hashes [2] = g_str_hash (method->name);
++	hashes [3] = mono_metadata_type_hash (sig->ret);
++	for (i = 0; i < sig->param_count; i++) {
++		hashes [4 + i] = mono_metadata_type_hash (sig->params [i]);
++	}
++	
++	/* Setup internal state */
++	a = b = c = 0xdeadbeef + (((guint32)hashes_count)<<2);
++
++	/* Handle most of the hashes */
++	while (hashes_count > 3) {
++		//printf ("mono_compute_imt_slot: in loop, hashes = %p, hashes_count = %d\n", hashes, hashes_count);
++		a += hashes [0];
++		b += hashes [1];
++		c += hashes [2];
++		mix (a,b,c);
++		hashes_count -= 3;
++		hashes += 3;
++	}
++	//printf ("mono_compute_imt_slot: finally, hashes = %p, hashes_count = %x\n", hashes, hashes_count);
++
++	/* Handle the last 3 hashes (all the case statements fall through) */
++	switch (hashes_count) { 
++	case 3 : c += hashes [2];
++	case 2 : b += hashes [1];
++	case 1 : a += hashes [0];
++		final (a,b,c);
++	case 0: /* nothing left to add */
++		break;
++	}
++	
++	/* Report the result */
++	return c % MONO_IMT_SIZE;
++}
++#undef rot
++#undef mix
++#undef final
++
++#define DEBUG_IMT 0
++
++static void
++add_imt_builder_entry (MonoImtBuilder imt_builder, MonoMethod *method, guint32 *imt_collisions_bitmap, int vtable_slot) {
++	guint32 imt_slot = mono_compute_imt_slot (method);
++	MonoImtBuilderEntry *entry = malloc (sizeof (MonoImtBuilderEntry));
++	
++	entry->method = method;
++	entry->vtable_slot = vtable_slot;
++	entry->next = imt_builder [imt_slot];
++	if (imt_builder [imt_slot] != NULL) {
++		entry->children = imt_builder [imt_slot]->children + 1;
++		*imt_collisions_bitmap |= (1 << imt_slot);
++	} else {
++		entry->children = 0;
++	}
++	imt_builder [imt_slot] = entry;
++#if DEBUG_IMT
++	printf ("Added IMT slot for method %s.%s.%s: imt_slot = %d, vtable_slot = %d, colliding with other %d entries\n",
++			method->klass->name_space, method->klass->name,
++			method->name, imt_slot, vtable_slot, entry->children);
++#endif
++}
++static void
++build_imt (MonoClass *klass, MonoVTable *vt, MonoDomain *domain, gpointer* imt) {
++	int i;
++	guint32 imt_collisions_bitmap = 0;
++	MonoImtBuilder imt_builder = calloc (MONO_IMT_SIZE, sizeof (MonoImtBuilderEntry*));
++
++#if DEBUG_IMT
++	printf ("Building IMT for class %s.%s\n", klass->name_space, klass->name);
++#endif
++	for (i = 0; i < klass->interface_offsets_count; ++i) {
++		MonoClass *iface = klass->interfaces_packed [i];
++		int interface_offset = klass->interface_offsets_packed [i];
++		int method_slot_in_interface;
++		for (method_slot_in_interface = 0; method_slot_in_interface < iface->method.count; method_slot_in_interface++) {
++			MonoMethod *method = iface->methods [method_slot_in_interface];
++			add_imt_builder_entry (imt_builder, method, &imt_collisions_bitmap, interface_offset + method_slot_in_interface);
++		}
++	}
++	for (i = 0; i < MONO_IMT_SIZE; ++i) {
++		imt_slot_initializer ((gpointer**) &(imt [i]), vt, domain, imt_builder [i]);
++	}
++	for (i = 0; i < MONO_IMT_SIZE; i++) {
++		MonoImtBuilderEntry* entry = imt_builder [i];
++		while (entry != NULL) {
++			MonoImtBuilderEntry* next = entry->next;
++			free (entry);
++			entry = next;
++		}
++	}
++	free (imt_builder);
++	/* FIXME: No locking for now... */
++	klass->imt_collisions_bitmap = imt_collisions_bitmap;
++}
++
+ static MonoVTable *mono_class_create_runtime_vtable (MonoDomain *domain, MonoClass *class);
+ 
+ /**
+@@ -975,14 +1110,22 @@
+ 	if (class->image->dynamic)
+ 		mono_class_setup_vtable (class);
+ 
+-	vtable_size = sizeof (gpointer) * (class->max_interface_id + 1) +
+-		sizeof (MonoVTable) + class->vtable_size * sizeof (gpointer);
++	if (ARCH_USE_IMT) {
++		vtable_size = sizeof (gpointer) * (MONO_IMT_SIZE) +
++			sizeof (MonoVTable) + class->vtable_size * sizeof (gpointer);
++	} else {
++		vtable_size = sizeof (gpointer) * (class->max_interface_id + 1) +
++			sizeof (MonoVTable) + class->vtable_size * sizeof (gpointer);
++	}
+ 
+ 	mono_stats.used_class_count++;
+ 	mono_stats.class_vtable_size += vtable_size;
+ 	interface_offsets = mono_mempool_alloc0 (domain->mp,  vtable_size);
+ 
+-	vt = (MonoVTable*) (interface_offsets + class->max_interface_id + 1);
++	if (ARCH_USE_IMT)
++		vt = (MonoVTable*) (interface_offsets + MONO_IMT_SIZE);
++	else
++		vt = (MonoVTable*) (interface_offsets + class->max_interface_id + 1);
+ 	vt->klass = class;
+ 	vt->rank = class->rank;
+ 	vt->domain = domain;
+@@ -1082,11 +1225,13 @@
+ 	//printf ("Initializing VT for class %s (interface_offsets_count = %d)\n",
+ 	//		class->name, class->interface_offsets_count);
+ 	
+-	/* initialize interface offsets */
+-	for (i = 0; i < class->interface_offsets_count; ++i) {
+-		int interface_id = class->interfaces_packed [i]->interface_id;
+-		int slot = class->interface_offsets_packed [i];
+-		interface_offsets [class->max_interface_id - interface_id] = &(vt->vtable [slot]);
++	if (! ARCH_USE_IMT) {
++		/* initialize interface offsets */
++		for (i = 0; i < class->interface_offsets_count; ++i) {
++			int interface_id = class->interfaces_packed [i]->interface_id;
++			int slot = class->interface_offsets_packed [i];
++			interface_offsets [class->max_interface_id - interface_id] = &(vt->vtable [slot]);
++		}
+ 	}
+ 
+ 	/* 
+@@ -1152,6 +1297,12 @@
+ 
+ 	mono_domain_unlock (domain);
+ 
++	if (ARCH_USE_IMT) {
++		/* Now that the vtable is full, we can actually fill up the IMT */
++		build_imt (class, vt, domain, interface_offsets);
++	}
++	
++
+ 	/* Initialization is now complete, we can throw if the InheritanceDemand aren't satisfied */
+ 	if (mono_is_security_manager_active () && (class->exception_type == MONO_EXCEPTION_SECURITY_INHERITANCEDEMAND)) {
+ 		MonoException *exc = mono_class_get_exception_for_failure (class);
+@@ -1228,13 +1379,21 @@
+ 		if (iclass->max_interface_id > max_interface_id) max_interface_id = iclass->max_interface_id;
+ 	}
+ 
+-	vtsize = sizeof (gpointer) * (max_interface_id + 1) +
+-		sizeof (MonoVTable) + class->vtable_size * sizeof (gpointer);
++	if (ARCH_USE_IMT) {
++		vtsize = sizeof (gpointer) * (MONO_IMT_SIZE) +
++			sizeof (MonoVTable) + class->vtable_size * sizeof (gpointer);
++	} else {
++		vtsize = sizeof (gpointer) * (class->max_interface_id + 1) +
++			sizeof (MonoVTable) + class->vtable_size * sizeof (gpointer);
++	}
+ 
+ 	mono_stats.class_vtable_size += vtsize + extra_interface_vtsize;
+ 
+ 	interface_offsets = mono_mempool_alloc0 (domain->mp, vtsize + extra_interface_vtsize);
+-	pvt = (MonoVTable*)(interface_offsets + max_interface_id + 1);
++	if (ARCH_USE_IMT)
++		pvt = (MonoVTable*) (interface_offsets + MONO_IMT_SIZE);
++	else
++		pvt = (MonoVTable*) (interface_offsets + max_interface_id + 1);
+ 	memcpy (pvt, vt, sizeof (MonoVTable) + class->vtable_size * sizeof (gpointer));
+ 
+ 	pvt->klass = mono_defaults.transparent_proxy_class;
+@@ -1264,11 +1423,13 @@
+ 	pvt->max_interface_id = max_interface_id;
+ 	pvt->interface_bitmap = class->interface_bitmap;
+ 
+-	/* initialize interface offsets */
+-	for (i = 0; i < class->interface_offsets_count; ++i) {
+-		int interface_id = class->interfaces_packed [i]->interface_id;
+-		int slot = class->interface_offsets_packed [i];
+-		interface_offsets [class->max_interface_id - interface_id] = &(pvt->vtable [slot]);
++	if (! ARCH_USE_IMT) {
++		/* initialize interface offsets */
++		for (i = 0; i < class->interface_offsets_count; ++i) {
++			int interface_id = class->interfaces_packed [i]->interface_id;
++			int slot = class->interface_offsets_packed [i];
++			interface_offsets [class->max_interface_id - interface_id] = &(pvt->vtable [slot]);
++		}
+ 	}
+ 
+ 	if (extra_interfaces) {
+@@ -1293,6 +1454,11 @@
+ 		g_slist_free (extra_interfaces);
+ 	}
+ 
++	if (ARCH_USE_IMT) {
++		/* Now that the vtable is full, we can actually fill up the IMT */
++		build_imt (class, pvt, domain, interface_offsets);
++	}
++
+ 	return pvt;
+ }
+ 
+Index: mono/metadata/class-internals.h
+===================================================================
+--- mono/metadata/class-internals.h	(revision 78299)
++++ mono/metadata/class-internals.h	(working copy)
+@@ -273,6 +273,7 @@
+ 	MonoClass **interfaces_packed;
+ 	guint16    *interface_offsets_packed;
+ 	guint8     *interface_bitmap;
++	guint32     imt_collisions_bitmap;
+ 	
+ 	MonoClass **interfaces;
+ 
+Index: mono/metadata/object-internals.h
+===================================================================
+--- mono/metadata/object-internals.h	(revision 78299)
++++ mono/metadata/object-internals.h	(working copy)
+@@ -1130,5 +1130,22 @@
+ MonoObject*
+ mono_nullable_box (guint8 *buf, MonoClass *klass) MONO_INTERNAL;
+ 
++#define MONO_IMT_SIZE 4
++typedef struct _MonoImtBuilderEntry {
++	MonoMethod *method;
++	int vtable_slot;
++	struct _MonoImtBuilderEntry *next;
++	int children;
++} MonoImtBuilderEntry;
++typedef struct _MonoImtBuilderEntry** MonoImtBuilder;
++
++typedef void (*MonoImtSlotInitializer) (gpointer **slot, MonoVTable *vtable, MonoDomain *domain, MonoImtBuilderEntry *imt_builder_entry);
++
++void
++mono_install_imt_slot_initializer (MonoImtSlotInitializer func) MONO_INTERNAL;
++
++guint32
++mono_compute_imt_slot (MonoMethod *method) MONO_INTERNAL;
++
+ #endif /* __MONO_OBJECT_INTERNALS_H__ */
+ 
+Index: mono/mini/inssel.brg
+===================================================================
+--- mono/mini/inssel.brg	(revision 78299)
++++ mono/mini/inssel.brg	(working copy)
+@@ -1721,9 +1721,16 @@
+ 	vtable_reg = mono_regstate_next_int (cfg->rs);
+ 	MONO_EMIT_NEW_LOAD_MEMBASE (cfg, vtable_reg, this_reg, G_STRUCT_OFFSET (MonoObject, vtable));
+ 	if (method->klass->flags & TYPE_ATTRIBUTE_INTERFACE) {
++#ifdef MONO_ARCH_HAVE_IMT
++		guint32 imt_slot = mono_compute_imt_slot (method);
++		mono_arch_emit_imt_argument (cfg, (MonoCallInst*)tree);
++		slot_reg = vtable_reg;
++		tree->inst_offset = (imt_slot - MONO_IMT_SIZE) * SIZEOF_VOID_P;
++#else
+ 		slot_reg = mono_regstate_next_int (cfg->rs);
+ 		mini_emit_load_intf_reg_vtable (cfg, slot_reg, vtable_reg, method->klass);
+ 		tree->inst_offset = method->slot * SIZEOF_VOID_P;
++#endif
+ 	} else {
+ 		slot_reg = vtable_reg;
+ 		tree->inst_offset = G_STRUCT_OFFSET (MonoVTable, vtable) + (method->slot * SIZEOF_VOID_P);
+Index: mono/mini/mini.c
+===================================================================
+--- mono/mini/mini.c	(revision 78299)
++++ mono/mini/mini.c	(working copy)
+@@ -11769,7 +11769,11 @@
+ 	mono_install_get_cached_class_info (mono_aot_get_cached_class_info);
+ 	mono_install_get_class_from_name (mono_aot_get_class_from_name);
+  	mono_install_jit_info_find_in_aot (mono_aot_find_jit_info);
+-
++#ifdef MONO_ARCH_HAVE_IMT
++	mono_install_imt_slot_initializer (mono_arch_initialize_imt_slot);
++#else
++	mono_install_imt_slot_initializer (NULL);
++#endif
+ 	if (debug_options.collect_pagefault_stats) {
+ 		mono_raw_buffer_set_make_unreadable (TRUE);
+ 		mono_aot_set_make_unreadable (TRUE);
+Index: mono/mini/mini.h
+===================================================================
+--- mono/mini/mini.h	(revision 78299)
++++ mono/mini/mini.h	(working copy)
+@@ -935,6 +935,7 @@
+ gboolean          mono_is_regsize_var (MonoType *t) MONO_INTERNAL;
+ CompRelation      mono_opcode_to_cond (int opcode) MONO_INTERNAL;
+ CompType          mono_opcode_to_type (int opcode, int cmp_opcode) MONO_INTERNAL;
++gpointer*         mono_convert_imt_slot_to_vtable_slot (gpointer* slot, gpointer *regs, MonoMethod *method) MONO_INTERNAL;
+ 
+ /* methods that must be provided by the arch-specific port */
+ void      mono_arch_cpu_init                    (void) MONO_INTERNAL;
+@@ -1009,6 +1010,10 @@
+ void     mono_arch_nullify_plt_entry            (guint8 *code) MONO_INTERNAL;
+ void     mono_arch_patch_delegate_trampoline    (guint8 *code, guint8 *tramp, gssize *regs, guint8 *addr) MONO_INTERNAL;
+ gpointer mono_arch_create_specific_trampoline   (gpointer arg1, MonoTrampolineType tramp_type, MonoDomain *domain, guint32 *code_len) MONO_INTERNAL;
++void     mono_arch_emit_imt_argument            (MonoCompile *cfg, MonoCallInst *call) MONO_INTERNAL;
++MonoMethod* mono_arch_find_imt_method           (gpointer *regs) MONO_INTERNAL;
++MonoObject* mono_arch_find_this_argument        (gpointer *regs, MonoMethod *method) MONO_INTERNAL;
++void     mono_arch_initialize_imt_slot          (gpointer **slot, MonoVTable *vtable, MonoDomain *domain, MonoImtBuilderEntry *imt_builder_entry) MONO_INTERNAL;
+ 
+ /* Exception handling */
+ gboolean mono_handle_exception                  (MonoContext *ctx, gpointer obj,
+Index: mono/mini/mini-x86.c
+===================================================================
+--- mono/mini/mini-x86.c	(revision 78299)
++++ mono/mini/mini-x86.c	(working copy)
+@@ -4085,6 +4085,85 @@
+ 	}
+ }
+ 
++#define DEBUG_IMT 0
++#define MONO_ARCH_IMT_REG X86_EDX
++void
++mono_arch_emit_imt_argument (MonoCompile *cfg, MonoCallInst *call)
++{
++	MonoInst *inst;
++	MONO_INST_NEW (cfg, inst, OP_PCONST);
++	//MONO_INST_NEW (cfg, inst, CEE_LDIND_I);
++	inst->inst_p0 = call->method;
++	inst->dreg = mono_regstate_next_int (cfg->rs);
++	mono_bblock_add_inst (cfg->cbb, inst);
++
++	mono_call_inst_add_outarg_reg (cfg, call, inst->dreg, MONO_ARCH_IMT_REG, FALSE);
++}
++
++//[1 + 4] x86_alu_reg_imm (code, X86_CMP, ins->sreg1, ins->inst_imm);
++//[1 + 1] x86_branch8(inst,cond,imm,is_signed)
++//        x86_patch(ins,target)
++//[1 + 5] x86_jump_mem(inst,mem)
++#define IMT_THUNK_SLOT_HANDLER_LENGTH 14
++#define IMT_THUNK_END_HANDLER_LENGTH 1
++void
++mono_arch_initialize_imt_slot (gpointer **slot, MonoVTable *vtable, MonoDomain *domain, MonoImtBuilderEntry *imt_builder_entry) {
++	#if DEBUG_IMT
++	printf ("mono_arch_initialize_imt_slot: working on slot at address %p\n", slot);
++	#endif
++	if (imt_builder_entry != NULL) {
++		if (imt_builder_entry->children == 0) {
++			/* No collision, store the vtable slot contents */
++			*slot = vtable->vtable [imt_builder_entry->vtable_slot];
++			#if DEBUG_IMT
++			printf ("mono_arch_initialize_imt_slot: entry '%s.%s.%s', vtable_slot %d\n",
++					imt_builder_entry->method->klass->name_space,
++					imt_builder_entry->method->klass->name,
++					imt_builder_entry->method->name,
++					imt_builder_entry->vtable_slot);
++			printf ("mono_arch_initialize_imt_slot: no collision, slot is %p\n", *slot);
++			#endif
++		} else {
++			/* Collision, build the thunk */
++			int thunk_length = (IMT_THUNK_SLOT_HANDLER_LENGTH * (imt_builder_entry->children + 1)) + IMT_THUNK_END_HANDLER_LENGTH;
++			guint8 *code = mono_code_manager_reserve (domain->code_mp, thunk_length);
++			guint8 *start = code;
++			*slot = (gpointer) code;
++			while (imt_builder_entry != NULL) {
++				guint8 *branch;
++				
++				x86_alu_reg_imm (code, X86_CMP, MONO_ARCH_IMT_REG, (guint32) imt_builder_entry->method);
++				branch = code;
++				x86_branch8 (code, X86_CC_NE, 0, FALSE);
++				x86_jump_mem (code, & (vtable->vtable [imt_builder_entry->vtable_slot]));
++				x86_patch (branch, code);
++				
++				#if DEBUG_IMT
++				printf ("mono_arch_initialize_imt_slot: entry '%s.%s.%s', vtable_slot %d, vtable_address %p at %p\n",
++						imt_builder_entry->method->klass->name_space,
++						imt_builder_entry->method->klass->name,
++						imt_builder_entry->method->name,
++						imt_builder_entry->vtable_slot,
++						& (vtable->vtable [imt_builder_entry->vtable_slot]),
++						branch + 2);
++				#endif
++				imt_builder_entry = imt_builder_entry->next;
++			}
++			x86_breakpoint (code);
++			g_assert ((code - start) == thunk_length);
++			#if DEBUG_IMT
++			printf ("mono_arch_initialize_imt_slot: collisions, slot is %p\n", *slot);
++			#endif
++		}
++	} else {
++		/* Empty slot */
++		*slot = NULL;
++		#if DEBUG_IMT
++		printf ("mono_arch_initialize_imt_slot: empty slot is NULL\n");
++		#endif
++	}
++}
++
+ MonoInst*
+ mono_arch_get_inst_for_method (MonoCompile *cfg, MonoMethod *cmethod, MonoMethodSignature *fsig, MonoInst **args)
+ {
+@@ -4221,7 +4300,80 @@
+ 	}
+ }
+ 
++/*
++ * FIXME:
++ * The following function is arch-independent, and should go in another
++ * file to be reused (as object.c, with prototype in object-internals.h)
++ */
+ gpointer*
++mono_convert_imt_slot_to_vtable_slot (gpointer* slot, gpointer *regs, MonoMethod *method) {
++	MonoObject *this_argument = mono_arch_find_this_argument (regs, method);
++	MonoVTable *vt = this_argument->vtable;
++	int displacement = slot - ((gpointer*)vt);
++	
++	if (displacement > 0) {
++		/* slot is in the vtable, not in the IMT */
++		#if DEBUG_IMT
++		printf ("mono_convert_imt_slot_to_vtable_slot: slot %p is in the vtable, not in the IMT\n", slot);
++		#endif
++		return slot;
++	} else {
++		MonoMethod *imt_method = mono_arch_find_imt_method (regs);
++		int interface_offset = mono_class_interface_offset (vt->klass, imt_method->klass);
++		int imt_slot = MONO_IMT_SIZE + displacement;
++		#if DEBUG_IMT
++		printf ("mono_convert_imt_slot_to_vtable_slot: method = %s.%s.%s, imt_method = %s.%s.%s\n",
++				method->klass->name_space, method->klass->name, method->name, 
++				imt_method->klass->name_space, imt_method->klass->name, imt_method->name);
++		#endif
++		g_assert (imt_slot < MONO_IMT_SIZE);
++		if (vt->klass->imt_collisions_bitmap & (1 << imt_slot)) {
++			/* FIXME: Why is the -4 needed here? */
++			int vtable_offset = interface_offset + imt_method->slot;
++			gpointer *vtable_slot = & (vt->vtable [vtable_offset]);
++			#if DEBUG_IMT
++			printf ("mono_convert_imt_slot_to_vtable_slot: slot %p[%d] is in the IMT, and colliding becomes %p[%d] (interface_offset = %d, method->slot = %d)\n", slot, imt_slot, vtable_slot, vtable_offset, interface_offset, imt_method->slot);
++			#endif
++			g_assert (vtable_offset >= 0);
++			return vtable_slot;
++		} else {
++			#if DEBUG_IMT
++			printf ("mono_convert_imt_slot_to_vtable_slot: slot %p[%d] is in the IMT, but not colliding\n", slot, imt_slot);
++			#endif
++			return slot;
++		}
++	}
++}
++
++#if (MONO_ARCH_HAVE_IMT)
++MonoMethod*
++mono_arch_find_imt_method (gpointer *regs) {
++	return (MonoMethod*) regs [MONO_ARCH_IMT_REG];
++}
++MonoObject*
++mono_arch_find_this_argument (gpointer *regs, MonoMethod *method) {
++	MonoMethodSignature *sig = mono_method_signature (method);
++	CallInfo *cinfo = get_call_info (NULL, sig, FALSE);
++	int this_argument_offset;
++	MonoObject *this_argument;
++	
++	if (MONO_TYPE_ISSTRUCT (sig->ret) && (cinfo->ret.storage == ArgOnStack)) {
++		//printf ("mono_arch_find_this_argument: ArgOnStack path, ");
++		this_argument_offset = 6*4;
++	} else {
++		//printf ("mono_arch_find_this_argument: normal path, ");
++		this_argument_offset = 5*4;
++	}
++	
++	this_argument = * (MonoObject**) (((guint8*) regs [X86_ESP]) + this_argument_offset);
++	//printf ("this_argument = %p\n", this_argument);
++	
++	g_free (cinfo);
++	return this_argument;
++}
++#endif
++
++gpointer*
+ mono_arch_get_vcall_slot_addr (guint8 *code, gpointer *regs)
+ {
+ 	guint8 reg = 0;
+Index: mono/mini/mini-x86.h
+===================================================================
+--- mono/mini/mini-x86.h	(revision 78299)
++++ mono/mini/mini-x86.h	(working copy)
+@@ -252,6 +252,7 @@
+ #define MONO_ARCH_HAVE_CREATE_SPECIFIC_TRAMPOLINE 1
+ #define MONO_ARCH_HAVE_CREATE_DELEGATE_TRAMPOLINE 1
+ #define MONO_ARCH_HAVE_CREATE_VARS 1
++#define MONO_ARCH_HAVE_IMT 1
+ 
+ #endif /* __MONO_MINI_X86_H__ */  
+ 
+Index: mono/mini/mini-trampolines.c
+===================================================================
+--- mono/mini/mini-trampolines.c	(revision 78299)
++++ mono/mini/mini-trampolines.c	(working copy)
+@@ -13,6 +13,8 @@
+ 
+ #include "mini.h"
+ 
++
++#define DEBUG_IMT 0
+ /**
+  * mono_magic_trampoline:
+  *
+@@ -26,7 +28,11 @@
+ 
+ 	addr = mono_compile_method (m);
+ 	g_assert (addr);
+-
++	
++	#if DEBUG_IMT
++	printf ("mono_magic_trampoline: method %s.%s.%s\n", m->klass->name_space, m->klass->name, m->name);
++	#endif
++	
+ 	/* the method was jumped to */
+ 	if (!code)
+ 		return addr;
+@@ -39,8 +45,10 @@
+ 
+ 		g_assert (*vtable_slot);
+ 
+-		if (mono_aot_is_got_entry (code, (guint8*)vtable_slot) || mono_domain_owns_vtable_slot (mono_domain_get (), vtable_slot))
++		if (mono_aot_is_got_entry (code, (guint8*)vtable_slot) || mono_domain_owns_vtable_slot (mono_domain_get (), vtable_slot)) {
++			vtable_slot = mono_convert_imt_slot_to_vtable_slot (vtable_slot, (gpointer*)regs, m);
+ 			*vtable_slot = mono_get_addr_from_ftnptr (addr);
++		}
+ 	}
+ 	else {
+ 		guint8 *plt_entry = mono_aot_get_plt_entry (code);

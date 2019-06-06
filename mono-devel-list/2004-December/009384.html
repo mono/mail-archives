@@ -1,0 +1,155 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] [PATCH] CAS declarative stack modifiers - affects JIT ports!
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5BPATCH%5D%20CAS%20declarative%20stack%20modifiers%20-%20affects%20JIT%20ports%21&In-Reply-To=1102517761.10158.65.camel%40pollux.novell">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="009304.html">
+   <LINK REL="Next"  HREF="009305.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] [PATCH] CAS declarative stack modifiers - affects JIT ports!</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5BPATCH%5D%20CAS%20declarative%20stack%20modifiers%20-%20affects%20JIT%20ports%21&In-Reply-To=1102517761.10158.65.camel%40pollux.novell"
+       TITLE="[Mono-devel-list] [PATCH] CAS declarative stack modifiers - affects JIT ports!">lupus at ximian.com
+       </A><BR>
+    <I>Mon Dec 13 09:57:15 EST 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="009304.html">[Mono-devel-list] [PATCH] CAS declarative stack modifiers - affects JIT ports!
+</A></li>
+        <LI>Next message: <A HREF="009305.html">[Mono-devel-list] Compiler Warnings AMD64 - final
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9384">[ date ]</a>
+              <a href="thread.html#9384">[ thread ]</a>
+              <a href="subject.html#9384">[ subject ]</a>
+              <a href="author.html#9384">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 12/08/04 Sebastien Pouliot wrote:
+&gt;<i> This is a newer version of the previous patch that use callbacks when
+</I>&gt;<i> playing with the stack. I.e. the current code for getting debug info
+</I>&gt;<i> from the stack has been re-written to use the callback, while the new
+</I>&gt;<i> security code use it.
+</I>
+What I had in mind for the stack walking callback is attached.
+The code is untested, but it should work well enough for your
+needs and doesn't have the large overhead of creating managed
+objects etc, which is not needed at all.
+We should also add a macro to the mini-$arch.h files to init
+the starting context:
+
+#define MONO_INIT_CONTEXT_FROM_FUNC(ctxstart_func) do {\
+		mono_arch_flush_register_windows ();	\
+		MONO_CONTEXT_SET_IP ((ctx), (start_func));	\
+	 	MONO_CONTEXT_SET_BP ((ctx), __builtin_frame_address (0));	\
+	} while (0)
+
+So we can finally reuse this code on other archs, too, remove the useless
+flush_register_windows() on !sparc etc.
+Would this work for you?
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+-------------- next part --------------
+Index: mini.h
+===================================================================
+--- mini.h	(revision 37690)
++++ mini.h	(working copy)
+@@ -816,6 +816,11 @@
+ gboolean mono_handle_exception                  (MonoContext *ctx, gpointer obj,
+ 						 gpointer original_ip, gboolean test_only);
+ void      mono_jit_walk_stack                   (MonoStackWalk func, gboolean do_il_offset, gpointer user_data);
++
++/* the new function to do stack walks */
++typedef gboolean (*MonoStackFrameWalk)          (MonoDomain *domain, MonoContext *ctx, MonoJitInfo *ji, gpointer data);
++void      mono_walk_stack                       (MonoDomain *domain, MonoJitTlsData *jit_tls, MonoContext *start_ctx, MonoStackFrameWalk func, gpointer user_data);
++
+ MonoArray *ves_icall_get_trace                  (MonoException *exc, gint32 skip, MonoBoolean need_file_info);
+ MonoBoolean ves_icall_get_frame_info            (gint32 skip, MonoBoolean need_file_info, 
+ 						 MonoReflectionMethod **method, 
+Index: mini-exceptions.c
+===================================================================
+--- mini-exceptions.c	(revision 37690)
++++ mini-exceptions.c	(working copy)
+@@ -154,7 +154,49 @@
+ 	return res;
+ }
+ 
++/**
++ * mono_walk_stack:
++ * @domain: starting appdomain
++ * @jit_tls: JIT data for the thread
++ * @start_ctx: starting state of the stack frame
++ * @func: callback to call for each stack frame
++ * @user_data: data passed to the callback
++ *
++ * This function walks the stack of a thread, starting from the state
++ * represented by jit_tls and start_ctx. For each frame the callback
++ * function is called with the relevant info. The walk ends when no more
++ * managed stack frames are found or when the callback returns a TRUE value.
++ * Note that the function can be used to walk the stack of a thread 
++ * different from the current.
++ */
+ void
++mono_walk_stack (MonoDomain *domain, MonoJitTlsData *jit_tls, MonoContext *start_ctx, MonoStackFrameWalk func, gpointer user_data)
++{
++	MonoLMF *lmf = jit_tls-&gt;lmf;
++	MonoJitInfo *ji, rji;
++	gint native_offset;
++	gboolean managed;
++	MonoContext ctx, new_ctx;
++
++	ctx = *start_ctx;
++
++	while (MONO_CONTEXT_GET_BP (&amp;ctx) &lt; jit_tls-&gt;end_of_stack) {
++		/* 
++		 * FIXME: mono_find_jit_info () will need to be able to return a different
++		 * MonoDomain when apddomain transitions are found on the stack.
++		 */
++		ji = mono_find_jit_info (domain, jit_tls, &amp;rji, NULL, &amp;ctx, &amp;new_ctx, NULL, &amp;lmf, &amp;native_offset, &amp;managed);
++		if (!ji || ji == (gpointer)-1)
++			return;
++
++		if (func (domain, &amp;new_ctx, ji, user_data))
++			return;
++		
++		ctx = new_ctx;
++	}
++}
++
++void
+ mono_jit_walk_stack (MonoStackWalk func, gboolean do_il_offset, gpointer user_data) {
+ 	MonoDomain *domain = mono_domain_get ();
+ 	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="009304.html">[Mono-devel-list] [PATCH] CAS declarative stack modifiers - affects JIT ports!
+</A></li>
+	<LI>Next message: <A HREF="009305.html">[Mono-devel-list] Compiler Warnings AMD64 - final
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#9384">[ date ]</a>
+              <a href="thread.html#9384">[ thread ]</a>
+              <a href="subject.html#9384">[ subject ]</a>
+              <a href="author.html#9384">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

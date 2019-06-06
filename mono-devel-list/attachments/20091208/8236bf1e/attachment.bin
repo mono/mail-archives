@@ -1,0 +1,1087 @@
+diff --git a/man/mono.1 b/man/mono.1
+index 7d5e2ef..65cca11 100644
+--- a/man/mono.1
++++ b/man/mono.1
+@@ -1282,10 +1282,7 @@ applications that hard-code Windows paths.  Set to a colon-separated
+ list of "drive" to strip drive letters, or "case" to do
+ case-insensitive file matching in every directory in a path.  "all"
+ enables all rewriting methods.  (Backslashes are always mapped to
+-slashes if this variable is set to a valid option). Additional option "report" can 
+-be set (it is not included in "all") to make mapping code print the names of
+-files in case a mismatch is found, together with a stack trace showing which managed method
+-the misnamed file has been requested from.
++slashes if this variable is set to a valid option).
+ .fi
+ .Sp
+ For example, this would work from the shell:
+@@ -1305,6 +1302,28 @@ directive instead, like this:
+ 
+ .fi
+ See mod_mono(8) for more details.
++
++Additionally. Mono includes a profiler module which allows one to track what
++adjustements to file paths IOMAP code needs to do. The tracking code reports
++the managed location (full stack trace) from which the IOMAP-ed call was made and,
++on process exit, the locations where all the IOMAP-ed strings were created in
++managed code. The latter report is only approximate as it is not always possible
++to estimate the actual location where the string was created. The code uses simple
++heuristics - it analyzes stack trace leading back to the string allocation location
++and ignores all the managed code which lives in assemblies installed in GAC as well as in the
++class libraries shipped with Mono (since they are assumed to be free of case-sensitivity
++issues). It then reports the first location in the user's code - in most cases this will be
++the place where the string is allocated or very close to the location. The reporting code
++is implemented as a custom profiler module (see the "PROFILING" section) and can be loaded
++in the following way:
++.fi
++.Sp
++.nf
++
++	mono --profile=iomap yourapplication.exe
++
++.fi
++Note, however, that Mono currently supports only one profiler module at a time.
+ .TP
+ \fBMONO_MANAGED_WATCHER\fR
+ If set to "disabled", System.IO.FileSystemWatcher will use a file watcher 
+diff --git a/mono/metadata/profiler-private.h b/mono/metadata/profiler-private.h
+index d060c8c..7c96266 100644
+--- a/mono/metadata/profiler-private.h
++++ b/mono/metadata/profiler-private.h
+@@ -34,6 +34,7 @@ void mono_profiler_method_end_invoke   (MonoMethod *method) MONO_INTERNAL;
+ 
+ void mono_profiler_code_transition (MonoMethod *method, int result) MONO_INTERNAL;
+ void mono_profiler_allocation      (MonoObject *obj, MonoClass *klass) MONO_INTERNAL;
++void mono_profiler_string_allocation (MonoDomain *domain, MonoString *str) MONO_INTERNAL;
+ void mono_profiler_monitor_event   (MonoObject *obj, MonoProfilerMonitorEvent event) MONO_INTERNAL;
+ void mono_profiler_stat_hit        (guchar *ip, void *context) MONO_INTERNAL;
+ void mono_profiler_stat_call_chain (int call_chain_depth, guchar **ips, void *context) MONO_INTERNAL;
+@@ -58,6 +59,8 @@ void mono_profiler_class_loaded (MonoClass *klass, int result) MONO_INTERNAL;
+ void mono_profiler_appdomain_event  (MonoDomain *domain, int code) MONO_INTERNAL;
+ void mono_profiler_appdomain_loaded (MonoDomain *domain, int result) MONO_INTERNAL;
+ 
++void mono_profiler_iomap (char *report, const char *pathname, const char *new_pathname) MONO_INTERNAL;
++
+ MonoProfileCoverageInfo* mono_profiler_coverage_alloc (MonoMethod *method, int entries) MONO_INTERNAL;
+ void                     mono_profiler_coverage_free  (MonoMethod *method) MONO_INTERNAL;
+ 
+diff --git a/mono/metadata/profiler.c b/mono/metadata/profiler.c
+index d8ae324..c622b5a 100644
+--- a/mono/metadata/profiler.c
++++ b/mono/metadata/profiler.c
+@@ -60,6 +60,7 @@ static MonoProfileMethodFunc   method_start_invoke;
+ static MonoProfileMethodFunc   method_end_invoke;
+ static MonoProfileMethodResult man_unman_transition;
+ static MonoProfileAllocFunc    allocation_cb;
++static MonoProfileStringAllocFunc string_allocation_cb;
+ static MonoProfileMonitorFunc  monitor_event_cb;
+ static MonoProfileStatFunc     statistical_cb;
+ static MonoProfileStatCallChainFunc statistical_call_chain_cb;
+@@ -72,6 +73,8 @@ static MonoProfileExceptionFunc	exception_throw_cb;
+ static MonoProfileMethodFunc exception_method_leave_cb;
+ static MonoProfileExceptionClauseFunc exception_clause_cb;
+ 
++static MonoProfileIomapFunc iomap_cb;
++
+ static MonoProfileThreadFunc   thread_start;
+ static MonoProfileThreadFunc   thread_end;
+ 
+@@ -212,6 +215,12 @@ mono_profiler_install_allocation (MonoProfileAllocFunc callback)
+ 	allocation_cb = callback;
+ }
+ 
++void 
++mono_profiler_install_string_allocation (MonoProfileStringAllocFunc callback)
++{
++	string_allocation_cb = callback;
++}
++
+ void
+ mono_profiler_install_monitor  (MonoProfileMonitorFunc callback)
+ {
+@@ -377,6 +386,13 @@ mono_profiler_allocation (MonoObject *obj, MonoClass *klass)
+ }
+ 
+ void
++mono_profiler_string_allocation (MonoDomain *domain, MonoString *str)
++{
++	if ((mono_profiler_events & MONO_PROFILE_STRING_ALLOC) && string_allocation_cb)
++		string_allocation_cb (current_profiler, domain, str);
++}
++
++void
+ mono_profiler_monitor_event      (MonoObject *obj, MonoProfilerMonitorEvent event) {
+ 	if ((mono_profiler_events & MONO_PROFILE_MONITOR_EVENTS) && monitor_event_cb) {
+ 		monitor_event_cb (current_profiler, obj, event);
+@@ -463,6 +479,12 @@ mono_profiler_assembly_loaded (MonoAssembly *assembly, int result)
+ 		assembly_end_load (current_profiler, assembly, result);
+ }
+ 
++void mono_profiler_iomap (char *report, const char *pathname, const char *new_pathname)
++{
++	if ((mono_profiler_events && MONO_PROFILE_IOMAP_EVENTS) && iomap_cb)
++		iomap_cb (current_profiler, report, pathname, new_pathname);
++}
++
+ void 
+ mono_profiler_module_event  (MonoImage *module, int code)
+ {
+@@ -624,6 +646,13 @@ void
+ mono_profiler_install_code_buffer_new (MonoProfilerCodeBufferNew callback) {
+ 	code_buffer_new = callback;
+ }
++
++void
++mono_profiler_install_iomap (MonoProfileIomapFunc callback)
++{
++	iomap_cb = callback;
++}
++
+ void
+ mono_profiler_code_buffer_new (gpointer buffer, int size, MonoProfilerCodeBufferType type, void *data) {
+ 	if (code_buffer_new)
+diff --git a/mono/metadata/profiler.h b/mono/metadata/profiler.h
+index 4601153..1c9d728 100644
+--- a/mono/metadata/profiler.h
++++ b/mono/metadata/profiler.h
+@@ -27,7 +27,9 @@ typedef enum {
+ 	MONO_PROFILE_INS_COVERAGE     = 1 << 14,
+ 	MONO_PROFILE_STATISTICAL      = 1 << 15,
+ 	MONO_PROFILE_METHOD_EVENTS    = 1 << 16,
+-	MONO_PROFILE_MONITOR_EVENTS   = 1 << 17
++	MONO_PROFILE_MONITOR_EVENTS   = 1 << 17,
++	MONO_PROFILE_IOMAP_EVENTS     = 1 << 18,
++	MONO_PROFILE_STRING_ALLOC     = 1 << 19
+ } MonoProfileFlags;
+ 
+ typedef enum {
+@@ -108,16 +110,18 @@ typedef void (*MonoProfileMethodInline)   (MonoProfiler *prof, MonoMethod   *par
+ 
+ typedef void (*MonoProfileThreadFunc)     (MonoProfiler *prof, gsize tid);
+ typedef void (*MonoProfileAllocFunc)      (MonoProfiler *prof, MonoObject *obj, MonoClass *klass);
++typedef void (*MonoProfileStringAllocFunc) (MonoProfiler *prof, MonoDomain *domain, MonoString *str);
+ typedef void (*MonoProfileStatFunc)       (MonoProfiler *prof, guchar *ip, void *context);
+ typedef void (*MonoProfileStatCallChainFunc) (MonoProfiler *prof, int call_chain_depth, guchar **ip, void *context);
+ typedef void (*MonoProfileGCFunc)         (MonoProfiler *prof, MonoGCEvent event, int generation);
+ typedef void (*MonoProfileGCResizeFunc)   (MonoProfiler *prof, gint64 new_size);
+ 
++typedef void (*MonoProfileIomapFunc) (MonoProfiler *prof, const char *report, const char *pathname, const char *new_pathname);
++
+ typedef gboolean (*MonoProfileCoverageFilterFunc)   (MonoProfiler *prof, MonoMethod *method);
+ 
+ typedef void (*MonoProfileCoverageFunc)   (MonoProfiler *prof, const MonoProfileCoverageEntry *entry);
+ 
+-
+ typedef void (*MonoProfilerCodeChunkNew) (MonoProfiler *prof, gpointer chunk, int size);
+ typedef void (*MonoProfilerCodeChunkDestroy) (MonoProfiler *prof, gpointer chunk);
+ typedef void (*MonoProfilerCodeBufferNew) (MonoProfiler *prof, gpointer buffer, int size, MonoProfilerCodeBufferType type, void *data);
+@@ -147,6 +151,7 @@ void mono_profiler_install_enter_leave (MonoProfileMethodFunc enter, MonoProfile
+ void mono_profiler_install_thread      (MonoProfileThreadFunc start, MonoProfileThreadFunc end);
+ void mono_profiler_install_transition  (MonoProfileMethodResult callback);
+ void mono_profiler_install_allocation  (MonoProfileAllocFunc callback);
++void mono_profiler_install_string_allocation (MonoProfileStringAllocFunc callback);
+ void mono_profiler_install_monitor     (MonoProfileMonitorFunc callback);
+ void mono_profiler_install_statistical (MonoProfileStatFunc callback);
+ void mono_profiler_install_statistical_call_chain (MonoProfileStatCallChainFunc callback, int call_chain_depth, MonoProfilerCallChainStrategy call_chain_strategy);
+@@ -160,6 +165,8 @@ void mono_profiler_install_code_chunk_new (MonoProfilerCodeChunkNew callback);
+ void mono_profiler_install_code_chunk_destroy (MonoProfilerCodeChunkDestroy callback);
+ void mono_profiler_install_code_buffer_new (MonoProfilerCodeBufferNew callback);
+ 
++void mono_profiler_install_iomap (MonoProfileIomapFunc callback);
++
+ void mono_profiler_load             (const char *desc);
+ 
+ G_END_DECLS
+diff --git a/mono/metadata/string-icalls.c b/mono/metadata/string-icalls.c
+index 71bdcc7..18eafcd 100644
+--- a/mono/metadata/string-icalls.c
++++ b/mono/metadata/string-icalls.c
+@@ -22,6 +22,8 @@
+ #include <mono/metadata/object.h>
+ #include <mono/metadata/exception.h>
+ #include <mono/metadata/debug-helpers.h>
++#include <mono/metadata/profiler.h>
++#include <mono/metadata/profiler-private.h>
+ 
+ /* Internal helper methods */
+ 
+@@ -209,7 +211,14 @@ ves_icall_System_String_InternalAllocateStr (gint32 length)
+ {
+ 	MONO_ARCH_SAVE_REGS;
+ 
+-	return mono_string_new_size(mono_domain_get (), length);
++	if (mono_profiler_events & MONO_PROFILE_STRING_ALLOC) {
++		MonoDomain *domain = mono_domain_get ();
++		MonoString *str = mono_string_new_size (domain, length);
++
++		mono_profiler_string_allocation (domain, str);
++		return str;
++	} else
++		return mono_string_new_size(mono_domain_get (), length);
+ }
+ 
+ MonoString  *
+diff --git a/mono/mini/method-to-ir.c b/mono/mini/method-to-ir.c
+index 4d6f33d..2517797 100644
+--- a/mono/mini/method-to-ir.c
++++ b/mono/mini/method-to-ir.c
+@@ -49,6 +49,8 @@
+ #include <mono/metadata/threads-types.h>
+ #include <mono/metadata/security-core-clr.h>
+ #include <mono/metadata/monitor.h>
++#include <mono/metadata/profiler-private.h>
++#include <mono/metadata/profiler.h>
+ #include <mono/utils/mono-compiler.h>
+ 
+ #include "mini.h"
+@@ -4189,7 +4191,7 @@ mini_redirect_call (MonoCompile *cfg, MonoMethod *method,
+ {
+ 	if (method->klass == mono_defaults.string_class) {
+ 		/* managed string allocation support */
+-		if (strcmp (method->name, "InternalAllocateStr") == 0) {
++		if (strcmp (method->name, "InternalAllocateStr") == 0 && !(mono_profiler_events & MONO_PROFILE_STRING_ALLOC)) {
+ 			MonoInst *iargs [2];
+ 			MonoVTable *vtable = mono_class_vtable (cfg->domain, method->klass);
+ 			MonoMethod *managed_alloc = NULL;
+diff --git a/mono/profiler/Makefile.am b/mono/profiler/Makefile.am
+index 0b0db4f..f9b674f 100644
+--- a/mono/profiler/Makefile.am
++++ b/mono/profiler/Makefile.am
+@@ -7,9 +7,9 @@ INCLUDES = \
+ if !DISABLE_PROFILER
+ if JIT_SUPPORTED
+ if PLATFORM_LINUX
+-lib_LTLIBRARIES = libmono-profiler-cov.la libmono-profiler-aot.la libmono-profiler-logging.la
++lib_LTLIBRARIES = libmono-profiler-cov.la libmono-profiler-aot.la libmono-profiler-logging.la libmono-profiler-iomap.la
+ else
+-lib_LTLIBRARIES = libmono-profiler-cov.la libmono-profiler-aot.la
++lib_LTLIBRARIES = libmono-profiler-cov.la libmono-profiler-aot.la libmono-profiler-iomap.la
+ endif
+ endif
+ endif
+@@ -24,4 +24,5 @@ libmono_profiler_aot_la_SOURCES = mono-profiler-aot.c
+ libmono_profiler_aot_la_LIBADD = $(top_builddir)/mono/mini/libmono.la
+ libmono_profiler_logging_la_SOURCES = mono-profiler-logging.c
+ libmono_profiler_logging_la_LIBADD = $(top_builddir)/mono/mini/libmono.la
+-
++libmono_profiler_iomap_la_SOURCES = mono-profiler-iomap.c
++libmono_profiler_iomap_la_LIBADD = $(top_builddir)/mono/mini/libmono.la
+diff --git a/mono/profiler/mono-profiler-iomap.c b/mono/profiler/mono-profiler-iomap.c
+new file mode 100644
+index 0000000..ef129b0
+--- /dev/null
++++ b/mono/profiler/mono-profiler-iomap.c
+@@ -0,0 +1,532 @@
++/*
++ * mono-profiler-iomap.c: IOMAP string profiler for Mono.
++ *
++ * Authors:
++ *   Marek Habersack <mhabersack@novell.com>
++ *
++ * Copyright (c) 2009 Novell, Inc (http://novell.com)
++ */
++#include "config.h"
++
++#include <string.h>
++#include <mono/utils/mono-io-portability.h>
++#include <mono/metadata/metadata.h>
++#include <mono/metadata/metadata-internals.h>
++#include <mono/metadata/class.h>
++#include <mono/metadata/class-internals.h>
++#include <mono/metadata/image.h>
++#include <mono/metadata/mono-debug.h>
++#include <mono/metadata/debug-helpers.h>
++#include <mono/metadata/threads.h>
++#include <mono/metadata/profiler.h>
++#include <mono/metadata/loader.h>
++#include <mono/io-layer/mono-mutex.h>
++
++#define BACKTRACE_SIZE 64
++
++typedef struct _MonoStackBacktraceInfo 
++{
++	MonoMethod *method;
++	gint native_offset;
++} MonoStackBacktraceInfo;
++
++typedef struct 
++{
++	guint32 count;
++	gchar *requestedName;
++	gchar *actualName;
++} MismatchedFilesStats;
++
++typedef struct _SavedString
++{
++	MonoString *string;
++	MonoDomain *domain;
++	void *stack [BACKTRACE_SIZE];
++	gint stack_entries;
++	struct _SavedString *next;
++} SavedString;
++
++typedef struct _SavedStringFindInfo
++{
++	guint32 hash;
++	size_t len;
++} SavedStringFindInfo;
++
++typedef struct _StringLocation
++{
++	gchar *hint;
++	struct _StringLocation *next;
++} StringLocation;
++
++struct _MonoProfiler
++{
++	GHashTable *mismatched_files_hash;
++	GHashTable *saved_strings_hash;
++	GHashTable *string_locations_hash;
++	gboolean may_have_locations;
++};
++
++typedef struct _StackWalkData
++{
++	MonoProfiler *prof;
++	void **stack;
++	int stack_size;
++	int frame_count;
++} StackWalkData;
++
++static mono_mutex_t mismatched_files_section;
++static gboolean runtime_initialized = FALSE;
++
++static inline void append_report (GString **report, const gchar *format, ...);
++static inline void print_report (const gchar *format, ...);
++static inline guint32 do_calc_string_hash (guint32 hash, const gchar *str);
++static inline guint32 calc_strings_hash (const gchar *str1, const gchar *str2, guint32 *str1hash);
++static void print_mismatched_stats (MonoProfiler *prof);
++static inline gchar *build_hint (SavedString *head);
++static inline gchar *build_hint_from_stack (MonoDomain *domain, void **stack, gint stack_entries);
++static inline void store_string_location (MonoProfiler *prof, const gchar *string, guint32 hash, size_t len);
++static void mono_portability_remember_string (MonoProfiler *prof, MonoDomain *domain, MonoString *str);
++void mono_profiler_startup (const char *desc);
++
++static void mismatched_stats_foreach_func (gpointer key, gpointer value, gpointer user_data)
++{
++	MismatchedFilesStats *stats = (MismatchedFilesStats*)value;
++	StringLocation *location;
++	MonoProfiler *prof = (MonoProfiler*)user_data;
++	guint32 hash;
++
++	hash = do_calc_string_hash (0, stats->requestedName);
++	fprintf (stdout,
++		 "    Count: %u\n"
++		 "Requested: %s (hash: 0x%X)\n"
++		 "   Actual: %s (hash: 0x%X)\n",
++		 stats->count, stats->requestedName, hash, stats->actualName, do_calc_string_hash (0, stats->actualName));
++
++	if (!prof->may_have_locations) {
++		fprintf (stdout, "\n");
++		return;
++	}
++
++	location = g_hash_table_lookup (prof->string_locations_hash, &hash);
++	if (location)
++		fprintf (stdout, "Locations:\n");
++
++	while (location) {
++		fprintf (stdout, "    %s", location->hint);
++		location = location->next;
++	}
++
++	fprintf (stdout, "\n");
++}
++
++static void print_mismatched_stats (MonoProfiler *prof)
++{
++	if (!prof->mismatched_files_hash || g_hash_table_size (prof->mismatched_files_hash) == 0)
++		return;
++
++	prof->may_have_locations = g_hash_table_size (prof->string_locations_hash) > 0;
++
++	fprintf (stdout, "\n-=-=-=-=-=-=-= MONO_IOMAP Stats -=-=-=-=-=-=-=\n");
++	g_hash_table_foreach (prof->mismatched_files_hash, mismatched_stats_foreach_func, (gpointer)prof);
++	fflush (stdout);
++}
++
++static guint mismatched_files_guint32_hash (gconstpointer key)
++{
++	if (!key)
++		return 0;
++
++	return *((guint32*)key);
++}
++
++static gboolean mismatched_files_guint32_equal (gconstpointer key1, gconstpointer key2)
++{
++	if (!key1 || !key2)
++		return FALSE;
++
++	return (gboolean)(*((guint32*)key1) == *((guint32*)key2));
++}
++
++static inline guint32 do_calc_string_hash (guint32 hash, const gchar *str)
++{
++	guint32 ret = hash;
++	gchar *cc = (gchar*)str;
++	gchar *end = (gchar*)(str + strlen (str) - 1);
++
++	for (; cc < end; cc += 2) {
++		ret = (ret << 5) - ret + *cc;
++		ret = (ret << 5) - ret + cc [1];
++	}
++	end++;
++	if (cc < end)
++		ret = (ret << 5) - ret + *cc;
++
++	return ret;
++}
++
++static inline guint32 calc_strings_hash (const gchar *str1, const gchar *str2, guint32 *str1hash)
++{
++	guint32 hash = do_calc_string_hash (0, str1);
++	if (str1hash)
++		*str1hash = hash;
++	return do_calc_string_hash (hash, str2);
++}
++
++static inline void print_report (const gchar *format, ...)
++{
++	MonoClass *klass;
++	MonoProperty *prop;
++	MonoString *str;
++	char *stack_trace;
++	va_list ap;
++
++	fprintf (stdout, "-=-=-=-=-=-=- MONO_IOMAP REPORT -=-=-=-=-=-=-\n");
++	va_start (ap, format);
++	vfprintf (stdout, format, ap);
++	fprintf (stdout, "\n");
++	va_end (ap);
++	klass = mono_class_from_name (mono_get_corlib (), "System", "Environment");
++	mono_class_init (klass);
++	prop = mono_class_get_property_from_name (klass, "StackTrace");
++	str = (MonoString*)mono_property_get_value (prop, NULL, NULL, NULL);
++	stack_trace = mono_string_to_utf8 (str);
++
++	fprintf (stdout, "-= Stack Trace =-\n%s\n\n", stack_trace);
++	g_free (stack_trace);
++	fflush (stdout);
++}
++
++static inline void append_report (GString **report, const gchar *format, ...)
++{
++#if GLIB_CHECK_VERSION(2,14,0)
++	va_list ap;
++	if (!*report)
++		*report = g_string_new ("");
++
++	va_start (ap, format);
++	g_string_append_vprintf (*report, format, ap);
++	va_end (ap);
++#else
++	g_assert_not_reached ();
++#endif
++}
++
++static gboolean saved_strings_find_func (gpointer key, gpointer value, gpointer user_data)
++{
++	SavedStringFindInfo *info = (SavedStringFindInfo*)user_data;
++	SavedString *saved = (SavedString*)value;
++	gchar *utf_str;
++	guint32 hash;
++
++	if (!info || !saved || saved->string->length != info->len)
++		return FALSE;
++
++	utf_str = mono_string_to_utf8 (saved->string);
++	hash = do_calc_string_hash (0, utf_str);
++	g_free (utf_str);
++
++	if (hash != info->hash)
++		return FALSE;
++
++	return TRUE;
++}
++
++static inline void store_string_location (MonoProfiler *prof, const gchar *string, guint32 hash, size_t len)
++{
++	StringLocation *location = g_hash_table_lookup (prof->string_locations_hash, &hash);
++	SavedString *saved;
++	SavedStringFindInfo info;
++	guint32 *hashptr;
++
++	if (location)
++		return;
++
++	info.hash = hash;
++	info.len = len;
++
++	/* Expensive but unavoidable... */
++	saved = (SavedString*)g_hash_table_find (prof->saved_strings_hash, saved_strings_find_func, &info);
++	hashptr = (guint32*)g_malloc (sizeof (guint32));
++	*hashptr = hash;
++	location = (StringLocation*)g_malloc0 (sizeof (location));
++
++	g_hash_table_insert (prof->string_locations_hash, hashptr, location);
++	if (!saved)
++		return;
++
++	g_hash_table_remove (prof->saved_strings_hash, saved->string);
++	location->hint = build_hint (saved);
++}
++
++static gboolean ignore_frame (MonoMethod *method)
++{
++	MonoClass *klass = method->klass;
++
++	if (method->wrapper_type != MONO_WRAPPER_NONE)
++		return TRUE;
++
++	/* Now ignore the assemblies we know shouldn't contain mixed-case names (only the most frequent cases) */
++	if (klass->image ) {
++		if (strcmp (klass->image->assembly_name, "mscorlib") == 0)
++			return TRUE;
++		else if (strcmp (klass->image->assembly_name, "System") == 0)
++			return TRUE;
++		else if (strncmp (klass->image->assembly_name, "Mono.", 5) == 0)
++			return TRUE;
++		else if (strncmp (klass->image->assembly_name, "System.", 7) == 0)
++			return TRUE;
++		else if (strcmp (klass->image->assembly_name, "PEAPI") == 0)
++			return TRUE;
++	}
++
++	return FALSE;
++}
++
++static inline gchar *build_hint_from_stack (MonoDomain *domain, void **stack, gint stack_entries)
++{
++	gchar *hint;
++	MonoMethod *method, *selectedMethod;
++	MonoAssembly *assembly;
++	MonoImage *image;
++	MonoDebugSourceLocation *location;
++	MonoStackBacktraceInfo *info;
++	gboolean use_full_trace;
++	char *methodName;
++	gint i, native_offset, firstAvailable;
++
++	selectedMethod = NULL;
++	firstAvailable = -1;
++	use_full_trace = FALSE;
++	native_offset = -1;
++	for (i = 0; i < stack_entries; i++) {
++		info = (MonoStackBacktraceInfo*) stack [i];
++		method = info ? info->method : NULL;
++
++		if (!method || method->wrapper_type != MONO_WRAPPER_NONE)
++			continue;
++
++		if (firstAvailable == -1)
++			firstAvailable = i;
++
++		image = method->klass->image;
++		assembly = image->assembly;
++
++		if ((assembly && assembly->in_gac) || ignore_frame (method))
++			continue;
++		selectedMethod = method;
++		native_offset = info->native_offset;
++		break;
++	}
++
++	if (!selectedMethod) {
++		/* All the frames were from assemblies installed in GAC. Find first frame that is
++		 * not in the ignore list */
++		for (i = 0; i < stack_entries; i++) {
++			info = (MonoStackBacktraceInfo*) stack [i];
++			method = info ? info->method : NULL;
++
++			if (!method || ignore_frame (method))
++				continue;
++			selectedMethod = method;
++			native_offset = info->native_offset;
++			break;
++		}
++
++		if (!selectedMethod)
++			use_full_trace = TRUE;
++	}
++
++	hint = NULL;
++	if (use_full_trace) {
++		GString *trace = g_string_new ("Full trace:\n");
++		for (i = firstAvailable; i < stack_entries; i++) {
++			info = (MonoStackBacktraceInfo*) stack [i];
++			method = info ? info->method : NULL;
++			if (!method || method->wrapper_type != MONO_WRAPPER_NONE)
++				continue;
++
++			location = mono_debug_lookup_source_location (method, info->native_offset, domain);
++			methodName = mono_method_full_name (method, TRUE);
++
++			if (location) {
++				append_report (&trace, "        %s in %s:%u\n", methodName, location->source_file, location->row);
++				mono_debug_free_source_location (location);
++			} else
++				append_report (&trace, "        %s\n", methodName);
++			g_free (methodName);
++		}
++
++		if (trace) {
++			if (trace->len)
++				hint = g_string_free (trace, FALSE);
++			else
++				g_string_free (trace, TRUE);
++		}
++	} else {
++		location = mono_debug_lookup_source_location (selectedMethod, native_offset, domain);
++		methodName = mono_method_full_name (selectedMethod, TRUE);
++
++		if (location) {
++			hint = g_strdup_printf ("%s in %s:%u\n", methodName, location->source_file, location->row);
++			mono_debug_free_source_location (location);
++		} else
++			hint = g_strdup_printf ("%s\n", methodName);
++		g_free (methodName);
++	}
++
++	return hint;
++}
++
++static inline gchar *build_hint (SavedString *head)
++{
++	SavedString *current;
++	gchar *tmp;
++	GString *hint = NULL;
++
++	current = head;
++	while (current) {
++		tmp = build_hint_from_stack (current->domain, current->stack, current->stack_entries);
++		current = current->next;
++		if (!tmp)
++			continue;
++
++		append_report (&hint, tmp);
++	}
++
++	if (hint) {
++		if (hint->len)
++			return g_string_free (hint, FALSE);
++		else {
++			g_string_free (hint, FALSE);
++			return NULL;
++		}
++	}
++
++	return NULL;
++}
++
++static gboolean stack_walk_func (MonoMethod *method, gint32 native_offset, gint32 il_offset, gboolean managed, gpointer data)
++{
++	StackWalkData *swdata = (StackWalkData*)data;
++	MonoStackBacktraceInfo *info;
++
++	if (swdata->frame_count >= swdata->stack_size)
++		return TRUE;
++
++	info = (MonoStackBacktraceInfo*)g_malloc (sizeof (*info));
++	info->method = method;
++	info->native_offset = native_offset;
++
++	swdata->stack [swdata->frame_count++] = info;
++	return FALSE;
++}
++
++static inline int mono_stack_backtrace (MonoProfiler *prof, MonoDomain *domain, void **stack, int size)
++{
++	StackWalkData data;
++
++	data.prof = prof;
++	data.stack = stack;
++	data.stack_size = size;
++	data.frame_count = 0;
++
++	mono_stack_walk_no_il (stack_walk_func, (gpointer)&data);
++
++	return data.frame_count;
++}
++
++static void mono_portability_remember_string (MonoProfiler *prof, MonoDomain *domain, MonoString *str)
++{
++	SavedString *head, *entry;
++
++	/* fprintf (stdout, "%s (%p, %p, %p)\n", __func__, prof, str, klass); */
++	if (!str || !domain || !runtime_initialized) {
++		/* fprintf (stdout, "\truntime not initialized or str null\n"); */
++		/* fflush (stdout); */
++		return;
++	}
++
++	entry = (SavedString*)g_malloc0 (sizeof (SavedString));
++	entry->string = str;
++	entry->domain = domain;
++	entry->stack_entries = mono_stack_backtrace (prof, domain, entry->stack, BACKTRACE_SIZE);
++	/* fprintf (stdout, "\tstack_entries == %u\n", entry->stack_entries); */
++	/* fflush (stdout); */
++	if (entry->stack_entries == 0) {
++		g_free (entry);
++		return;
++	}
++	
++	//mono_mutex_lock (&mismatched_files_section);
++	head = (SavedString*)g_hash_table_lookup (prof->saved_strings_hash, (gpointer)str);
++	if (head) {
++		while (head->next)
++			head = head->next;
++		head->next = entry;
++	} else
++		g_hash_table_insert (prof->saved_strings_hash, (gpointer)str, (gpointer)entry);
++	//mono_mutex_unlock (&mismatched_files_section);
++}
++
++static void mono_portability_iomap_event (MonoProfiler *prof, const char *report, const char *pathname, const char *new_pathname)
++{
++	guint32 hash, pathnameHash;
++	MismatchedFilesStats *stats;
++
++	if (!runtime_initialized)
++		return;
++
++	mono_mutex_lock (&mismatched_files_section);
++	hash = calc_strings_hash (pathname, new_pathname, &pathnameHash);
++	stats = (MismatchedFilesStats*)g_hash_table_lookup (prof->mismatched_files_hash, &hash);
++	if (stats == NULL) {
++		guint32 *hashptr;
++
++		stats = (MismatchedFilesStats*) g_malloc (sizeof (MismatchedFilesStats));
++		stats->count = 1;
++		stats->requestedName = g_strdup (pathname);
++		stats->actualName = g_strdup (new_pathname);
++		hashptr = (guint32*)g_malloc (sizeof (guint32));
++		if (hashptr) {
++			*hashptr = hash;
++			g_hash_table_insert (prof->mismatched_files_hash, (gpointer)hashptr, stats);
++		} else
++			g_error ("Out of memory allocating integer pointer for mismatched files hash table.");
++
++		store_string_location (prof, (const gchar*)stats->requestedName, pathnameHash, strlen (stats->requestedName));
++		mono_mutex_unlock (&mismatched_files_section);
++
++		print_report ("%s -     Found file path: '%s'\n", report, new_pathname);
++	} else {
++		mono_mutex_unlock (&mismatched_files_section);
++		stats->count++;
++	}
++}
++
++static void runtime_initialized_cb (MonoProfiler *prof)
++{
++	runtime_initialized = TRUE;
++}
++
++static void profiler_shutdown (MonoProfiler *prof)
++{
++	print_mismatched_stats (prof);
++	mono_mutex_destroy (&mismatched_files_section);
++}
++
++void mono_profiler_startup (const char *desc)
++{
++	MonoProfiler *prof = g_new0 (MonoProfiler, 1);
++
++	mono_mutex_init (&mismatched_files_section, NULL);
++	prof->mismatched_files_hash = g_hash_table_new (mismatched_files_guint32_hash, mismatched_files_guint32_equal);
++	prof->saved_strings_hash = g_hash_table_new (NULL, NULL);
++	prof->string_locations_hash = g_hash_table_new (mismatched_files_guint32_hash, mismatched_files_guint32_equal);
++
++	mono_profiler_install (prof, profiler_shutdown);
++	mono_profiler_install_runtime_initialized (runtime_initialized_cb);
++	mono_profiler_install_iomap (mono_portability_iomap_event);
++	mono_profiler_install_string_allocation (mono_portability_remember_string);
++
++	mono_profiler_set_events (MONO_PROFILE_STRING_ALLOC | MONO_PROFILE_IOMAP_EVENTS);
++}
+diff --git a/mono/utils/mono-io-portability.c b/mono/utils/mono-io-portability.c
+index b4058d5..839b9b3 100644
+--- a/mono/utils/mono-io-portability.c
++++ b/mono/utils/mono-io-portability.c
+@@ -12,6 +12,8 @@
+ #include <mono/metadata/object.h>
+ #include <mono/utils/mono-hash.h>
+ #include <mono/metadata/gc-internal.h>
++#include <mono/metadata/profiler.h>
++#include <mono/metadata/profiler-private.h>
+ 
+ #ifdef DISABLE_PORTABILITY
+ int __mono_io_portability_helpers = PORTABILITY_NONE;
+@@ -30,62 +32,11 @@ mono_portability_find_file (const gchar *pathname, gboolean last_exists)
+ 
+ #else
+ 
+-typedef struct 
+-{
+-	guint32 count;
+-	gchar *requestedName;
+-	gchar *actualName;
+-} MismatchedFilesStats;
+-
+-static CRITICAL_SECTION mismatched_files_section;
+-static MonoGHashTable *mismatched_files_hash = NULL;
+-
+-static inline gchar *mono_portability_find_file_internal (GString **report, gboolean *differs, const gchar *pathname, gboolean last_exists);
+-static inline void append_report (GString **report, const gchar *format, ...);
+-static inline void print_report (const gchar *report);
+-static inline guint32 calc_strings_hash (const gchar *str1, const gchar *str2);
+-static void print_mismatched_stats_at_exit (void);
+-
+ #include <dirent.h>
+ 
+ int __mono_io_portability_helpers = PORTABILITY_UNKNOWN;
+ 
+-static void mismatched_stats_foreach_func (gpointer key, gpointer value, gpointer user_data)
+-{
+-	MismatchedFilesStats *stats = (MismatchedFilesStats*)value;
+-
+-	fprintf (stdout,
+-		 "    Count: %u\n"
+-		 "Requested: %s\n"
+-		 "   Actual: %s\n\n",
+-		 stats->count, stats->requestedName, stats->actualName);
+-}
+-
+-static void print_mismatched_stats_at_exit (void)
+-{
+-	if (!mismatched_files_hash || mono_g_hash_table_size (mismatched_files_hash) == 0)
+-		return;
+-
+-	fprintf (stdout, "\n-=-=-=-=-=-=-= MONO_IOMAP Stats -=-=-=-=-=-=-=\n");
+-	mono_g_hash_table_foreach (mismatched_files_hash, mismatched_stats_foreach_func, NULL);
+-	fflush (stdout);
+-}
+-
+-static guint mismatched_files_guint32_hash (gconstpointer key)
+-{
+-	if (!key)
+-		return 0;
+-
+-	return *((guint32*)key);
+-}
+-
+-static gboolean mismatched_files_guint32_equal (gconstpointer key1, gconstpointer key2)
+-{
+-	if (!key1 || !key2)
+-		return FALSE;
+-
+-	return (gboolean)(*((guint32*)key1) == *((guint32*)key2));
+-}
++static inline gchar *mono_portability_find_file_internal (GString **report, const gchar *pathname, gboolean last_exists);
+ 
+ void mono_portability_helpers_init (void)
+ {
+@@ -120,18 +71,9 @@ void mono_portability_helpers_init (void)
+                                 __mono_io_portability_helpers |= PORTABILITY_CASE;
+                         } else if (!strncasecmp (options[i], "all", 3)) {
+                                 __mono_io_portability_helpers |= (PORTABILITY_DRIVE | PORTABILITY_CASE);
+-			} else if (!strncasecmp (options[i], "report", 7)) {
+-				__mono_io_portability_helpers |= PORTABILITY_REPORT;
+ 			}
+                 }
+ 	}
+-
+-	if (IS_PORTABILITY_REPORT) {
+-		InitializeCriticalSection (&mismatched_files_section);
+-		MONO_GC_REGISTER_ROOT (mismatched_files_hash);
+-		mismatched_files_hash = mono_g_hash_table_new (mismatched_files_guint32_hash, mismatched_files_guint32_equal);
+-		g_atexit (print_mismatched_stats_at_exit);
+-	}
+ }
+ 
+ /* Returns newly allocated string, or NULL on failure */
+@@ -171,47 +113,6 @@ static gchar *find_in_dir (DIR *current, const gchar *name)
+ 	return(NULL);
+ }
+ 
+-static inline guint32 do_calc_string_hash (guint32 hash, const gchar *str)
+-{
+-	guint32 ret = hash;
+-	gchar *cc = (gchar*)str;
+-	gchar *end = (gchar*)(str + strlen (str) - 1);
+-
+-	for (; cc < end; cc += 2) {
+-		ret = (ret << 5) - ret + *cc;
+-		ret = (ret << 5) - ret + cc [1];
+-	}
+-	end++;
+-	if (cc < end)
+-		ret = (ret << 5) - ret + *cc;
+-
+-	return ret;
+-}
+-
+-static inline guint32 calc_strings_hash (const gchar *str1, const gchar *str2)
+-{
+-	return do_calc_string_hash (do_calc_string_hash (0, str1), str2);
+-}
+-
+-static inline void print_report (const gchar *report)
+-{
+-	MonoClass *klass;
+-	MonoProperty *prop;
+-	MonoString *str;
+-	char *stack_trace;
+-
+-	fprintf (stdout, "-=-=-=-=-=-=- MONO_IOMAP REPORT -=-=-=-=-=-=-\n%s\n", report);
+-	klass = mono_class_from_name (mono_defaults.corlib, "System", "Environment");
+-	mono_class_init (klass);
+-	prop = mono_class_get_property_from_name (klass, "StackTrace");
+-	str = (MonoString*)mono_property_get_value (prop, NULL, NULL, NULL);
+-	stack_trace = mono_string_to_utf8 (str);
+-
+-	fprintf (stdout, "-= Stack Trace =-\n%s\n\n", stack_trace);
+-	g_free (stack_trace);
+-	fflush (stdout);
+-}
+-
+ static inline void append_report (GString **report, const gchar *format, ...)
+ {
+ #if GLIB_CHECK_VERSION(2,14,0)
+@@ -227,32 +128,43 @@ static inline void append_report (GString **report, const gchar *format, ...)
+ #endif
+ }
+ 
++static inline void do_mono_profiler_iomap (GString **report, const char *pathname, const char *new_pathname)
++{
++	char *rep = NULL;
++	GString *tmp = report ? *report : NULL;
++
++	if (tmp) {
++		if (tmp->len > 0)
++			rep = g_string_free (tmp, FALSE);
++		else
++			g_string_free (tmp, TRUE);
++		*report = NULL;
++	}
++
++	mono_profiler_iomap (rep, pathname, new_pathname);
++	g_free (rep);
++}
++
+ gchar *mono_portability_find_file (const gchar *pathname, gboolean last_exists)
+ {
+ 	GString *report = NULL;
+-	gboolean differs = FALSE;
+-	gchar *ret =  mono_portability_find_file_internal (&report, &differs, pathname, last_exists);
+-	if (report) {
+-		if (report->len && differs) {
+-			char *rep = g_string_free (report, FALSE);
+-			print_report (rep);
+-			g_free (rep);
+-		} else
+-			g_string_free (report, TRUE);
+-	}
++	gchar *ret = mono_portability_find_file_internal (&report, pathname, last_exists);
++
++	if (report)
++		g_string_free (report, TRUE);
+ 
+ 	return ret;
+ }
+ 
+ /* Returns newly-allocated string or NULL on failure */
+-static inline gchar *mono_portability_find_file_internal (GString **report, gboolean *differs, const gchar *pathname, gboolean last_exists)
++static inline gchar *mono_portability_find_file_internal (GString **report, const gchar *pathname, gboolean last_exists)
+ {
+ 	gchar *new_pathname, **components, **new_components;
+ 	int num_components = 0, component = 0;
+ 	DIR *scanning = NULL;
+ 	size_t len;
+-	gboolean do_report = IS_PORTABILITY_REPORT;
+ 	gboolean drive_stripped = FALSE;
++	gboolean do_report = (mono_profiler_get_events () & MONO_PROFILE_IOMAP_EVENTS) != 0;
+ 
+ 	if (IS_PORTABILITY_NONE) {
+ 		return(NULL);
+@@ -260,6 +172,7 @@ static inline gchar *mono_portability_find_file_internal (GString **report, gboo
+ 
+ 	if (do_report)
+ 		append_report (report, " - Requested file path: '%s'\n", pathname);
++
+ 	new_pathname = g_strdup (pathname);
+ 	
+ #ifdef DEBUG
+@@ -316,7 +229,7 @@ static inline gchar *mono_portability_find_file_internal (GString **report, gboo
+ 		g_message ("%s: Found it\n", __func__);
+ #endif
+ 		if (do_report && drive_stripped)
+-			*differs = TRUE;
++			do_mono_profiler_iomap (report, pathname, new_pathname);
+ 
+ 		return(new_pathname);
+ 	}
+@@ -487,38 +400,13 @@ static inline gchar *mono_portability_find_file_internal (GString **report, gboo
+ 	if ((last_exists &&
+ 	     access (new_pathname, F_OK) == 0) ||
+ 	    (!last_exists)) {
+-		if (do_report && strcmp (pathname, new_pathname) != 0) {
+-			guint32 hash;
+-			MismatchedFilesStats *stats;
+-
+-			EnterCriticalSection (&mismatched_files_section);
+-			hash = calc_strings_hash (pathname, new_pathname);
+-			stats = (MismatchedFilesStats*)mono_g_hash_table_lookup (mismatched_files_hash, &hash);
+-			if (stats == NULL) {
+-				guint32 *hashptr;
+-
+-				stats = (MismatchedFilesStats*) g_malloc (sizeof (MismatchedFilesStats));
+-				stats->count = 1;
+-				stats->requestedName = g_strdup (pathname);
+-				stats->actualName = g_strdup (new_pathname);
+-				hashptr = (guint32*)g_malloc (sizeof (guint32));
+-				*hashptr = hash;
+-				mono_g_hash_table_insert (mismatched_files_hash, (gpointer)hashptr, stats);
+-
+-				*differs = TRUE;
+-				append_report (report, " - Found file path: '%s'\n", new_pathname);
+-			} else {
+-				stats->count++;
+-				LeaveCriticalSection (&mismatched_files_section);
+-			}
+-		}
+-		
++		if (do_report && strcmp (pathname, new_pathname) != 0)
++			do_mono_profiler_iomap (report, pathname, new_pathname);
++
+ 		return(new_pathname);
+ 	}
+-	
++
+ 	g_free (new_pathname);
+ 	return(NULL);
+ }
+-
+-
+ #endif
+diff --git a/mono/utils/mono-io-portability.h b/mono/utils/mono-io-portability.h
+index 4ce4187..3b532ad 100644
+--- a/mono/utils/mono-io-portability.h
++++ b/mono/utils/mono-io-portability.h
+@@ -8,8 +8,7 @@ enum {
+         PORTABILITY_NONE        = 0x00,
+         PORTABILITY_UNKNOWN     = 0x01,
+         PORTABILITY_DRIVE       = 0x02,
+-        PORTABILITY_CASE        = 0x04,
+-	PORTABILITY_REPORT      = 0x08
++        PORTABILITY_CASE        = 0x04
+ };
+ 
+ void mono_portability_helpers_init (void) MONO_INTERNAL;
+@@ -21,7 +20,6 @@ extern int __mono_io_portability_helpers MONO_INTERNAL;
+ #define IS_PORTABILITY_UNKNOWN (__mono_io_portability_helpers & PORTABILITY_UNKNOWN)
+ #define IS_PORTABILITY_DRIVE (__mono_io_portability_helpers & PORTABILITY_DRIVE)
+ #define IS_PORTABILITY_CASE (__mono_io_portability_helpers & PORTABILITY_CASE)
+-#define IS_PORTABILITY_REPORT (__mono_io_portability_helpers & PORTABILITY_REPORT)
+ #define IS_PORTABILITY_SET (__mono_io_portability_helpers > 0)
+ 
+ #endif

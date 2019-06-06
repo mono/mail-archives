@@ -1,0 +1,363 @@
+Index: mono/utils/mono-dl.c
+===================================================================
+--- mono/utils/mono-dl.c	(revision 159550)
++++ mono/utils/mono-dl.c	(working copy)
+@@ -29,11 +29,6 @@
+ 	".so",
+ 	".bundle"
+ };
+-#elif EMBEDDED_PINVOKE
+-#define SOPREFIX ""
+-static const char suffixes [][1] = {
+-	""
+-};
+ #else
+ #define SOPREFIX "lib"
+ static const char suffixes [][4] = {
+@@ -80,15 +75,6 @@
+ 	return lflags;
+ }
+ 
+-#elif EMBEDDED_PINVOKE
+-#define SO_HANDLE_TYPE void*
+-void *LL_SO_OPEN   (const char *file, int flags);
+-int   LL_SO_CLOSE  (void *handle);
+-#define LL_SO_SYMBOL(module,symbol) _LL_SO_SYMBOL((module)->handle, (symbol))
+-void *_LL_SO_SYMBOL (void *handle, const char *symbol);
+-char *LL_SO_ERROR();
+-#define LL_SO_TRFLAGS(flags)      0
+-
+ #else
+ /* no dynamic loader supported */
+ #define SO_HANDLE_TYPE void*
+@@ -103,8 +89,18 @@
+ struct _MonoDl {
+ 	SO_HANDLE_TYPE handle;
+ 	int main_module;
++	MonoDlMapping *dl_mapping;
+ };
+ 
++MonoDlMapping *
++dl_mapping_open (const char *file);
++
++void *
++dl_mapping_symbol (void *handle, const char *symbol);
++
++char *
++dl_mapping_error (void);
++
+ #ifdef TARGET_WIN32
+ 
+ static char*
+@@ -314,6 +310,7 @@
+ {
+ 	MonoDl *module;
+ 	void *lib;
++	MonoDlMapping *dl_mapping = NULL;
+ 	int lflags = LL_SO_TRFLAGS (flags);
+ 
+ 	if (error_msg)
+@@ -328,6 +325,9 @@
+ 	module->main_module = name == NULL? TRUE: FALSE;
+ 	lib = LL_SO_OPEN (name, lflags);
+ 	if (!lib) {
++		dl_mapping = dl_mapping_open (name);
++	}
++	if (!lib && !dl_mapping) {
+ 		char *lname;
+ 		char *llname;
+ 		const char *suff;
+@@ -358,6 +358,7 @@
+ 		}
+ 	}
+ 	module->handle = lib;
++	module->dl_mapping = dl_mapping;
+ 	return module;
+ }
+ 
+@@ -377,17 +378,22 @@
+ {
+ 	void *sym;
+ 
++	if (module->dl_mapping) {
++		sym = dl_mapping_symbol (module->dl_mapping, name);
++	} else {
+ #if MONO_DL_NEED_USCORE
+-	{
+-		char *usname = malloc (strlen (name) + 2);
+-		*usname = '_';
+-		strcpy (usname + 1, name);
+-		sym = LL_SO_SYMBOL (module, usname);
+-		free (usname);
+-	}
++		{
++			char *usname = malloc (strlen (name) + 2);
++			*usname = '_';
++			strcpy (usname + 1, name);
++			sym = LL_SO_SYMBOL (module, usname);
++			free (usname);
++		}
+ #else
+-	sym = LL_SO_SYMBOL (module, name);
++		sym = LL_SO_SYMBOL (module, name);
+ #endif
++	}
++
+ 	if (sym) {
+ 		if (symbol)
+ 			*symbol = sym;
+@@ -395,7 +401,7 @@
+ 	}
+ 	if (symbol)
+ 		*symbol = NULL;
+-	return LL_SO_ERROR ();
++	return (module->dl_mapping != NULL)? dl_mapping_error () :  LL_SO_ERROR ();
+ }
+ 
+ /**
+@@ -485,7 +491,6 @@
+ 	return res;
+ }
+ 
+-#if EMBEDDED_PINVOKE
+ static GHashTable *mono_dls;
+ static char *ll_last_error = "";
+ 
+@@ -494,10 +499,8 @@
+  * @name: Library name, this is the name used by the DllImport as the external library name
+  * @mappings: the mappings to register for P/Invoke.
+  *
+- * This function is only available on builds that define
+- * EMBEDDED_PINVOKE, this is available for systems that do not provide
+- * a dynamic linker but still want to use DllImport to easily invoke
+- * code from the managed side into the unmanaged world.
++ * The mappings registered using this function are used as fallbacks if the dynamic linker 
++ * fails, or if the platform doesn't have a dynamic linker.
+  *
+  * Mappings is a pointer to the first element of an array of
+  * MonoDlMapping values.  The list must be terminated with both 
+@@ -532,29 +535,23 @@
+ 	g_hash_table_insert (mono_dls, g_strdup (name), mappings);
+ }
+ 
+-void *
+-LL_SO_OPEN (const char *file, int flag)
++MonoDlMapping *
++dl_mapping_open (const char *file)
+ {
+-	void *mappings;
++	MonoDlMapping *mappings;
+ 	
+ 	if (mono_dls == NULL){
+ 		ll_last_error = "Library not registered";
+ 		return NULL;
+ 	}
+ 		
+-	mappings = g_hash_table_lookup (mono_dls, file);
++	mappings = (MonoDlMapping *) g_hash_table_lookup (mono_dls, file);
+ 	ll_last_error = mappings == NULL ? "File not registered" : "";
+ 	return mappings;
+ }
+ 
+-int LL_SO_CLOSE (void *handle)
+-{
+-	// No-op
+-	return 0;
+-}
+-
+ void *
+-_LL_SO_SYMBOL (void *handle, const char *symbol)
++dl_mapping_symbol (void *handle, const char *symbol)
+ {
+ 	MonoDlMapping *mappings = (MonoDlMapping *) handle;
+ 	
+@@ -569,8 +566,7 @@
+ }
+ 
+ char *
+-LL_SO_ERROR (void)
++dl_mapping_error (void)
+ {
+ 	return g_strdup (ll_last_error);
+ }
+-#endif
+Index: mono/utils/mono-embed.h
+===================================================================
+--- mono/utils/mono-embed.h	(revision 159550)
++++ mono/utils/mono-embed.h	(working copy)
+@@ -1,10 +1,12 @@
+ #ifndef __MONO_EMBED_H__
+ #define __MONO_EMBED_H__
+ 
++#include <mono/utils/mono-publib.h>
++
++MONO_BEGIN_DECLS
++
+ /* 
+- * These are only used and available on embedded systems, the
+- * EMBEDDED_PINVOKE configuration option must be set, and it
+- * overrides any platform symbol loading functionality 
++ * This is a fallback for platform symbol loading functionality.
+  */
+ typedef struct {
+ 	const char *name;	
+@@ -13,4 +15,6 @@
+ 
+ void mono_dl_register_library (const char *name, MonoDlMapping *mappings);
+ 
++MONO_END_DECLS
++
+ #endif /* __MONO_EMBED_H__ */
+Index: msvc/libmono.vcproj
+===================================================================
+--- msvc/libmono.vcproj	(revision 159550)
++++ msvc/libmono.vcproj	(working copy)
+@@ -830,10 +830,9 @@
+ 			</File>
+ 			<File
+ 				RelativePath="..\mono\utils\mono-compiler.h"
+-				></File>
+-      <File RelativePath="..\mono\metadata\runtime.c" />
+-      <File RelativePath="..\mono\metadata\runtime.h" />
+-      <File
++				>
++			</File>
++			<File
+ 				RelativePath="..\mono\utils\mono-counters.c"
+ 				>
+ 				<FileConfiguration
+@@ -1022,6 +1021,10 @@
+ 				>
+ 			</File>
+ 			<File
++				RelativePath="..\mono\utils\mono-embed.h"
++				>
++			</File>
++			<File
+ 				RelativePath="..\mono\utils\mono-error-internals.h"
+ 				>
+ 			</File>
+@@ -1033,11 +1036,7 @@
+ 				RelativePath="..\mono\utils\mono-error.h"
+ 				>
+ 			</File>
+-      <File RelativePath="..\mono\utils\mono-semaphore.c"></File>
+-      <File RelativePath="..\mono\utils\mono-semaphore.h"></File>
+-      <File RelativePath="..\mono\metadata\mono-wsq.c"></File>
+-      <File RelativePath="..\mono\metadata\mono-wsq.h"></File>
+-      <File
++			<File
+ 				RelativePath="..\mono\utils\mono-filemap.c"
+ 				>
+ 			</File>
+@@ -1642,6 +1641,14 @@
+ 				>
+ 			</File>
+ 			<File
++				RelativePath="..\mono\utils\mono-semaphore.c"
++				>
++			</File>
++			<File
++				RelativePath="..\mono\utils\mono-semaphore.h"
++				>
++			</File>
++			<File
+ 				RelativePath="..\mono\utils\mono-sha1.c"
+ 				>
+ 				<FileConfiguration
+@@ -1846,6 +1853,14 @@
+ 				>
+ 			</File>
+ 			<File
++				RelativePath="..\mono\metadata\mono-wsq.c"
++				>
++			</File>
++			<File
++				RelativePath="..\mono\metadata\mono-wsq.h"
++				>
++			</File>
++			<File
+ 				RelativePath="..\mono\utils\monobitset.c"
+ 				>
+ 				<FileConfiguration
+@@ -1938,6 +1953,14 @@
+ 				>
+ 			</File>
+ 			<File
++				RelativePath="..\mono\metadata\runtime.c"
++				>
++			</File>
++			<File
++				RelativePath="..\mono\metadata\runtime.h"
++				>
++			</File>
++			<File
+ 				RelativePath="..\mono\utils\strenc.c"
+ 				>
+ 				<FileConfiguration
+@@ -4006,6 +4029,14 @@
+ 				>
+ 			</File>
+ 			<File
++				RelativePath="..\mono\metadata\mono-basic-block.c"
++				>
++			</File>
++			<File
++				RelativePath="..\mono\metadata\mono-basic-block.h"
++				>
++			</File>
++			<File
+ 				RelativePath="..\mono\metadata\mono-config.c"
+ 				>
+ 				<FileConfiguration
+@@ -4185,15 +4216,7 @@
+ 				RelativePath="..\mono\metadata\mono-debug-debugger.h"
+ 				>
+ 			</File>
+-      <File
+-				RelativePath="..\mono\metadata\mono-basic-block.c"
+-				>
+-      </File>
+-      <File
+-				RelativePath="..\mono\metadata\mono-basic-block.h"
+-				>
+-      </File>
+-      <File
++			<File
+ 				RelativePath="..\mono\metadata\mono-debug.c"
+ 				>
+ 				<FileConfiguration
+@@ -6062,10 +6085,6 @@
+ 				>
+ 			</File>
+ 			<File
+-				RelativePath="..\mono\mini\xdebug.c"
+-				>
+-			</File>
+-			<File
+ 				RelativePath="..\mono\mini\debugger-agent.h"
+ 				>
+ 			</File>
+@@ -7321,6 +7340,10 @@
+ 				RelativePath="..\mono\mini\wapihandles.c"
+ 				>
+ 			</File>
++			<File
++				RelativePath="..\mono\mini\xdebug.c"
++				>
++			</File>
+ 			<Filter
+ 				Name="x86"
+ 				>
+Index: msvc/mono.def
+===================================================================
+--- msvc/mono.def	(revision 159550)
++++ msvc/mono.def	(working copy)
+@@ -232,6 +232,7 @@
+ mono_digest_get_public_token
+ mono_disasm_code
+ mono_disasm_code_one
++mono_dl_register_library
+ mono_dllmap_insert
+ mono_domain_add_class_static_data
+ mono_domain_assembly_open

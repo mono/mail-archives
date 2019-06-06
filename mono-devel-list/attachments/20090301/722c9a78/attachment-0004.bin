@@ -1,0 +1,214 @@
+>From c45fbdb0f1d99d56f660149c897012824d8cbd8a Mon Sep 17 00:00:00 2001
+From: Andreas <andreas@blacklight.(none)>
+Date: Sun, 1 Mar 2009 10:24:38 +0100
+Subject: [PATCH] Introduce a new CopyFileDistinct function which provides detailed error codes
+
+---
+ mono/io-layer/io.c |   97 ++++++++++++++++++++++++++++++++++++++++++++-------
+ mono/io-layer/io.h |    2 +
+ 2 files changed, 85 insertions(+), 14 deletions(-)
+
+diff --git a/mono/io-layer/io.c b/mono/io-layer/io.c
+index eeb9c4c..7c887f7 100644
+--- a/mono/io-layer/io.c
++++ b/mono/io-layer/io.c
+@@ -1965,8 +1965,21 @@ write_file (int src_fd, int dest_fd, struct stat *st_src, gboolean report_errors
+ 	return TRUE ;
+ }
+ 
++#define DISTINCT_NO_ERROR                  0 
++#define DISTINCT_SOURCE_ERROR              1
++#define DISTINCT_DEST_ERROR                2
++#define DISTINCT_SOURCE_INVALID_NAME       3
++#define DISTINCT_SOURCE_INVALID_PARAMETER  4
++#define DISTINCT_SOURCE_IS_DIRECTORY       5
++#define DISTINCT_SOURCE_NOT_FOUND          6
++#define DISTINCT_DEST_INVALID_NAME         7
++#define DISTINCT_DEST_INVALID_PARAMETER    8
++#define DISTINCT_DEST_IS_DIRECTORY         9
++#define DISTINCT_DEST_NOT_FOUND           10
++#define DISTINCT_DEST_EXIST               11
++
+ /**
+- * CopyFile:
++ * CopyFileDistinct:
+  * @name: a pointer to a NULL-terminated unicode string, that names
+  * the file to be copied.
+  * @dest_name: a pointer to a NULL-terminated unicode string, that is the
+@@ -1975,15 +1988,15 @@ write_file (int src_fd, int dest_fd, struct stat *st_src, gboolean report_errors
+  *
+  * Copies file @name to @dest_name
+  *
+- * Return value: %TRUE on success, %FALSE otherwise.
++ * Return value: Distinct error code.
+  */
+-gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
++guint32 CopyFileDistinct (const gunichar2 *name, const gunichar2 *dest_name,
+ 		   gboolean fail_if_exists)
+ {
+ 	gchar *utf8_src, *utf8_dest;
+ 	int src_fd, dest_fd;
+ 	struct stat st;
+-	gboolean ret = TRUE;
++	guint32 ret = DISTINCT_NO_ERROR;
+ 	
+ 	if(name==NULL) {
+ #ifdef DEBUG
+@@ -1991,7 +2004,7 @@ gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ #endif
+ 
+ 		SetLastError (ERROR_INVALID_NAME);
+-		return(FALSE);
++		return DISTINCT_SOURCE_INVALID_NAME;
+ 	}
+ 	
+ 	utf8_src = mono_unicode_to_external (name);
+@@ -2002,7 +2015,7 @@ gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ #endif
+ 
+ 		SetLastError (ERROR_INVALID_PARAMETER);
+-		return(FALSE);
++		return DISTINCT_SOURCE_INVALID_PARAMETER;
+ 	}
+ 	
+ 	if(dest_name==NULL) {
+@@ -2012,7 +2025,7 @@ gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ 
+ 		g_free (utf8_src);
+ 		SetLastError (ERROR_INVALID_NAME);
+-		return(FALSE);
++		return DISTINCT_DEST_INVALID_NAME;
+ 	}
+ 	
+ 	utf8_dest = mono_unicode_to_external (dest_name);
+@@ -2026,17 +2039,23 @@ gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ 
+ 		g_free (utf8_src);
+ 		
+-		return(FALSE);
++		return DISTINCT_DEST_INVALID_PARAMETER;
+ 	}
+ 	
+ 	src_fd = _wapi_open (utf8_src, O_RDONLY, 0);
+-	if (src_fd < 0) {
++	if (src_fd < 0) {	
+ 		_wapi_set_last_path_error_from_errno (NULL, utf8_src);
+ 		
+ 		g_free (utf8_src);
+ 		g_free (utf8_dest);
+-		
+-		return(FALSE);
++
++		switch(errno)
++		{
++			case ENOENT:
++				return DISTINCT_SOURCE_NOT_FOUND;
++			default:
++				return DISTINCT_SOURCE_ERROR;
++		}
+ 	}
+ 
+ 	if (fstat (src_fd, &st) < 0) {
+@@ -2046,7 +2065,26 @@ gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ 		g_free (utf8_dest);
+ 		close (src_fd);
+ 		
+-		return(FALSE);
++		switch(errno)
++		{
++			case ENOENT:
++				//should already be handled earlier!?
++				return DISTINCT_SOURCE_NOT_FOUND;
++			default:
++				return DISTINCT_SOURCE_ERROR;				
++		}
++	}
++
++	if (S_ISDIR(st.st_mode))
++	{
++		errno = EISDIR;
++		_wapi_set_last_error_from_errno ();
++
++		g_free (utf8_src);
++		g_free (utf8_dest);
++		close (src_fd);
++
++		return DISTINCT_SOURCE_IS_DIRECTORY;
+ 	}
+ 	
+ 	if (fail_if_exists) {
+@@ -2067,6 +2105,7 @@ gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ 			SetLastError (ERROR_ALREADY_EXISTS);
+ 		}
+ 	}
++
+ 	if (dest_fd < 0) {
+ 		_wapi_set_last_error_from_errno ();
+ 
+@@ -2074,11 +2113,23 @@ gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ 		g_free (utf8_dest);
+ 		close (src_fd);
+ 
+-		return(FALSE);
++		switch(errno)
++		{
++			case EISDIR:
++				return DISTINCT_DEST_IS_DIRECTORY;
++			case ENOENT:
++				return DISTINCT_DEST_NOT_FOUND;
++			case EEXIST:
++				if (fail_if_exists)
++					return DISTINCT_DEST_EXIST;
++			default:
++				return DISTINCT_DEST_ERROR;
++		}
+ 	}
+ 
++	//TODO: create a write_file_distinct
+ 	if (!write_file (src_fd, dest_fd, &st, TRUE))
+-		ret = FALSE;
++		ret = DISTINCT_DEST_ERROR; //basically this is abiguous
+ 
+ 	g_free (utf8_src);
+ 	g_free (utf8_dest);
+@@ -2088,6 +2139,24 @@ gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ 	return ret;
+ }
+ 
++/**
++ * CopyFile:
++ * @name: a pointer to a NULL-terminated unicode string, that names
++ * the file to be copied.
++ * @dest_name: a pointer to a NULL-terminated unicode string, that is the
++ * new name for the file.
++ * @fail_if_exists: if TRUE and dest_name exists, the copy will fail.
++ *
++ * Copies file @name to @dest_name
++ *
++ * Return value: %TRUE on success, %FALSE otherwise.
++ */
++gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
++		   gboolean fail_if_exists)
++{
++	return CopyFileDistinct(name, dest_name, fail_if_exists) == DISTINCT_NO_ERROR;
++}
++
+ static gchar*
+ convert_arg_to_utf8 (const gunichar2 *arg, const gchar *arg_name)
+ {
+diff --git a/mono/io-layer/io.h b/mono/io-layer/io.h
+index dbdc185..689606d 100644
+--- a/mono/io-layer/io.h
++++ b/mono/io-layer/io.h
+@@ -198,6 +198,8 @@ extern gboolean RemoveDirectory (const gunichar2 *name);
+ extern gboolean MoveFile (const gunichar2 *name, const gunichar2 *dest_name);
+ extern gboolean CopyFile (const gunichar2 *name, const gunichar2 *dest_name,
+ 			  gboolean fail_if_exists);
++extern guint32 CopyFileDistinct (const gunichar2 *name, const gunichar2 *dest_name,
++			  gboolean fail_if_exists);
+ extern gboolean ReplaceFile (const gunichar2 *replacedFileName, const gunichar2 *replacementFileName,
+ 			     const gunichar2 *backupFileName, guint32 replaceFlags, 
+ 			     gpointer exclude, gpointer reserved);
+-- 
+1.6.0.4
+

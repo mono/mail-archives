@@ -1,0 +1,602 @@
+Index: System.Data.Common/Key.cs
+===================================================================
+--- System.Data.Common/Key.cs	(revision 53630)
++++ System.Data.Common/Key.cs	(working copy)
+@@ -163,30 +163,78 @@
+ 			return _filter.EvalBoolean(_tmpRow);
+ 		}
+ 
++		internal bool ContainsVersion (DataRowState state, DataRowVersion version)
++		{
++			switch (state) {
++				case DataRowState.Unchanged: {
++					if ((_rowStateFilter & DataViewRowState.Unchanged) != DataViewRowState.None) {
++						return ((version & DataRowVersion.Default) != 0);
++					}
++
++					break;
++				}
++				case DataRowState.Added: {
++					if ((_rowStateFilter & DataViewRowState.Added) != DataViewRowState.None) {
++						return ((version & DataRowVersion.Default) != 0);
++					}
++
++					break;
++				}
++				case DataRowState.Deleted: {
++					if ((_rowStateFilter & DataViewRowState.Deleted) != DataViewRowState.None) {
++						return (version == DataRowVersion.Original);
++					}
++
++					break;
++				}
++				default:
++					if ((_rowStateFilter & DataViewRowState.ModifiedCurrent) != DataViewRowState.None) {
++						return ((version & DataRowVersion.Default) != 0);
++					}
++					else if ((_rowStateFilter & DataViewRowState.ModifiedOriginal) != DataViewRowState.None) {
++						return (version == DataRowVersion.Original);
++					}
++
++					break;
++			}
++
++            return false;
++		}
++
+ 		internal static int GetRecord(DataRow row, DataViewRowState rowStateFilter)
+ 		{
++			switch (row.RowState) {
++				case DataRowState.Unchanged: {
++					if ((rowStateFilter & DataViewRowState.Unchanged) != DataViewRowState.None) {
++						return row.Proposed >= 0 ? row.Proposed : row.Current;
++					}
+ 
+-			if (row.Original == row.Current) {
+-				 if ((rowStateFilter & DataViewRowState.Unchanged) != DataViewRowState.None) {
+-					 return row.Current;
+-				 }
+-			}
+-			else if (row.Original == -1) {
+-				  if ((rowStateFilter & DataViewRowState.Added) != DataViewRowState.None) {
+-					return row.Current;
+-				  }
+-			}
+-			else if (row.Current == -1) {
+-				     if ((rowStateFilter & DataViewRowState.Deleted) != DataViewRowState.None) {
++					break;
++				}
++				case DataRowState.Added: {
++					if ((rowStateFilter & DataViewRowState.Added) != DataViewRowState.None) {
++						return row.Proposed >= 0 ? row.Proposed : row.Current;
++					}
++
++					break;
++				}
++				case DataRowState.Deleted: {
++					if ((rowStateFilter & DataViewRowState.Deleted) != DataViewRowState.None) {
+ 						return row.Original;
+-					 }
++					}
++
++					break;
++				}
++				default:
++					if ((rowStateFilter & DataViewRowState.ModifiedCurrent) != DataViewRowState.None) {
++						return row.Proposed >= 0 ? row.Proposed : row.Current;
++					}
++					else if ((rowStateFilter & DataViewRowState.ModifiedOriginal) != DataViewRowState.None) {
++						return row.Original;
++					}
++
++					break;
+ 			}
+-			else if ((rowStateFilter & DataViewRowState.ModifiedCurrent) != DataViewRowState.None) {
+-				return row.Current;
+-			}
+-			else if ((rowStateFilter & DataViewRowState.ModifiedOriginal) != DataViewRowState.None) {
+-				return row.Original;
+-			}
+ 
+             return -1;
+ 		}
+Index: System.Data.Common/ChangeLog
+===================================================================
+--- System.Data.Common/ChangeLog	(revision 53630)
++++ System.Data.Common/ChangeLog	(working copy)
+@@ -1,3 +1,11 @@
++2005-12-12  Konstantin Triger <kostat@mainsoft.com>
++
++	* Key.cs: Added ContainsVersion function, refactoring.
++	* Index.cs: Fixed Reset() to be ready for Update() calls.
++	   Otherwise the index can be rebuilt with new values inside the
++	   Update() call itself.
++	   Fixed FindIndexExact(), Update(), Delete().
++
+ 2005-11-22  Konstantin Triger <kostat@mainsoft.com>
+ 
+ 	* DbProviderFactory.cs: TARGET_JVM ifdef.
+Index: System.Data.Common/Index.cs
+===================================================================
+--- System.Data.Common/Index.cs	(revision 53630)
++++ System.Data.Common/Index.cs	(working copy)
+@@ -162,6 +162,7 @@
+ 		internal void Reset()
+ 		{
+ 			_array = null;
++			RebuildIndex();
+ 		}
+ 
+ 		private void RebuildIndex()
+@@ -333,8 +334,11 @@
+ 		 */ 
+ 		private int FindIndexExact(int record)
+ 		{
+-			int index = System.Array.BinarySearch(Array,record);
+-			return (index > 0) ? index : -1;
++			for (int i = 0, size = Size; i < size; i++)
++				if (Array[i] == record)
++					return i;
++
++			return -1;
+ 		}
+ 
+ 		/*
+@@ -359,7 +363,7 @@
+ 			if (oldRecord == -1)
+ 				return;
+ 
+-			int index = FindIndex(oldRecord);
++			int index = FindIndexExact(oldRecord);
+ 			if (index != -1) {
+ 				if ((_hasDuplicates == IndexDuplicatesState.True)) {
+ 					int c1 = 1;
+@@ -388,18 +392,29 @@
+ 			_size--;
+ 		}
+ 
+-		internal void Update(DataRow row,int newRecord)
+-		{
+-			int oldRecord = Key.GetRecord(row);
+ 
+-			if (oldRecord == -1 || Size == 0) {
+-				Add(row,newRecord);
++		internal void Update(DataRow row,int oldRecord, DataRowVersion oldVersion, DataRowState oldState)
++		{			
++			bool contains = Key.ContainsVersion (oldState, oldVersion);
++			int newRecord = Key.GetRecord(row);	
++			// the record did not appeared in the index before update
++			if (oldRecord == -1 || Size == 0 || !contains) {
++				if (newRecord >= 0) {
++					if (FindIndexExact(newRecord) < 0)
++						Add(row,newRecord);
++				}
+ 				return;
+ 			}
++			
++			// the record will not appeare in the index after update
++			if (newRecord < 0 || !Key.CanContain (newRecord)) {
++				Delete (oldRecord);
++				return;
++			}
+ 
+-			int oldIdx = FindIndex(oldRecord);
++			int oldIdx = FindIndexExact(oldRecord);
+ 
+-			if( oldIdx == -1 || Key.Table.RecordCache[Array[oldIdx]] != row ) {
++			if( oldIdx == -1 ) {
+ 				Add(row,newRecord);
+ 				return;
+ 			}
+@@ -477,11 +492,15 @@
+ 			}
+ 		}
+ 
++		internal void Add(DataRow row) {
++			Add(row, Key.GetRecord(row));
++		}
++
+ 		private void Add(DataRow row,int newRecord)
+ 		{
+ 			int newIdx;
+ 
+-			if (!Key.CanContain (newRecord))
++			if (newRecord < 0 || !Key.CanContain (newRecord))
+ 				return;
+ 
+ 			if (Size == 0) {
+Index: System.Data/ChangeLog
+===================================================================
+--- System.Data/ChangeLog	(revision 53630)
++++ System.Data/ChangeLog	(working copy)
+@@ -1,3 +1,12 @@
++2005-12-12  Konstantin Triger <kostat@mainsoft.com>
++
++	* DataRow.cs: Added index Updates.
++		EndEdit() fixed to first update indices and then AssertConstraints
++		based on those indices.
++		Added Validate() and AssertConstraints() functions.
++	* DataRowCollection.cs: Removed ValidateDataRowInternal().
++	* DataTable: Fixed Clear().
++
+ 2005-11-26  Konstantin Triger <kostat@mainsoft.com>
+ 
+ 	* ConflictOption.cs: TARGET_JVM include.
+Index: System.Data/DataRow.cs
+===================================================================
+--- System.Data/DataRow.cs	(revision 53630)
++++ System.Data/DataRow.cs	(working copy)
+@@ -592,12 +592,17 @@
+ 					return;
+ 			case DataRowState.Added:
+ 			case DataRowState.Modified:
++					int original = Original;
++					DataRowState oldState = RowState;
+                                 if (Original >= 0) {
+                                         Table.RecordCache.DisposeRecord(Original);
+                                 }
+                                 Original = Current;
++					foreach (Index index in Table.Indexes)
++						index.Update(this, original, DataRowVersion.Original, oldState);
+ 				break;
+ 			case DataRowState.Deleted:
++				Table.DeleteRowFromIndexes(this);
+ 				_table.Rows.RemoveInternal (this);
+ 				DetachRow();
+ 				break;
+@@ -638,12 +643,13 @@
+ 			 }
+ 
+ 			if (HasVersion (DataRowVersion.Proposed)) {
++				int oldRecord = Proposed;
++				DataRowState oldState = RowState;
+ 				Table.RecordCache.DisposeRecord(Proposed);
+ 				Proposed = -1;
+ 
+-				int newVersion = (HasVersion (DataRowVersion.Current)) ? Current : Original;					
+ 				foreach(Index index in Table.Indexes)
+-					index.Update(this,newVersion);					
++					index.Update(this,oldRecord, DataRowVersion.Proposed, oldState);					
+ 			}
+ 		}
+ 
+@@ -679,14 +685,17 @@
+ 			default:
+ 				// check what to do with child rows
+ 				CheckChildRows(DataRowAction.Delete);
+-				_table.DeleteRowFromIndexes (this);
+ 				break;
+ 			}
+ 			if (Current >= 0) {
++				int current = Current;
++				DataRowState oldState = RowState;
+ 				if (Current != Original) {
+ 					_table.RecordCache.DisposeRecord(Current);
+ 				}
+ 				Current = -1;
++				foreach(Index index in Table.Indexes)
++					index.Update(this, current, DataRowVersion.Current, oldState);
+ 			}
+ 			_table.DeletedDataRow(this, DataRowAction.Delete);
+ 		}
+@@ -843,38 +852,46 @@
+ 					_inChangingEvent = false;
+ 				}
+ 				
+-				//Calling next method validates UniqueConstraints
+-				//and ForeignKeys.
+-				bool rowValidated = false;
+-				try
+-				{
+-					if ((_table.DataSet == null || _table.DataSet.EnforceConstraints) && !_table._duringDataLoad) {
+-						_table.Rows.ValidateDataRowInternal(this);
+-						rowValidated = true;
+-					}
+-				}
+-				catch (Exception e)
+-				{
+-					Table.RecordCache.DisposeRecord(Proposed);
+-					Proposed = -1;
+-					throw e;
+-				}
++				DataRowState oldState = RowState;
+ 
+-				CheckChildRows(DataRowAction.Change);
+-				if (Original != Current) {
+-					Table.RecordCache.DisposeRecord(Current);
+-				}
+-
++				int oldRecord = Current;
+ 				Current = Proposed;
+ 				Proposed = -1;
+ 
+-				if (!rowValidated) {
+-					// keep indexes updated even if there was no need to validate row
++				if (!Table._duringDataLoad) {
+ 					foreach(Index index in Table.Indexes) {
+-						index.Update(this,Current); //FIXME: why Current ?!
++						index.Update(this,oldRecord, DataRowVersion.Current, oldState);
+ 					}
+ 				}
+ 
++				try {
++					AssertConstraints();
++
++					// restore previous state to let the cascade update to find the rows
++					Proposed = Current;
++					Current = oldRecord;
++
++					CheckChildRows(DataRowAction.Change);
++
++					// apply new state
++					Current = Proposed;
++					Proposed = -1;
++				}
++				catch {
++					int proposed = Proposed >= 0 ? Proposed : Current;
++					Current = oldRecord;
++					if (!Table._duringDataLoad) {
++						foreach(Index index in Table.Indexes) {
++							index.Update(this,proposed, DataRowVersion.Current, RowState);
++						}
++					}
++					throw;
++				}
++
++				if (Original != oldRecord) {
++					Table.RecordCache.DisposeRecord(oldRecord);
++				}
++
+ 				// Note : row state must not be changed before all the job on indexes finished,
+ 				// since the indexes works with recods rather than with rows and the decision
+ 				// which of row records to choose depends on row state.
+@@ -1304,10 +1321,7 @@
+ 				CheckChildRows(DataRowAction.Rollback);
+ 
+ 				if (Current != Original) {
+-					foreach(Index index in Table.Indexes) {
+-						index.Delete (this);
+-						index.Update(this,Original);
+-					}
++					Table.DeleteRowFromIndexes(this);
+ 					Current = Original;
+ 				}
+ 			       
+@@ -1320,12 +1334,9 @@
+ 						_table.Rows.RemoveInternal (this);
+ 						break;
+ 					case DataRowState.Modified:
+-						if ((_table.DataSet == null || _table.DataSet.EnforceConstraints) && !_table._duringDataLoad)
+-							_table.Rows.ValidateDataRowInternal(this);
+-						break;
+ 					case DataRowState.Deleted:
+-						if ((_table.DataSet == null || _table.DataSet.EnforceConstraints) && !_table._duringDataLoad)
+-							_table.Rows.ValidateDataRowInternal(this);
++						Table.AddRowToIndexes(this);
++						AssertConstraints();
+ 						break;
+ 				} 
+ 				
+@@ -1624,6 +1635,35 @@
+ 			}
+ 		}
+ 
++		internal void Validate() {
++			Table.AddRowToIndexes(this);
++			AssertConstraints();
++		}
++
++		void AssertConstraints() {
++			if (Table == null || Table._duringDataLoad)
++				return;
++				
++			if (Table.DataSet != null && !Table.DataSet.EnforceConstraints)
++				return;
++
++			foreach(DataColumn column in Table.Columns) {
++				if (!column.AllowDBNull && IsNull(column)) {
++					throw new NoNullAllowedException(_nullConstraintMessage);
++				}
++			}
++
++			foreach(Constraint constraint in Table.Constraints) {
++				try {
++					constraint.AssertConstraint(this);
++				}
++				catch(Exception e) {
++					Table.DeleteRowFromIndexes(this);
++					throw e;
++				}
++			}
++		}
++
+ 		internal void CheckNullConstraints()
+ 		{
+ 			if (_nullConstraintViolation) {
+@@ -1665,17 +1705,15 @@
+                                 && RowState == DataRowState.Unchanged)) {
+ 				Table.ChangingDataRow (this, DataRowAction.ChangeCurrentAndOriginal);
+ 				temp = Table.CreateRecord (values);
++								Table.DeleteRowFromIndexes(this);
+                                 if (HasVersion (DataRowVersion.Original) && Current != Original)
+                                         Table.RecordCache.DisposeRecord (Original);
+                                 Original = temp;
+-                                // update the pk index
+-                                index = Table.GetIndex(Table.PrimaryKey,null,DataViewRowState.None,null,false);
+-                                if (index != null)
+-                                        index.Update (this, temp);
+ 
+                                 if (HasVersion (DataRowVersion.Current))
+                                         Table.RecordCache.DisposeRecord (Current);
+                                 Current = temp;
++								Table.AddRowToIndexes(this);
+ 				Table.ChangedDataRow (this, DataRowAction.ChangeCurrentAndOriginal);
+                                 return;
+                         }
+@@ -1697,19 +1735,16 @@
+ 				if (RowState == DataRowState.Added 
+ 				    || Table.CompareRecords (rindex, temp) != 0) {
+ 					Table.ChangingDataRow (this, DataRowAction.Change);
++										Table.DeleteRowFromIndexes(this);
+                                         if (HasVersion (DataRowVersion.Proposed)) {
+                                                 Table.RecordCache.DisposeRecord (Proposed);
+                                                 Proposed = -1;
+                                         }
+-                                        
+-                                        // update the pk index
+-                                        index = Table.GetIndex(Table.PrimaryKey,null,DataViewRowState.None,null,false);
+-                                        if (index != null)
+-                                                index.Update (this, temp);
+-
++  
+                                         if (Original != Current)
+                                                 Table.RecordCache.DisposeRecord (Current);
+                                         Current = temp;
++										Table.AddRowToIndexes(this);
+ 					Table.ChangedDataRow (this, DataRowAction.Change);
+                                 } else {
+ 					Table.ChangingDataRow (this, DataRowAction.Nothing);
+Index: System.Data/DataRowCollection.cs
+===================================================================
+--- System.Data/DataRowCollection.cs	(revision 53630)
++++ System.Data/DataRowCollection.cs	(working copy)
+@@ -95,9 +95,7 @@
+ 			
+ 			row.BeginEdit();
+ 
+-			if (!table._duringDataLoad)
+-				// we have to check that the new row doesn't colide with existing row
+-				ValidateDataRowInternal(row);
++			row.Validate();
+ 
+ 			AddInternal(row);
+ 		}
+@@ -124,9 +122,8 @@
+ 			DataRow row = table.NewNotInitializedRow();
+ 			int newRecord = table.CreateRecord(values);
+ 			row.ImportRecord(newRecord);
+-			if ((table.DataSet == null || table.DataSet.EnforceConstraints) && !table._duringDataLoad)
+-				// we have to check that the new row doesn't colide with existing row
+-				ValidateDataRowInternal(row);
++
++			row.Validate();
+ 			AddInternal (row);
+ 			return row;
+ 		}
+@@ -277,9 +274,7 @@
+ 			if (row.RowID != -1)
+ 				throw new ArgumentException ("This row already belongs to this table.");
+ 			
+-			if ((table.DataSet == null || table.DataSet.EnforceConstraints) && !table._duringDataLoad)
+-				// we have to check that the new row doesn't colide with existing row
+-				ValidateDataRowInternal(row);
++			row.Validate();
+ 				
+ 			row.Table.ChangingDataRow (row, DataRowAction.Add);
+ 
+@@ -340,41 +335,5 @@
+ 		{			
+ 			Remove(this[index]);
+ 		}
+-
+-		///<summary>
+-		///Internal method used to validate a given DataRow with respect
+-		///to the DataRowCollection
+-		///</summary>
+-		[MonoTODO]
+-		internal void ValidateDataRowInternal(DataRow row)
+-		{
+-			int newRecord = (row.Proposed >= 0) ? row.Proposed : row.Current;
+-			if (newRecord < 0)
+-				return;
+-
+-			foreach(Index index in table.Indexes) {
+-				index.Update(row,newRecord);
+-			}
+-
+-			if (!(table.DataSet == null || table.DataSet.EnforceConstraints))
+-				return;
+-
+-			//first check for null violations.
+-			row._nullConstraintViolation = true;
+-			row.CheckNullConstraints();
+-
+-			foreach(Constraint constraint in table.Constraints) {
+-				try {
+-					constraint.AssertConstraint(row);
+-				}
+-				catch(Exception e) {
+-					// remove row from indexes
+-					foreach(Index index in table.Indexes) {
+-						index.Delete(newRecord);
+-					}
+-					throw e;
+-				}
+-			}
+-		}
+ 	}
+ }
+Index: System.Data/DataTable.cs
+===================================================================
+--- System.Data/DataTable.cs	(revision 53630)
++++ System.Data/DataTable.cs	(working copy)
+@@ -713,6 +713,8 @@
+ 		public void Clear () {
+                         // Foriegn key constraints are checked in _rows.Clear method
+ 			_rows.Clear ();
++			foreach(Index index in Indexes)
++				index.Reset();
+ #if NET_2_0
+                         OnTableCleared (new DataTableClearEventArgs (this));
+ #endif // NET_2_0
+@@ -1018,9 +1020,7 @@
+ 				}
+ 			}
+ 
+-			if (EnforceConstraints)
+-				// we have to check that the new row doesn't colide with existing row
+-				Rows.ValidateDataRowInternal(newRow);
++			newRow.Validate();
+ 
+ 			Rows.AddInternal(newRow);		
+ 	
+@@ -1175,11 +1175,8 @@
+ 					row.AcceptChanges();
+ 				}
+ 				
+-				if (shouldUpdateIndex || !fAcceptChanges) {
+-					// AcceptChanges not always updates indexes because it calls EndEdit
+-					foreach(Index index in Indexes) {
+-						index.Update(row,tmpRecord);
+-					}
++				if (shouldUpdateIndex && !fAcceptChanges) {
++					AddRowToIndexes(row);
+ 				}
+ 
+ 			}
+@@ -1222,9 +1219,7 @@
+                                 row = NewNotInitializedRow ();
+                                 row.ImportRecord (CreateRecord(values));
+ 
+-                                if (EnforceConstraints) 
+-                                        // we have to check that the new row doesn't colide with existing row
+-                                        Rows.ValidateDataRowInternal(row); // this adds to index ;-)
++                                row.Validate(); // this adds to index ;-)
+                                      
+                                 if (loadOption == LoadOption.OverwriteChanges ||
+                                     loadOption == LoadOption.PreserveChanges) {
+@@ -1588,6 +1583,14 @@
+ 			}
+ 		}
+ 
++		internal void AddRowToIndexes (DataRow row) {
++			if (_indexes != null) {
++				foreach (Index indx in _indexes) {
++					indx.Add (row);
++				}
++			}
++		}
++
+ 		internal void DeleteRowFromIndexes (DataRow row)
+ 		{
+ 			if (_indexes != null) {

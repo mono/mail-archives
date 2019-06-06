@@ -1,0 +1,243 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] String class speed improvements
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20String%20class%20speed%20improvements&In-Reply-To=45634606.6080706%40seznam.cz">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="021523.html">
+   <LINK REL="Next"  HREF="021497.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] String class speed improvements</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20String%20class%20speed%20improvements&In-Reply-To=45634606.6080706%40seznam.cz"
+       TITLE="[Mono-dev] String class speed improvements">lupus at ximian.com
+       </A><BR>
+    <I>Wed Nov 22 10:36:17 EST 2006</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="021523.html">[Mono-dev] String class speed improvements (UPDATE)
+</A></li>
+        <LI>Next message: <A HREF="021497.html">[Mono-dev] String class speed improvements
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21489">[ date ]</a>
+              <a href="thread.html#21489">[ thread ]</a>
+              <a href="subject.html#21489">[ subject ]</a>
+              <a href="author.html#21489">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 11/21/06 Marek Safar wrote:
+&gt;<i> Index: System/String.cs
+</I>&gt;<i> ===================================================================
+</I>&gt;<i> --- System/String.cs	(revision 68265)
+</I>&gt;<i> +++ System/String.cs	(working copy)
+</I>&gt;<i> @@ -692,6 +692,64 @@
+</I>&gt;<i>  			return InternalIndexOfAny (anyOf, startIndex, count);
+</I>&gt;<i>  		}
+</I>&gt;<i>  
+</I>&gt;<i> +		unsafe int InternalIndexOfAny (char[] anyOf, int startIndex, int count)
+</I>&gt;<i> +		{
+</I>&gt;<i> +			if (anyOf.Length == 0)
+</I>&gt;<i> +				return -1;
+</I>&gt;<i> +
+</I>&gt;<i> +			if (anyOf.Length == 1)
+</I>&gt;<i> +				return IndexOfImpl (anyOf [0], startIndex, count);
+</I>&gt;<i> +
+</I>&gt;<i> +			int anyOfLength = anyOf.Length;
+</I>&gt;<i> +			fixed (char* any_ptr = anyOf) {
+</I>&gt;<i> +				char highest = *any_ptr;
+</I>&gt;<i> +				char lowest = *any_ptr;
+</I>&gt;<i> +
+</I>&gt;<i> +				for (int i = 1; i != anyOfLength; ++i) {
+</I>&gt;<i> +					if (any_ptr[i] &gt; highest) {
+</I>
+When I did similar optimizations I used a slightly different pattern.
+Instead of using an index var (i in this case), use a pointer to the end
+of the data and change the condition in the loop to p &lt; endp, with p
+being the pointer to the char that is increased at each iteration
+instead of increasing i and then indexing.
+Anyway, I think we should have a fast path here for small strings: if
+the string is small and anyOf is large, we waste a lot of time.
+This is way I always suggested, when optimizing string methods, to
+create benchmarks that exercise many different situations, so that a
+proper balance can be had. Your test bench should have different lengths
+of strings, typically of 0, 3-4, 6-8, 10-20, 30-40, 100 and 1000 chars.
+The anyof array could be of 0, 1, 3, 5, 10, 20 chars.
+
+&gt;<i> +						highest = any_ptr[i];
+</I>&gt;<i> +						continue;
+</I>&gt;<i> +					}
+</I>&gt;<i> +
+</I>&gt;<i> +					if (any_ptr[i] &lt; lowest)
+</I>&gt;<i> +						lowest = any_ptr[i];
+</I>&gt;<i> +				}
+</I>&gt;<i> +
+</I>&gt;<i> +				anyOfLength--;
+</I>&gt;<i> +
+</I>&gt;<i> +				fixed (char* start = &amp;start_char) {
+</I>&gt;<i> +					char* s1_ptr = start + startIndex;
+</I>&gt;<i> +
+</I>&gt;<i> +					for (int i = startIndex; i &lt; startIndex + count; ++i) {
+</I>
+Use a end pointer here, too: the index can be retrieved with a simple
+sub + shift at the end: reducing the number of variables that needs to
+go into a global register is almost always worth it, especially on x86.
+
+&gt;<i> +						if (*s1_ptr &gt; highest || *s1_ptr &lt; lowest) {
+</I>&gt;<i> +							s1_ptr++;
+</I>&gt;<i> +							continue;
+</I>&gt;<i> +						}
+</I>&gt;<i> +
+</I>&gt;<i> +						// We have always at least 2 characters
+</I>&gt;<i> +						if (*s1_ptr == *any_ptr || *s1_ptr == any_ptr[1])
+</I>&gt;<i> +							return i;
+</I>&gt;<i> +
+</I>&gt;<i> +						int ii = anyOfLength;
+</I>&gt;<i> +						while (ii &gt; 2) {
+</I>&gt;<i> +							if (*s1_ptr == any_ptr[ii] || *s1_ptr == any_ptr[ii - 1])
+</I>&gt;<i> +								return i;
+</I>&gt;<i> +
+</I>&gt;<i> +							ii -= 2;
+</I>&gt;<i> +						}
+</I>&gt;<i> +
+</I>&gt;<i> +						if (ii &gt; 1 &amp;&amp; *s1_ptr == any_ptr[2])
+</I>&gt;<i> +							return i;
+</I>
+Did you experiment also with a simple loop here (using the usual end
+pointer as well instead of ii)? It should be a good balance between
+the speed with small and big anyof arrays.
+
+&gt;<i>  		public int IndexOf (String value)
+</I>&gt;<i> @@ -786,11 +847,65 @@
+</I>&gt;<i>  			if ((startIndex == 0 &amp;&amp; this.length == 0) || (startIndex == this.length) || (count == 0))
+</I>&gt;<i>  				return -1;
+</I>&gt;<i>  
+</I>&gt;<i> -			for (int pos = startIndex; pos &lt; startIndex + count; pos++) {
+</I>&gt;<i> -				if (this[pos] == value)
+</I>&gt;<i> -					return(pos);
+</I>&gt;<i> +			return IndexOfImpl (value, startIndex, count);
+</I>&gt;<i> +		}
+</I>&gt;<i> +
+</I>&gt;<i> +		unsafe int IndexOfImpl(char value, int startIndex, int count)
+</I>&gt;<i> +		{
+</I>&gt;<i> +			fixed (char* start = &amp;start_char) {
+</I>&gt;<i> +				char* s1_ptr = start + startIndex;
+</I>&gt;<i> +
+</I>&gt;<i> +				while (count &gt;= 8) {
+</I>&gt;<i> +					if (*s1_ptr == value)
+</I>&gt;<i> +						return startIndex;
+</I>&gt;<i> +					if (s1_ptr[1] == value)
+</I>&gt;<i> +						return startIndex + 1;
+</I>&gt;<i> +					if (s1_ptr[2] == value)
+</I>&gt;<i> +						return startIndex + 2;
+</I>&gt;<i> +					if (s1_ptr[3] == value)
+</I>&gt;<i> +						return startIndex + 3;
+</I>&gt;<i> +					if (s1_ptr[4] == value)
+</I>&gt;<i> +						return startIndex + 4;
+</I>&gt;<i> +					if (s1_ptr[5] == value)
+</I>&gt;<i> +						return startIndex + 5;
+</I>&gt;<i> +					if (s1_ptr[6] == value)
+</I>&gt;<i> +						return startIndex + 6;
+</I>&gt;<i> +					if (s1_ptr[7] == value)
+</I>&gt;<i> +						return startIndex + 7;
+</I>&gt;<i> +
+</I>&gt;<i> +					s1_ptr += 8;
+</I>&gt;<i> +					startIndex += 8;
+</I>&gt;<i> +					count -= 8;
+</I>&gt;<i> +				}
+</I>
+Use an end pointer here, too and you can drop one hot var.
+
+&gt;<i> +
+</I>&gt;<i> +				if (count &gt;= 4) {
+</I>&gt;<i> +					if (*s1_ptr == value)
+</I>&gt;<i> +						return startIndex;
+</I>&gt;<i> +					if (s1_ptr[1] == value)
+</I>&gt;<i> +						return startIndex + 1;
+</I>&gt;<i> +					if (s1_ptr[2] == value)
+</I>&gt;<i> +						return startIndex + 2;
+</I>&gt;<i> +					if (s1_ptr[3] == value)
+</I>&gt;<i> +						return startIndex + 3;
+</I>&gt;<i> +
+</I>&gt;<i> +					s1_ptr += 4;
+</I>&gt;<i> +					startIndex += 4;
+</I>&gt;<i> +					count -= 4;
+</I>&gt;<i> +				}
+</I>&gt;<i> +
+</I>&gt;<i> +				if (count &gt;= 2) {
+</I>&gt;<i> +					if (*s1_ptr == value)
+</I>&gt;<i> +						return startIndex;
+</I>&gt;<i> +					if (s1_ptr[1] == value)
+</I>&gt;<i> +						return startIndex + 1;
+</I>&gt;<i> +
+</I>&gt;<i> +					s1_ptr += 2;
+</I>&gt;<i> +					startIndex += 2;
+</I>&gt;<i> +					count -= 2;
+</I>&gt;<i> +				}
+</I>&gt;<i> +
+</I>&gt;<i> +				return count != 0 &amp;&amp; *s1_ptr == value ? startIndex : -1;
+</I>
+A simple loop for the last 3 chars would likely be better here.
+Also check if unrolling 8 times really has big perf differences:
+if we could unroll just four times it would be better for smaller
+strings.
+
+&gt;<i> +		/* This method is culture-insensitive */
+</I>&gt;<i> +		unsafe int LastIndexOfImpl (char value, int startIndex, int count)
+</I>&gt;<i> +		{
+</I>
+Same comments as for the test above, additionally, it might be better to
+avoid negative indexes.
+
+&gt;<i> @@ -1100,7 +1270,14 @@
+</I>&gt;<i>  		/* This method is culture insensitive */
+</I>&gt;<i>  		public String Replace (char oldChar, char newChar)
+</I>&gt;<i>  		{
+</I>&gt;<i> -			return InternalReplace (oldChar, newChar);
+</I>&gt;<i> +			if (this.length == 0 || oldChar == newChar)
+</I>&gt;<i> +				return this;
+</I>&gt;<i> +
+</I>&gt;<i> +			int start_pos = IndexOfImpl (oldChar, 0, this.length);
+</I>&gt;<i> +			if (start_pos == -1)
+</I>&gt;<i> +				return this;
+</I>&gt;<i> +			
+</I>&gt;<i> +			return InternalReplace (oldChar, newChar, start_pos);
+</I>
+Instead of changing the icall, just implement all the method in managed
+code.
+Thanks!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="021523.html">[Mono-dev] String class speed improvements (UPDATE)
+</A></li>
+	<LI>Next message: <A HREF="021497.html">[Mono-dev] String class speed improvements
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#21489">[ date ]</a>
+              <a href="thread.html#21489">[ thread ]</a>
+              <a href="subject.html#21489">[ subject ]</a>
+              <a href="author.html#21489">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

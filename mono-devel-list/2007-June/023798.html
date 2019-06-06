@@ -1,0 +1,370 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] PATCH: Make Process.Start() use the same 'mono' runtime
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20PATCH%3A%20Make%20Process.Start%28%29%20use%20the%20same%20%27mono%27%20runtime&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="023811.html">
+   <LINK REL="Next"  HREF="023799.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] PATCH: Make Process.Start() use the same 'mono' runtime</H1>
+    <B>Jonathan Gilbert</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20PATCH%3A%20Make%20Process.Start%28%29%20use%20the%20same%20%27mono%27%20runtime&In-Reply-To="
+       TITLE="[Mono-dev] PATCH: Make Process.Start() use the same 'mono' runtime">2a5gjx302 at sneakemail.com
+       </A><BR>
+    <I>Sat Jun  2 16:29:30 EDT 2007</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="023811.html">[Mono-dev] New Mono.Data.Sqlite problems with UTF8 conversion on Windows
+</A></li>
+        <LI>Next message: <A HREF="023799.html">[Mono-dev] PATCH: Make Process.Start() use the same 'mono'	runtime
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23798">[ date ]</a>
+              <a href="thread.html#23798">[ thread ]</a>
+              <a href="subject.html#23798">[ subject ]</a>
+              <a href="author.html#23798">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hello,
+
+A long time ago, I ran into the issue where Process.Start within mono
+doesn't do what is expected. On Windows, it always runs the child process
+with Microsoft's framework, which can cause problems if it is remoting back
+to the parent process and hits an incompatibility. On other platforms, it
+is even worse: The Process.Start call simply does nothing, since the host
+operating system does not recognize the PECOFF/CLR binary format.
+
+Recently, I saw someone else having the same issue and decided it was
+finally time to do something about it (actually in my opinion it was time
+to do something about it a long time ago). I have created a patch to enable
+mono to find itself and call the child process with the same 'mono'
+interpreter if it is a CLR EXE file. I implemented it by means of an
+environment variable. While this may seem strange, I think it is the most
+logical choice. I have enumerated the advantages and disadvantages that I see:
+
+Advantages:
+- Allows people embedding mono to specify which external 'mono' binary is
+used, if any, by Process.Start calls.
+- Environment variable is inherited by child processes; children of a
+'mono' process that embed mono will automatically use the same 'mono'.
+- Programs that are aware of multiple run-times can easily override or
+remove the value to determine which run-time will be used for a
+Process.Start call (e.g. DotGNU or MS .NET).
+- No new i-calls or exported data symbols are needed.
+
+Disadvantages:
+- Does not work on platforms that do not support environment variables (do
+we support any of those?).
+
+If I've missed anything and there is any particularly good reason not to
+implement it in this way, I'd be happy to hear it. :-)
+
+The patch makes changes in two places:
+- Mini Driver: Good-lookin'!
+er...
+- mini/driver.c: In mono_main, the MONOEXECUTABLE environment variable is
+set to argv[0] (unless argv[0] is empty -- I don't know if this can ever
+happen, so the check can be removed if it is needless). I copied the
+GLIB_CHECK_VERSION block that defines a g_setenv macro for older glib
+versions over from metadata/icall.c.
+- io-layer/processes.c: In CreateProcess, after the executable has been
+identified, it is checked for PE and CLR headers using a new method
+is_managed_binary (static to processes.c). If it is, then the command-line
+is rebuilt to include the argv[0] value captured in the MONOEXECUTABLE
+environment variable at the head and then CreateProcess is called
+recursively. Note: It occurs to me that if the mono executable itself is
+ever identified as a CLR executable, this will result in an unbounded loop
+that will blow the bottom off of the stack in fairly short order. Is this
+something to be concerned about?
+
+I have included a simple test program for it too. (It isn't precisely a
+test-case, though if needed I can figure out how to make one of them too.
+:<i>-) Simply compile parent.cs and child.cs with mcs (no flags needed), and
+</I>then 'mono parent.exe'. Before the patch, only the Process.Start call which
+explicitly specifies 'mono' will work (assuming you have 'mono' in your
+path). After the patch, both Process.Start calls in parent.cs will work
+correctly.
+
+I don't know if this patch is ready to be applied -- I probably don't even
+know all of the cross-platform ramifications that it might have. Let me
+know what you think about it :-)
+
+I must apologize, by the way, for my mailer; if I attach the patch files as
+plain text, it attempts to send them with no content-encoding and my
+outbound mail server complains about the bare LF line endings. As such, I
+have had to simply paste the patch into the e-mail. Since this is likely to
+break it for the purposes of applying, I also attached a gzipped copy of
+the file.
+
+Enjoy,
+
+Jonathan Gilbert
+
+Index: mono/io-layer/processes.c
+===================================================================
+--- mono/io-layer/processes.c	(revision 78469)
++++ mono/io-layer/processes.c	(working copy)
+@@ -18,6 +18,7 @@
+ #include &lt;unistd.h&gt;
+ #include &lt;signal.h&gt;
+ #include &lt;sys/wait.h&gt;
++#include &lt;fcntl.h&gt;
+ 
+ #include &lt;mono/io-layer/wapi.h&gt;
+ #include &lt;mono/io-layer/wapi-private.h&gt;
+@@ -459,6 +460,140 @@
+ 	return (ret);
+ }
+ 
++static gboolean
++is_managed_binary (const gchar *filename)
++{
++	int original_errno = errno;
++#ifdef HAVE_LARGE_FILE_SUPPORT
++	int file = open (filename, O_RDONLY | O_LARGEFILE);
++#else
++	int file = open (filename, O_RDONLY);
++#endif
++	unsigned char buffer[8];
++	off_t file_size;
++	off_t pe_header_offset;
++	gboolean managed_so_far = TRUE;
++	int num_read;
++
++	/* If we are unable to open the file, then we definitely
++	 * can't say that it is managed. The child mono process
++	 * probably wouldn't be able to open it anyway.
++	 */
++	if (file &lt; 0) {
++		errno = original_errno;
++		return FALSE;
++	}
++
++	/* Retrieve the length of the file for future sanity checks. */
++	file_size = lseek (file, 0, SEEK_END);
++	lseek (file, 0, SEEK_SET);
++
++	/* We know we need to read a header field at offset 60. */
++	if (file_size &lt; 64)
++		managed_so_far = FALSE;
++
++	/* Verify the MZ executable signature word. */
++	if (managed_so_far) {
++		num_read = read (file, buffer, 2);
++
++		if ((num_read != 2)
++		 || (buffer[0] != 'M')
++		 || (buffer[1] != 'Z'))
++			managed_so_far = FALSE;
++	}
++
++	/* Get the offset of the PE header. */
++	if (managed_so_far) {
++		off_t new_offset = lseek (file, 60, SEEK_SET);
++
++		if (new_offset != 60)
++			managed_so_far = FALSE;
++		else {
++			num_read = read (file, buffer, 4);
++
++			if (num_read != 4)
++				managed_so_far = FALSE;
++			else {
++				pe_header_offset =  buffer[0]
++				                 | (buffer[1] &lt;&lt;  8)
++				                 | (buffer[2] &lt;&lt; 16)
++				                 | (buffer[3] &lt;&lt; 24);
++
++				if (pe_header_offset + 24 &gt; file_size)
++					managed_so_far = FALSE;
++			}
++		}
++	}
++
++	/* Verify that the header we've found is in fact the PE header. */
++	if (managed_so_far) {
++		off_t new_offset = lseek (file, pe_header_offset, SEEK_SET);
++
++		if (new_offset != pe_header_offset)
++			managed_so_far = FALSE;
++		else {
++			num_read = read (file, buffer, 4);
++
++			if ((num_read != 4)
++			 || (buffer[0] != 'P')
++			 || (buffer[1] != 'E')
++			 || (buffer[2] != 0)
++			 || (buffer[3] != 0))
++				managed_so_far = FALSE;
++		}
++	}
++
++	/* Verify that the header we want in the optional header data
++	 * is present in this binary.
++	 */
++	if (managed_so_far) {
++		off_t new_offset = lseek (file, pe_header_offset + 20, SEEK_SET);
++
++		if (new_offset != pe_header_offset + 20)
++			managed_so_far = FALSE;
++		else {
++			num_read = read (file, buffer, 2);
++
++			if ((num_read != 2)
++			 || ((buffer[0] | (buffer[1] &lt;&lt; 8)) &lt; 216))
++				managed_so_far = FALSE;
++		}
++	}
++
++	/* Read the CLR header address and size fields. These will be
++	 * zero if the binary is not managed.
++	 */
++	if (managed_so_far) {
++		off_t optional_header_offset = pe_header_offset + 24;
++		off_t new_offset = lseek (file, optional_header_offset + 208, SEEK_SET);
++
++		if (new_offset != optional_header_offset + 208)
++			managed_so_far = FALSE;
++		else {
++			guint32 first_word, second_word;
++
++			num_read = read (file, buffer, 8);
++
++			/* We are not concerned with endianness, only with
++			 * whether it is zero or not.
++			 */
++			first_word = *(guint32 *)&amp;buffer[0];
++			second_word = *(guint32 *)&amp;buffer[4];
++
++			if ((num_read != 8)
++			 || (first_word == 0)
++			 || (second_word == 0))
++				managed_so_far = FALSE;
++		}
++	}
++
++	close (file);
++
++	errno = original_errno;
++
++	return managed_so_far;
++}
++
+ gboolean CreateProcess (const gunichar2 *appname, const gunichar2 *cmdline,
+ 			WapiSecurityAttributes *process_attrs G_GNUC_UNUSED,
+ 			WapiSecurityAttributes *thread_attrs G_GNUC_UNUSED,
+@@ -741,6 +876,35 @@
+ 		   args_after_prog);
+ #endif
+ 	
++	/* Check for CLR binaries; if found, we will try to invoke
++	 * them using the same mono binary that started us.
++	 */
++	if (is_managed_binary (prog) &amp;&amp; (appname == NULL)) {
++		char *mono_executable = getenv (&quot;MONOEXECUTABLE&quot;);
++
++		if (mono_executable != NULL) {
++			gsize bytes_ignored;
++
++			appname = mono_unicode_from_external (mono_executable, &amp;bytes_ignored);
++
++			if (appname != NULL) {
++				cmdline = utf16_concat (appname, utf16_space, cmdline, NULL);
++
++				g_free ((gunichar2 *)appname);
++
++				if (cmdline != NULL) {
++					gboolean return_value = CreateProcess (NULL, cmdline, process_attrs,
++						thread_attrs, inherit_handles, create_flags, new_environ,
++						cwd, startup, process_info);
++
++					g_free ((gunichar2 *)cmdline);
++
++					return return_value;
++				}
++			}
++		}
++	}
++
+ 	if (args_after_prog != NULL &amp;&amp; *args_after_prog) {
+ 		gchar *qprog;
+ 
+Index: mono/mini/driver.c
+===================================================================
+--- mono/mini/driver.c	(revision 78469)
++++ mono/mini/driver.c	(working copy)
+@@ -49,6 +49,7 @@
+ #include &quot;inssel.h&quot;
+ #include &lt;locale.h&gt;
+ #include &quot;version.h&quot;
++#include &lt;glib.h&gt;
+ 
+ static FILE *mini_stats_fd = NULL;
+ 
+@@ -671,6 +672,14 @@
+ 	&quot;\tDisabled:      &quot; DISABLED_FEATURES &quot;\n&quot;
+ 	&quot;&quot;;
+ 
++/*
++ * If your platform lacks setenv/unsetenv, you must upgrade your glib.
++ */
++#if !GLIB_CHECK_VERSION(2,4,0)
++#define g_setenv(a,b,c)   setenv(a,b,c)
++#define g_unsetenv(a) unsetenv(a)
++#endif
++
+ int
+ mono_main (int argc, char* argv[])
+ {
+@@ -717,6 +726,9 @@
+ 	g_log_set_always_fatal (G_LOG_LEVEL_ERROR);
+ 	g_log_set_fatal_mask (G_LOG_DOMAIN, G_LOG_LEVEL_ERROR);
+ 
++	if ((argv [0] != NULL) &amp;&amp; (argv [0] [0] != 0))
++		g_setenv (&quot;MONOEXECUTABLE&quot;, argv [0], TRUE);
++
+ 	opt = parse_optimizations (NULL);
+ 
+ 	for (i = 1; i &lt; argc; ++i) {
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: ProcessStartFix.diff.gz
+Type: application/octet-stream
+Size: 2060 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20070602/7c62d5f5/attachment.obj">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20070602/7c62d5f5/attachment.obj</A> 
+-------------- next part --------------
+A non-text attachment was scrubbed...
+Name: testapps.tar.gz
+Type: application/octet-stream
+Size: 377 bytes
+Desc: not available
+Url : <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20070602/7c62d5f5/attachment-0001.obj">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20070602/7c62d5f5/attachment-0001.obj</A> 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="023811.html">[Mono-dev] New Mono.Data.Sqlite problems with UTF8 conversion on Windows
+</A></li>
+	<LI>Next message: <A HREF="023799.html">[Mono-dev] PATCH: Make Process.Start() use the same 'mono'	runtime
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23798">[ date ]</a>
+              <a href="thread.html#23798">[ thread ]</a>
+              <a href="subject.html#23798">[ subject ]</a>
+              <a href="author.html#23798">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

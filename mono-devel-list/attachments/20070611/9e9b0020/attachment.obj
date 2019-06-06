@@ -1,0 +1,139 @@
+Index: verify.c
+===================================================================
+--- verify.c	(revision 79204)
++++ verify.c	(working copy)
+@@ -80,6 +80,9 @@
+ 	guint32 ip_offset;
+ 	MonoMethodSignature *signature;
+ 	MonoMethodHeader *header;
++	
++	MonoGenericContext *generic_context;
++	MonoImage *image;
+ } VerifyContext;
+ 
+ //////////////////////////////////////////////////////////////////
+@@ -2213,6 +2216,67 @@
+ 		ADD_VERIFY_ERROR (ctx, g_strdup_printf ("ret cannot escape exception blocks at 0x%04x", ctx->ip_offset));
+ }
+ 
++/* FIXME: we could just load the signature instead of the whole MonoMethod
++ * TODO handle vararg calls
++ * TODO handle non virt calls to non-final virtual calls (exception clause in page 52 of partition 3)
++ */
++static void
++do_invoke_method (VerifyContext *ctx, int method_token)
++{
++	int param_count, i;
++	MonoMethodSignature *sig;
++	ILStackDesc *value;
++	MonoMethod *method = mono_get_method_full (ctx->image, method_token, NULL, ctx->generic_context);
++
++	if (!method) {
++		ADD_VERIFY_ERROR (ctx, g_strdup_printf ("Method 0x%08x not found at 0x%04x", method_token, ctx->ip_offset));
++		return;
++	}
++
++	if (!(sig = mono_method_signature (method)))
++		sig = mono_method_get_signature (method, ctx->image, method_token);
++
++	param_count = sig->param_count + sig->hasthis;
++	check_underflow (ctx, param_count);
++
++	for (i = sig->param_count - 1; i >= 0; --i) {
++		VERIFIER_DEBUG ( printf ("verifying argument %d\n", i); );
++		value = stack_pop (ctx);
++		if (!verify_type_compat (ctx, sig->params[i], value)) {
++			ADD_VERIFY_ERROR (ctx, g_strdup_printf ("Incompatible parameter value with function signature at 0x%04x", ctx->ip_offset));
++			return;
++		}
++	}
++
++	if (sig->hasthis) {
++		MonoType dummy;
++
++		VERIFIER_DEBUG ( printf ("verifying this argument\n"); );
++
++		memset (&dummy, 0, sizeof (MonoType));
++		dummy.data.klass = method->klass;
++
++		if (method->klass == mono_defaults.object_class)
++			dummy.type = MONO_TYPE_OBJECT;
++		else if(method->klass == mono_defaults.string_class)
++			dummy.type = MONO_TYPE_STRING;
++		else
++			dummy.type = MONO_TYPE_CLASS;
++
++		value = stack_pop (ctx);
++
++		if (!verify_type_compat (ctx, &dummy, value)) {
++			ADD_VERIFY_ERROR (ctx, g_strdup_printf ("Incompatible return value on stack with method signature ret at 0x%04x", ctx->ip_offset));
++			return;
++		}
++	}
++
++	if (sig->ret->type != MONO_TYPE_VOID) {
++		check_overflow (ctx);
++		set_stack_value (stack_push (ctx), sig->ret, FALSE);
++	}
++}
++
+ /*Merge the stacks and perform compat checks*/
+ static void
+ merge_stacks (VerifyContext *ctx, ILCodeDesc *from, ILCodeDesc *to, int start) 
+@@ -2316,7 +2380,7 @@
+ 	ctx.header = mono_method_get_header (method);
+ 	ip = ctx.header->code;
+ 	end = ip + ctx.header->code_size;
+-	image = method->klass->image;
++	ctx.image = image = method->klass->image;
+ 
+ 
+ 	ctx.max_args = ctx.signature->param_count + ctx.signature->hasthis;
+@@ -2325,6 +2389,7 @@
+ 
+ 	ctx.code = g_new0 (ILCodeDesc, ctx.header->code_size);
+ 	ctx.code_size = ctx.header->code_size;
++
+ 	memset(ctx.code, 0, sizeof (ILCodeDesc) * ctx.header->code_size);
+ 
+ 
+@@ -2341,7 +2406,7 @@
+ 	}
+ 
+ 	if (ctx.signature->is_inflated)
+-		generic_context = mono_method_get_context (method);
++		ctx.generic_context = generic_context = mono_method_get_context (method);
+ 		
+ 	stack_init(&ctx, &ctx.eval);
+ 
+@@ -2597,28 +2662,10 @@
+ 			break;
+ 		case CEE_CALL:
+ 		case CEE_CALLVIRT:
+-			token = read32 (ip + 1);
+-			/*
+-			 * FIXME: we could just load the signature ...
+-			 */
+-			cmethod = mono_get_method_full (image, token, NULL, generic_context);
+-			if (!cmethod)
+-				ADD_VERIFY_ERROR (&ctx, g_strdup_printf ("Method 0x%08x not found at 0x%04x", token, ip_offset));
+-			if (mono_method_signature (cmethod)) {
+-				csig = mono_method_signature (cmethod);
+-			} else {
+-				csig = mono_method_get_signature (cmethod, image, token);
+-			}
+-
+-			check_underflow (&ctx, csig->param_count + csig->hasthis);
+-			ctx.eval.size -= csig->param_count + csig->hasthis;
+-			if (csig->ret->type != MONO_TYPE_VOID) {
+-				check_overflow (&ctx);
+-				type_to_eval_stack_type (csig->ret, stack_top (&ctx), FALSE);
+-				++ctx.eval.size;
+-			}
++			do_invoke_method (&ctx, read32 (ip + 1));
+ 			ip += 5;
+ 			break;
++
+ 		case CEE_CALLI:
+ 			token = read32 (ip + 1);
+ 			/*

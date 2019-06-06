@@ -1,0 +1,120 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [android-devel] Runtime crashes on Android
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.dot.net?Subject=Re%3A%20%5BMono-dev%5D%20%5Bandroid-devel%5D%20Runtime%20crashes%20on%20Android&In-Reply-To=%3C072FD78F-C118-4A71-96C2-7974F7B6EFC8%40vt.edu%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="044031.html">
+   <LINK REL="Next"  HREF="044034.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [android-devel] Runtime crashes on Android</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.dot.net?Subject=Re%3A%20%5BMono-dev%5D%20%5Bandroid-devel%5D%20Runtime%20crashes%20on%20Android&In-Reply-To=%3C072FD78F-C118-4A71-96C2-7974F7B6EFC8%40vt.edu%3E"
+       TITLE="[Mono-dev] [android-devel] Runtime crashes on Android">jonpryor at vt.edu
+       </A><BR>
+    <I>Thu Nov 17 11:21:09 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="044031.html">[Mono-dev] Runtime crashes on Android
+</A></li>
+        <LI>Next message (by thread): <A HREF="044034.html">[Mono-dev] Mono CI weather report 11/18
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#44033">[ date ]</a>
+              <a href="thread.html#44033">[ thread ]</a>
+              <a href="subject.html#44033">[ subject ]</a>
+              <a href="author.html#44033">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Reply inline…
+
+On Nov 16, 2016, at 4:29 PM, Bernhard Urban via android-devel &lt;<A HREF="http://lists.dot.net/mailman/listinfo/mono-devel-list">android-devel at lists.dot.net</A>&gt; wrote:
+&gt;<i> everytime I look at a runtime bug on Android, something doesn't feel right. Reports look different to each other. So I tried to get a better understanding on how we handle a SIGSEGV in the runtime and what the output is supposed to be. There are three basic steps [1]:
+</I>&gt;<i> 
+</I>&gt;<i> (1) we print a managed stacktrace.
+</I>&gt;<i> (2) we print a native stacktrace: we do that either via libunwind or libcorkscrew depending on what is available. if neither is available, we do nothing.
+</I>&gt;<i> (3) we call `exit (-1)`, which might give us more information such as a register dump.
+</I>
+Unfortunately, there are (implicitly!) *more* than three basic steps, and I’m fairly sure I still don’t understand what all is going on. For more wonderful context:
+
+	<A HREF="https://github.com/mono/mono/commit/5d07b77a67f61576318a30e8b1c5f65f7f26b1cf">https://github.com/mono/mono/commit/5d07b77a67f61576318a30e8b1c5f65f7f26b1cf</A>
+&gt;<i> when a process crashes on Android, ideally:
+</I>&gt;<i> 
+</I>&gt;<i> 1. The Android signal handler is executed,
+</I>&gt;<i> 2. Bionic will attempt to connect to /system/bin/debuggerd.
+</I>&gt;<i> 3. debuggerd will try to connect to the crashing process, then
+</I>&gt;<i>  retrieve &quot;useful&quot; information from the crashing process (stack
+</I>&gt;<i>  trace, register values, etc.)
+</I>
+
+The “fun” is in trying to intermix Mono’s SIGSEGV handling mechanism in with Android’s infrastructure, which involves having an extra process (`debuggerd`) connect to the process to dump process state.
+
+Additionally, I *believe* — but have not retested or reverified — that the `exit(-1)` within `mini-exceptions.c` won’t be executed, because of the Xamarin.Android calls `mono_set_crash_chaining(1)`, which sets `mono_do_crash_chaining` to 1:
+
+	<A HREF="https://github.com/xamarin/xamarin-android/blob/f862032/src/monodroid/jni/monodroid-glue.c#L2802">https://github.com/xamarin/xamarin-android/blob/f862032/src/monodroid/jni/monodroid-glue.c#L2802</A>
+
+Not that any of the above in any way helps further improve reliability…
+
+&gt;<i> That's the idea, unfortunately that is not always what we get.  In order to see the behaviour across different devices and versions of Android, I made this simple crashing app: [2]. As soon as you click the button the application segfaults. For that I wrote a UI test and sent it off to Xamarin Test Cloud and collected the logs: [3]. Note that every device ran the same APK.
+</I>&gt;<i> 
+</I>&gt;<i> Out of 19 devices, there are really only two devices where the crash report looks like it should: samsung_google_nexus_10-4.4.txt and xiaomi_mi_4-4.4.4.txt.  On many devices we only get a managed stacktrace and then the fun is over.
+</I>&gt;<i> 
+</I>&gt;<i> Why?
+</I>&gt;<i> 
+</I>&gt;<i> Good question. Luckily I have a device on my desk where this is the case, so I did a bit of printf debugging. What I figured out is, that the call to `mono_exception_native_unwind ()` in [4] is where the fun stops. The message I see on adb logcat:
+</I>&gt;<i> 
+</I>&gt;<i> 11-15 20:51:44.790  7093  7093 E audit   : type=1701 msg=audit(1479239504.790:1839): auid=4294967295 uid=10288 gid=10288 ses=4294967295 subj=u:r:untrusted_app:s0:c512,c768 pid=14937 comm=&quot;artup.lulzcrash&quot; exe=&quot;/system/bin/app_process32&quot; sig=11
+</I>
+Are there any other `adb logcat` messages? The above looks like an SELinux-related message. (I have no idea what it *means*, but that’s what it looks like…)
+
+&gt;<i> I see the text of a printf right before that call. printf at the beginning of the function doesn't happen. If I move `mono_exception_native_unwind ()` right before the managed stack unwinding, it crashes there, so it isn't a timeout mechanism. I have no idea why on earth this is the case. Unfortunately there is no clue from which PC the signal is coming from (maybe we cause another fault in the handler? maybe android interferes somehow?)
+</I>
+`debuggerd`?
+
+&gt;<i> Anyone has some idea?  Please tell me I overlook something obvious here.  (I haven't had success yet with gdb/lldb)
+</I>
+I’ve only had success with gdb when using 32-bit targets. 64-bit targets give me gdb protocol mismatch errors. :-(
+
+&gt;<i> Regardless, I want to suggest some things:
+</I>&gt;<i> 
+</I>&gt;<i> (a) we should get rid of the dynamic loading of libunwind/libcorkscrew. Some devices don't ship it. Instead, we should include it in the runtime. I think it's worth the extra footprint (if that is the concern why it wasn't done in the first place).
+</I>
+This is *absolutely* something we should consider. This is even more important in the context of Android 7.0 Nougat, which won’t allow us to load those native libraries, even if they do exist.
+
+- Jon
+
+</PRE>
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="044031.html">[Mono-dev] Runtime crashes on Android
+</A></li>
+	<LI>Next message (by thread): <A HREF="044034.html">[Mono-dev] Mono CI weather report 11/18
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#44033">[ date ]</a>
+              <a href="thread.html#44033">[ thread ]</a>
+              <a href="subject.html#44033">[ subject ]</a>
+              <a href="author.html#44033">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.dot.net/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

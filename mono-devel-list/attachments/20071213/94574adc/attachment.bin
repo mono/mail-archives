@@ -1,0 +1,304 @@
+Index: metadata/threads.c
+===================================================================
+--- metadata/threads.c	(revision 91047)
++++ metadata/threads.c	(working copy)
+@@ -184,6 +184,8 @@
+ static CRITICAL_SECTION delayed_free_table_mutex;
+ static GArray *delayed_free_table = NULL;
+ 
++static gboolean shutting_down = FALSE;
++
+ guint32
+ mono_thread_get_tls_key (void)
+ {
+@@ -200,13 +202,21 @@
+ 
+ /* handle_store() and handle_remove() manage the array of threads that
+  * still need to be waited for when the main thread exits.
++ *
++ * If handle_store() returns FALSE the thread must not be started
++ * because Mono is shutting down.
+  */
+-static void handle_store(MonoThread *thread)
++static gboolean handle_store(MonoThread *thread)
+ {
+ 	mono_threads_lock ();
+ 
+ 	THREAD_DEBUG (g_message ("%s: thread %p ID %"G_GSIZE_FORMAT, __func__, thread, (gsize)thread->tid));
+ 
++	if (shutting_down) {
++		mono_threads_unlock ();
++		return FALSE;
++	}
++
+ 	if(threads==NULL) {
+ 		MONO_GC_REGISTER_ROOT (threads);
+ 		threads=mono_g_hash_table_new(NULL, NULL);
+@@ -219,6 +229,8 @@
+ 				 thread);
+ 
+ 	mono_threads_unlock ();
++
++	return TRUE;
+ }
+ 
+ static gboolean handle_remove(MonoThread *thread)
+@@ -663,9 +675,8 @@
+ 
+ 	thread->threadpool_thread = threadpool_thread;
+ 
+-	handle_store(thread);
+-
+-	ResumeThread (thread_handle);
++	if (handle_store (thread))
++		ResumeThread (thread_handle);
+ }
+ 
+ void
+@@ -724,6 +735,7 @@
+ 	MonoThread *thread;
+ 	HANDLE thread_handle;
+ 	gsize tid;
++	gboolean may_start;
+ 
+ 	if ((thread = mono_thread_current ())) {
+ 		if (domain != mono_domain_get ())
+@@ -762,7 +774,8 @@
+ 
+ 	THREAD_DEBUG (g_message ("%s: Attached thread ID %"G_GSIZE_FORMAT" (handle %p)", __func__, tid, thread_handle));
+ 
+-	handle_store(thread);
++	may_start = handle_store(thread);
++	g_assert (may_start);
+ 
+ 	THREAD_DEBUG (g_message ("%s: (%"G_GSIZE_FORMAT") Setting current_object_key to %p", __func__, GetCurrentThreadId (), thread));
+ 
+@@ -924,7 +937,8 @@
+ 	 * launched, to avoid the main thread deadlocking while trying
+ 	 * to clean up a thread that will never be signalled.
+ 	 */
+-	handle_store (thread);
++	if (!handle_store (thread))
++		return;
+ 
+ 	ResumeThread (thread->handle);
+ 
+@@ -2465,10 +2479,90 @@
+ 	return (thread->tid != self && !mono_gc_is_finalizer_thread (thread)); 
+ }
+ 
++static MonoException* mono_thread_execute_interruption (MonoThread *thread);
++
++/** 
++ * mono_threads_set_shutting_down:
++ * @may_abort: Whether the function is allowed to abort the current
++ * thread if it cannot shut down Mono.
++ *
++ * Is called by a thread that wants to shut down Mono.  Returs whether
++ * the thread is allowed to do that.  The reason for not allowing it
++ * is because another thread has already commenced shutdown.
++ */
++gboolean
++mono_threads_set_shutting_down (gboolean may_abort)
++{
++	MonoThread *current_thread = mono_thread_current ();
++
++	mono_threads_lock ();
++
++	if (shutting_down) {
++		if (may_abort) {
++			ves_icall_System_Threading_Thread_Abort (current_thread, NULL);
++
++			return FALSE;
++		} else {
++			mono_threads_unlock ();
++
++			/* Make sure we're properly suspended/stopped */
++
++			EnterCriticalSection (current_thread->synch_cs);
++
++			if ((current_thread->state & ThreadState_SuspendRequested) ||
++					(current_thread->state & ThreadState_AbortRequested) ||
++					(current_thread->state & ThreadState_StopRequested)) {
++				LeaveCriticalSection (current_thread->synch_cs);
++				mono_thread_execute_interruption (current_thread);
++			} else {
++				current_thread->state |= ThreadState_Stopped;
++				LeaveCriticalSection (current_thread->synch_cs);
++			}
++
++			/* Wake up other threads potentially waiting for us */
++
++			_wapi_thread_signal_self (0);
++
++			/* Wait for the end of the world */
++
++			for (;;)
++				Sleep (10000);
++		}
++	} else {
++		shutting_down = TRUE;
++
++		mono_threads_unlock ();
++
++		/* Even though our state hasn't changed we still wake
++		   up other threads.  Actually we only care about the
++		   main thread, which might be waiting for us to
++		   finish. */
++
++		_wapi_thread_signal_self (0);
++
++		return TRUE;
++	}
++}
++
++/** 
++ * mono_threads_is_shutting_down:
++ *
++ * Returns whether a thread has commenced shutdown of Mono.  Note that
++ * if the function returns FALSE the caller must not assume that
++ * shutdown is not in progress, because the situation might have
++ * changed since the function returned.  For that reason this function
++ * is of very limited utility.
++ */
++gboolean
++mono_threads_is_shutting_down (void)
++{
++	return shutting_down;
++}
++
+ void mono_thread_manage (void)
+ {
+ 	struct wait_data *wait=g_new0 (struct wait_data, 1);
+-	
++
+ 	/* join each thread that's still running */
+ 	THREAD_DEBUG (g_message ("%s: Joining each running thread...", __func__));
+ 	
+@@ -2482,6 +2576,11 @@
+ 	
+ 	do {
+ 		mono_threads_lock ();
++		if (shutting_down) {
++			/* somebody else is shutting down */
++			mono_threads_unlock ();
++			break;
++		}
+ 		THREAD_DEBUG (g_message ("%s: There are %d threads to join", __func__, mono_g_hash_table_size (threads));
+ 			mono_g_hash_table_foreach (threads, print_tids, NULL));
+ 	
+@@ -2496,6 +2595,10 @@
+ 		THREAD_DEBUG (g_message ("%s: I have %d threads after waiting.", __func__, wait->num));
+ 	} while(wait->num>0);
+ 
++	mono_threads_set_shutting_down (FALSE);
++
++	/* No new threads will be created after this point */
++
+ 	mono_runtime_set_shutting_down ();
+ 
+ 	THREAD_DEBUG (g_message ("%s: threadpool cleanup", __func__));
+Index: metadata/threads-types.h
+===================================================================
+--- metadata/threads-types.h	(revision 91047)
++++ metadata/threads-types.h	(working copy)
+@@ -137,6 +137,9 @@
+ extern void mono_thread_init_apartment_state (void) MONO_INTERNAL;
+ extern void mono_thread_cleanup_apartment_state (void) MONO_INTERNAL;
+ 
++extern gboolean mono_threads_set_shutting_down (gboolean may_abort) MONO_INTERNAL;
++extern gboolean mono_threads_is_shutting_down (void) MONO_INTERNAL;
++
+ typedef struct {
+ 	gpointer hazard_pointers [2];
+ } MonoThreadHazardPointers;
+Index: metadata/icall.c
+===================================================================
+--- metadata/icall.c	(revision 91047)
++++ metadata/icall.c	(working copy)
+@@ -6134,6 +6134,9 @@
+ {
+ 	MONO_ARCH_SAVE_REGS;
+ 
++	if (!mono_threads_set_shutting_down (TRUE))
++		return;
++
+ 	mono_runtime_set_shutting_down ();
+ 
+ 	/* Suspend all managed threads since the runtime is going away */
+Index: io-layer/threads.c
+===================================================================
+--- io-layer/threads.c	(revision 91047)
++++ io-layer/threads.c	(working copy)
+@@ -238,6 +238,8 @@
+ 	MONO_SEM_POST (&thread->suspend_sem);
+ }
+ 
++extern gboolean mono_threads_is_shutting_down (void);
++
+ static void *thread_start_routine (gpointer args) G_GNUC_NORETURN;
+ static void *thread_start_routine (gpointer args)
+ {
+@@ -249,7 +251,10 @@
+ 
+ 	thr_ret = pthread_setspecific (thread_hash_key,
+ 				       (void *)thread->handle);
+-	g_assert (thr_ret == 0);
++	if (thr_ret != 0) {
++		g_assert (mono_threads_is_shutting_down ());
++		pthread_exit (NULL);
++	}
+ 
+ 	thread->id = pthread_self();
+ 
+Index: tests/thread-exit.cs
+===================================================================
+--- tests/thread-exit.cs	(revision 0)
++++ tests/thread-exit.cs	(revision 0)
+@@ -0,0 +1,32 @@
++using System;
++using System.Threading;
++
++class FibThread {
++    static long fib (long n) {
++	if (n < 2)
++	    return n;
++	else
++	    return fib (n - 1) + fib (n - 2);
++    }
++
++    public void work () {
++	for (long i = 0; i < 30; ++i)
++	    Console.WriteLine (fib (i).ToString ());
++	Console.WriteLine ("exiting");
++	System.Environment.Exit (0);
++    }
++}
++
++public class Test {
++    public static Thread newThread () {
++	FibThread ft = new FibThread ();
++	return new Thread (new ThreadStart (ft.work));
++    }
++
++    static int Main () {
++	Thread t = newThread ();
++	t.Start ();
++	Console.WriteLine ("started");
++	return 1;
++    }
++}
+Index: tests/Makefile.am
+===================================================================
+--- tests/Makefile.am	(revision 91047)
++++ tests/Makefile.am	(working copy)
+@@ -242,7 +242,8 @@
+ 	imt_big_iface_test.cs \
+ 	dbnull-missing.cs	\
+ 	test-type-ctor.cs 	\
+-	soft-float-tests.cs
++	soft-float-tests.cs	\
++	thread-exit.cs
+ 
+ if X86
+ # bug #71274

@@ -1,0 +1,248 @@
+Index: mono/mini/method-to-ir.c
+===================================================================
+--- mono/mini/method-to-ir.c	(revision 141511)
++++ mono/mini/method-to-ir.c	(working copy)
+@@ -4603,57 +4603,28 @@
+ }
+ 
+ static MonoMethod*
+-method_access_exception (void)
++throw_exception (void)
+ {
+ 	static MonoMethod *method = NULL;
+ 
+ 	if (!method) {
+ 		MonoSecurityManager *secman = mono_security_manager_get_methods ();
+-		method = mono_class_get_method_from_name (secman->securitymanager,
+-							  "MethodAccessException", 2);
++		method = mono_class_get_method_from_name (secman->securitymanager, "ThrowException", 1);
+ 	}
+ 	g_assert (method);
+ 	return method;
+ }
+ 
+ static void
+-emit_throw_method_access_exception (MonoCompile *cfg, MonoMethod *caller, MonoMethod *callee,
+-				    MonoBasicBlock *bblock, unsigned char *ip)
++emit_throw_exception (MonoCompile *cfg, MonoException *ex)
+ {
+-	MonoMethod *thrower = method_access_exception ();
+-	MonoInst *args [2];
++	MonoMethod *thrower = throw_exception ();
++	MonoInst *args [1];
+ 
+-	EMIT_NEW_METHODCONST (cfg, args [0], caller);
+-	EMIT_NEW_METHODCONST (cfg, args [1], callee);
++	EMIT_NEW_PCONST (cfg, args [0], ex);
+ 	mono_emit_method_call (cfg, thrower, args, NULL);
+ }
+ 
+-static MonoMethod*
+-field_access_exception (void)
+-{
+-	static MonoMethod *method = NULL;
+-
+-	if (!method) {
+-		MonoSecurityManager *secman = mono_security_manager_get_methods ();
+-		method = mono_class_get_method_from_name (secman->securitymanager,
+-							  "FieldAccessException", 2);
+-	}
+-	g_assert (method);
+-	return method;
+-}
+-
+-static void
+-emit_throw_field_access_exception (MonoCompile *cfg, MonoMethod *caller, MonoClassField *field,
+-				    MonoBasicBlock *bblock, unsigned char *ip)
+-{
+-	MonoMethod *thrower = field_access_exception ();
+-	MonoInst *args [2];
+-
+-	EMIT_NEW_METHODCONST (cfg, args [0], caller);
+-	EMIT_NEW_METHODCONST (cfg, args [1], field);
+-	mono_emit_method_call (cfg, thrower, args, NULL);
+-}
+-
+ /*
+  * Return the original method is a wrapper is specified. We can only access 
+  * the custom attributes from the original method.
+@@ -4687,7 +4658,7 @@
+ 
+ 	/* caller is Critical! only SafeCritical and Critical callers can access the field, so we throw if caller is Transparent */
+ 	if (mono_security_core_clr_method_level (caller, TRUE) == MONO_SECURITY_CORE_CLR_TRANSPARENT)
+-		emit_throw_field_access_exception (cfg, caller, field, bblock, ip);
++		emit_throw_exception (cfg, mono_get_exception_field_access ());
+ }
+ 
+ static void
+@@ -4705,7 +4676,7 @@
+ 
+ 	/* caller is Critical! only SafeCritical and Critical callers can call it, so we throw if the caller is Transparent */
+ 	if (mono_security_core_clr_method_level (caller, TRUE) == MONO_SECURITY_CORE_CLR_TRANSPARENT)
+-		emit_throw_method_access_exception (cfg, caller, callee, bblock, ip);
++		emit_throw_exception (cfg, mono_get_exception_method_access ());
+ }
+ 
+ /*
+@@ -5641,12 +5612,20 @@
+ 	}
+ 
+ 	if (mono_security_get_mode () == MONO_SECURITY_MODE_CORE_CLR) {
++		/* check if this is native code, e.g. an icall or a p/invoke */
+ 		if (method->wrapper_type == MONO_WRAPPER_MANAGED_TO_NATIVE) {
+ 			MonoMethod *wrapped = mono_marshal_method_from_wrapper (method);
+-			if (wrapped && (wrapped->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL)) {
+-				if (!(method->klass && method->klass->image &&
+-						mono_security_core_clr_is_platform_image (method->klass->image))) {
+-					emit_throw_method_access_exception (cfg, method, wrapped, bblock, ip);
++			if (wrapped) {
++				gboolean pinvk = (wrapped->flags & METHOD_ATTRIBUTE_PINVOKE_IMPL);
++				gboolean icall = (wrapped->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL);
++
++				/* if this ia a native call then it can only be JITted from platform code */
++				if ((icall || pinvk) && method->klass && method->klass->image) {
++					if (!mono_security_core_clr_is_platform_image (method->klass->image)) {
++						MonoException *ex = icall ? mono_get_exception_security () : 
++							mono_get_exception_method_access ();
++						emit_throw_exception (cfg, ex);
++					}
+ 				}
+ 			}
+ 		}
+Index: mono/mini/ChangeLog
+===================================================================
+--- mono/mini/ChangeLog	(revision 141511)
++++ mono/mini/ChangeLog	(working copy)
+@@ -1,3 +1,9 @@
++2009-09-08  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* method-to-ir.c: For CoreCLR throw a SecurityException if an 
++	internal call is defined outside platform code. Reduce code 
++	duplication with existing [Method|Field]AccessException
++
+ 2009-09-08  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* cpu-x86.md mini-x86.c: Remove more unused opcodes.
+Index: ../mcs/class/corlib/System.Security/ChangeLog
+===================================================================
+--- ../mcs/class/corlib/System.Security/ChangeLog	(revision 141511)
++++ ../mcs/class/corlib/System.Security/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2009-09-08  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* SecurityManager.cs, SecurityManager_2_1.cs: Replace existing
++	throw methods (for coreclr) with a single one.
++
+ 2009-05-02  Sebastien Pouliot  <sebastien@ximian.com>
+ 
+ 	* CodeAccessPermission.cs (ThrowSecurityException): Don't include
+Index: ../mcs/class/corlib/System.Security/SecurityManager.cs
+===================================================================
+--- ../mcs/class/corlib/System.Security/SecurityManager.cs	(revision 141511)
++++ ../mcs/class/corlib/System.Security/SecurityManager.cs	(working copy)
+@@ -736,14 +736,11 @@
+ 			throw new SecurityException (message, an, granted, refused, method, SecurityAction.InheritanceDemand, null, null, null);
+ 		}
+ 
+-		private static void FieldAccessException (IntPtr caller, IntPtr field)
+-		{
+-			throw new FieldAccessException (Locale.GetText ("Field access not allowed."));
+-		}
++		// called by the runtime when CoreCLR is enabled
+ 
+-		private static void MethodAccessException (IntPtr caller, IntPtr callee)
++		private static void ThrowException (Exception ex)
+ 		{
+-			throw new MethodAccessException (Locale.GetText ("Method call not allowed."));
++			throw ex;
+ 		}
+ 
+ 		// internal - get called by the class loader
+Index: ../mcs/class/corlib/System.Security/SecurityManager_2_1.cs
+===================================================================
+--- ../mcs/class/corlib/System.Security/SecurityManager_2_1.cs	(revision 141511)
++++ ../mcs/class/corlib/System.Security/SecurityManager_2_1.cs	(working copy)
+@@ -101,16 +101,11 @@
+ 
+ 		// called by the runtime when CoreCLR is enabled
+ 
+-		private static void FieldAccessException (IntPtr caller, IntPtr field)
++		private static void ThrowException (Exception ex)
+ 		{
+-			throw new FieldAccessException (Locale.GetText ("Field access not allowed."));
++			throw ex;
+ 		}
+ 
+-		private static void MethodAccessException (IntPtr caller, IntPtr callee)
+-		{
+-			throw new MethodAccessException (Locale.GetText ("Method call not allowed."));
+-		}
+-
+ 		// internal - get called by the class loader
+ 
+ 		// Called when
+Index: ../moon/test/2.0/moon-unit/ChangeLog
+===================================================================
+--- ../moon/test/2.0/moon-unit/ChangeLog	(revision 141518)
++++ ../moon/test/2.0/moon-unit/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2009-09-08  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* security/MiscTest.cs: Add test cases for internal calls
++
+ 2009-09-04  Chris Toshok  <toshok@ximian.com>
+ 
+ 	* System.Windows/VisualStateTest.cs: remove AddRemoveHandlerTest
+Index: ../moon/test/2.0/moon-unit/security/MiscTest.cs
+===================================================================
+--- ../moon/test/2.0/moon-unit/security/MiscTest.cs	(revision 141518)
++++ ../moon/test/2.0/moon-unit/security/MiscTest.cs	(working copy)
+@@ -27,11 +27,23 @@
+ //
+ 
+ using System;
++using System.Security;
++using System.Runtime.CompilerServices;
+ using System.Windows;
+ 
+ using Mono.Moonlight.UnitTesting;
+ using Microsoft.VisualStudio.TestTools.UnitTesting;
+ 
++// this icall exists on both mono and sl
++// note: CSC prefer this type when compiling this assembly, while SMCS prefers the original type from mscorlib.dll
++namespace System.Runtime.CompilerServices {
++	public class RuntimeHelpers {
++
++		[MethodImpl (MethodImplOptions.InternalCall)]
++		public static extern object GetObjectValue (object obj);
++	}
++}
++
+ namespace MoonTest.Security {
+ 
+ 	[TestClass]
+@@ -66,6 +78,24 @@
+ 			AppDomainManager [,] adm = new AppDomainManager [0, 0];
+ 			Assert.IsNotNull (adm, "AppDomainManager[,]");
+ 		}
++
++		[TestMethod]
++		[ExpectedException (typeof (SecurityException))]
++		[MoonlightBug ("smcs compiles this as using mscorlib, while csc compile this using the newly defined type")]
++		public void RedefineNonCriticalInternalCall ()
++		{
++			RuntimeHelpers.GetObjectValue (null);
++		}
++
++		[MethodImpl (MethodImplOptions.InternalCall)]
++		static extern void NonExistingInternalCall ();
++
++		[TestMethod]
++		[ExpectedException (typeof (SecurityException))]
++		public void DefineNonExistingInternalCall ()
++		{
++			NonExistingInternalCall ();
++		}
+ 	}
+ }
+ 

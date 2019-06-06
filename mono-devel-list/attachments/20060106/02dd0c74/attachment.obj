@@ -1,0 +1,1525 @@
+Index: mono/mono/metadata/class.c
+===================================================================
+--- mono/mono/metadata/class.c	(revision 55123)
++++ mono/mono/metadata/class.c	(working copy)
+@@ -2271,6 +2271,8 @@
+ 			if (cmethod != default_finalize) {
+ 				class->has_finalize = 1;
+ 			}
++			else if ( class->flags & TYPE_ATTRIBUTE_IMPORT && !MONO_CLASS_IS_INTERFACE(class) )
++				class->has_finalize = 1;
+ 		}
+ 
+ 		for (i = 0; i < class->method.count; ++i) {
+@@ -2693,6 +2695,12 @@
+ 		g_assert (class->field.count == 0);
+ 	}
+ 
++	/* reserve space to store COM object pointer in RCW */
++	if (class->flags & TYPE_ATTRIBUTE_IMPORT && !MONO_CLASS_IS_INTERFACE(class)) {
++		class->instance_size += sizeof (gpointer);
++		g_assert (class->field.count == 0);
++	}
++
+ 	if (class->enumtype) {
+ 		class->enum_basetype = mono_class_find_enum_basetype (class);
+ 		class->cast_class = class->element_class = mono_class_from_mono_type (class->enum_basetype);
+Index: mono/mono/metadata/domain.c
+===================================================================
+--- mono/mono/metadata/domain.c	(revision 55123)
++++ mono/mono/metadata/domain.c	(working copy)
+@@ -756,7 +756,13 @@
+ 
+ 	mono_defaults.executioncontext_class = mono_class_from_name (
+ 	        mono_defaults.corlib, "System.Threading", "ExecutionContext");
++	
++	mono_defaults.guidattribute_class = mono_class_from_name (
++	        mono_defaults.corlib, "System.Runtime.InteropServices", "GuidAttribute");
+ 
++	mono_defaults.variant_class = mono_class_from_name (
++	        mono_defaults.corlib, "System", "Variant");
++
+ 	/*
+ 	 * Note that mono_defaults.generic_*_class is only non-NULL if we're
+ 	 * using the 2.0 corlib.
+Index: mono/mono/metadata/metadata.h
+===================================================================
+--- mono/mono/metadata/metadata.h	(revision 55123)
++++ mono/mono/metadata/metadata.h	(working copy)
+@@ -144,6 +144,7 @@
+ 	MONO_MARSHAL_CONV_BOOL_VARIANTBOOL,
+ 	MONO_MARSHAL_CONV_BOOL_I4,
+ 	MONO_MARSHAL_CONV_STR_BSTR,
++	MONO_MARSHAL_CONV_BSTR_STR,
+ 	MONO_MARSHAL_CONV_STR_LPSTR,
+ 	MONO_MARSHAL_CONV_LPSTR_STR,
+ 	MONO_MARSHAL_CONV_LPTSTR_STR,
+@@ -165,8 +166,11 @@
+ 	MONO_MARSHAL_CONV_ARRAY_LPARRAY,
+ 	MONO_MARSHAL_CONV_OBJECT_INTERFACE,
+ 	MONO_MARSHAL_CONV_OBJECT_IDISPATCH,
++	MONO_MARSHAL_CONV_IDISPATCH_OBJECT,
+ 	MONO_MARSHAL_CONV_OBJECT_IUNKNOWN,
++	MONO_MARSHAL_CONV_IUNKNOWN_OBJECT,
+ 	MONO_MARSHAL_CONV_OBJECT_STRUCT,
++	MONO_MARSHAL_CONV_STRUCT_OBJECT,
+ 	MONO_MARSHAL_CONV_DEL_FTN,
+ 	MONO_MARSHAL_CONV_FTN_DEL,
+ 	MONO_MARSHAL_FREE_ARRAY
+Index: mono/mono/metadata/class-internals.h
+===================================================================
+--- mono/mono/metadata/class-internals.h	(revision 55123)
++++ mono/mono/metadata/class-internals.h	(working copy)
+@@ -681,6 +681,8 @@
+ 	MonoClass *iremotingtypeinfo_class;
+ 	MonoClass *runtimesecurityframe_class;
+ 	MonoClass *executioncontext_class;
++	MonoClass *guidattribute_class;
++	MonoClass *variant_class;
+ 	MonoClass *generic_array_class;
+ 	MonoClass *generic_nullable_class;
+ } MonoDefaults;
+Index: mono/mono/metadata/object-internals.h
+===================================================================
+--- mono/mono/metadata/object-internals.h	(revision 55123)
++++ mono/mono/metadata/object-internals.h	(working copy)
+@@ -184,9 +184,18 @@
+ 	MonoObject *unwrapped_server;
+ 	gint32      target_domain_id;
+ 	MonoString *target_uri;
++	MonoObject *object_identity;
++	MonoObject *obj_TP;
++	MonoObject *stub_data;
+ } MonoRealProxy;
+ 
+ typedef struct {
++	MonoRealProxy  real_proxy;
++	gpointer	itf_hash_table;
++	MonoString *type_name;
++} MonoComProxy;
++
++typedef struct {
+ 	MonoObject	 object;
+ 	MonoRealProxy	*rp;	
+ 	MonoRemoteClass *remote_class;
+@@ -994,6 +1003,27 @@
+ 	guint32 location;
+ } MonoManifestResourceInfo;
+ 
++typedef struct {
++	MonoObject object;
++	guint16 intType;
++} MonoInterfaceTypeAttribute;
++
++typedef struct {
++	MonoObject object;
++	gpointer comptr;
++} MonoCOMWrapper;
++
++typedef struct {
++	MonoMarshalByRefObject object;
++	gpointer intType;
++} Mono__ComObject;
++
++
++typedef struct {
++	MonoObject object;
++	guint32 argnum;
++} MonoLCIDConversionAttribute;
++
+ /* Keep in sync with System.GenericParameterAttributes */
+ typedef enum {
+ 	GENERIC_PARAMETER_ATTRIBUTE_NON_VARIANT		= 0,
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 55123)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -68,6 +68,15 @@
+ static void
+ emit_struct_conv (MonoMethodBuilder *mb, MonoClass *klass, gboolean to_object);
+ 
++void
++component_get_object_and_fnc_ptr(MonoObject *this, MonoMethod* method, gpointer* pObj, gpointer* pFunc);
++
++gpointer
++component_get_interface(MonoObject *this, MonoClass* klass);
++
++void
++component_create (MonoObject * this, gpointer ptr);
++
+ #ifdef DEBUG_RUNTIME_CODE
+ static char*
+ indenter (MonoDisHelper *dh, MonoMethod *method, guint32 ip_offset)
+@@ -136,7 +145,6 @@
+ 		register_icall (mono_string_new_wrapper, "mono_string_new_wrapper", "obj ptr", FALSE);
+ 		register_icall (mono_string_to_utf8, "mono_string_to_utf8", "ptr obj", FALSE);
+ 		register_icall (mono_string_to_lpstr, "mono_string_to_lpstr", "ptr obj", FALSE);
+-		register_icall (mono_string_to_bstr, "mono_string_to_bstr", "ptr obj", FALSE);
+ 		register_icall (mono_string_to_ansibstr, "mono_string_to_ansibstr", "ptr object", FALSE);
+ 		register_icall (mono_string_builder_to_utf8, "mono_string_builder_to_utf8", "ptr object", FALSE);
+ 		register_icall (mono_string_builder_to_utf16, "mono_string_builder_to_utf16", "ptr object", FALSE);
+@@ -156,6 +164,9 @@
+ 		register_icall (g_free, "g_free", "void ptr", FALSE);
+ 		register_icall (mono_object_isinst, "mono_object_isinst", "object object ptr", FALSE);
+ 		register_icall (mono_struct_delete_old, "mono_struct_delete_old", "void ptr ptr", FALSE);
++		register_icall (component_get_object_and_fnc_ptr, "component_get_object_and_fnc_ptr", "void object ptr ptr ptr", FALSE);
++		register_icall (component_get_interface, "component_get_interface", "ptr object ptr", FALSE);
++		register_icall (component_create, "component_create", "void object ptr", FALSE);
+ 	}
+ }
+ 
+@@ -348,6 +359,61 @@
+ 	}
+ }
+ 
++static void
++release_com_objects (gpointer key, gpointer value, gpointer user_data)
++{
++	MonoObject *exc = NULL;
++	static MonoMethod *marshal_release = NULL;
++	static MonoMethod *coinitialize = NULL;
++	static int co_init = 0;
++	gpointer pa [1];
++	if (!marshal_release)
++		marshal_release = mono_class_get_method_from_name (mono_class_from_name(mono_defaults.corlib, "System.Runtime.InteropServices", "Marshal"), "Release", 1);
++	g_assert(marshal_release);
++
++	if (!coinitialize)
++	{
++		gpointer pa [2];
++		int int_null = 0;
++		int coinit_mta = 2;
++		coinitialize = mono_class_get_method_from_name (mono_class_from_name(mono_defaults.corlib, "System", "COMInteropHelpers"), "CoInitializeEx", 2);
++		g_assert(coinitialize);
++		pa[0] = &int_null;
++		pa[1] = &coinit_mta;
++		mono_runtime_invoke(coinitialize, NULL, pa, NULL);
++	}
++
++	pa[0] = &value;
++
++	mono_runtime_invoke(marshal_release, NULL, pa, &exc);
++
++	if (exc)
++	{
++	}
++}
++
++void 
++mono_free_com_object (MonoObject *object)
++{
++	gpointer pUnk = NULL;
++	static MonoClass* transparent_proxy = NULL;
++
++	if (!transparent_proxy)
++		transparent_proxy = mono_class_from_name (mono_defaults.corlib, "System.Runtime.Remoting.Proxies", "TransparentProxy");
++
++	if (object->vtable->klass == transparent_proxy) {
++		/* TODO */
++	}
++	else {
++		/* ((MonoCOMWrapper*)this)->comptr;
++		 * This is not working for some reason.
++		 */
++		GHashTable* itf_hash = *((int*)object+sizeof(MonoObject));
++		g_hash_table_foreach(itf_hash, release_com_objects, object);
++	}
++
++}
++
+ gpointer
+ mono_array_to_savearray (MonoArray *array)
+ {
+@@ -500,15 +566,8 @@
+ }	
+ 
+ gpointer
+-mono_string_to_ansibstr (MonoString *string_obj)
++mono_string_to_ansibstr (MonoString *s)
+ {
+-	g_error ("UnmanagedMarshal.BStr is not implemented.");
+-	return NULL;
+-}
+-
+-gpointer
+-mono_string_to_bstr (MonoString *string_obj)
+-{
+ 	g_error ("UnmanagedMarshal.AnsiBStr is not implemented.");
+ 	return NULL;
+ }
+@@ -1091,7 +1150,21 @@
+ 	case MONO_MARSHAL_CONV_ARRAY_LPARRAY:
+ 		g_error ("Structure field of type %s can't be marshalled as LPArray", mono_class_from_mono_type (type)->name);
+ 		break;
+-	case MONO_MARSHAL_CONV_STR_BSTR:
++	case MONO_MARSHAL_CONV_STR_BSTR: {
++		static MonoMethod *string_to_bstr = NULL;
++		if (!string_to_bstr)
++			string_to_bstr= mono_class_get_method_from_name_flags (mono_defaults.marshal_class, "StringToBSTR", 1, METHOD_ATTRIBUTE_PUBLIC);
++		g_assert (string_to_bstr);
++		
++		mono_mb_emit_ldloc (mb, 1);
++		mono_mb_emit_ldloc (mb, 0);
++		mono_mb_emit_byte (mb, CEE_LDIND_I);
++
++		mono_mb_emit_byte (mb, CEE_CALL);
++		mono_mb_emit_i4 (mb, mono_mb_add_data (mb, string_to_bstr));
++		mono_mb_emit_byte (mb, CEE_STIND_I);
++		break;
++	}
+ 	case MONO_MARSHAL_CONV_STR_ANSIBSTR:
+ 	case MONO_MARSHAL_CONV_STR_TBSTR:
+ 	case MONO_MARSHAL_CONV_ARRAY_SAVEARRAY:
+@@ -1114,8 +1187,6 @@
+ 	case MONO_MARSHAL_CONV_STR_LPTSTR:
+ 	case MONO_MARSHAL_CONV_STR_LPSTR:
+ 		return mono_string_to_lpstr;
+-	case MONO_MARSHAL_CONV_STR_BSTR:
+-		return mono_string_to_bstr;
+ 	case MONO_MARSHAL_CONV_STR_TBSTR:
+ 	case MONO_MARSHAL_CONV_STR_ANSIBSTR:
+ 		return mono_string_to_ansibstr;
+@@ -1143,6 +1214,9 @@
+ 		return mono_string_to_byvalstr;
+ 	case MONO_MARSHAL_CONV_STR_BYVALWSTR:
+ 		return mono_string_to_byvalwstr;
++	case MONO_MARSHAL_CONV_OBJECT_STRUCT:
++	case MONO_MARSHAL_CONV_STR_BSTR:
++	case MONO_MARSHAL_CONV_BSTR_STR:
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+@@ -1310,6 +1384,24 @@
+ 	if (info->native_size == 0)
+ 		return;
+ 
++	if (klass == mono_defaults.variant_class)
++	{
++		int msize = mono_class_value_size (klass, NULL);
++		static MonoMethod *get_native_variant_for_object = NULL;
++		if (!get_native_variant_for_object)
++			get_native_variant_for_object = mono_class_get_method_from_name_flags (mono_defaults.marshal_class, "GetNativeVariantForObject", 2, METHOD_ATTRIBUTE_PUBLIC);
++		g_assert (get_native_variant_for_object);
++		
++		mono_mb_emit_ldloc (mb, 0);
++		mono_mb_emit_ldloc (mb, 1);
++
++		mono_mb_emit_byte (mb, CEE_CALL);
++		mono_mb_emit_i4 (mb, mono_mb_add_data (mb, get_native_variant_for_object));
++
++		mono_mb_emit_add_to_local (mb, 1, msize);
++		return;
++	}
++
+ 	if (klass->blittable) {
+ 		int msize = mono_class_value_size (klass, NULL);
+ 		g_assert (msize == info->native_size);
+@@ -1663,6 +1755,8 @@
+ 		return MONO_MARSHAL_CONV_STR_LPSTR;
+ 	case MONO_NATIVE_LPTSTR:
+ 		return MONO_MARSHAL_CONV_STR_LPTSTR;
++	case MONO_NATIVE_BSTR:
++		return MONO_MARSHAL_CONV_STR_BSTR;
+ 	default:
+ 		return -1;
+ 	}
+@@ -1702,6 +1796,8 @@
+ 		return MONO_MARSHAL_CONV_LPSTR_STR;
+ 	case MONO_NATIVE_LPTSTR:
+ 		return MONO_MARSHAL_CONV_LPTSTR_STR;
++	case MONO_NATIVE_BSTR:
++		return MONO_MARSHAL_CONV_BSTR_STR;
+ 	default:
+ 		return -1;
+ 	}
+@@ -3084,6 +3180,8 @@
+ {
+ 	if (target_type == MONO_REMOTING_TARGET_APPDOMAIN)
+ 		return mono_marshal_get_xappdomain_invoke (method);
++	else if (method->klass->flags & TYPE_ATTRIBUTE_IMPORT)
++		return component_get_native_wrapper(method);
+ 	else
+ 		return mono_marshal_get_remoting_invoke (method);
+ }
+@@ -4564,6 +4662,8 @@
+ 	int pos = 0, pos2;
+ 
+ 	klass = t->data.klass;
++	if (!klass)
++		klass = mono_defaults.variant_class;
+ 
+ 	switch (action) {
+ 	case MARSHAL_ACTION_CONV_IN:
+@@ -4801,9 +4901,18 @@
+ 			g_free (msg);
+ 			mono_raise_exception (exc);
+ 		}
+-		else
++		else if (conv != MONO_MARSHAL_CONV_STR_BSTR)
+ 			mono_mb_emit_icall (mb, conv_to_icall (conv));
++		else {
++			static MonoMethod *string_to_bstr = NULL;
++			if (!string_to_bstr)
++				string_to_bstr = mono_class_get_method_from_name_flags (mono_defaults.marshal_class, "StringToBSTR", 1, METHOD_ATTRIBUTE_PUBLIC);
++			g_assert (string_to_bstr);
++			mono_mb_emit_byte (mb, CEE_CALL);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, string_to_bstr));
++		}
+ 
++
+ 		mono_mb_emit_stloc (mb, conv_arg);
+ 		break;
+ 
+@@ -4816,7 +4925,16 @@
+ 		} else {
+ 			if (mono_marshal_need_free (t, m->piinfo, spec)) {
+ 				mono_mb_emit_ldloc (mb, conv_arg);
+-				mono_mb_emit_icall (mb, mono_marshal_free);
++				if (mono_marshal_get_string_encoding ( m->piinfo, spec) == MONO_NATIVE_BSTR) {
++					static MonoMethod *free_bstr = NULL;
++					if (!free_bstr)
++						free_bstr = mono_class_get_method_from_name_flags (mono_defaults.marshal_class, "FreeBSTR", 1, METHOD_ATTRIBUTE_PUBLIC);
++					g_assert (free_bstr);
++					mono_mb_emit_byte (mb, CEE_CALL);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, free_bstr));
++				}
++				else
++					mono_mb_emit_icall (mb, mono_marshal_free);
+ 			}
+ 		}
+ 		break;
+@@ -4832,12 +4950,32 @@
+ 		}
+ 
+ 		mono_mb_emit_ldloc (mb, 0);
+-		mono_mb_emit_icall (mb, conv_to_icall (conv));
++		if (conv != MONO_MARSHAL_CONV_BSTR_STR) {
++			mono_mb_emit_icall (mb, conv_to_icall (conv));
++		}
++		else {
++			static MonoMethod *bstr_to_string = NULL;
++			if (!bstr_to_string)
++				bstr_to_string = mono_class_get_method_from_name_flags (mono_defaults.marshal_class, "PtrToStringBSTR", 1, METHOD_ATTRIBUTE_PUBLIC);
++			g_assert (bstr_to_string);
++			mono_mb_emit_byte (mb, CEE_CALL);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, bstr_to_string));
++		}
+ 		mono_mb_emit_stloc (mb, 3);
+ 
+ 		/* free the string */
+ 		mono_mb_emit_ldloc (mb, 0);
+-		mono_mb_emit_icall (mb, g_free);
++
++		if (mono_marshal_get_string_encoding ( m->piinfo, spec) == MONO_NATIVE_BSTR) {
++			static MonoMethod *free_bstr = NULL;
++			if (!free_bstr)
++				free_bstr = mono_class_get_method_from_name_flags (mono_defaults.marshal_class, "FreeBSTR", 1, METHOD_ATTRIBUTE_PUBLIC);
++			g_assert (free_bstr);
++			mono_mb_emit_byte (mb, CEE_CALL);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, free_bstr));
++		}
++		else
++			mono_mb_emit_icall (mb, g_free);
+ 		break;
+ 
+ 	case MARSHAL_ACTION_MANAGED_CONV_IN:
+@@ -4884,17 +5022,41 @@
+ 	int pos, pos2, loc;
+ 
+ 	if (mono_class_from_mono_type (t) == mono_defaults.object_class) {
+-		mono_raise_exception (mono_get_exception_not_implemented ("Marshalling of type object is not implemented"));
++		/* should only allow for COM Interop? */
++	//	mono_raise_exception (mono_get_exception_not_implemented ("Marshalling of type object is not implemented"));
+ 	}
+ 
+ 	switch (action) {
+ 	case MARSHAL_ACTION_CONV_IN:
++		if (mono_class_from_mono_type (t) == mono_defaults.object_class) {
++			klass = mono_defaults.variant_class;
++			*conv_arg_type = &klass->byval_arg;
++			conv_arg = mono_mb_add_local (mb, &klass->byval_arg);
++		}
++		else {
+ 		*conv_arg_type = &mono_defaults.int_class->byval_arg;
+ 		conv_arg = mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
+ 
++		}
+ 		m->orig_conv_args [argnum] = 0;
+ 
+-		if (klass->delegate) {
++		if (mono_class_from_mono_type (t) == mono_defaults.object_class) {
++			static MonoMethod *get_native_variant_for_object = NULL;
++			if (!get_native_variant_for_object)
++				get_native_variant_for_object = mono_class_get_method_from_name_flags (mono_defaults.marshal_class, "GetNativeVariantForObject", 2, METHOD_ATTRIBUTE_PUBLIC);
++			g_assert (get_native_variant_for_object);
++
++			mono_mb_emit_ldarg (mb, argnum);
++			if (t->byref)
++				mono_mb_emit_byte(mb, CEE_LDIND_REF);
++			mono_mb_emit_ldloc_addr (mb, conv_arg);
++			mono_mb_emit_byte (mb, CEE_CALL);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, get_native_variant_for_object));
++
++
++			//mono_mb_emit_stloc (mb, conv_arg);
++		}
++		else if (klass->delegate) {
+ 			g_assert (!t->byref);
+ 			mono_mb_emit_ldarg (mb, argnum);
+ 			mono_mb_emit_icall (mb, conv_to_icall (MONO_MARSHAL_CONV_DEL_FTN));
+@@ -4917,6 +5079,13 @@
+ 			}
+ 
+ 			mono_mb_emit_stloc (mb, conv_arg);
++		} else if (klass->flags & TYPE_ATTRIBUTE_IMPORT) {
++			mono_mb_emit_ldarg (mb, argnum);
++			mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
++			mono_mb_emit_byte (mb, CEE_MONO_OBJADDR);
++			mono_mb_emit_icon(mb, klass);
++			mono_mb_emit_icall(mb, component_get_interface);
++			mono_mb_emit_stloc (mb, conv_arg);
+ 		} else if (klass->blittable) {
+ 			mono_mb_emit_ldarg (mb, argnum);
+ 			mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
+@@ -5006,9 +5175,15 @@
+ 			break;
+ 		}
+ 
++		if (mono_class_from_mono_type (t) == mono_defaults.object_class)
++			break;
++
+ 		if (klass->delegate)
+ 			break;
+ 
++		if (klass->flags & TYPE_ATTRIBUTE_IMPORT)
++			break;
++
+ 		if (t->byref && (t->attrs & PARAM_ATTRIBUTE_OUT)) {
+ 			/* allocate a new object */
+ 			mono_mb_emit_ldarg (mb, argnum);
+@@ -5078,7 +5253,18 @@
+ 		break;
+ 
+ 	case MARSHAL_ACTION_CONV_RESULT:
+-		if (klass->delegate) {
++		if (mono_class_from_mono_type (t) == mono_defaults.object_class && spec->native != MONO_NATIVE_INTERFACE && spec->native != MONO_NATIVE_IDISPATCH) {
++			static MonoMethod *get_value = NULL;
++
++			/* make the call to GetValue () */
++			if (!get_value)
++				get_value = mono_class_get_method_from_name_flags (mono_defaults.variant_class, "GetValue", 1, METHOD_ATTRIBUTE_PUBLIC);
++			g_assert (get_value);
++			mono_mb_emit_byte (mb, CEE_CALL);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, get_value));
++			mono_mb_emit_stloc (mb, 3);
++		}
++		else if (klass && klass->delegate) {
+ 			g_assert (!t->byref);
+ 			mono_mb_emit_stloc (mb, 0);
+ 			mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
+@@ -5088,47 +5274,101 @@
+ 			mono_mb_emit_icall (mb, conv_to_icall (MONO_MARSHAL_CONV_FTN_DEL));
+ 			mono_mb_emit_stloc (mb, 3);
+ 		} else {
+-			/* set src */
+-			mono_mb_emit_stloc (mb, 0);
+-	
+-			/* Make a copy since emit_conv modifies local 0 */
+-			loc = mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
+-			mono_mb_emit_ldloc (mb, 0);
+-			mono_mb_emit_stloc (mb, loc);
+-	
+-			mono_mb_emit_byte (mb, CEE_LDNULL);
+-			mono_mb_emit_stloc (mb, 3);
+-	
+-			mono_mb_emit_ldloc (mb, 0);
+-			mono_mb_emit_byte (mb, CEE_BRFALSE);
+-			pos = mb->pos;
+-			mono_mb_emit_i4 (mb, 0);
+-	
+-			/* allocate result object */
+-	
+-			mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
+-			mono_mb_emit_byte (mb, CEE_MONO_NEWOBJ);	
+-			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, klass));
+-			mono_mb_emit_stloc (mb, 3);
+-					
+-			/* set dst  */
+-	
+-			mono_mb_emit_ldloc (mb, 3);
+-			mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
+-			mono_mb_emit_byte (mb, CEE_MONO_OBJADDR);
+-			mono_mb_emit_icon (mb, sizeof (MonoObject));
+-			mono_mb_emit_byte (mb, CEE_ADD);
+-			mono_mb_emit_byte (mb, CEE_STLOC_1);
+-								
+-			/* emit conversion code */
+-			emit_struct_conv (mb, klass, TRUE);
+-	
+-			emit_struct_free (mb, klass, loc);
+-	
+-			/* Free the pointer allocated by unmanaged code */
+-			mono_mb_emit_ldloc (mb, loc);
+-			mono_mb_emit_icall (mb, g_free);
+-			mono_mb_patch_addr (mb, pos, mb->pos - (pos + 4));
++			if (spec->native == MONO_NATIVE_INTERFACE || spec->native == MONO_NATIVE_IDISPATCH)
++			{
++				static MonoMethod *comproxy_constructor = NULL;
++				static MonoMethod *get_transparent_proxy = NULL;
++				static MonoClass * com_proxy_class = NULL;
++
++				if (!com_proxy_class)
++					com_proxy_class = mono_class_from_name (mono_defaults.corlib, "System", "ComProxy");
++				g_assert (com_proxy_class);
++
++				if (!comproxy_constructor)
++					comproxy_constructor = mono_class_get_method_from_name_flags (com_proxy_class, ".ctor", 0, METHOD_ATTRIBUTE_PRIVATE);
++				g_assert (comproxy_constructor);
++
++				if (!get_transparent_proxy)
++					get_transparent_proxy = mono_class_get_method_from_name_flags (com_proxy_class, "GetTransparentProxy", 0, METHOD_ATTRIBUTE_PUBLIC);
++				g_assert (get_transparent_proxy);
++				
++
++				/* store IUnknown pointer */
++				mono_mb_emit_stloc (mb, 0);
++				/* create local for ComProxy object */
++				loc = mono_mb_add_local (mb, &mono_defaults.object_class->byval_arg);
++
++				/* Create ComProxy object and store in loc*/
++				mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
++				mono_mb_emit_byte (mb, CEE_MONO_NEWOBJ);	
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, com_proxy_class));
++				mono_mb_emit_stloc (mb, loc);
++
++				/* Call ComProxy() constructor */
++				mono_mb_emit_ldloc (mb, loc);
++				mono_mb_emit_byte (mb, CEE_CALL);
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, comproxy_constructor));
++
++				/* create hash table and store IUnknown */
++				mono_mb_emit_ldloc (mb, loc);
++				mono_mb_emit_ldloc (mb, 0);
++				mono_mb_emit_icall (mb, component_create);
++
++				/* make the call to GetTransparentProxy () */
++				mono_mb_emit_ldloc (mb, loc);
++				mono_mb_emit_byte (mb, CEE_CALLVIRT);
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, get_transparent_proxy));
++
++				mono_mb_emit_byte (mb, CEE_CASTCLASS);
++				if (!klass)
++					klass = mono_defaults.object_class;
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, klass));
++				mono_mb_emit_stloc (mb, 3);
++			}
++			else
++			{
++				/* set src */
++				mono_mb_emit_stloc (mb, 0);
++		
++				/* Make a copy since emit_conv modifies local 0 */
++				loc = mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
++				mono_mb_emit_ldloc (mb, 0);
++				mono_mb_emit_stloc (mb, loc);
++		
++				mono_mb_emit_byte (mb, CEE_LDNULL);
++				mono_mb_emit_stloc (mb, 3);
++		
++				mono_mb_emit_ldloc (mb, 0);
++				mono_mb_emit_byte (mb, CEE_BRFALSE);
++				pos = mb->pos;
++				mono_mb_emit_i4 (mb, 0);
++		
++				/* allocate result object */
++		
++				mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
++				mono_mb_emit_byte (mb, CEE_MONO_NEWOBJ);	
++				mono_mb_emit_i4 (mb, mono_mb_add_data (mb, klass));
++				mono_mb_emit_stloc (mb, 3);
++						
++				/* set dst  */
++		
++				mono_mb_emit_ldloc (mb, 3);
++				mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
++				mono_mb_emit_byte (mb, CEE_MONO_OBJADDR);
++				mono_mb_emit_icon (mb, sizeof (MonoObject));
++				mono_mb_emit_byte (mb, CEE_ADD);
++				mono_mb_emit_byte (mb, CEE_STLOC_1);
++									
++				/* emit conversion code */
++				emit_struct_conv (mb, klass, TRUE);
++		
++				emit_struct_free (mb, klass, loc);
++		
++				/* Free the pointer allocated by unmanaged code */
++				mono_mb_emit_ldloc (mb, loc);
++				mono_mb_emit_icall (mb, g_free);
++				mono_mb_patch_addr (mb, pos, mb->pos - (pos + 4));
++			}
+ 		}
+ 		break;
+ 
+@@ -5283,6 +5523,15 @@
+ 		mono_mb_patch_addr (mb, pos2, mb->pos - (pos2 + 4));
+ 		break;
+ 
++	case MARSHAL_ACTION_PUSH:
++		mono_mb_emit_ldloc (mb, conv_arg);
++		if (!t->byref) {
++			mono_mb_emit_byte (mb, MONO_CUSTOM_PREFIX);
++			mono_mb_emit_byte (mb, CEE_MONO_LDNATIVEOBJ);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, mono_defaults.variant_class));
++		}
++		break;
++
+ 	default:
+ 		g_assert_not_reached ();
+ 	}
+@@ -6077,7 +6326,458 @@
+ 	return conv_arg;
+ }
+ 
++
++
++static MonoType*
++mono_marshal_com_return_type(MonoMethodSignature *sig, MonoMarshalSpec *spec)
++{
++	int type;
++	MonoType* ret = NULL;
++
++	/* convert the result */
++	if (!sig->ret->byref) {
++		type = sig->ret->type;
++
++		if (spec && spec->native == MONO_NATIVE_CUSTOM) {
++			ret = &mono_defaults.int_class->byval_arg;
++		} else {
++			switch (type) {
++			case MONO_TYPE_I1:
++			case MONO_TYPE_U1:
++			case MONO_TYPE_I2:
++			case MONO_TYPE_U2:
++			case MONO_TYPE_I4:
++			case MONO_TYPE_U4:
++			case MONO_TYPE_I:
++			case MONO_TYPE_U:
++			case MONO_TYPE_PTR:
++			case MONO_TYPE_R4:
++			case MONO_TYPE_R8:
++			case MONO_TYPE_I8:
++			case MONO_TYPE_U8:
++				/* no conversions necessary */
++				ret = sig->ret;
++				break;
++			case MONO_TYPE_VALUETYPE:
++				/* no conversions necessary ??*/
++				ret = sig->ret;
++				break;
++			case MONO_TYPE_OBJECT:
++				if (spec && (spec->native == MONO_NATIVE_IDISPATCH || spec->native == MONO_NATIVE_IUNKNOWN))
++					ret = &mono_defaults.int_class->byval_arg;
++				else
++					ret = &mono_defaults.variant_class->byval_arg;
++				break;
++			case MONO_TYPE_STRING:
++			case MONO_TYPE_CLASS:
++			case MONO_TYPE_BOOLEAN:
++			case MONO_TYPE_ARRAY:
++			case MONO_TYPE_SZARRAY:
++				ret = &mono_defaults.int_class->byval_arg;
++				break;
++			case MONO_TYPE_CHAR:
++				/* fixme: we need conversions here */
++				ret = &mono_defaults.int_class->byval_arg;
++				//mono_mb_emit_stloc (mb, 3);
++				break;
++			case MONO_TYPE_TYPEDBYREF:
++			case MONO_TYPE_FNPTR:
++			default:
++				g_warning ("return type 0x%02x unknown", sig->ret->type);	
++				g_assert_not_reached ();
++			}
++		}
++		return ret;
++	}
++	g_warning ("byref return val");	
++	g_assert_not_reached ();
++	return ret;
++}
++
+ /**
++ * mono_marshal_com_convert_signature:
++ * @sig: The signature of the managed function
++ * @com_sig: The signature of the unmanaged COM function
++ * @mspecs: The marshalling specs of the params
++ * @lcid_arg: Index of 1-based LCID arg
++ *
++ */
++static void
++mono_marshal_com_convert_signature(MonoMethodSignature *sig, MonoMethodSignature *com_sig, MonoMarshalSpec **mspecs, int lcid_arg)
++{
++	int i = 0;
++
++	/* interface ptr is first arg */
++	com_sig->hasthis = 1;
++	/* assume HRESULT returned for now */
++	com_sig->ret = &mono_defaults.int_class->byval_arg;
++	/* assume COM is stdcall for now */
++	com_sig->call_convention = MONO_CALL_STDCALL;
++	/* not sure about this */
++	com_sig->pinvoke = 1;
++
++	for (i = 0; i < sig->param_count; i++)
++	{
++		com_sig->params[i] = sig->params[i];
++		if (mono_class_from_mono_type (com_sig->params[i]) == mono_defaults.object_class) {
++			if (com_sig->params[i]->byref)
++				com_sig->params[i]  = &mono_defaults.variant_class->this_arg;
++			else
++				com_sig->params[i]  = &mono_defaults.variant_class->byval_arg;
++		}
++	}
++
++	/* handle stupid LCIDConversionAttribute */
++	if (lcid_arg) {
++		for (i = sig->param_count; i >lcid_arg; i--)
++		{
++			com_sig->params[i] = com_sig->params[i-1];
++		}
++		com_sig->params[lcid_arg] = &mono_defaults.int32_class->byval_arg;
++	}
++
++	if (!MONO_TYPE_IS_VOID(sig->ret))
++		com_sig->params[sig->param_count + (lcid_arg ? 1 : 0)] = mono_marshal_com_return_type(sig, mspecs[0]);
++
++}
++
++/**
++ * mono_marshal_emit_com_wrapper:
++ * @sig: The signature of the native function
++ * @piinfo: Marshalling information
++ * @mspecs: Marshalling information
++ * @func: the native function to call
++ *
++ */
++static void
++mono_marshal_emit_com_wrapper (MonoMethodBuilder *mb, MonoMethodSignature *sig, MonoMethodPInvoke *piinfo, MonoMarshalSpec **mspecs)
++{
++	EmitMarshalContext m;
++	MonoMethodSignature *csig;
++	MonoClass *klass;
++	int i, argnum, *tmp_locals;
++	int type;
++	int loc_itf_ptr;
++	int loc_func_ptr;
++	int loc_func_hresult;
++	int loc_func_retval;
++	int loc_lcid;
++	int extra_args = 0;
++	int lcid_arg = 0;
++	MonoMethodSignature *callsig = NULL;	
++	static MonoClass *lcidconversion_attribute = NULL;
++	MonoCustomAttrInfo *cinfo = NULL;
++	MonoLCIDConversionAttribute* lcid_attribute = NULL;
++
++	m.mb = mb;
++	m.piinfo = piinfo;
++
++	/* we copy the signature, so that we can set pinvoke to 0 */
++	csig = mono_metadata_signature_dup (sig);
++	csig->pinvoke = 1;
++
++	/* we allocate local for use with emit_struct_conv() */
++	/* allocate local 0 (pointer) src_ptr */
++	mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
++	/* allocate local 1 (pointer) dst_ptr */
++	mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
++	/* allocate local 2 (boolean) delete_old */
++	mono_mb_add_local (mb, &mono_defaults.boolean_class->byval_arg);
++
++	/* delete_old = FALSE */
++	mono_mb_emit_icon (mb, 0);
++	mono_mb_emit_stloc (mb, 2);
++
++	if (!MONO_TYPE_IS_VOID(sig->ret)) {
++		MonoType* return_type = NULL;
++		/* allocate local 3 to store the return value */
++		mono_mb_add_local (mb, sig->ret);
++		
++		/* allocate local for parameter for return value */
++		return_type = mono_marshal_com_return_type(sig, mspecs[0]);
++		loc_func_retval = mono_mb_add_local (mb, return_type);
++
++		if (return_type == &mono_defaults.variant_class->byval_arg) {
++			MonoMethod *variant_init;
++
++			mono_mb_emit_ldloc_addr(mb, loc_func_retval);
++			/* make the call to VariantInit () */
++			variant_init = mono_class_get_method_from_name_flags (mono_defaults.variant_class, "VariantInit", 1, METHOD_ATTRIBUTE_PUBLIC);
++			g_assert (variant_init);
++			mono_mb_emit_byte (mb, CEE_CALL);
++			mono_mb_emit_i4 (mb, mono_mb_add_data (mb, variant_init));
++		}
++
++		extra_args++;
++	}
++
++	
++	/* locals */
++	loc_itf_ptr = mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
++	loc_func_ptr = mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
++	loc_func_hresult = mono_mb_add_local (mb, &mono_defaults.int_class->byval_arg);
++
++
++	/* support for LCIDConversionAttribute */
++	if (!lcidconversion_attribute)
++		lcidconversion_attribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "LCIDConversionAttribute");
++
++	cinfo = mono_custom_attrs_from_method (&piinfo->method);
++	if (cinfo) {
++		lcid_attribute = (MonoLCIDConversionAttribute*)mono_custom_attrs_get_attr (cinfo, lcidconversion_attribute);
++		if (!cinfo->cached)
++			mono_custom_attrs_free (cinfo);
++		if (lcid_attribute) {
++			lcid_arg = lcid_attribute->argnum;
++			if (lcid_arg) {
++				loc_lcid  = mono_mb_add_local (mb, &mono_defaults.int32_class->byval_arg);
++				mono_mb_emit_icon (mb, 1033);
++				mono_mb_emit_stloc(mb, loc_lcid);
++				extra_args++;
++			}
++		}
++	}
++
++
++	/* 
++	 * get interface pointer and function pointer
++	 * store in locals declared above
++	 */
++	mono_mb_emit_ldarg	(mb, 0);
++	mono_mb_emit_byte (mb, CEE_LDC_I4);
++	mono_mb_emit_i4 (mb, &piinfo->method);
++	mono_mb_emit_ldloc_addr(mb, loc_itf_ptr);
++	mono_mb_emit_ldloc_addr(mb, loc_func_ptr);
++	mono_mb_emit_icall (mb, component_get_object_and_fnc_ptr);
++	emit_thread_interrupt_checkpoint (mb);
++
++
++	callsig = mono_metadata_signature_alloc (piinfo->method.klass->image, csig->param_count + extra_args);
++	mono_marshal_com_convert_signature(csig, callsig, mspecs, lcid_arg);
++
++	/* we first do all conversions */
++	tmp_locals = alloca (sizeof (int) * (sig->param_count + (!MONO_TYPE_IS_VOID(csig->ret) ? 1 : 0) ) );
++	m.orig_conv_args = alloca (sizeof (int) * (sig->param_count + 1));
++
++	for (i = 0; i < sig->param_count; i ++) {
++		tmp_locals [i] = emit_marshal (&m, i + sig->hasthis, sig->params [i], mspecs [i + 1], 0, &csig->params [i], MARSHAL_ACTION_CONV_IN);
++	}
++
++
++	if (mspecs [0] && mspecs [0]->native == MONO_NATIVE_CUSTOM) {
++		/* Return type custom marshaling */
++		/*
++		 * Since we can't determine the return type of the unmanaged function,
++		 * we assume it returns a pointer, and pass that pointer to
++		 * MarshalNativeToManaged.
++		 */
++		csig->ret = &mono_defaults.int_class->byval_arg;
++	}
++
++	/* push all arguments */
++
++	/* 'this' pointer */
++	mono_mb_emit_ldloc (mb, loc_itf_ptr);
++
++	for (i = 0; i < sig->param_count + (lcid_arg ? 1 : 0); i++) {
++		int index = i;
++		MonoType *t = NULL;
++		MonoMarshalSpec *spec = NULL;
++
++		if (lcid_arg && i >= lcid_arg) {
++			if (i == lcid_arg) {
++				/* 1033 is eng-us, hard code it for now*/
++				mono_mb_emit_ldloc (mb, loc_lcid);
++				continue;
++			}
++			index--;
++		}
++
++		t = sig->params [index];
++		spec = mspecs [index + 1];
++
++		if (spec && ((spec->native == MONO_NATIVE_CUSTOM) || (spec->native == MONO_NATIVE_ASANY)))
++			emit_marshal (&m, index + sig->hasthis, t, spec, tmp_locals [index], NULL, MARSHAL_ACTION_PUSH);
++		//else if (mono_class_from_mono_type (t) == mono_defaults.object_class)
++		//	emit_marshal (&m, index + sig->hasthis, t, spec, tmp_locals [index], NULL, MARSHAL_ACTION_PUSH);
++		else {
++			argnum = index + sig->hasthis;
++
++			switch (t->type) {
++			case MONO_TYPE_BOOLEAN:
++				if (t->byref) {
++					g_assert (tmp_locals [index]);
++					mono_mb_emit_ldloc_addr (mb, tmp_locals [index]);
++				} else
++					mono_mb_emit_ldarg (mb, argnum);
++				break;
++			case MONO_TYPE_I1:
++			case MONO_TYPE_U1:
++			case MONO_TYPE_I2:
++			case MONO_TYPE_U2:
++			case MONO_TYPE_I4:
++			case MONO_TYPE_U4:
++			case MONO_TYPE_I:
++			case MONO_TYPE_U:
++			case MONO_TYPE_PTR:
++			case MONO_TYPE_R4:
++			case MONO_TYPE_R8:
++			case MONO_TYPE_I8:
++			case MONO_TYPE_U8:
++				mono_mb_emit_ldarg (mb, argnum);
++				break;
++			case MONO_TYPE_VALUETYPE:
++				emit_marshal (&m, index + sig->hasthis, t, spec, tmp_locals [index], NULL, MARSHAL_ACTION_PUSH);
++				break;
++			case MONO_TYPE_STRING:
++			case MONO_TYPE_CLASS:
++			case MONO_TYPE_OBJECT:
++			case MONO_TYPE_ARRAY:
++			case MONO_TYPE_SZARRAY:
++				g_assert (tmp_locals [index]);
++				if (t->byref) 
++					mono_mb_emit_ldloc_addr (mb, tmp_locals [index]);
++				else
++					mono_mb_emit_ldloc (mb, tmp_locals [index]);
++				break;
++			case MONO_TYPE_CHAR:
++				/* fixme: dont know how to marshal that. We cant simply
++				 * convert it to a one byte UTF8 character, because an
++				 * unicode character may need more that one byte in UTF8 */
++				mono_mb_emit_ldarg (mb, argnum);
++				break;
++			case MONO_TYPE_TYPEDBYREF:
++			case MONO_TYPE_FNPTR:
++			default:
++				g_warning ("type 0x%02x unknown", t->type);	
++				g_assert_not_reached ();
++			}
++		}
++	}			
++
++	
++	if (!MONO_TYPE_IS_VOID(csig->ret))
++		mono_mb_emit_ldloc_addr (mb, loc_func_retval);
++
++	/* call the native method */
++	//mono_mb_emit_native_call (mb, csig, func);
++	/* function ptr */
++	mono_mb_emit_ldloc (mb, loc_func_ptr);
++	mono_mb_emit_calli (mb, callsig);
++
++	/* store HRESULT, TODO: convert to exception*/
++	mono_mb_emit_stloc (mb, loc_func_hresult);
++
++	/* load return value if there is one */
++	if (!MONO_TYPE_IS_VOID(csig->ret))
++	{
++		mono_mb_emit_ldloc (mb, loc_func_retval);
++	}
++
++	/* convert the result */
++	if (!sig->ret->byref) {
++		MonoMarshalSpec *spec = mspecs [0];
++		type = sig->ret->type;
++
++		if (spec && spec->native == MONO_NATIVE_CUSTOM) {
++			emit_marshal (&m, 0, sig->ret, spec, 0, NULL, MARSHAL_ACTION_CONV_RESULT);
++		} else {
++
++		handle_enum:
++			switch (type) {
++			case MONO_TYPE_VOID:
++				break;
++			case MONO_TYPE_I1:
++			case MONO_TYPE_U1:
++			case MONO_TYPE_I2:
++			case MONO_TYPE_U2:
++			case MONO_TYPE_I4:
++			case MONO_TYPE_U4:
++			case MONO_TYPE_I:
++			case MONO_TYPE_U:
++			case MONO_TYPE_PTR:
++			case MONO_TYPE_R4:
++			case MONO_TYPE_R8:
++			case MONO_TYPE_I8:
++			case MONO_TYPE_U8:
++				/* no conversions necessary */
++				mono_mb_emit_stloc (mb, 3);
++				break;
++			case MONO_TYPE_VALUETYPE:
++				klass = sig->ret->data.klass;
++				if (klass->enumtype) {
++					type = sig->ret->data.klass->enum_basetype->type;
++					goto handle_enum;
++				}
++				emit_marshal (&m, 0, sig->ret, spec, 0, NULL, MARSHAL_ACTION_CONV_RESULT);
++				break;
++			case MONO_TYPE_STRING:
++			case MONO_TYPE_CLASS:
++			case MONO_TYPE_OBJECT:
++			case MONO_TYPE_BOOLEAN:
++			case MONO_TYPE_ARRAY:
++			case MONO_TYPE_SZARRAY:
++				emit_marshal (&m, 0, sig->ret, spec, 0, NULL, MARSHAL_ACTION_CONV_RESULT);
++				break;
++			case MONO_TYPE_CHAR:
++				/* fixme: we need conversions here */
++				mono_mb_emit_stloc (mb, 3);
++				break;
++			case MONO_TYPE_TYPEDBYREF:
++			case MONO_TYPE_FNPTR:
++			default:
++				g_warning ("return type 0x%02x unknown", sig->ret->type);	
++				g_assert_not_reached ();
++			}
++		}
++	} else {
++		mono_mb_emit_stloc (mb, 3);
++	}
++
++	/* 
++	 * Need to call this after converting the result since MONO_VTADDR needs 
++	 * to be adjacent to the call instruction.
++	 */
++	emit_thread_interrupt_checkpoint (mb);
++
++	/* we need to convert byref arguments back and free string arrays */
++	for (i = 0; i < sig->param_count; i++) {
++		MonoType *t = sig->params [i];
++		MonoMarshalSpec *spec = mspecs [i + 1];
++
++		argnum = i + sig->hasthis;
++
++		if (spec && ((spec->native == MONO_NATIVE_CUSTOM) || (spec->native == MONO_NATIVE_ASANY))) {
++			emit_marshal (&m, argnum, t, spec, tmp_locals [i], NULL, MARSHAL_ACTION_CONV_OUT);
++			continue;
++		}
++
++		switch (t->type) {
++		case MONO_TYPE_STRING:
++		case MONO_TYPE_VALUETYPE:
++		case MONO_TYPE_CLASS:
++		case MONO_TYPE_OBJECT:
++		case MONO_TYPE_SZARRAY:
++			emit_marshal (&m, argnum, t, spec, tmp_locals [i], NULL, MARSHAL_ACTION_CONV_OUT);
++			break;
++		case MONO_TYPE_BOOLEAN:
++			if (!t->byref)
++				continue;
++			mono_mb_emit_ldarg (mb, argnum);
++			mono_mb_emit_ldloc (mb, tmp_locals [i]);
++			if (mspecs [i + 1] != NULL && mspecs [i + 1]->native == MONO_NATIVE_VARIANTBOOL)
++				mono_mb_emit_byte (mb, CEE_NEG);
++			mono_mb_emit_byte (mb, CEE_STIND_I1);
++		}
++	}
++
++	if (!MONO_TYPE_IS_VOID(sig->ret))
++		mono_mb_emit_ldloc (mb, 3);
++
++	mono_mb_emit_byte (mb, CEE_RET);
++}
++
++/**
+  * mono_marshal_emit_native_wrapper:
+  * @sig: The signature of the native function
+  * @piinfo: Marshalling information
+@@ -6320,6 +7020,169 @@
+ 	mono_mb_emit_byte (mb, CEE_RET);
+ }
+ 
++
++
++
++void
++component_get_object_and_fnc_ptr(MonoObject *this, MonoMethod* method, gpointer* pObj, gpointer* pFunc)
++{
++	int offset = 0;
++	MonoClass* itf = NULL;
++	static MonoClass* transparent_proxy = NULL;
++	static MonoClass *interface_type_attribute = NULL;
++
++	if (!transparent_proxy)
++		transparent_proxy = mono_class_from_name (mono_defaults.corlib, "System.Runtime.Remoting.Proxies", "TransparentProxy");
++	if (!interface_type_attribute)
++		interface_type_attribute = mono_class_from_name (mono_defaults.corlib, "System.Runtime.InteropServices", "InterfaceTypeAttribute");
++
++	if (this->vtable->klass == transparent_proxy) {
++		itf = method->klass;
++		offset = method->slot;
++	}
++	else {
++		int i = 0;
++		/* ((MonoCOMWrapper*)this)->comptr;
++		 * This is not working for some reason.
++		 */
++		//pUnk = *((int*)this+sizeof(MonoObject));
++		for (i = 0; i < method->klass->interface_count; i++) {
++			int first;
++			itf = method->klass->interfaces[i];
++
++			first = method->klass->interface_offsets[itf->interface_id];
++			if (first <= method->slot && first + itf->method.count > method->slot) {
++				offset = method->slot - first;
++				break;
++			}
++		}
++	}
++
++	*pObj = component_get_interface(this, itf);
++
++	if (*pObj) {
++		MonoInterfaceTypeAttribute* itf_attr = NULL; 
++		MonoCustomAttrInfo *cinfo = NULL;
++		int * vtable = *((int**)*pObj);
++
++		cinfo = mono_custom_attrs_from_class (itf);
++		itf_attr = (MonoInterfaceTypeAttribute*)mono_custom_attrs_get_attr (cinfo, interface_type_attribute);
++		if (!cinfo->cached)
++			mono_custom_attrs_free (cinfo);
++
++		if (itf_attr && itf_attr->intType == 1)
++			offset += 3; /* 3 methods in IUnknown*/
++		else
++			offset += 7; /* 7 methods in IDispatch*/
++
++		*pFunc = *(vtable + offset);
++	}
++	else {
++		/* bad news */
++		g_assert(0);
++	}
++}
++
++void
++component_create (MonoObject * this, gpointer ptr)
++{
++	static MonoClass* com_proxy = NULL;
++	GHashTable* itf_hash = g_hash_table_new (NULL, NULL);
++	
++	if (!com_proxy)
++		com_proxy = mono_class_from_name (mono_defaults.corlib, "System", "ComProxy");
++
++	if (this->vtable->klass == com_proxy) {
++		MonoComProxy *cp = (MonoComProxy *)this;
++		g_hash_table_insert(itf_hash, -1, ptr);
++		cp->itf_hash_table = itf_hash; 
++	}
++	else {
++		g_hash_table_insert(itf_hash, -1, ptr);
++		*((int*)this+sizeof(MonoObject)) = itf_hash;
++	}
++}
++
++MonoMethod *
++component_get_native_wrapper (MonoMethod *method)
++{
++	MonoMethodSignature *sig, *csig;
++	MonoMethodBuilder *mb;
++	MonoMethod *res;
++	GHashTable *cache;
++
++	g_assert (method != NULL);
++	g_assert (method->klass->flags & TYPE_ATTRIBUTE_IMPORT);
++	g_assert (method->iflags & (METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL | METHOD_IMPL_ATTRIBUTE_RUNTIME));
++
++	cache = method->klass->image->native_wrapper_cache;
++	if ((res = mono_marshal_find_in_cache (cache, method)))
++		return res;
++	sig = mono_method_signature (method);
++
++	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_MANAGED_TO_NATIVE);
++	mb->method->save_lmf = 1;
++
++	// g_print ("Finding internal method for COM object '%s.%s::%s'.\n",method->klass->name_space, method->klass->name,method->name);
++
++	if (!strcmp(method->name,".ctor"))
++	{
++		MonoMethod *create_instance = mono_class_get_method_from_name (mono_class_from_name(mono_defaults.corlib, "System", "COMInteropHelpers"), "CreateInstance", 1);
++		mono_mb_emit_ldarg (mb, 0); 
++		mono_mb_emit_ldarg (mb, 0); 
++		g_assert (create_instance);
++		mono_mb_emit_byte (mb, CEE_CALL);
++		mono_mb_emit_i4 (mb, mono_mb_add_data (mb, create_instance));
++
++
++		mono_mb_emit_icall (mb, component_create);
++		
++		
++		emit_thread_interrupt_checkpoint (mb);
++		mono_mb_emit_byte (mb, CEE_RET);
++
++		csig = mono_metadata_signature_dup (sig);
++		csig->pinvoke = 0;
++		res = mono_mb_create_and_cache (cache, method,
++										mb, csig, csig->param_count + 16);
++		mono_mb_free (mb);
++		return res;
++	}
++	else
++	{
++		/* get the function pointer from the object/vtable */
++		MonoMethodSignature *callsig = NULL;		
++		MonoMarshalSpec **mspecs;
++		MonoMethodPInvoke *piinfo = (MonoMethodPInvoke *) method;
++		int i = 0;
++		int loc_itf_ptr;
++		int loc_func_ptr;
++		int loc_func_hresult;
++		int loc_func_retval;
++
++		csig = sig;
++
++		mspecs = g_new (MonoMarshalSpec*, csig->param_count + 1);
++		mono_method_get_marshal_info (method, mspecs);
++		
++		mono_marshal_emit_com_wrapper (mb, sig, piinfo, mspecs);
++
++		csig = mono_metadata_signature_dup (csig);
++		csig->pinvoke = 0;
++		res = mono_mb_create_and_cache (cache, method,
++										mb, csig, csig->param_count + 16);
++		mono_mb_free (mb);
++
++		for (i = sig->param_count; i >= 0; i--)
++			if (mspecs [i])
++				mono_metadata_free_marshal_spec (mspecs [i]);
++		g_free (mspecs);
++
++		return res;
++	}
++}
++
++
+ /**
+  * mono_marshal_get_native_wrapper:
+  * @method: The MonoMethod to wrap.
+@@ -6348,6 +7211,9 @@
+ 	if ((res = mono_marshal_find_in_cache (cache, method)))
+ 		return res;
+ 
++	if (method->klass->flags & TYPE_ATTRIBUTE_IMPORT)
++		return component_get_native_wrapper(method);
++
+ 	sig = mono_method_signature (method);
+ 
+ 	if (!(method->iflags & METHOD_IMPL_ATTRIBUTE_INTERNAL_CALL) &&
+@@ -7747,17 +8613,7 @@
+ 		return mono_string_new_utf16 (domain, ptr, len);
+ }
+ 
+-MonoString *
+-ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringBSTR (gpointer ptr)
+-{
+-	MONO_ARCH_SAVE_REGS;
+ 
+-	g_warning ("PtrToStringBSTR not implemented");
+-	g_assert_not_reached ();
+-
+-	return NULL;
+-}
+-
+ guint32 
+ ves_icall_System_Runtime_InteropServices_Marshal_GetLastWin32Error (void)
+ {
+@@ -8053,6 +8909,80 @@
+ 	return mono_ftnptr_to_delegate (mono_type_get_class (type->type), ftn);
+ }
+ 
++gpointer
++component_get_interface(MonoObject *this, MonoClass* klass)
++{
++	GHashTable* itf_hash;
++	gpointer itf;
++	MonoCustomAttrInfo *cinfo = NULL;
++
++	g_assert(klass->interface_id);
++
++
++	if (this->vtable->klass == mono_defaults.transparent_proxy_class) {
++		MonoTransparentProxy *tp = ((MonoTransparentProxy *)this);
++		MonoComProxy *cp = tp->rp;
++		g_assert (cp->itf_hash_table != NULL);
++		itf_hash = (GHashTable*)cp->itf_hash_table;
++	}
++	else {
++		itf_hash = *((int*)this+sizeof(MonoObject));
++	}
++	itf = g_hash_table_lookup(itf_hash, klass);
++	
++	
++	if (itf == NULL)
++	{
++		MonoObject * itf_obj;
++		static MonoMethod *marshal_get_com_object_for_object = NULL;
++		gpointer pa [2];
++		if (!marshal_get_com_object_for_object)
++			marshal_get_com_object_for_object = mono_class_get_method_from_name (mono_class_from_name(mono_defaults.corlib, "System.Runtime.InteropServices", "Marshal"), "GetComInterfaceForObject", 2);
++		g_assert(marshal_get_com_object_for_object);
++		pa[0] = this;
++		pa[1] = type_from_handle(&klass->byval_arg);
++		itf_obj = mono_runtime_invoke(marshal_get_com_object_for_object, NULL, pa, NULL);
++		itf = *(int*)mono_object_unbox(itf_obj);
++		g_assert(itf);
++		g_hash_table_insert(itf_hash, klass, itf);
++		
++	}
++
++	return itf;
++}
++
++gpointer
++ves_icall_System_Runtime_InteropServices_Marshal_GetIUnknownForObject (MonoObject *obj)
++{
++	gpointer pUnk = NULL;
++	static MonoClass* com_proxy = NULL;
++	GHashTable* itf_hash;
++
++	if (!com_proxy)
++		com_proxy = mono_class_from_name (mono_defaults.corlib, "System", "ComProxy");
++	
++	if (obj->vtable->klass == mono_defaults.transparent_proxy_class) {
++		MonoTransparentProxy * tp = (MonoTransparentProxy *)obj;
++		MonoComProxy *cp = (MonoComProxy *)tp->rp;
++		g_assert (cp->itf_hash_table != NULL);
++
++		itf_hash = (GHashTable*)cp->itf_hash_table;
++		pUnk = g_hash_table_lookup(itf_hash, -1);
++	}
++	else if (obj->vtable->klass == com_proxy) {
++		MonoComProxy *cp = ((MonoComProxy *)obj);
++		g_assert (cp->itf_hash_table != NULL);
++
++		itf_hash = (GHashTable*)cp->itf_hash_table;
++		pUnk = g_hash_table_lookup(itf_hash, -1);
++	}
++	else {
++		itf_hash = *((int*)obj+sizeof(MonoObject));
++		pUnk = g_hash_table_lookup(itf_hash, -1);
++	}
++	return pUnk;
++}
++
+ MonoMarshalType *
+ mono_marshal_load_type_info (MonoClass* klass)
+ {
+Index: mono/mono/metadata/marshal.h
+===================================================================
+--- mono/mono/metadata/marshal.h	(revision 55123)
++++ mono/mono/metadata/marshal.h	(working copy)
+@@ -61,9 +61,6 @@
+ gpointer
+ mono_string_to_ansibstr (MonoString *string_obj);
+ 
+-gpointer
+-mono_string_to_bstr (MonoString *string_obj);
+-
+ void
+ mono_string_to_byvalstr (gpointer dst, MonoString *src, int size);
+ 
+@@ -78,6 +75,8 @@
+ 
+ void mono_delegate_free_ftnptr (MonoDelegate *delegate);
+ 
++void mono_free_com_object (MonoObject *object);
++
+ void
+ mono_marshal_set_last_error (void);
+ 
+@@ -302,9 +301,6 @@
+ MonoString *
+ ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringUni_len (guint16 *ptr, gint32 len);
+ 
+-MonoString *
+-ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringBSTR (gpointer ptr);
+-
+ guint32 
+ ves_icall_System_Runtime_InteropServices_Marshal_GetLastWin32Error (void);
+ 
+@@ -350,6 +346,12 @@
+ MonoDelegate*
+ ves_icall_System_Runtime_InteropServices_Marshal_GetDelegateForFunctionPointerInternal (void *ftn, MonoReflectionType *type);
+ 
++gpointer
++ves_icall_System_Runtime_InteropServices_Marshal_GetIUnknownForObject (MonoObject *obj);
++
++MonoMethod *
++component_get_native_wrapper (MonoMethod *method);
++
+ G_END_DECLS
+ 
+ #endif /* __MONO_MARSHAL_H__ */
+Index: mono/mono/metadata/icall.c
+===================================================================
+--- mono/mono/metadata/icall.c	(revision 55123)
++++ mono/mono/metadata/icall.c	(working copy)
+@@ -6132,6 +6132,8 @@
+ 	return display_name;
+ }
+ 
++
++
+ static guchar dbase64 [] = {
+ 	128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+ 	128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+@@ -6821,6 +6823,7 @@
+ 	{"FreeHGlobal", ves_icall_System_Runtime_InteropServices_Marshal_FreeHGlobal},
+ 	{"GetDelegateForFunctionPointerInternal", ves_icall_System_Runtime_InteropServices_Marshal_GetDelegateForFunctionPointerInternal},
+ 	{"GetFunctionPointerForDelegateInternal", mono_delegate_to_ftnptr},
++	{"GetIUnknownForObject", ves_icall_System_Runtime_InteropServices_Marshal_GetIUnknownForObject},
+ 	{"GetLastWin32Error", ves_icall_System_Runtime_InteropServices_Marshal_GetLastWin32Error},
+ 	{"OffsetOf", ves_icall_System_Runtime_InteropServices_Marshal_OffsetOf},
+ 	{"Prelink", ves_icall_System_Runtime_InteropServices_Marshal_Prelink},
+@@ -6829,7 +6832,6 @@
+ 	{"PtrToStringAnsi(intptr,int)", ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringAnsi_len},
+ 	{"PtrToStringAuto(intptr)", ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringAnsi},
+ 	{"PtrToStringAuto(intptr,int)", ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringAnsi_len},
+-	{"PtrToStringBSTR", ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringBSTR},
+ 	{"PtrToStringUni(intptr)", ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringUni},
+ 	{"PtrToStringUni(intptr,int)", ves_icall_System_Runtime_InteropServices_Marshal_PtrToStringUni_len},
+ 	{"PtrToStructure(intptr,System.Type)", ves_icall_System_Runtime_InteropServices_Marshal_PtrToStructure_type},
+Index: mono/mono/metadata/gc.c
+===================================================================
+--- mono/mono/metadata/gc.c	(revision 55123)
++++ mono/mono/metadata/gc.c	(working copy)
+@@ -99,6 +99,16 @@
+ 		return;
+ 	}
+ 
++	/* COM objects need to have release called on the IUnknown pointer
++	   Not sure if this is the best way to do it.
++	 */
++
++	if ( o->vtable->klass->flags & TYPE_ATTRIBUTE_IMPORT && !MONO_CLASS_IS_INTERFACE(o->vtable->klass) )
++	{
++		mono_free_com_object(o);
++		return;
++	}
++
+ 	mono_runtime_invoke (mono_class_get_finalizer (o->vtable->klass), o, NULL, &exc);
+ 
+ 	if (exc) {
+Index: mono/mono/mini/mini.c
+===================================================================
+--- mono/mono/mini/mini.c	(revision 55123)
++++ mono/mono/mini/mini.c	(working copy)
+@@ -9613,7 +9613,7 @@
+ 		MonoMethod *nm;
+ 		MonoMethodPInvoke* piinfo = (MonoMethodPInvoke *) method;
+ 
+-		if (method->iflags & METHOD_IMPL_ATTRIBUTE_NATIVE)
++		if (method->iflags & METHOD_IMPL_ATTRIBUTE_NATIVE && !(method->klass->flags & TYPE_ATTRIBUTE_IMPORT))
+ 			g_error ("Method '%s' in assembly '%s' contains native code and mono can't run it. The assembly was probably created by Managed C++.\n", mono_method_full_name (method, TRUE), method->klass->image->name);
+ 
+ 		if (!piinfo->addr) {

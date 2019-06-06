@@ -1,0 +1,337 @@
+diff --git a/mono/metadata/ChangeLog b/mono/metadata/ChangeLog
+index b5fab23..59078aa 100644
+--- a/mono/metadata/ChangeLog
++++ b/mono/metadata/ChangeLog
+@@ -1,3 +1,32 @@
++2008-11-10  Rodrigo Kumpera  <rkumpera@novell.com>
++
++	* appdomain.c (unload_thread_main): Clean up threadpool by
++	calling mono_thread_pool_remove_domain_jobs.
++
++	* domain-internals.h (struct _MonoDomain): Add new fields to
++	help coordinate the cleanup of the threadpool.
++
++	* threadpool.c (mono_thread_pool_remove_domain_jobs): New fuction
++	that cleans up the threadpool of all jobs associated with an appdomain.
++	It does that by cleaning up the queues and making sure all active
++	threads are accounted.
++
++	* threadpool.c (async_invoke_io_thread): Ignore job if its domain is
++	unloaded or in the process of. Take this is such way that there is
++	no race condition between another thread starting the unload and the
++	current thread acknowledging it.
++
++	* threadpool.c (async_invoke_thread): Same.
++
++	* threadpool.c (start_io_thread_or_queue): Increment threadpool_jobs before
++	firing the new thread.
++
++	* threadpool.c (start_tpthread): Same.
++
++	* theadpool.c (append_job): Increment threadpool_jobs before queueing.
++
++	* threadpool.h: Add mono_thread_pool_remove_domain_jobs.
++
+ 2008-11-06  Jonathan Chambers  <joncham@gmail.com>
+ 
+ 	* file-io.c (ves_icall_System_IO_MonoIO_DuplicateHandle): 
+diff --git a/mono/metadata/appdomain.c b/mono/metadata/appdomain.c
+index d229ca0..4d92d08 100644
+--- a/mono/metadata/appdomain.c
++++ b/mono/metadata/appdomain.c
+@@ -1876,6 +1876,11 @@ unload_thread_main (void *arg)
+ 		return 1;
+ 	}
+ 
++	if (!mono_thread_pool_remove_domain_jobs (domain, -1)) {
++		data->failure_reason = g_strdup_printf ("Cleanup of threadpool jobs of domain %s timed out.", domain->friendly_name);
++		return 1;
++	}
++
+ 	/* Finalize all finalizable objects in the doomed appdomain */
+ 	if (!mono_domain_finalize (domain, -1)) {
+ 		data->failure_reason = g_strdup_printf ("Finalization of domain %s timed out.", domain->friendly_name);
+diff --git a/mono/metadata/domain-internals.h b/mono/metadata/domain-internals.h
+index ceb1c08..1594e0e 100644
+--- a/mono/metadata/domain-internals.h
++++ b/mono/metadata/domain-internals.h
+@@ -215,6 +215,10 @@ struct _MonoDomain {
+ 
+ 	/* Information maintained by the JIT engine */
+ 	gpointer runtime_info;
++
++	/*thread pool jobs, used to coordinate shutdown.*/
++	int					threadpool_jobs;
++	HANDLE				cleanup_semaphore;
+ };
+ 
+ typedef struct  {
+diff --git a/mono/metadata/threadpool.c b/mono/metadata/threadpool.c
+index 727f47f..bc42642 100644
+--- a/mono/metadata/threadpool.c
++++ b/mono/metadata/threadpool.c
+@@ -231,6 +231,22 @@ get_events_from_list (MonoMList *list)
+ 				(SOCKET)(gssize)x->handle, x->buffer, x->offset, x->size,\
+ 				 x->socket_flags, &x->error);
+ 
++
++static gboolean
++clear_job (MonoDomain *domain, MonoAsyncResult *ar)
++{
++	int remaining_jobs = InterlockedDecrement (&domain->threadpool_jobs);
++	if (remaining_jobs == 0 && domain->cleanup_semaphore) {
++		EnterCriticalSection (&ares_lock);
++		mono_g_hash_table_remove (ares_htable, ar);
++		LeaveCriticalSection (&ares_lock);
++
++		ReleaseSemaphore (domain->cleanup_semaphore, 1, NULL);
++		return TRUE;
++	}
++	return FALSE;
++}
++
+ static void
+ async_invoke_io_thread (gpointer data)
+ {
+@@ -261,23 +277,36 @@ async_invoke_io_thread (gpointer data)
+ 			/* worker threads invokes methods in different domains,
+ 			 * so we need to set the right domain here */
+ 			domain = ((MonoObject *)ar)->vtable->domain;
+-			mono_thread_push_appdomain_ref (domain);
+-			if (mono_domain_set (domain, FALSE)) {
+-				ASyncCall *ac;
+-
+-				mono_async_invoke (ar);
+-				ac = (ASyncCall *) ar->object_data;
+-				/*
+-				if (ac->msg->exc != NULL)
+-					mono_unhandled_exception (ac->msg->exc);
+-				*/
+-				mono_domain_set (mono_get_root_domain (), TRUE);
++
++			g_assert (domain);
++
++			if (domain->state == MONO_APPDOMAIN_UNLOADED || domain->state == MONO_APPDOMAIN_UNLOADING) {
++				clear_job (domain, ar);
++				data = NULL;
++			} else {
++				mono_thread_push_appdomain_ref (domain);
++				if (clear_job (domain, ar)) {
++					data = NULL;
++					mono_thread_pop_appdomain_ref ();
++					continue;
++				}
++				if (mono_domain_set (domain, FALSE)) {
++					ASyncCall *ac;
++
++					mono_async_invoke (ar);
++					ac = (ASyncCall *) ar->object_data;
++					/*
++					if (ac->msg->exc != NULL)
++						mono_unhandled_exception (ac->msg->exc);
++					*/
++					mono_domain_set (mono_get_root_domain (), TRUE);
++				}
++				mono_thread_pop_appdomain_ref ();
++				InterlockedDecrement (&busy_io_worker_threads);
++				/* If the callee changes the background status, set it back to TRUE */
++				if (*version != '1' && !mono_thread_test_state (thread , ThreadState_Background))
++					ves_icall_System_Threading_Thread_SetState (thread, ThreadState_Background);
+ 			}
+-			mono_thread_pop_appdomain_ref ();
+-			InterlockedDecrement (&busy_io_worker_threads);
+-			/* If the callee changes the background status, set it back to TRUE */
+-			if (*version != '1' && !mono_thread_test_state (thread , ThreadState_Background))
+-				ves_icall_System_Threading_Thread_SetState (thread, ThreadState_Background);
+ 		}
+ 
+ 		data = dequeue_job (&io_queue_lock, &async_io_queue);
+@@ -328,6 +357,8 @@ start_io_thread_or_queue (MonoSocketAsyncResult *ares)
+ 	    worker < mono_io_max_worker_threads) {
+ 		InterlockedIncrement (&busy_io_worker_threads);
+ 		InterlockedIncrement (&io_worker_threads);
++		if (ares)
++			InterlockedIncrement (&ares->obj.vtable->domain->threadpool_jobs);
+ 		mono_thread_create_internal (mono_get_root_domain (), async_invoke_io_thread, ares, TRUE);
+ 	} else {
+ 		append_job (&io_queue_lock, &async_io_queue, (MonoObject*)ares);
+@@ -1004,6 +1035,8 @@ start_tpthread (MonoAsyncResult *data)
+ {
+ 	InterlockedIncrement (&mono_worker_threads);
+ 	InterlockedIncrement (&busy_worker_threads);
++	if (data)
++		InterlockedIncrement (&data->object.vtable->domain->threadpool_jobs);
+ 	mono_thread_create_internal (mono_get_root_domain (), async_invoke_thread, data, TRUE);
+ }
+ 
+@@ -1076,6 +1109,8 @@ start_thread_or_queue (MonoAsyncResult *ares)
+ 	int busy, worker;
+ 
+ 	if ((int) InterlockedCompareExchange (&tp_idle_started, 1, 0) == 0) {
++		/*FIXME this could cause a race condition as unloading could happen before this thread starts and
++		 increment MonoDomain::threadpool_jobs. */
+ 		mono_thread_create_internal (mono_get_root_domain (), start_idle_threads, ares, TRUE);
+ 		return;
+ 	}
+@@ -1151,6 +1186,9 @@ mono_thread_pool_cleanup (void)
+ static void
+ append_job (CRITICAL_SECTION *cs, TPQueue *list, MonoObject *ar)
+ {
++	if (ar)
++		InterlockedIncrement (&ar->vtable->domain->threadpool_jobs);
++
+ 	EnterCriticalSection (cs);
+ 	if (list->array && (list->next_elem < mono_array_length (list->array))) {
+ 		mono_array_setref (list->array, list->next_elem, ar);
+@@ -1179,6 +1217,84 @@ append_job (CRITICAL_SECTION *cs, TPQueue *list, MonoObject *ar)
+ 	LeaveCriticalSection (cs);
+ }
+ 
++
++static void
++clear_queue (CRITICAL_SECTION *cs, TPQueue *list, MonoDomain *domain)
++{
++	int i, count = 0;
++	EnterCriticalSection (cs);
++	/*remove*/
++	for (i = list->first_elem; i < list->next_elem; ++i) {
++		MonoObject *obj = mono_array_get (list->array, MonoObject*, i);
++		if (obj->vtable->domain == domain) {
++			EnterCriticalSection (&ares_lock);
++			mono_g_hash_table_remove (ares_htable, obj);
++			LeaveCriticalSection (&ares_lock);
++
++			mono_array_set (list->array, MonoObject*, i, NULL);
++			InterlockedDecrement (&domain->threadpool_jobs);
++			++count;
++		}
++	}
++	/*compact*/
++	if (count) {
++		int idx = 0;
++		for (i = list->first_elem; i < list->next_elem; ++i) {
++			MonoObject *obj = mono_array_get (list->array, MonoObject*, i);
++			if (obj)
++				mono_array_set (list->array, MonoObject*, idx++, obj);
++		}
++		list->first_elem = 0;
++		list->next_elem = count;
++	}
++	LeaveCriticalSection (cs);
++}
++
++/*
++ * Clean up the threadpool of all domain jobs.
++ * Can only be called as part of the domain unloading process as
++ * it will wait for all jobs to be visible to the interruption code. 
++ */
++gboolean
++mono_thread_pool_remove_domain_jobs (MonoDomain *domain, int timeout)
++{
++	HANDLE sem_handle;
++	int result = TRUE;
++	guint32 start_time = 0;
++
++	clear_queue (&mono_delegate_section, &async_call_queue, domain);
++	clear_queue (&io_queue_lock, &async_io_queue, domain);
++
++	/*
++	 * There might be some threads out that could be about to execute stuff from the given domain.
++	 * We avoid that by setting up a semaphore to be pulsed by the thread that reaches zero.
++	 */
++	sem_handle = CreateSemaphore (NULL, 0, 1, NULL);
++	
++	domain->cleanup_semaphore = sem_handle;
++	/*
++	 * The memory barrier here is required to have global ordering between assigning to cleanup_semaphone
++	 * and reading threadpool_jobs.
++	 * Otherwise this thread could read a stale version of threadpool_jobs and wait forever.
++	 */
++	mono_memory_write_barrier ();
++
++	if (domain->threadpool_jobs && timeout != -1)
++		start_time = mono_msec_ticks ();
++	while (domain->threadpool_jobs) {
++		WaitForSingleObject (sem_handle, timeout);
++		if (timeout != -1 && (mono_msec_ticks () - start_time) > timeout) {
++			result = FALSE;
++			break;
++		}
++	}
++
++	domain->cleanup_semaphore = NULL;
++	CloseHandle (sem_handle);
++	return result;
++}
++
++
+ static MonoObject*
+ dequeue_job (CRITICAL_SECTION *cs, TPQueue *list)
+ {
+@@ -1231,23 +1347,37 @@ async_invoke_thread (gpointer data)
+ 			/* worker threads invokes methods in different domains,
+ 			 * so we need to set the right domain here */
+ 			domain = ((MonoObject *)ar)->vtable->domain;
+-			mono_thread_push_appdomain_ref (domain);
+-			if (mono_domain_set (domain, FALSE)) {
+-				ASyncCall *ac;
+-
+-				mono_async_invoke (ar);
+-				ac = (ASyncCall *) ar->object_data;
+-				/*
+-				if (ac->msg->exc != NULL)
+-					mono_unhandled_exception (ac->msg->exc);
+-				*/
+-				mono_domain_set (mono_get_root_domain (), TRUE);
++
++			g_assert (domain);
++
++			if (domain->state == MONO_APPDOMAIN_UNLOADED || domain->state == MONO_APPDOMAIN_UNLOADING) {
++				clear_job (domain, ar);
++				data = NULL;
++			} else {
++				mono_thread_push_appdomain_ref (domain);
++				if (clear_job (domain, ar)) {
++					data = NULL;
++					mono_thread_pop_appdomain_ref ();
++					continue;
++				}
++
++				if (mono_domain_set (domain, FALSE)) {
++					ASyncCall *ac;
++
++					mono_async_invoke (ar);
++					ac = (ASyncCall *) ar->object_data;
++					/*
++					if (ac->msg->exc != NULL)
++						mono_unhandled_exception (ac->msg->exc);
++					*/
++					mono_domain_set (mono_get_root_domain (), TRUE);
++				}
++				mono_thread_pop_appdomain_ref ();
++				InterlockedDecrement (&busy_worker_threads);
++				/* If the callee changes the background status, set it back to TRUE */
++				if (*version != '1' && !mono_thread_test_state (thread , ThreadState_Background))
++					ves_icall_System_Threading_Thread_SetState (thread, ThreadState_Background);
+ 			}
+-			mono_thread_pop_appdomain_ref ();
+-			InterlockedDecrement (&busy_worker_threads);
+-			/* If the callee changes the background status, set it back to TRUE */
+-			if (*version != '1' && !mono_thread_test_state (thread , ThreadState_Background))
+-				ves_icall_System_Threading_Thread_SetState (thread, ThreadState_Background);
+ 		}
+ 
+ 		data = dequeue_job (&mono_delegate_section, &async_call_queue);
+diff --git a/mono/metadata/threadpool.h b/mono/metadata/threadpool.h
+index b24e171..129addd 100644
+--- a/mono/metadata/threadpool.h
++++ b/mono/metadata/threadpool.h
+@@ -17,6 +17,8 @@ mono_thread_pool_finish (MonoAsyncResult *ares, MonoArray **out_args,
+ 
+ void mono_thread_pool_cleanup (void) MONO_INTERNAL;
+ 
++gboolean mono_thread_pool_remove_domain_jobs (MonoDomain *domain, int timeout) MONO_INTERNAL;
++
+ void
+ ves_icall_System_Threading_ThreadPool_GetAvailableThreads (int *workerThreads,
+ 							   int *completionPortThreads) MONO_INTERNAL;

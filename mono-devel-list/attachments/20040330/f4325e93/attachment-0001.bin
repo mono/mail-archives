@@ -1,0 +1,387 @@
+Index: metadata/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/ChangeLog,v
+retrieving revision 1.1470
+diff -u -b -r1.1470 ChangeLog
+--- metadata/ChangeLog	30 Mar 2004 03:26:16 -0000	1.1470
++++ metadata/ChangeLog	30 Mar 2004 18:44:57 -0000
+@@ -1,3 +1,20 @@
++2004-03-30  Jackson Harper  <jackson@ximian.com>
++
++	* appdomain.c: Set assembly references public token value when
++	PublicKeyToken is specified, not the hash_value. Free public token
++	values when free assembly name data.
++	* assembly.c: Lookup assemblies in the gac if their public token
++	value is set. Add function to allow enabling user gac
++	lookups. Specify whether or not the assembly was loaded from the GAC.
++	* image.h: Add a field for an assembly references public token
++	value to MonoAssemblyname. Add a field to MonoAssembly to specifiy
++	whether an assembly has been loaded from the GAC.
++	* loader.h: Add function to enable/disable the user gac.
++	* mono-config.c: Check if the usergac is enabled in the config
++	file.
++	* icall.c: New icall to determine whether or not an assembly has
++	been loaded from the GAC.
++	
+ 2004-03-29 Ben Maurer  <bmaurer@users.sourceforge.net>
+ 
+ 	* reflection.c, icall.c: add support for pinning variables. 
+Index: metadata/appdomain.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/appdomain.c,v
+retrieving revision 1.122
+diff -u -b -r1.122 appdomain.c
+--- metadata/appdomain.c	28 Mar 2004 16:15:17 -0000	1.122
++++ metadata/appdomain.c	30 Mar 2004 18:44:58 -0000
+@@ -751,6 +751,7 @@
+ 	g_free ((void *) aname->name);
+ 	g_free ((void *) aname->culture);
+ 	g_free ((void *) aname->hash_value);
++	g_free ((void *) aname->public_tok_value);
+ }
+ 
+ static gboolean
+@@ -809,49 +810,7 @@
+ 			tmp++;
+ 			value += 15;
+ 			if (*value && strcmp (value, "null")) {
+-				gint i, len;
+-				gchar h, l;
+-				gchar *result;
+-				
+-				value = g_strstrip (g_strdup (value));
+-				len = strlen (value);
+-				if (len % 2) {
+-					g_free (value);
+-					g_strfreev (parts);
+-					return FALSE;
+-				}
+-				
+-				aname->hash_len = len / 2;
+-				aname->hash_value = g_malloc0 (aname->hash_len);
+-				result = (gchar *) aname->hash_value;
+-				
+-				for (i = 0; i < len; i++) {
+-					if (i % 2) {
+-						l = g_ascii_xdigit_value (value [i]);
+-						if (l == -1) {
+-							g_free (value);
+-							g_strfreev (parts);
+-							return FALSE;
+-						}
+-						result [i / 2] = (h * 16) + l;
+-					} else {
+-						h = g_ascii_xdigit_value (value [i]);
+-						if (h == -1) {
+-							g_free (value);
+-							g_strfreev (parts);
+-							return FALSE;
+-						}
+-					}
+-				}
+-				g_free (value);
+-
+-				/*
+-				g_print ("PublicKeyToken: ");
+-				for (i = 0; i < aname->hash_len; i++) {
+-					g_print ("%x", 0x00FF & aname->hash_value [i]); 
+-				}
+-				g_print ("\n");
+-				*/
++				aname->public_tok_value = g_strstrip (g_strdup (value));
+ 			}
+ 		}
+ 	}
+Index: metadata/assembly.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/assembly.c,v
+retrieving revision 1.85
+diff -u -b -r1.85 assembly.c
+--- metadata/assembly.c	11 Mar 2004 16:13:06 -0000	1.85
++++ metadata/assembly.c	30 Mar 2004 18:44:58 -0000
+@@ -46,6 +46,8 @@
+ /* A hastable of thread->assembly list mappings */
+ static GHashTable *assemblies_loading;
+ 
++gboolean allow_user_gac = FALSE;
++
+ #ifdef PLATFORM_WIN32
+ 
+ static void
+@@ -61,6 +63,23 @@
+ }
+ #endif
+ 
++
++static gchar*
++encode_public_tok (const guchar *token, gint32 len)
++{
++	static gchar allowed [] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
++	gchar *res;
++	int i;
++
++	res = g_malloc (len * 2);
++	for (i = 0; i < len; i++) {
++		res [i * 2] = allowed [token [i] >> 4];
++		res [i * 2 + 1] = allowed [token [i] & 0xF];
++	}
++	res [len * 2] = 0;
++	return res;
++}
++
+ static void
+ check_env (void) {
+ 	const char *path;
+@@ -204,7 +223,8 @@
+ 	MonoTableInfo *t;
+ 	guint32 cols [MONO_ASSEMBLYREF_SIZE];
+ 	const char *hash;
+-	int i;
++	const char *public_tok;
++	int i, public_tok_len;
+ 
+ 	*status = MONO_IMAGE_OK;
+ 
+@@ -233,6 +253,13 @@
+ 		aname.minor = cols [MONO_ASSEMBLYREF_MINOR_VERSION];
+ 		aname.build = cols [MONO_ASSEMBLYREF_BUILD_NUMBER];
+ 		aname.revision = cols [MONO_ASSEMBLYREF_REV_NUMBER];
++		if (cols [MONO_ASSEMBLYREF_PUBLIC_KEY]) {
++			public_tok = mono_metadata_blob_heap (image, cols [MONO_ASSEMBLYREF_PUBLIC_KEY]);
++			public_tok_len = mono_metadata_decode_blob_size (public_tok, &public_tok);
++			aname.public_tok_value = encode_public_tok (public_tok, public_tok_len);
++		} else {
++			aname.public_tok_value = NULL;
++		} 
+ 
+ 		image->references [i] = mono_assembly_load (&aname, image->assembly->basedir, status);
+ 
+@@ -612,12 +639,12 @@
+ mono_assembly_load (MonoAssemblyName *aname, const char *basedir, MonoImageOpenStatus *status)
+ {
+ 	MonoAssembly *result;
+-	char *fullpath, *filename;
++	char *fullpath, *filename, *asmbname;
++	int len;
+ 
+ 	result = invoke_assembly_preload_hook (aname, assemblies_path);
+ 	if (result)
+ 		return result;
+-
+ 	/* g_print ("loading %s\n", aname->name); */
+ 	/* special case corlib */
+ 	if ((strcmp (aname->name, "mscorlib") == 0) || (strcmp (aname->name, "corlib") == 0)) {
+@@ -642,29 +669,71 @@
+ 	result = search_loaded (aname);
+ 	if (result)
+ 		return result;
++
+ 	/* g_print ("%s not found in cache\n", aname->name); */
+-	if (strstr (aname->name, ".dll"))
++	if (strstr (aname->name, ".dll")) {
+ 		filename = g_strdup (aname->name);
+-	else
++		len = strlen (filename) - 4;
++		asmbname = malloc (len);
++		strncpy (asmbname, aname->name, len);
++	} else {
+ 		filename = g_strconcat (aname->name, ".dll", NULL);
++		asmbname = g_strdup (aname->name);
++	}
+ 	if (basedir) {
+ 		fullpath = g_build_filename (basedir, filename, NULL);
+ 		result = mono_assembly_open (fullpath, status);
+ 		g_free (fullpath);
+ 		if (result) {
++			result->in_gac = FALSE;
++			g_free (filename);
++			g_free (asmbname);
++			return result;
++		}
++	}
++	/* try the gac */
++	if (aname->public_tok_value) {
++		gchar *version;
++		version = g_strdup_printf ("%d.%d.%d.%d_%s_%s", aname->major,
++				aname->minor, aname->build, aname->revision,
++				aname->culture, aname->public_tok_value);
++
++		fullpath = g_build_path (G_DIR_SEPARATOR_S, MONO_ASSEMBLIES, "mono", "gac",
++				asmbname, version, filename, NULL);
++		result = mono_assembly_open (fullpath, status);
++
++		g_free (fullpath);
++
++		if (!result && allow_user_gac && getenv ("HOME")) {
++			fullpath = g_build_path (G_DIR_SEPARATOR_S, getenv ("HOME"), ".mono", "gac",
++					asmbname, version, filename, NULL);
++			result = mono_assembly_open (fullpath, status);
++			g_free (fullpath);
++		}
++
++		g_free (version);
++
++		if (result) {
++			result->in_gac = TRUE;
+ 			g_free (filename);
++			g_free (asmbname);
+ 			return result;
+ 		}
+ 	}
+ 	if (assemblies_path) {
+ 		result = load_in_path (filename, (const char**)assemblies_path, status);
+ 		if (result) {
++			result->in_gac = FALSE;
+ 			g_free (filename);
++			g_free (asmbname);
+ 			return result;
+ 		}
+ 	}
+ 	result = load_in_path (filename, default_path, status);
++	if (result)
++		result->in_gac = FALSE;
+ 	g_free (filename);
++	g_free (asmbname);
+ 	return result;
+ }
+ 
+@@ -754,4 +823,10 @@
+ mono_assembly_get_main (void)
+ {
+ 	return(main_assembly);
++}
++
++void
++mono_assembly_allow_user_gac (gboolean allow)
++{
++	allow_user_gac = allow;
+ }
+Index: metadata/image.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/image.h,v
+retrieving revision 1.58
+diff -u -b -r1.58 image.h
+--- metadata/image.h	19 Feb 2004 23:31:05 -0000	1.58
++++ metadata/image.h	30 Mar 2004 18:44:58 -0000
+@@ -12,6 +12,7 @@
+ 	const char *culture;
+ 	const char *hash_value;
+ 	const guint8* public_key;
++	const char *public_tok_value;
+ 	guint32 hash_alg;
+ 	guint32 hash_len;
+ 	guint32 flags;
+@@ -21,6 +22,7 @@
+ typedef struct {
+ 	int   ref_count;
+ 	char *basedir;
++	gboolean in_gac;
+ 	MonoAssemblyName aname;
+ 	GModule *aot_module;
+ 	MonoImage *image;
+Index: metadata/loader.h
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/loader.h,v
+retrieving revision 1.64
+diff -u -b -r1.64 loader.h
+--- metadata/loader.h	25 Mar 2004 22:06:07 -0000	1.64
++++ metadata/loader.h	30 Mar 2004 18:44:58 -0000
+@@ -196,4 +196,7 @@
+ 
+ MonoGenericParam *mono_metadata_load_generic_params (MonoImage *image, guint32 token, guint32 *num);
+ 
++void
++mono_assembly_allow_user_gac (gboolean allow);
++
+ #endif
+Index: metadata/mono-config.c
+===================================================================
+RCS file: /cvs/public/mono/mono/metadata/mono-config.c,v
+retrieving revision 1.6
+diff -u -b -r1.6 mono-config.c
+--- metadata/mono-config.c	11 Apr 2003 23:19:35 -0000	1.6
++++ metadata/mono-config.c	30 Mar 2004 18:44:58 -0000
+@@ -200,6 +200,32 @@
+ 	dllmap_finish
+ };
+ 
++static void
++usergac_start (gpointer user_data, 
++	      const gchar	  *element_name,
++	      const gchar	 **attribute_names,
++	      const gchar	 **attribute_values)
++{
++	int i;
++
++	if (strcmp (element_name, "user_gac") == 0) {
++		for (i = 0; attribute_names [i]; ++i) {
++			if (strcmp (attribute_names [i], "allow") == 0)
++				mono_assembly_allow_user_gac (
++					strcasecmp (attribute_values [i], "true") == 0);
++		}
++	}
++}
++
++static const MonoParseHandler
++usergac_handler = {
++	"user_gac",
++	NULL,
++	usergac_start,
++	NULL, /* text */
++	NULL, /* end */
++	NULL
++};
+ 
+ static int inited = 0;
+ 
+@@ -209,6 +235,7 @@
+ 	inited = 1;
+ 	config_handlers = g_hash_table_new (g_str_hash, g_str_equal);
+ 	g_hash_table_insert (config_handlers, (gpointer) dllmap_handler.element_name, (gpointer) &dllmap_handler);
++	g_hash_table_insert (config_handlers, (gpointer) usergac_handler.element_name, (gpointer) &usergac_handler);
+ }
+ 
+ /* FIXME: error handling */
+Index: mini/ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/ChangeLog,v
+retrieving revision 1.421
+diff -u -b -r1.421 ChangeLog
+--- mini/ChangeLog	30 Mar 2004 17:19:19 -0000	1.421
++++ mini/ChangeLog	30 Mar 2004 18:44:59 -0000
+@@ -1,3 +1,8 @@
++2004-03-30  Jackson Harper  <jackson@ximian.com>
++
++	* driver.c: parse config file before loading first assembly. This
++	allows the user gac to be enabled/disabled.
++	
+ 2004-03-30  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* mini-sparc.c: Update status.
+Index: mini/driver.c
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/driver.c,v
+retrieving revision 1.45
+diff -u -b -r1.45 driver.c
+--- mini/driver.c	20 Mar 2004 22:02:47 -0000	1.45
++++ mini/driver.c	30 Mar 2004 18:44:59 -0000
+@@ -755,6 +755,11 @@
+ 	if (enable_debugging)
+ 		mono_debug_init (domain, MONO_DEBUG_FORMAT_MONO);
+ 
++	/* Parse gac loading options before loading assemblies. */
++	if (mono_compile_aot || action == DO_EXEC) {
++		mono_config_parse (config_file);
++	}
++
+ 	assembly = mono_assembly_open (aname, NULL);
+ 	if (!assembly) {
+ 		fprintf (stderr, "cannot open assembly %s\n", aname);
+@@ -774,7 +779,6 @@
+ 	if (mono_compile_aot || action == DO_EXEC) {
+ 		const guchar *error;
+ 
+-		mono_config_parse (config_file);
+ 		//mono_set_rootdir ();
+ 
+ 		error = mono_check_corlib_version ();

@@ -1,0 +1,182 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] [PATCH] more support for Google Native Client
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20more%20support%20for%20Google%20Native%20Client&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="036570.html">
+   <LINK REL="Next"  HREF="036589.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] [PATCH] more support for Google Native Client</H1>
+    <B>Elijah Taylor</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20%5BPATCH%5D%20more%20support%20for%20Google%20Native%20Client&In-Reply-To="
+       TITLE="[Mono-dev] [PATCH] more support for Google Native Client">elijahtaylor at google.com
+       </A><BR>
+    <I>Tue Dec 21 15:12:53 EST 2010</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="036570.html">[Mono-dev] VS2010 remote debugging?
+</A></li>
+        <LI>Next message: <A HREF="036589.html">[Mono-dev] [PATCH] more support for Google Native Client
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#36569">[ date ]</a>
+              <a href="thread.html#36569">[ thread ]</a>
+              <a href="subject.html#36569">[ subject ]</a>
+              <a href="author.html#36569">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Greetings Mono developers!
+
+
+*[tl;dr  very large patch for Native
+Client&lt;<A HREF="http://www.chromium.org/nativeclient">http://www.chromium.org/nativeclient</A>&gt; support
+hosted here &lt;<A HREF="https://github.com/elijahtaylor/mono">https://github.com/elijahtaylor/mono</A>&gt;, would love feedback and
+many eyes to look at it]
+*
+
+
+I'm back with another round of changes for supporting Google's Native Client
+(NaCl), including support for amd64, JIT compilation, and Garbage
+Collection.  It's a large set of changes, forked on Dec 14 in github @
+<A HREF="https://github.com/elijahtaylor/mono.">https://github.com/elijahtaylor/mono.</A>  I would appreciate feedback on these
+changes... to facilitate this, I'll try to explain the largest changes by
+feature (please email if clarification is needed):
+
+*1) amd64 codegen*
+
+   - Rules located here:
+   <A HREF="http://www.chromium.org/nativeclient/design-documents/nacl-sfi-model-on-x86-64-systems">http://www.chromium.org/nativeclient/design-documents/nacl-sfi-model-on-x86-64-systems</A>
+      - Removed %r15 from register allocation, LMF save/restore, etc.  (r15
+      is special and not modifiable by untrusted code)
+      - Sandbox all data access through membase address mode.  If not %rsp
+      or %rbp relative, re-write as clearing upper 32-bits + memindex
+addressing
+      - align functions, call sites
+      - Sandbox returns and all indirect jumps (need to be 32-byte aligned,
+      cleared upper 32-bits)
+      - Never omit frame pointer as general operations to rbp aren't allowed
+
+*2) NaCl x86-64 is ILP32 (this is the largest set of changes and may make
+some mono devs unhappy)*
+
+   - Set SIZEOF_REGISTER == 8 while sizeof(gpointer) == 4 for NaCl amd64 (we
+   can use 8-byte instructions, but pointers are 4-bytes)
+   - Re-write large portions of mini-amd64.c, tramp-amd64.c,
+   exceptions-amd64.c, mini.c, method-to-ir.c to use appropriate sizes
+   (SIZEOF_REGISTER, sizeof(gpointer), literal '8').  *These changes are
+   disruptive, but ultimately they should be more correct than what was there
+   before.  *It's our opinion that these changes actually improve Mono
+   despite their impact.
+   - We only generate NaCl amd64 code from an ILP32 machine (either a 32-bit
+   application for AOT code, or NaCl runtime JIT), so we may not have caught
+   all of the [8 &lt;--&gt; SIZEOF_REGISTER] conversions, but we likely caught most
+   of the [sizeof(gpointer) &lt;--&gt; SIZEOF_REGISTER] and [8 &lt;--&gt; sizeof(gpointer)]
+   changes that are necessary.
+   - Change atomic operations and default pointer directives to use 32-bit
+   instructions (long instead of quad)
+   - Change default operations to use 32-bit integers/pointers (eg,
+   OP_LOAD_MEMBASE uses 4-bytes instead of 8)
+
+*3) JIT support for NaCl*
+
+   - Since we're unable to emit code directly in its final executable
+   location, we instead:
+      - reserve a buffer on the heap
+      - create a hash table entry mapping the temp location and final
+      location
+      - modify all non-local patches relative to the final location
+      - request the NaCl runtime to install the created code in the final
+      location
+   - See mono/utils/mono-codeman.c changes for more detail.
+   - For every codeman *reserve*, we must add a codeman *validate* call in
+   order to install the method/trampoline/blob in the final location (as well
+   as validate it for NaCl, pad it out, etc)
+   - We don't delete or reuse code  (we can, but it's icky and the benefits
+   don't outweigh the cost)
+   - Backpatching changed to use NaCl syscalls to modify existing dynamic
+   code
+
+*4) GC support for NaCl (boehm only)*
+
+   - NaCl compiler and Mono code generator both emit instrumentation at GC
+   &quot;safe points&quot; (back branches and function prologs), for cooperative thread
+   parking (we're not allowed to send and receive signals)
+   - Added new opcode OP_NACL_GC_SAFE_POINT to handle mono instrumentation
+   - modified pthread_stop_world.c and pthread_support.c somewhat
+   extensively to support this new way of stopping the world
+   - wrapped pthread_exit because NaCl doesn't support pthread cleanup
+   functions
+   - added machine type NACL to libgc with machine specific defines
+
+
+*5) Misc bug fixes (not NaCl-specific)*
+
+   - fix *x86_memindex_emit* when disp is 32-bit
+   - properly exclude code in libgc/gc_dlopen.c when DYNAMIC_LOADING not
+   defined
+   - properly exclude code based on DISABLE_SOCKETS by including config.h
+   before checking define
+   - clean up calculation of offset for amd64 AOT specific trampoline args
+   - fix bug in *mono_bblock_insert_before_ins* when trying to insert an
+   instruction to the beginning of an existing basic block.
+   - fix small typo bug in genmdesc.pl which kept amd64 from being able to
+   be a target of cross compiling
+   - fix struct passing in amd64 with sizeof(struct) == 16 when fields
+   aren't 8-byte aligned (eg, first field is 12 bytes, second field is 4
+   bytes), pass on stack instead of in registers (mini-amd64.c:*
+   add_valuetype*)
+   - add extra checks to mini-amd64.c:*mono_arch_emit_exceptions* to keep
+   exception/R4/R8 emitting from overflowing a buffer silently
+   - fix bugs in *new_codechunk* and *mono_code_manager_reserve_align* which
+   allowed unaligned code to be allocated.
+
+
+I know we're close to holidays so I don't have any delusions that these
+changes will get in by the end of the year :)  Please feel free to pick
+apart these changes and let me know if there are things that should be
+changed.
+
+-Elijah
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: <A HREF="http://lists.ximian.com/pipermail/mono-devel-list/attachments/20101221/6daa2505/attachment.html">http://lists.ximian.com/pipermail/mono-devel-list/attachments/20101221/6daa2505/attachment.html</A> 
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="036570.html">[Mono-dev] VS2010 remote debugging?
+</A></li>
+	<LI>Next message: <A HREF="036589.html">[Mono-dev] [PATCH] more support for Google Native Client
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#36569">[ date ]</a>
+              <a href="thread.html#36569">[ thread ]</a>
+              <a href="subject.html#36569">[ subject ]</a>
+              <a href="author.html#36569">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,168 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] [patch] fix SoapReader to not make assumptions about the values of id and href parameters in the XML
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5Bpatch%5D%20fix%20SoapReader%20to%20not%20make%20assumptions%20about%20the%20values%20of%20id%0A%20and%20href%20parameters%20in%20the%20XML&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="008074.html">
+   <LINK REL="Next"  HREF="008078.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] [patch] fix SoapReader to not make assumptions about the values of id and href parameters in the XML</H1>
+    <B>Stefan Paletta</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20%5Bpatch%5D%20fix%20SoapReader%20to%20not%20make%20assumptions%20about%20the%20values%20of%20id%0A%20and%20href%20parameters%20in%20the%20XML&In-Reply-To="
+       TITLE="[Mono-devel-list] [patch] fix SoapReader to not make assumptions about the values of id and href parameters in the XML">stefanp at cabal1.com
+       </A><BR>
+    <I>Sun Sep 26 13:29:40 EDT 2004</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="008074.html">[Mono-devel-list] Cross-Platform.NET
+</A></li>
+        <LI>Next message: <A HREF="008078.html">[Mono-devel-list] mono-debugger wrapper.c does not build
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8076">[ date ]</a>
+              <a href="thread.html#8076">[ thread ]</a>
+              <a href="subject.html#8076">[ subject ]</a>
+              <a href="author.html#8076">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Greetings.
+
+There are two mechanisms in SoapReader that assign the Id under which an 
+object will be stored in the ObjectManager: the NextAvailableId property 
+that assigns values counting downwards from long.MaxValue, and GetId() 
+and GetHref() that try to parse the XML id and href parameters. The 
+latter two make some stupid assumptions about the format of these 
+parameters, as they expect to find a unique number starting at char 
+position 4 or 5 in the parameter string. Basically they want 'ref-1', 
+'ref-2' etc., like the .NET framework generates its Ids. Obviously, 
+neither can this format be relied on to be present, nor will this 
+necessarily yield unique numbers. Even the Mono SOAP client e.g.
+generates ids like 'id1' etc., and SoapReader will throw an exception on 
+these.
+
+My patch introduces a hashtable to store the mapping between the textual 
+id and href parameter values and the corresponding id number. It makes 
+no assumptions about the format of these parameters, other than that 
+href will always start with a hashmark to indicate a local reference. 
+The id numbers are assigned from the NextAvailableId property. I also 
+changed the NextAvailableId to count upwards from 1, as the numberspace 
+is now no longer shared.
+
+-Stefan
+-- 
+ junior guru   SP666-RIPE     JID:<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">stefanp at jabber.de.cw.net</A>    <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">SMP at IRC</A>
+-------------- next part --------------
+Index: class/System.Runtime.Serialization.Formatters.Soap/System.Runtime.Serialization.Formatters.Soap/SoapReader.cs
+===================================================================
+RCS file: /mono/mcs/class/System.Runtime.Serialization.Formatters.Soap/System.Runtime.Serialization.Formatters.Soap/SoapReader.cs,v
+retrieving revision 1.14
+diff -u -r1.14 SoapReader.cs
+--- class/System.Runtime.Serialization.Formatters.Soap/System.Runtime.Serialization.Formatters.Soap/SoapReader.cs	13 Sep 2004 16:04:42 -0000	1.14
++++ class/System.Runtime.Serialization.Formatters.Soap/System.Runtime.Serialization.Formatters.Soap/SoapReader.cs	26 Sep 2004 16:35:08 -0000
+@@ -46,11 +46,12 @@
+ 		private SoapTypeMapper mapper;
+ 		private ObjectManager objMgr;
+ 		private StreamingContext _context;
+-		private long _nextAvailableId = long.MaxValue;
++		private long _nextAvailableId;
+ 		private ISurrogateSelector _surrogateSelector;
+ 		private XmlTextReader xmlReader;
+ 		private Hashtable _fieldIndices;
+-		private long _topObjectId = 1;
++		private long _topObjectId;
++		private Hashtable _xmlIdToObjectId;
+ 		
+ 		class TypeMetadata
+ 		{
+@@ -66,7 +67,7 @@
+ 		{
+ 			get 
+ 			{
+-				_nextAvailableId--;
++				_nextAvailableId++;
+ 				return _nextAvailableId;
+ 			}
+ 		}
+@@ -82,6 +83,7 @@
+ 			_context = context;
+ 			_surrogateSelector = selector;
+ 			_fieldIndices = new Hashtable();
++			_xmlIdToObjectId = new Hashtable();
+ 		}
+ 
+ 		#endregion
+@@ -172,21 +174,42 @@
+ 
+ 		private long GetId()
+ 		{
+-			long id = 0;
++			long id;
++			object saved;
+ 
+ 			string strId = xmlReader[&quot;id&quot;];
+ 			if(strId == null || strId == String.Empty) return 0;
+-			id = Convert.ToInt64(strId.Substring(4));
++			saved = _xmlIdToObjectId[strId];
++			if(saved == null)
++			{
++				id = NextAvailableId;
++				_xmlIdToObjectId[strId] = id;
++			}
++			else
++			{
++				id = (long)saved;
++			}
+ 			return id;
+ 		}
+ 
+ 		private long GetHref()
+ 		{
+-			long href = 0;
++			long href;
++			object saved;
+ 			
+ 			string strHref = xmlReader[&quot;href&quot;];
+ 			if(strHref == null || strHref == string.Empty) return 0;
+-			href = Convert.ToInt64(strHref.Substring(5));
++			strHref = strHref.Substring(1); // skip '#'
++			saved = _xmlIdToObjectId[strHref];
++			if(saved == null)
++			{
++				href = NextAvailableId;
++				_xmlIdToObjectId[strHref] = href;
++			}
++			else
++			{
++				href = (long)saved;
++			}
+ 			return href;
+ 		}
+ 
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="008074.html">[Mono-devel-list] Cross-Platform.NET
+</A></li>
+	<LI>Next message: <A HREF="008078.html">[Mono-devel-list] mono-debugger wrapper.c does not build
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8076">[ date ]</a>
+              <a href="thread.html#8076">[ thread ]</a>
+              <a href="subject.html#8076">[ subject ]</a>
+              <a href="author.html#8076">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

@@ -1,0 +1,363 @@
+diff --git a/mono/metadata/Makefile.am b/mono/metadata/Makefile.am
+index 0eb0eff..2b11a7f 100644
+--- a/mono/metadata/Makefile.am
++++ b/mono/metadata/Makefile.am
+@@ -160,6 +160,9 @@ libmonoruntime_la_SOURCES = \
+ 	threadpool-internals.h	\
+ 	verify.c		\
+ 	verify-internals.h	\
++	mono-error.c	\
++	mono-error.h	\
++	mono-error-internal.h	\
+ 	wrapper-types.h
+ 
+ libmonoruntime_static_la_SOURCES = $(libmonoruntime_la_SOURCES)
+diff --git a/mono/metadata/mono-error-internals.h b/mono/metadata/mono-error-internals.h
+new file mode 100644
+index 0000000..ab67965
+--- /dev/null
++++ b/mono/metadata/mono-error-internals.h
+@@ -0,0 +1,43 @@
++#ifndef __MONO_ERROR_INTERNALS_H__
++#define __MONO_ERROR_INTERNALS_H__
++
++#include "mono/utils/mono-compiler.h"
++#include "mono/metadata/object-internals.h"
++
++void
++mono_error_set_error (MonoError *error, int error_code, char *msg_format, ...) MONO_INTERNAL;
++
++void
++mono_error_set_assembly_name (MonoError *error, char *assembly_name) MONO_INTERNAL;
++
++void
++mono_error_set_member_name (MonoError *error, char *member_name) MONO_INTERNAL;
++
++void
++mono_error_set_type_name (MonoError *error, char *type_name) MONO_INTERNAL;
++
++void
++mono_error_set_class (MonoError *error, MonoClass *klass) MONO_INTERNAL;
++
++void
++mono_error_set_assembly_load (MonoError *error, char *assembly_name, char *msg_format, ...) MONO_INTERNAL;
++
++void
++mono_error_set_type_load (MonoError *error, MonoClass *klass, char *msg_format, ...) MONO_INTERNAL;
++
++void
++mono_error_set_type_load2 (MonoError *error, char *type_name, char *assembly_name, char *msg_format, ...) MONO_INTERNAL;
++
++void
++mono_error_set_method_load (MonoError *error, MonoClass *klass, char *method_name, char *msg_format, ...) MONO_INTERNAL;
++
++void
++mono_error_set_field_load (MonoError *error, MonoClass *klass, char *field_name, char *msg_format, ...) MONO_INTERNAL;
++
++void
++mono_error_set_bad_image (MonoError *error, char *assembly_name, char *msg_format, ...) MONO_INTERNAL;
++
++MonoException*
++mono_error_prepare_exception (MonoError *error, MonoDomain *domain) MONO_INTERNAL;
++
++#endif
+diff --git a/mono/metadata/mono-error.c b/mono/metadata/mono-error.c
+new file mode 100644
+index 0000000..5d5621e
+--- /dev/null
++++ b/mono/metadata/mono-error.c
+@@ -0,0 +1,253 @@
++/*
++ * mono-error.c: Error handling code
++ *
++ * Authors:
++ *	Rodrigo Kumpera    (rkumpera@novell.com)
++ * Copyright 2009 Novell, Inc (http://www.novell.com)
++ */
++#include <glib.h>
++
++#include "mono-error.h"
++#include "mono-error-internals.h"
++
++#include "exception.h"
++#include "object-internals.h"
++#include "debug-helpers.h"
++
++#define mono_error_get_message(E) (((E)->flags & MONO_ERROR_ON_SIGNAL_CONTEXT) ? (E)->message : (E)->full_message)
++
++#define set_error_message() do { \
++	va_start (args, msg_format); \
++	if (error->flags & MONO_ERROR_ON_SIGNAL_CONTEXT) \
++		g_vsnprintf (error->message, 128, msg_format, args); \
++	else\
++		error->full_message = g_strdup_vprintf (msg_format, args); \
++	va_end (args); \
++} while (0)
++
++void
++mono_error_init (MonoError *error, unsigned short flags)
++{
++	error->error_code = MONO_EXCEPTION_NONE;
++	error->flags = flags;
++	error->type_name = error->assembly_name = error->member_name = error->full_message = NULL;
++	error->klass = NULL;
++	error->message [0] = 0;
++}
++
++void
++mono_error_cleanup (MonoError *error)
++{
++	if (error->flags & MONO_ERROR_ON_SIGNAL_CONTEXT) //no memory was allocated
++		return;
++	g_free (error->type_name);
++	g_free (error->assembly_name);
++	g_free (error->member_name);
++	g_free (error->full_message);
++}
++
++gboolean
++mono_error_ok (MonoError *error)
++{
++	return error->error_code != MONO_EXCEPTION_NONE;
++}
++
++unsigned short
++mono_error_get_error_code (MonoError *error)
++{
++	return error->error_code;
++}
++
++void
++mono_error_set_error (MonoError *error, int error_code, char *msg_format, ...)
++{
++	va_list args;
++
++	error->error_code = error_code;
++	set_error_message ();
++}
++
++void
++mono_error_set_assembly_name (MonoError *error, char *assembly_name)
++{
++	if (error->flags & MONO_ERROR_ON_SIGNAL_CONTEXT)
++		error->assembly_name = assembly_name;
++	else 
++		error->assembly_name = g_strdup (assembly_name);
++}
++
++void
++mono_error_set_member_name (MonoError *error, char *member_name)
++{
++	if (error->flags & MONO_ERROR_ON_SIGNAL_CONTEXT)
++		error->member_name = member_name;
++	else 
++		error->member_name = g_strdup (member_name);
++}
++
++void
++mono_error_set_type_name (MonoError *error, char *type_name)
++{
++	if (error->flags & MONO_ERROR_ON_SIGNAL_CONTEXT)
++		error->type_name = type_name;
++	else 
++		error->type_name = g_strdup (type_name);
++}
++
++void
++mono_error_set_class (MonoError *error, MonoClass *klass)
++{
++	error->klass = klass;	
++}
++
++void
++mono_error_set_assembly_load (MonoError *error, char *assembly_name, char *msg_format, ...)
++{
++	va_list args;
++	error->error_code = MONO_EXCEPTION_FILE_NOT_FOUND;
++
++	mono_error_set_assembly_name (error, assembly_name);
++
++	set_error_message ();
++}
++
++void
++mono_error_set_type_load (MonoError *error, MonoClass *klass, char *msg_format, ...)
++{
++	va_list args;
++	error->error_code = MONO_EXCEPTION_TYPE_LOAD;
++
++	mono_error_set_class (error, klass);
++	set_error_message ();
++}
++
++void
++mono_error_set_method_load (MonoError *error, MonoClass *klass, char *method_name, char *msg_format, ...)
++{
++	va_list args;
++	error->error_code = MONO_EXCEPTION_MISSING_METHOD;
++
++	mono_error_set_class (error, klass);
++	mono_error_set_member_name (error, method_name);
++	set_error_message ();
++}
++
++void
++mono_error_set_type_load2 (MonoError *error, char *type_name, char *assembly_name, char *msg_format, ...)
++{
++	va_list args;
++	error->error_code = MONO_EXCEPTION_TYPE_LOAD;
++
++	mono_error_set_type_name (error, type_name);
++	mono_error_set_assembly_name (error, assembly_name);
++	set_error_message ();
++}
++
++void
++mono_error_set_field_load (MonoError *error, MonoClass *klass, char *field_name, char *msg_format, ...)
++{
++	va_list args;
++	error->error_code = MONO_EXCEPTION_MISSING_FIELD;
++
++	mono_error_set_class (error, klass);
++	mono_error_set_member_name (error, field_name);
++	set_error_message ();	
++}
++
++void
++mono_error_set_bad_image (MonoError *error, char *assembly_name, char *msg_format, ...)
++{
++	va_list args;
++	error->error_code = MONO_EXCEPTION_BAD_IMAGE;
++
++	mono_error_set_assembly_name (error, assembly_name);
++	set_error_message ();
++}
++
++static MonoString*
++get_type_name_as_mono_string (MonoError *error, MonoDomain *domain)
++{
++	MonoString* res = NULL;
++
++	if (error->type_name) {
++		res = mono_string_new (domain, error->type_name);
++	} else if (error->klass) {
++		char *name = mono_type_full_name (&error->klass->byval_arg);
++		res = mono_string_new (domain, name);
++		g_free (name);
++	}
++	return res;
++}
++
++MonoException*
++mono_error_prepare_exception (MonoError *error, MonoDomain *domain)
++{
++	MonoException* exception = NULL;
++
++	switch (error->error_code) {
++	case MONO_EXCEPTION_NONE:
++		break;
++	//TODO MONO_EXCEPTION_SECURITY_LINKDEMAND MONO_EXCEPTION_SECURITY_INHERITANCEDEMAND
++	case MONO_EXCEPTION_INVALID_PROGRAM:
++		exception = mono_exception_from_name_msg (mono_defaults.corlib, "System", "InvalidProgramException", mono_error_get_message (error));
++		break;
++
++	case MONO_EXCEPTION_UNVERIFIABLE_IL:
++		exception = mono_exception_from_name_msg (mono_defaults.corlib, "System.Security", "VerificationException", mono_error_get_message (error));
++		break;
++
++	case MONO_EXCEPTION_MISSING_METHOD:
++		if ((error->type_name || error->klass) && error->member_name) {
++			MonoString *type_name = get_type_name_as_mono_string (error, domain);
++			MonoString *method_name = mono_string_new (domain, error->member_name);
++			exception = mono_exception_from_name_two_strings (mono_defaults.corlib, "System", "MissingMethodException", type_name, method_name);
++			MONO_OBJECT_SETREF (exception, message, mono_string_new (domain, mono_error_get_message (error)));
++		} else {
++		 	exception = mono_exception_from_name_msg (mono_defaults.corlib, "System", "MissingMethodException", mono_error_get_message (error));
++		}
++		break;
++
++	case MONO_EXCEPTION_MISSING_FIELD:
++		if ((error->type_name || error->klass) && error->member_name) {
++			MonoString *type_name = get_type_name_as_mono_string (error, domain);
++			MonoString *field_name = mono_string_new (domain, error->member_name);
++			exception = mono_exception_from_name_two_strings (mono_defaults.corlib, "System", "MissingFieldException", type_name, field_name);
++			MONO_OBJECT_SETREF (exception, message, mono_string_new (domain, mono_error_get_message (error)));
++		} else {
++		 	exception = mono_exception_from_name_msg (mono_defaults.corlib, "System", "MissingFieldException", mono_error_get_message (error));
++		}
++		break;
++
++	case MONO_EXCEPTION_TYPE_LOAD: {
++		MonoString *class_name = get_type_name_as_mono_string (error, domain);
++		MonoString *assembly_name = error->assembly_name ? mono_string_new (domain, error->assembly_name) : NULL;
++		exception = mono_exception_from_name_two_strings (mono_get_corlib (), "System", "TypeLoadException", class_name, assembly_name);
++		MONO_OBJECT_SETREF (exception, message, mono_string_new (domain, mono_error_get_message (error)));
++		}
++		break;
++	case MONO_EXCEPTION_FILE_NOT_FOUND: {
++		MonoString *msg = mono_string_new (domain, mono_error_get_message (error));
++		MonoString *assembly_name = error->assembly_name ? mono_string_new (domain, error->assembly_name) : NULL;
++		exception = mono_exception_from_name_two_strings (mono_get_corlib (), "System.IO", "FileNotFoundException", msg, assembly_name);
++		}
++		break;
++
++	case MONO_EXCEPTION_METHOD_ACCESS:
++		exception = mono_exception_from_name_msg (mono_defaults.corlib, "System", "MethodAccessException", mono_error_get_message (error));
++		break;	
++
++	case MONO_EXCEPTION_FIELD_ACCESS:
++		exception = mono_exception_from_name_msg (mono_defaults.corlib, "System", "FieldAccessException", mono_error_get_message (error));
++		break;	
++
++	case MONO_EXCEPTION_BAD_IMAGE:
++		exception = mono_exception_from_name_msg (mono_defaults.corlib, "System", "BadImageFormatException", mono_error_get_message (error));
++		break;
++	/*MONO_EXCEPTION_GENERIC_SHARING_FAILED and MONO_EXCEPTION_OBJECT_SUPPLIED are JIT artifacts that should be fixed there*/
++	default:
++		g_warning ("Invalid error code %d", error->error_code);
++		exception = mono_get_exception_execution_engine ("Invalid MonoError error-code");
++	}
++
++	return exception;
++}
+diff --git a/mono/metadata/mono-error.h b/mono/metadata/mono-error.h
+new file mode 100644
+index 0000000..1984614
+--- /dev/null
++++ b/mono/metadata/mono-error.h
+@@ -0,0 +1,35 @@
++#ifndef __MONO_ERROR_H__
++#define __MONO_ERROR_H__
++
++#include <mono/metadata/class.h>
++#include <mono/metadata/metadata.h>
++
++/*Don't allocate memory or call signal unsafe functions*/
++#define MONO_ERROR_ON_SIGNAL_CONTEXT 0x0001
++
++typedef struct {
++	unsigned short error_code; //MONO_EXCEPTION_*
++    unsigned short flags; //MONO_ERROR_*
++
++	char *type_name;
++	char *assembly_name;
++	char *member_name;
++	MonoClass *klass;
++	char *full_message;
++	gpointer padding [4];
++    char message [128];
++} MonoError;
++
++void
++mono_error_init (MonoError *error, unsigned short flags);
++
++void
++mono_error_cleanup (MonoError *error);
++
++gboolean
++mono_error_ok (MonoError *error);
++
++unsigned short
++mono_error_get_error_code (MonoError *error);
++
++#endif

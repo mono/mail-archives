@@ -1,0 +1,282 @@
+Index: mini.c
+===================================================================
+--- mini.c	(revision 37335)
++++ mini.c	(working copy)
+@@ -8068,6 +8068,7 @@
+ 	jinfo->code_size = cfg->code_len;
+ 	jinfo->used_regs = cfg->used_int_regs;
+ 	jinfo->domain_neutral = (cfg->opt & MONO_OPT_SHARED) != 0;
++	jinfo->cas_inited = FALSE; /* initialization delayed at the first stalk walk using this method */
+ 
+ 	if (header->num_clauses) {
+ 		int i;
+@@ -8656,6 +8657,8 @@
+ 				ves_icall_get_frame_info);
+ 	mono_add_internal_call ("System.Diagnostics.StackTrace::get_trace", 
+ 				ves_icall_get_trace);
++	mono_add_internal_call ("System.Security.SecurityFrame::_GetSecurityFrameInformation",
++				ves_icall_System_Security_SecurityFrame_GetSecurityFrameInformation);
+ 	mono_add_internal_call ("Mono.Runtime::mono_runtime_install_handlers", 
+ 				mono_runtime_install_handlers);
+ 
+Index: mini.h
+===================================================================
+--- mini.h	(revision 37335)
++++ mini.h	(working copy)
+@@ -849,4 +849,7 @@
+ extern void
+ mono_perform_ssapre (MonoCompile *cfg);
+ 
++/* CAS - stack walk */
++MonoBoolean ves_icall_System_Security_SecurityFrame_GetSecurityFrameInformation (gint32 skip, MonoReflectionMethod **method, gint32 *flags);
++
+ #endif /* __MONO_MINI_H__ */
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 37335)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,15 @@
++2004-11-29  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* declsec.c|h: Added function to cache the declarative stack modifiers
++	in MonoJitInfo.
++	* mini.c: Initialize jinfo->cas_inited to FALSE when MonoJitInfo is
++	created. Register internal call for System.Security.SecurityFrame::
++	_GetSecurityFrameInformation.
++	* mini.h: Added definition for new icall (in mini-exceptions.c).
++	* mini-exceptions.c: Added internal call GetSecurityFrameInformation
++	to retrieve the methods and declarative security flags for (non-
++	wrappers) methods on the stack.
++
+ 2004-12-07  Zoltan Varga  <vargaz@freemail.hu>
+ 
+ 	* mini-sparc.c (mono_arch_output_basic_block): Fix LOCALLOC_IMM
+Index: mini-exceptions.c
+===================================================================
+--- mini-exceptions.c	(revision 37335)
++++ mini-exceptions.c	(working copy)
+@@ -187,11 +187,10 @@
+ 	}
+ }
+ 
+-MonoBoolean
+-ves_icall_get_frame_info (gint32 skip, MonoBoolean need_file_info, 
+-			  MonoReflectionMethod **method, 
+-			  gint32 *iloffset, gint32 *native_offset,
+-			  MonoString **file, gint32 *line, gint32 *column)
++typedef MonoBoolean (* MonoGetFrameExtraInfo) (MonoJitInfo *ji, gint32 *native_offset, void* callback_data);
++
++static MonoBoolean
++get_frame_info (gint32 skip, MonoReflectionMethod **method, gint32 *native_offset, MonoGetFrameExtraInfo callback, void* callback_data)
+ {
+ 	MonoDomain *domain = mono_domain_get ();
+ 	MonoJitTlsData *jit_tls = TlsGetValue (mono_jit_tls_id);
+@@ -201,7 +200,7 @@
+ 
+ 	mono_arch_flush_register_windows ();
+ 
+-	MONO_CONTEXT_SET_IP (&ctx, ves_icall_get_frame_info);
++	MONO_CONTEXT_SET_IP (&ctx, get_frame_info);
+ 	MONO_CONTEXT_SET_BP (&ctx, __builtin_frame_address (0));
+ 
+ 	skip++;
+@@ -214,12 +213,7 @@
+ 		if (!ji || ji == (gpointer)-1 || MONO_CONTEXT_GET_BP (&ctx) >= jit_tls->end_of_stack)
+ 			return FALSE;
+ 
+-		/* skip all wrappers ??*/
+-		if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
+-		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
+-		    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
+-		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
+-		    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE)
++		if (!callback (ji, native_offset, callback_data))
+ 			continue;
+ 
+ 		skip--;
+@@ -227,22 +221,122 @@
+ 	} while (skip >= 0);
+ 
+ 	*method = mono_method_get_object (domain, ji->method, NULL);
+-	*iloffset = mono_debug_il_offset_from_address (ji->method, *native_offset, domain);
++	return TRUE;
++}
+ 
+-	if (need_file_info) {
+-		gchar *filename;
++typedef struct {
++	gint32 iloffset;
++	MonoBoolean need_file_info;
++	MonoString *file;
++	gint32 line;
++	gint32 column;
++} MonoFrameDebugInfo;
+ 
+-		filename = mono_debug_source_location_from_address (ji->method, *native_offset, line, domain);
++static MonoBoolean
++callback_get_frame_debug_info (MonoJitInfo *ji, gint32 *native_offset, void* callback_data)
++{
++	/* FIXME: skip all wrappers ??*/
++	if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
++	    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++	    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
++	    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
++	    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE)
++		return FALSE;
+ 
+-		*file = filename? mono_string_new (domain, filename): NULL;
+-		*column = 0;
++	MonoDomain *domain = mono_domain_get ();
++	MonoFrameDebugInfo *di = (MonoFrameDebugInfo*) callback_data;
++	di->iloffset = mono_debug_il_offset_from_address (ji->method, *native_offset, domain);
+ 
++	if (di->need_file_info) {
++		gchar *filename = mono_debug_source_location_from_address (ji->method, *native_offset, &di->line, domain);
++
++		di->file = filename ? mono_string_new (domain, filename): NULL;
++		di->column = 0;
++
+ 		g_free (filename);
+ 	}
++	return TRUE;
++}
+ 
++typedef struct {
++	guint32 flags;
++} MonoFrameSecurityInfo;
++
++static MonoBoolean
++callback_get_frame_security_info (MonoJitInfo *ji, gint32 *native_offset, void* callback_data)
++{
++	/* FIXME: skip all wrappers ?? probably not - case by case testing is required */
++	if (ji->method->wrapper_type == MONO_WRAPPER_RUNTIME_INVOKE ||
++	    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_INVOKE ||
++	    ji->method->wrapper_type == MONO_WRAPPER_XDOMAIN_DISPATCH ||
++	    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE_WITH_CHECK ||
++	    ji->method->wrapper_type == MONO_WRAPPER_REMOTING_INVOKE)
++		return FALSE;
++
++	MonoFrameSecurityInfo *si = (MonoFrameSecurityInfo*) callback_data;
++	if (si) {
++		int f = 0;
++		if (!ji->cas_inited) {
++			if (mono_method_has_declsec (ji->method)) {
++				/* Cache the stack modifiers into the MonoJitInfo structure to speed up future stack walks */
++				mono_declsec_cache_stack_modifiers (ji);
++			}
++			ji->cas_inited = TRUE;
++		}
++
++		if (ji->cas_class_assert)
++			f |= MONO_JITINFO_STACKMOD_ASSERT;
++		if (ji->cas_class_deny)
++			f |= MONO_JITINFO_STACKMOD_DENY;
++		if (ji->cas_class_permitonly)
++			f |= MONO_JITINFO_STACKMOD_PERMITONLY;
++		f <<= 8;
++		if (ji->cas_method_assert)
++			f |= MONO_JITINFO_STACKMOD_ASSERT;
++		if (ji->cas_method_deny)
++			f |= MONO_JITINFO_STACKMOD_DENY;
++		if (ji->cas_method_permitonly)
++			f |= MONO_JITINFO_STACKMOD_PERMITONLY;
++
++		si->flags = f;
++	}
+ 	return TRUE;
+ }
+ 
++MonoBoolean
++ves_icall_get_frame_info (gint32 skip, MonoBoolean need_file_info, 
++			  MonoReflectionMethod **method, 
++			  gint32 *iloffset, gint32 *native_offset,
++			  MonoString **file, gint32 *line, gint32 *column)
++{
++	MonoFrameDebugInfo di;
++	di.need_file_info = need_file_info;
++
++	if (get_frame_info (skip, method, native_offset, callback_get_frame_debug_info, (void*)&di)) {
++		*iloffset = di.iloffset;
++		if (need_file_info) {
++			*file = di.file;
++			*line = di.line;
++			*column = di.column;
++		}
++		return TRUE;
++	}
++	return FALSE;
++}
++
++MonoBoolean
++ves_icall_System_Security_SecurityFrame_GetSecurityFrameInformation (gint32 skip, MonoReflectionMethod **method, gint32 *flags)
++{
++	MonoFrameSecurityInfo si;
++	guint32 native_offset;
++
++	if (get_frame_info (skip, method, &native_offset, callback_get_frame_security_info, (void*)&si)) {
++		*flags = si.flags;
++		return TRUE;
++	}
++	return FALSE;
++}
++
+ static MonoArray *
+ glist_to_array (GList *list) 
+ {
+Index: declsec.c
+===================================================================
+--- declsec.c	(revision 37335)
++++ declsec.c	(working copy)
+@@ -26,3 +26,25 @@
+ 	}
+ 	return FALSE;
+ }
++
++
++/*
++ * Fill actions for the specific index (which may either be an encoded class token or
++ * an encoded method token) from the metadata image.
++ * Returns TRUE if some actions requiring code generation are present, FALSE otherwise.
++ */
++void
++mono_declsec_cache_stack_modifiers (MonoJitInfo *jinfo)
++{
++	/* first find the stack modifiers applied to the method */
++	guint32 flags = mono_declsec_flags_from_method (jinfo->method);
++	jinfo->cas_method_assert = (flags & MONO_DECLSEC_FLAG_ASSERT) != 0;
++	jinfo->cas_method_deny = (flags & MONO_DECLSEC_FLAG_DENY) != 0;
++	jinfo->cas_method_permitonly = (flags & MONO_DECLSEC_FLAG_PERMITONLY) != 0;
++
++	/* then find the stack modifiers applied to the class */
++	flags = mono_declsec_flags_from_class (jinfo->method->klass);
++	jinfo->cas_class_assert = (flags & MONO_DECLSEC_FLAG_ASSERT) != 0;
++	jinfo->cas_class_deny = (flags & MONO_DECLSEC_FLAG_DENY) != 0;
++	jinfo->cas_class_permitonly = (flags & MONO_DECLSEC_FLAG_PERMITONLY) != 0;
++}
+Index: declsec.h
+===================================================================
+--- declsec.h	(revision 37335)
++++ declsec.h	(working copy)
+@@ -13,9 +13,22 @@
+ #include <string.h>
+ 
+ #include "mono/metadata/class-internals.h"
++#include "mono/metadata/domain-internals.h"
+ #include "mono/metadata/object.h"
+ #include "mono/metadata/tabledefs.h"
+ 
++
++/* Definitions */
++
++/* limited flags used in MonoJitInfo for stack modifiers */
++enum {
++	MONO_JITINFO_STACKMOD_ASSERT		= 0x01,
++	MONO_JITINFO_STACKMOD_DENY		= 0x02,
++	MONO_JITINFO_STACKMOD_PERMITONLY	= 0x04
++};
++
++/* Prototypes */
+ MonoBoolean mono_method_has_declsec (MonoMethod *method);
++void mono_declsec_cache_stack_modifiers (MonoJitInfo *jinfo);
+ 
+ #endif /* _MONO_MINI_DECLSEC_H_ */

@@ -1,0 +1,305 @@
+diff --git a/configure.in b/configure.in
+index 4b6567d..8e806db 100644
+--- a/configure.in
++++ b/configure.in
+@@ -1432,7 +1432,7 @@ if test x$target_win32 = xno; then
+ 			child ()
+ 			{
+ 				struct sigaction sa;
+-				struct sigaltstack sas;
++				stack_t sas;
+ 				pthread_t id;
+ 				pthread_attr_t attr;
+ 
+diff --git a/mono/metadata/threads.c b/mono/metadata/threads.c
+index 0701262..f34706f 100644
+--- a/mono/metadata/threads.c
++++ b/mono/metadata/threads.c
+@@ -929,7 +929,11 @@ mono_thread_get_stack_bounds (guint8 **staddr, size_t *stsize)
+ #if defined(HAVE_PTHREAD_GET_STACKSIZE_NP) && defined(HAVE_PTHREAD_GET_STACKADDR_NP)
+ 	*staddr = (guint8*)pthread_get_stackaddr_np (pthread_self ());
+ 	*stsize = pthread_get_stacksize_np (pthread_self ());
++
++	/* staddr points to the start of the stack, not the end */
++	*staddr -= *stsize;
+ 	*staddr = (guint8*)((gssize)*staddr & ~(mono_pagesize () - 1));
++
+ 	return;
+ 	/* FIXME: simplify the mess below */
+ #elif !defined(HOST_WIN32)
+diff --git a/mono/mini/exceptions-amd64.c b/mono/mini/exceptions-amd64.c
+index cf5dbf1..1107a36 100644
+--- a/mono/mini/exceptions-amd64.c
++++ b/mono/mini/exceptions-amd64.c
+@@ -723,7 +723,6 @@ handle_signal_exception (gpointer obj, gboolean test_only)
+ gboolean
+ mono_arch_handle_exception (void *sigctx, gpointer obj, gboolean test_only)
+ {
+-#if defined(MONO_ARCH_USE_SIGACTION) && defined(UCONTEXT_GREGS)
+ 	/*
+ 	 * Handling the exception in the signal handler is problematic, since the original
+ 	 * signal is disabled, and we could run arbitrary code though the debugger. So
+@@ -748,29 +747,8 @@ mono_arch_handle_exception (void *sigctx, gpointer obj, gboolean test_only)
+ 	UCONTEXT_REG_RIP (sigctx) = (guint64)handle_signal_exception;
+ 
+ 	return TRUE;
+-#else
+-	MonoContext mctx;
+-
+-	mono_arch_sigctx_to_monoctx (sigctx, &mctx);
+-
+-	if (mono_debugger_handle_exception (&mctx, (MonoObject *)obj))
+-		return TRUE;
+-
+-	mono_handle_exception (&mctx, obj, MONO_CONTEXT_GET_IP (&mctx), test_only);
+-
+-	mono_arch_monoctx_to_sigctx (&mctx, sigctx);
+-
+-	return TRUE;
+-#endif
+ }
+ 
+-#if defined(MONO_ARCH_USE_SIGACTION) && defined(UCONTEXT_GREGS)
+-static inline guint64*
+-gregs_from_ucontext (ucontext_t *ctx)
+-{
+-	return (guint64 *) UCONTEXT_GREGS (ctx);
+-}
+-#endif
+ void
+ mono_arch_sigctx_to_monoctx (void *sigctx, MonoContext *mctx)
+ {
+@@ -910,13 +888,15 @@ altstack_handle_and_restore (void *sigctx, gpointer obj, gboolean stack_ovf)
+ void
+ mono_arch_handle_altstack_exception (void *sigctx, gpointer fault_addr, gboolean stack_ovf)
+ {
+-#if defined(MONO_ARCH_USE_SIGACTION) && defined(UCONTEXT_GREGS)
++#if defined(MONO_ARCH_USE_SIGACTION)
+ 	MonoException *exc = NULL;
+ 	ucontext_t *ctx = (ucontext_t*)sigctx;
+-	guint64 *gregs = gregs_from_ucontext (ctx);
+-	MonoJitInfo *ji = mini_jit_info_table_find (mono_domain_get (), (gpointer)gregs [REG_RIP], NULL);
++	MonoJitInfo *ji = mini_jit_info_table_find (mono_domain_get (), (gpointer)UCONTEXT_REG_RIP (ctx), NULL);
+ 	gpointer *sp;
+ 	int frame_size;
++#if defined(__APPLE__)
++	ucontext_t *newctx;
++#endif
+ 
+ 	if (stack_ovf)
+ 		exc = mono_domain_get ()->stack_overflow_ex;
+@@ -932,20 +912,28 @@ mono_arch_handle_altstack_exception (void *sigctx, gpointer fault_addr, gboolean
+ 	 * 128 is the size of the red zone
+ 	 */
+ 	frame_size = sizeof (ucontext_t) + sizeof (gpointer) * 4 + 128;
++#if defined (__APPLE__)
++	frame_size += sizeof (*((mcontext_t)0));
++#endif
+ 	frame_size += 15;
+ 	frame_size &= ~15;
+-	sp = (gpointer)(gregs [REG_RSP] & ~15);
++	sp = (gpointer)(UCONTEXT_REG_RSP (ctx) & ~15);
+ 	sp = (gpointer)((char*)sp - frame_size);
+ 	/* the arguments must be aligned */
+-	sp [-1] = (gpointer)gregs [REG_RIP];
++	sp [-1] = (gpointer)UCONTEXT_REG_RIP (ctx);
+ 	/* may need to adjust pointers in the new struct copy, depending on the OS */
+ 	memcpy (sp + 4, ctx, sizeof (ucontext_t));
++#if defined(__APPLE__)
++	memcpy (sp + 4 + sizeof (ucontext_t), ctx->uc_mcontext, sizeof (*((mcontext_t)0)));
++	newctx = (ucontext_t *) (sp + 4);
++	newctx->uc_mcontext = (mcontext_t) (sp + 4 + sizeof (ucontext_t));
++#endif
+ 	/* at the return form the signal handler execution starts in altstack_handle_and_restore() */
+-	gregs [REG_RIP] = (unsigned long)altstack_handle_and_restore;
+-	gregs [REG_RSP] = (unsigned long)(sp - 1);
+-	gregs [REG_RDI] = (unsigned long)(sp + 4);
+-	gregs [REG_RSI] = (guint64)exc;
+-	gregs [REG_RDX] = stack_ovf;
++	UCONTEXT_REG_RIP (ctx) = (unsigned long)altstack_handle_and_restore;
++	UCONTEXT_REG_RSP (ctx) = (unsigned long)(sp - 1);
++	UCONTEXT_REG_RDI (ctx) = (unsigned long)(sp + 4);
++	UCONTEXT_REG_RSI (ctx) = (guint64)exc;
++	UCONTEXT_REG_RDX (ctx) = stack_ovf;
+ #endif
+ }
+ 
+diff --git a/mono/mini/exceptions-x86.c b/mono/mini/exceptions-x86.c
+index 883b3df..4a5035f 100644
+--- a/mono/mini/exceptions-x86.c
++++ b/mono/mini/exceptions-x86.c
+@@ -1091,6 +1091,9 @@ mono_arch_handle_altstack_exception (void *sigctx, gpointer fault_addr, gboolean
+ 	MonoJitInfo *ji = mini_jit_info_table_find (mono_domain_get (), (gpointer)UCONTEXT_REG_EIP (ctx), NULL);
+ 	gpointer *sp;
+ 	int frame_size;
++#if defined(__APPLE__)
++	ucontext_t *newctx;
++#endif
+ 
+ 	/* if we didn't find a managed method for the ip address and it matches the fault
+ 	 * address, we assume we followed a broken pointer during an indirect call, so
+@@ -1117,7 +1120,11 @@ mono_arch_handle_altstack_exception (void *sigctx, gpointer fault_addr, gboolean
+ 	 *   ctx arg
+ 	 *   return ip
+ 	 */
++#if defined(__APPLE__)
++	frame_size = sizeof (ucontext_t) + sizeof(*((mcontext_t)0)) + sizeof (gpointer) * 4;
++#else
+ 	frame_size = sizeof (ucontext_t) + sizeof (gpointer) * 4;
++#endif
+ 	frame_size += 15;
+ 	frame_size &= ~15;
+ 	sp = (gpointer)(UCONTEXT_REG_ESP (ctx) & ~15);
+@@ -1131,6 +1138,11 @@ mono_arch_handle_altstack_exception (void *sigctx, gpointer fault_addr, gboolean
+ 	sp [2] = (gpointer)stack_ovf;
+ 	/* may need to adjust pointers in the new struct copy, depending on the OS */
+ 	memcpy (sp + 4, ctx, sizeof (ucontext_t));
++#if defined(__APPLE__)
++	memcpy (sp + 4 + sizeof (ucontext_t), ctx->uc_mcontext, sizeof (*((mcontext_t)0)));
++	newctx = (ucontext_t *) (sp + 4);
++	newctx->uc_mcontext = (mcontext_t) (sp + 4 + sizeof (ucontext_t));
++#endif
+ 	/* at the return form the signal handler execution starts in altstack_handle_and_restore() */
+ 	UCONTEXT_REG_EIP (ctx) = (unsigned long)altstack_handle_and_restore;
+ 	UCONTEXT_REG_ESP (ctx) = (unsigned long)(sp - 1);
+diff --git a/mono/mini/mini-amd64.h b/mono/mini/mini-amd64.h
+index c48e015..f935099 100644
+--- a/mono/mini/mini-amd64.h
++++ b/mono/mini/mini-amd64.h
+@@ -84,9 +84,11 @@ struct sigcontext {
+ #define MONO_ARCH_USE_SHARED_FP_SIMD_BANK 1
+ #endif
+ 
+-
+-
++#if defined(__APPLE__)
++#define MONO_ARCH_SIGNAL_STACK_SIZE MINSIGSTKSZ
++#else
+ #define MONO_ARCH_SIGNAL_STACK_SIZE (16 * 1024)
++#endif
+ 
+ #define MONO_ARCH_HAVE_RESTORE_STACK_SUPPORT 1
+ 
+diff --git a/mono/mini/mini-exceptions.c b/mono/mini/mini-exceptions.c
+index 5a73ac9..3881b7e 100644
+--- a/mono/mini/mini-exceptions.c
++++ b/mono/mini/mini-exceptions.c
+@@ -1594,13 +1594,23 @@ mono_handle_exception (MonoContext *ctx, gpointer obj, gpointer original_ip, gbo
+ #error "Can't use sigaltstack without sigaction"
+ #endif
+ 
++/*
++ * Handling a ovf on osx requires a lot more stack space than on linux because
++ * we might end up in CoreFoundation getting the locale
++ */
++#if defined (__APPLE__)
++#define MONO_MIN_OVF_GUARD_SIZE 16 * 4096
++#else
++#define MONO_MIN_OVF_GUARD_SIZE 8 * 4096
++#endif
++
+ #define ALIGN_TO(val,align) ((((guint64)val) + ((align) - 1)) & ~((align) - 1))
+ 
+ void
+ mono_setup_altstack (MonoJitTlsData *tls)
+ {
+ 	size_t stsize = 0;
+-	struct sigaltstack sa;
++	stack_t sa;
+ 	guint8 *staddr = NULL;
+ 
+ 	if (mono_running_on_valgrind ())
+@@ -1611,11 +1621,12 @@ mono_setup_altstack (MonoJitTlsData *tls)
+ 	g_assert (staddr);
+ 
+ 	tls->end_of_stack = staddr + stsize;
+-
+ 	/*g_print ("thread %p, stack_base: %p, stack_size: %d\n", (gpointer)pthread_self (), staddr, stsize);*/
+ 
+ 	tls->stack_ovf_guard_base = staddr + mono_pagesize ();
+-	tls->stack_ovf_guard_size = ALIGN_TO (8 * 4096, mono_pagesize ());
++	tls->stack_ovf_guard_size = ALIGN_TO (MONO_MIN_OVF_GUARD_SIZE, mono_pagesize ());
++
++	/*g_print ("guarding %p - %p\n", (gpointer)tls->stack_ovf_guard_base, (gpointer)(tls->stack_ovf_guard_base + tls->stack_ovf_guard_size));*/
+ 
+ 	if (mono_mprotect (tls->stack_ovf_guard_base, tls->stack_ovf_guard_size, MONO_MMAP_NONE)) {
+ 		/* mprotect can fail for the main thread stack */
+@@ -1641,13 +1652,19 @@ mono_setup_altstack (MonoJitTlsData *tls)
+ 	sa.ss_sp = tls->signal_stack;
+ 	sa.ss_size = MONO_ARCH_SIGNAL_STACK_SIZE;
+ 	sa.ss_flags = SS_ONSTACK;
+-	sigaltstack (&sa, NULL);
++	if (sigaltstack (&sa, NULL) < 0) {
++		// OLD 2.4 kernels and OSX need this
++		sa.ss_flags = 0;
++		if (sigaltstack (&sa, NULL) < 0) {
++			perror ("sigaltstack");
++		}
++	}
+ }
+ 
+ void
+ mono_free_altstack (MonoJitTlsData *tls)
+ {
+-	struct sigaltstack sa;
++	stack_t sa;
+ 	int err;
+ 
+ 	sa.ss_sp = tls->signal_stack;
+@@ -1682,13 +1699,19 @@ static gboolean
+ try_restore_stack_protection (MonoJitTlsData *jit_tls, int extra_bytes)
+ {
+ 	gint32 unprotect_size = jit_tls->stack_ovf_guard_size;
++	/* OSX requires a ton of stack space when we're handling an overflow exception, because
++	 * we might call into corefoundation to get the locale and other such things
++	 * as such we'll just give the entire page back to the system
++	 */
++#if !defined(__APPLE__)
+ 	/* we need to leave some room for throwing the exception */
+ 	while (unprotect_size >= 0 && (char*)jit_tls->stack_ovf_guard_base + unprotect_size > ((char*)&unprotect_size - extra_bytes))
+ 		unprotect_size -= mono_pagesize ();
++#endif
+ 	/* at this point we could try and build a new domain->stack_overflow_ex, but only if there
+ 	 * is sufficient stack
+ 	 */
+-	//fprintf (stderr, "restoring stack protection: %p-%p (%d)\n", jit_tls->stack_ovf_guard_base, (char*)jit_tls->stack_ovf_guard_base + unprotect_size, unprotect_size);
++	/*fprintf (stderr, "restoring stack protection: %p-%p (%d)\n", jit_tls->stack_ovf_guard_base, (char*)jit_tls->stack_ovf_guard_base + unprotect_size, unprotect_size);*/
+ 	if (unprotect_size)
+ 		mono_mprotect (jit_tls->stack_ovf_guard_base, unprotect_size, MONO_MMAP_NONE);
+ 	return unprotect_size == jit_tls->stack_ovf_guard_size;
+@@ -1749,11 +1772,19 @@ mono_handle_soft_stack_ovf (MonoJitTlsData *jit_tls, MonoJitInfo *ji, void *ctx,
+ 		guint32 guard_size;
+ 		gboolean handled = FALSE;
+ 
++#if defined(__APPLE__)
++		/* OSX requires a ton of stack space when we're handling an overflow exception, because
++		 * we might call into corefoundation to get the locale and other such things
++		 * as such we'll just give the entire page back to the system
++		 */
++		guard_size = jit_tls->stack_ovf_guard_size;
++#else
+ 		guard_size = jit_tls->stack_ovf_guard_size - (mono_pagesize () * SIZEOF_VOID_P / 4);
+ 		while (guard_size && fault_addr < (guint8*)jit_tls->stack_ovf_guard_base + guard_size) {
+ 			guard_size -= mono_pagesize ();
+ 		}
+ 		guard_size = jit_tls->stack_ovf_guard_size - guard_size;
++#endif
+ 		/*fprintf (stderr, "unprotecting: %d\n", guard_size);*/
+ 		mono_mprotect ((char*)jit_tls->stack_ovf_guard_base + jit_tls->stack_ovf_guard_size - guard_size, guard_size, MONO_MMAP_READ|MONO_MMAP_WRITE);
+ #ifdef MONO_ARCH_SIGSEGV_ON_ALTSTACK
+diff --git a/mono/mini/mini-x86.h b/mono/mini/mini-x86.h
+index 8e712e3..62c72f4 100644
+--- a/mono/mini/mini-x86.h
++++ b/mono/mini/mini-x86.h
+@@ -82,7 +82,11 @@ struct sigcontext {
+ #endif
+ 
+ /* we should lower this size and make sure we don't call heavy stack users in the segv handler */
++#if defined(__APPLE__)
++#define MONO_ARCH_SIGNAL_STACK_SIZE MINSIGSTKSZ
++#else
+ #define MONO_ARCH_SIGNAL_STACK_SIZE (16 * 1024)
++#endif
+ #define MONO_ARCH_HAVE_RESTORE_STACK_SUPPORT 1
+ 
+ #define MONO_ARCH_CPU_SPEC x86_desc

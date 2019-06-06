@@ -1,0 +1,584 @@
+Index: domain.c
+===================================================================
+--- domain.c	(revisión: 38513)
++++ domain.c	(copia de trabajo)
+@@ -284,7 +284,9 @@
+ 	domain->code_mp = mono_code_manager_new ();
+ 	domain->env = mono_g_hash_table_new ((GHashFunc)mono_string_hash, (GCompareFunc)mono_string_equal);
+ 	domain->assemblies_by_name = g_hash_table_new (g_str_hash, g_str_equal);
++	domain->assemblies_refonly_by_name = g_hash_table_new (g_str_hash, g_str_equal);
+ 	domain->assemblies = NULL;
++	domain->assemblies_refonly = NULL;
+ 	domain->class_vtable_hash = g_hash_table_new (NULL, NULL);
+ 	domain->proxy_vtable_hash = mono_g_hash_table_new ((GHashFunc)mono_string_hash, (GCompareFunc)mono_string_equal);
+ 	domain->static_data_hash = mono_g_hash_table_new (NULL, NULL);
+@@ -781,10 +783,13 @@
+ 	
+ 	g_free (domain->friendly_name);
+ 	g_hash_table_foreach (domain->assemblies_by_name, remove_assembly, NULL);
++	g_hash_table_foreach (domain->assemblies_refonly_by_name, remove_assembly, NULL);
+ 
+ 	mono_g_hash_table_destroy (domain->env);
+ 	g_hash_table_destroy (domain->assemblies_by_name);
++	g_hash_table_destroy (domain->assemblies_refonly_by_name);
+ 	g_list_free (domain->assemblies);
++	g_list_free (domain->assemblies_refonly);
+ 	g_hash_table_destroy (domain->class_vtable_hash);
+ 	mono_g_hash_table_destroy (domain->proxy_vtable_hash);
+ 	mono_g_hash_table_destroy (domain->static_data_hash);
+Index: appdomain.c
+===================================================================
+--- appdomain.c	(revisión: 38513)
++++ appdomain.c	(copia de trabajo)
+@@ -46,6 +46,10 @@
+ mono_domain_assembly_search (MonoAssemblyName *aname,
+ 							 gpointer user_data);
+ 
++static MonoAssembly *
++mono_domain_assembly_refonly_search (MonoAssemblyName *aname,
++							 gpointer user_data);
++
+ static void
+ mono_domain_fire_assembly_load (MonoAssembly *assembly, gpointer user_data);
+ 
+@@ -81,7 +85,8 @@
+ 	mono_marshal_init ();
+ 
+ 	mono_install_assembly_preload_hook (mono_domain_assembly_preload, NULL);
+-	mono_install_assembly_search_hook (mono_domain_assembly_search, NULL);
++	mono_install_assembly_search_hook (mono_domain_assembly_search, (gpointer) FALSE);
++	mono_install_assembly_refonly_search_hook (mono_domain_assembly_search, (gpointer) TRUE);
+ 	mono_install_assembly_load_hook (mono_domain_fire_assembly_load, NULL);
+ 	mono_install_lookup_dynamic_token (mono_reflection_lookup_dynamic_token);
+ 
+@@ -472,7 +477,7 @@
+ }
+ 
+ MonoArray *
+-ves_icall_System_AppDomain_GetAssemblies (MonoAppDomain *ad)
++ves_icall_System_AppDomain_GetAssemblies (MonoAppDomain *ad, MonoBoolean ref_only)
+ {
+ 	MonoDomain *domain = ad->data; 
+ 	static MonoClass *System_Reflection_Assembly;
+@@ -491,14 +496,18 @@
+ 
+ 	/* Need to skip internal assembly builders created by remoting */
+ 	mono_domain_lock (domain);
+-	g_hash_table_foreach (domain->assemblies_by_name, filter_assembly, &ah);
++	if (!ref_only)
++		g_hash_table_foreach (domain->assemblies_by_name, filter_assembly, &ah);
++	g_hash_table_foreach (domain->assemblies_refonly_by_name, filter_assembly, &ah);
+ 	mono_domain_unlock (domain);
+ 
+ 	res = mono_array_new (domain, System_Reflection_Assembly, ah.len);
+ 	ah.res = res;
+ 
+ 	mono_domain_lock (domain);
+-	g_hash_table_foreach (domain->assemblies_by_name, add_assembly, &ah);
++	if (!ref_only)
++		g_hash_table_foreach (domain->assemblies_by_name, add_assembly, &ah);
++	g_hash_table_foreach (domain->assemblies_refonly_by_name, add_assembly, &ah);
+ 	mono_domain_unlock (domain);
+ 
+ 	return res;
+@@ -529,6 +538,8 @@
+ static void
+ add_assemblies_to_domain (MonoDomain *domain, MonoAssembly *ass)
+ {
++	GHashTable *assemblies_by_name;
++	GList *assemblies;
+ 	gint i;
+ 
+ 	if (!ass->aname.name)
+@@ -536,13 +547,25 @@
+ 
+ 	mono_domain_lock (domain);
+ 
+-	if (g_hash_table_lookup (domain->assemblies_by_name, ass->aname.name)) {
++	if (ass->ref_only) {
++		assemblies_by_name = domain->assemblies_refonly_by_name;
++		assemblies = domain->assemblies_refonly;
++	} else {
++		assemblies_by_name = domain->assemblies_by_name;
++		assemblies = domain->assemblies;
++	}
++	
++	if (g_hash_table_lookup (assemblies_by_name, ass->aname.name)) {
+ 		mono_domain_unlock (domain);
+ 		return; /* This is ok while no lazy loading of assemblies */
+ 	}
+ 
+-	g_hash_table_insert (domain->assemblies_by_name, (gpointer) ass->aname.name, ass);
+-	domain->assemblies = g_list_prepend (domain->assemblies, ass);
++	g_hash_table_insert (assemblies_by_name, (gpointer) ass->aname.name, ass);
++	if (ass->ref_only)
++		domain->assemblies_refonly = g_list_prepend (assemblies, ass);
++	else
++		domain->assemblies = g_list_prepend (assemblies, ass);
++	
+ 	mono_domain_unlock (domain);
+ 
+ 	if (ass->image->references)
+@@ -836,9 +859,11 @@
+ 	MonoDomain *domain = mono_domain_get ();
+ 	GList *tmp;
+ 	MonoAssembly *ass;
++	gboolean ref_only = (gboolean) user_data;
+ 
+ 	mono_domain_lock (domain);
+-	for (tmp = domain->assemblies; tmp; tmp = tmp->next) {
++	tmp = ref_only ? domain->assemblies_refonly : domain->assemblies;
++	for (; tmp; tmp = tmp->next) {
+ 		ass = tmp->data;
+ 		/* Dynamic assemblies can't match here in MS.NET */
+ 		if (ass->dynamic || !mono_assembly_names_equal (aname, &ass->aname))
+@@ -853,7 +878,7 @@
+ }
+ 
+ MonoReflectionAssembly *
+-ves_icall_System_Reflection_Assembly_LoadFrom (MonoString *fname)
++ves_icall_System_Reflection_Assembly_LoadFrom (MonoString *fname, MonoBoolean ref_only)
+ {
+ 	MonoDomain *domain = mono_domain_get ();
+ 	char *name, *filename;
+@@ -869,7 +894,7 @@
+ 		
+ 	name = filename = mono_string_to_utf8 (fname);
+ 
+-	ass = mono_assembly_open (filename, &status);
++	ass = mono_assembly_open_refonly (filename, &status, ref_only);
+ 	
+ 	g_free (name);
+ 
+Index: assembly.c
+===================================================================
+--- assembly.c	(revisión: 38513)
++++ assembly.c	(copia de trabajo)
+@@ -55,6 +55,9 @@
+ /* A hastable of thread->assembly list mappings */
+ static GHashTable *assemblies_loading;
+ 
++/* A hashtable of reflection only load thread->assemblies mappings */
++static GHashTable *assemblies_refonly_loading;
++
+ /* If defined, points to the bundled assembly information */
+ const MonoBundledAssembly **bundles;
+ 
+@@ -150,13 +153,13 @@
+ }
+ 
+ static MonoAssembly*
+-search_loaded (MonoAssemblyName* aname)
++search_loaded (MonoAssemblyName* aname, gboolean ref_only)
+ {
+ 	GList *tmp;
+ 	MonoAssembly *ass;
+ 	GList *loading;
+ 
+-	ass = mono_assembly_invoke_search_hook (aname);
++	ass = ref_only? mono_assembly_refonly_invoke_search_hook (aname) : mono_assembly_invoke_search_hook (aname);
+ 	if (ass)
+ 		return ass;
+ 	
+@@ -164,7 +167,7 @@
+ 	 * The assembly might be under load by this thread. In this case, it is
+ 	 * safe to return an incomplete instance to prevent loops.
+ 	 */
+-	loading = g_hash_table_lookup (assemblies_loading, GetCurrentThread ());
++	loading = g_hash_table_lookup (ref_only ? assemblies_refonly_loading : assemblies_loading, GetCurrentThread ());
+ 	for (tmp = loading; tmp; tmp = tmp->next) {
+ 		ass = tmp->data;
+ 		if (!mono_assembly_names_equal (aname, &ass->aname))
+@@ -236,6 +239,7 @@
+ 	InitializeCriticalSection (&assemblies_mutex);
+ 
+ 	assemblies_loading = g_hash_table_new (NULL, NULL);
++	assemblies_refonly_loading = g_hash_table_new (NULL, NULL);
+ }
+ 
+ gboolean
+@@ -349,7 +353,28 @@
+ 		memset (aname.public_key_token, 0, MONO_PUBLIC_KEY_TOKEN_LENGTH);
+ 	} 
+ 
+-	reference = mono_assembly_load (&aname, image->assembly->basedir, &status);
++	if (image->assembly->ref_only) {
++		if (!strcmp (aname.name, "mscorlib")) {
++			reference = mono_assembly_loaded (&aname, FALSE);
++			if (!reference)
++				reference = mono_assembly_loaded (&aname, TRUE);
++			/*
++			 * Currently I load mscorlib as a true assembly, as long as I do not implement
++			 * the refonly version of mono_assembly_load
++			 */
++			if (!reference)
++				reference = mono_assembly_load (&aname, image->assembly->basedir, &status);
++		}
++		else
++			reference = mono_assembly_loaded (&aname, TRUE);
++		/*
++		 * Here we must advice that the error was due to
++		 * a non loaded reference using the ReflectionOnly api
++		*/
++		if (!reference)
++			reference = (gpointer)-1;
++	} else
++		reference = mono_assembly_load (&aname, image->assembly->basedir, &status);
+ 
+ 	if (reference == NULL){
+ 		/*
+@@ -467,6 +492,7 @@
+ };
+ 
+ AssemblySearchHook *assembly_search_hook = NULL;
++AssemblySearchHook *assembly_refonly_search_hook = NULL;
+ 
+ MonoAssembly*
+ mono_assembly_invoke_search_hook (MonoAssemblyName *aname)
+@@ -482,6 +508,20 @@
+ 	return NULL;
+ }
+ 
++MonoAssembly*
++mono_assembly_refonly_invoke_search_hook (MonoAssemblyName *aname)
++{
++	AssemblySearchHook *hook;
++
++	for (hook = assembly_refonly_search_hook; hook; hook = hook->next) {
++		MonoAssembly *ass = hook->func (aname, hook->user_data);
++		if (ass)
++			return ass;
++	}
++
++	return NULL;
++}
++
+ void          
+ mono_install_assembly_search_hook (MonoAssemblySearchFunc func, gpointer user_data)
+ {
+@@ -496,6 +536,20 @@
+ 	assembly_search_hook = hook;
+ }	
+ 
++void
++mono_install_assembly_refonly_search_hook (MonoAssemblySearchFunc func, gpointer user_data)
++{
++	AssemblySearchHook *hook;
++
++	g_return_if_fail (func != NULL);
++
++	hook = g_new0 (AssemblySearchHook, 1);
++	hook->func = func;
++	hook->user_data = user_data;
++	hook->next = assembly_refonly_search_hook;
++	assembly_refonly_search_hook = hook;
++}
++
+ typedef struct AssemblyPreLoadHook AssemblyPreLoadHook;
+ struct AssemblyPreLoadHook {
+ 	AssemblyPreLoadHook *next;
+@@ -657,6 +711,12 @@
+ MonoAssembly *
+ mono_assembly_open (const char *filename, MonoImageOpenStatus *status)
+ {
++	return mono_assembly_open_refonly (filename, status, FALSE);
++}
++
++MonoAssembly *
++mono_assembly_open_refonly (const char *filename, MonoImageOpenStatus *status, gboolean ref_only)
++{
+ 	MonoImage *image;
+ 	MonoAssembly *ass;
+ 	MonoImageOpenStatus def_status;
+@@ -707,12 +767,13 @@
+ 		return NULL;
+ 	}
+ 
+-	ass = mono_assembly_load_from (image, fname, status);
++	ass = mono_assembly_load_from_refonly (image, fname, status, ref_only);
+ 
+ 	if (ass) {
+ 		mono_trace (G_LOG_LEVEL_INFO, MONO_TRACE_ASSEMBLY,
+ 				"Assembly Loader loaded assembly from location: '%s'.", filename);
+-		mono_config_for_assembly (ass->image);
++		if (!ref_only)
++			mono_config_for_assembly (ass->image);
+ 	}
+ 
+ 	g_free (fname);
+@@ -721,12 +782,20 @@
+ }
+ 
+ MonoAssembly *
+-mono_assembly_load_from (MonoImage *image, const char*fname, 
++mono_assembly_load_from (MonoImage *image, const char *fname,
+ 			 MonoImageOpenStatus *status)
+ {
++	return mono_assembly_load_from_refonly (image, fname, status, FALSE);
++}
++
++MonoAssembly *
++mono_assembly_load_from_refonly (MonoImage *image, const char*fname, 
++			 MonoImageOpenStatus *status, gboolean ref_only)
++{
+ 	MonoAssembly *ass, *ass2;
+ 	char *base_dir;
+ 	GList *loading;
++	GHashTable *ass_loading;
+ 
+ #if defined (PLATFORM_WIN32)
+ 	{
+@@ -759,6 +828,7 @@
+ 	 */
+ 	ass = g_new0 (MonoAssembly, 1);
+ 	ass->basedir = base_dir;
++	ass->ref_only = ref_only;
+ 	ass->image = image;
+ 
+ 	mono_assembly_fill_assembly_name (image, &ass->aname);
+@@ -767,9 +837,10 @@
+ 	 * Atomically search the loaded list and add ourselves to it if necessary.
+ 	 */
+ 	EnterCriticalSection (&assemblies_mutex);
+-	if (ass->aname.name)
++	if (ass->aname.name) {
+ 		/* avoid loading the same assembly twice for now... */
+-		if ((ass2 = search_loaded (&ass->aname))) {
++		ass2 = search_loaded (&ass->aname, ref_only);
++		if (ass2) {
+ 			g_free (ass);
+ 			g_free (base_dir);
+ 			mono_image_close (image);
+@@ -777,9 +848,11 @@
+ 			LeaveCriticalSection (&assemblies_mutex);
+ 			return ass2;
+ 		}
+-	loading = g_hash_table_lookup (assemblies_loading, GetCurrentThread ());
++	}
++	ass_loading = ref_only? assemblies_refonly_loading : assemblies_loading;
++	loading = g_hash_table_lookup (ass_loading, GetCurrentThread ());
+ 	loading = g_list_prepend (loading, ass);
+-	g_hash_table_insert (assemblies_loading, GetCurrentThread (), loading);
++	g_hash_table_insert (ass_loading, GetCurrentThread (), loading);
+ 	LeaveCriticalSection (&assemblies_mutex);
+ 
+ 	image->assembly = ass;
+@@ -788,13 +861,13 @@
+ 
+ 	EnterCriticalSection (&assemblies_mutex);
+ 
+-	loading = g_hash_table_lookup (assemblies_loading, GetCurrentThread ());
++	loading = g_hash_table_lookup (ass_loading, GetCurrentThread ());
+ 	loading = g_list_remove (loading, ass);
+ 	if (loading == NULL)
+ 		/* Prevent memory leaks */
+-		g_hash_table_remove (assemblies_loading, GetCurrentThread ());
++		g_hash_table_remove (ass_loading, GetCurrentThread ());
+ 	else
+-		g_hash_table_insert (assemblies_loading, GetCurrentThread (), loading);
++		g_hash_table_insert (ass_loading, GetCurrentThread (), loading);
+ 	if (*status != MONO_IMAGE_OK) {
+ 		LeaveCriticalSection (&assemblies_mutex);
+ 		mono_assembly_close (ass);
+@@ -802,7 +875,7 @@
+ 	}
+ 
+ 	if (ass->aname.name) {
+-		ass2 = search_loaded (&ass->aname);
++		ass2 = search_loaded (&ass->aname, ref_only);
+ 		if (ass2) {
+ 			/* Somebody else has loaded the assembly before us */
+ 			LeaveCriticalSection (&assemblies_mutex);
+@@ -854,7 +927,7 @@
+ 	memset (&aname, 0, sizeof (MonoAssemblyName));
+ 	aname.name = name;
+ 
+-	res = mono_assembly_loaded (&aname);
++	res = mono_assembly_loaded (&aname, FALSE);
+ 	if (res)
+ 		return res;
+ 
+@@ -972,7 +1045,7 @@
+ 	MonoAssembly *result;
+ 	char *fullpath, *filename;
+ 
+-	result = mono_assembly_loaded (aname);
++	result = mono_assembly_loaded (aname, FALSE);
+ 	if (result)
+ 		return result;
+ 
+@@ -1047,12 +1120,12 @@
+ }
+ 
+ MonoAssembly*
+-mono_assembly_loaded (MonoAssemblyName *aname)
++mono_assembly_loaded (MonoAssemblyName *aname, gboolean ref_only)
+ {
+ 	MonoAssembly *res;
+ 
+ 	EnterCriticalSection (&assemblies_mutex);
+-	res = search_loaded (aname);
++	res = search_loaded (aname, ref_only);
+ 	LeaveCriticalSection (&assemblies_mutex);
+ 
+ 	return res;
+Index: assembly.h
+===================================================================
+--- assembly.h	(revisión: 38513)
++++ assembly.h	(copia de trabajo)
+@@ -8,15 +8,20 @@
+ void          mono_assemblies_init     (void);
+ MonoAssembly *mono_assembly_open       (const char *filename,
+ 				       	MonoImageOpenStatus *status);
++MonoAssembly *mono_assembly_open_refonly (const char *filename,
++					MonoImageOpenStatus *status, gboolean ref_only);
+ MonoAssembly* mono_assembly_load       (MonoAssemblyName *aname, 
+                                        	const char       *basedir, 
+ 				     	MonoImageOpenStatus *status);
+ MonoAssembly* mono_assembly_load_from  (MonoImage *image, const char *fname,
+ 					MonoImageOpenStatus *status);
++MonoAssembly* mono_assembly_load_from_refonly  (MonoImage *image, const char *fname,
++					MonoImageOpenStatus *status, gboolean ref_only);
+ 
+ MonoAssembly* mono_assembly_load_with_partial_name (const char *name, MonoImageOpenStatus *status);
+ 
+-MonoAssembly* mono_assembly_loaded     (MonoAssemblyName *aname);
++MonoAssembly* mono_assembly_loaded     (MonoAssemblyName *aname, gboolean ref_only);
++MonoAssembly* mono_assembly_refonly_loaded     (MonoAssemblyName *aname);
+ void          mono_assembly_load_reference (MonoImage *image, int index);
+ void          mono_assembly_load_references (MonoImage *image, MonoImageOpenStatus *status);
+ MonoImage*    mono_assembly_load_module (MonoAssembly *assembly, guint32 idx);
+@@ -40,8 +45,10 @@
+  */
+ typedef MonoAssembly *(*MonoAssemblySearchFunc)         (MonoAssemblyName *aname, gpointer user_data);
+ void          mono_install_assembly_search_hook (MonoAssemblySearchFunc func, gpointer user_data);
++void          mono_install_assembly_refonly_search_hook (MonoAssemblySearchFunc func, gpointer user_data);
+ 
+ MonoAssembly* mono_assembly_invoke_search_hook (MonoAssemblyName *aname);
++MonoAssembly* mono_assembly_refonly_invoke_search_hook (MonoAssemblyName *aname);
+ 
+ /* Installs a function which is called before a new assembly is loaded
+  * The hook are invoked from last hooked to first. If any of them returns
+Index: metadata-internals.h
+===================================================================
+--- metadata-internals.h	(revisión: 38513)
++++ metadata-internals.h	(copia de trabajo)
+@@ -14,6 +14,7 @@
+ 	MonoImage *image;
+ 	gboolean dynamic;
+ 	gboolean corlib_internal;
++	gboolean ref_only;
+ };
+ 
+ typedef struct {
+Index: domain-internals.h
+===================================================================
+--- domain-internals.h	(revisión: 38513)
++++ domain-internals.h	(copia de trabajo)
+@@ -88,7 +88,9 @@
+ 	MonoCodeManager    *code_mp;
+ 	MonoGHashTable     *env;
+ 	GHashTable         *assemblies_by_name;
++	GHashTable         *assemblies_refonly_by_name;
+ 	GList              *assemblies;
++	GList              *assemblies_refonly;
+ 	MonoAssembly       *entry_assembly;
+ 	MonoAppDomainSetup *setup;
+ 	char               *friendly_name;
+@@ -171,10 +173,12 @@
+ ves_icall_System_AppDomain_getFriendlyName         (MonoAppDomain *ad);
+ 
+ MonoArray *
+-ves_icall_System_AppDomain_GetAssemblies           (MonoAppDomain *ad);
++ves_icall_System_AppDomain_GetAssemblies           (MonoAppDomain *ad,
++						    MonoBoolean refonly);
+ 
+ MonoReflectionAssembly *
+-ves_icall_System_Reflection_Assembly_LoadFrom      (MonoString *fname);
++ves_icall_System_Reflection_Assembly_LoadFrom      (MonoString *fname,
++						    MonoBoolean refonly);
+ 
+ MonoReflectionAssembly *
+ ves_icall_System_AppDomain_LoadAssembly            (MonoAppDomain *ad, 
+Index: exception.c
+===================================================================
+--- exception.c	(revisión: 38513)
++++ exception.c	(copia de trabajo)
+@@ -342,6 +342,13 @@
+ }
+ 
+ MonoException *
++mono_get_exception_file_load (const guchar *msg)
++{
++	return mono_exception_from_name_msg (
++			mono_get_corlib (), "System.IO", "FileLoadException", msg);
++}
++
++MonoException *
+ mono_get_exception_type_initialization (const gchar *type_name, MonoException *inner)
+ {
+ 	MonoClass *klass;
+Index: exception.h
+===================================================================
+--- exception.h	(revisión: 38513)
++++ exception.h	(copia de trabajo)
+@@ -92,6 +92,9 @@
+ mono_get_exception_file_not_found2       (const guchar *msg, MonoString *fname);
+ 
+ MonoException *
++mono_get_exception_file_load		(const guchar *msg);
++
++MonoException *
+ mono_get_exception_type_initialization (const gchar *type_name, MonoException *inner);
+ 
+ MonoException *
+Index: icall.c
+===================================================================
+--- icall.c	(revisión: 38513)
++++ icall.c	(copia de trabajo)
+@@ -3348,6 +3348,14 @@
+ 	return res;
+ }
+ 
++static MonoBoolean
++ves_icall_System_Reflection_Assembly_get_ReflectionOnly (MonoReflectionAssembly *assembly)
++{
++	MONO_ARCH_SAVE_REGS;
++
++	return assembly->assembly->ref_only;
++}
++
+ static MonoString *
+ ves_icall_System_Reflection_Assembly_InternalImageRuntimeVersion (MonoReflectionAssembly *assembly)
+ {
+@@ -6002,6 +6010,7 @@
+ 	{"get_EntryPoint", ves_icall_System_Reflection_Assembly_get_EntryPoint},
+ 	{"get_ManifestModule", ves_icall_System_Reflection_Assembly_get_ManifestModule},
+ 	{"get_MetadataToken", mono_reflection_get_token},
++	{"get_ReflectionOnly", ves_icall_System_Reflection_Assembly_get_ReflectionOnly},
+ 	{"get_code_base", ves_icall_System_Reflection_Assembly_get_code_base},
+ 	{"get_global_assembly_cache", ves_icall_System_Reflection_Assembly_get_global_assembly_cache},
+ 	{"get_location", ves_icall_System_Reflection_Assembly_get_location},
+Index: reflection.c
+===================================================================
+--- reflection.c	(revisión: 38513)
++++ reflection.c	(copia de trabajo)
+@@ -5330,7 +5330,8 @@
+ 			return klass->reflection_info;
+ 		}
+ 	}
+-	mono_class_init (klass);
++	if (!klass->image->assembly->ref_only)
++		mono_class_init (klass);
+ 	res = (MonoReflectionType *)mono_object_new (domain, mono_defaults.monotype_class);
+ 	res->type = type;
+ 	mono_g_hash_table_insert (domain->type_hash, type, res);
+@@ -6096,7 +6097,7 @@
+ 	}
+ 
+ 	if (info.assembly.name) {
+-		assembly = mono_assembly_loaded (&info.assembly);
++		assembly = mono_assembly_loaded (&info.assembly, image->assembly->ref_only);
+ 		if (!assembly) {
+ 			/* then we must load the assembly ourselve - see #60439 */
+ 			assembly = mono_assembly_load (&info.assembly, NULL, NULL);

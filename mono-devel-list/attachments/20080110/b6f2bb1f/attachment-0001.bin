@@ -1,0 +1,223 @@
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 92275)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,11 @@
++2008-01-10  Jonathan Pryor  <jpryor@novell.com>
++
++	* signal.c: Provide a safe version of signal(3), as it isn't safe for
++	  marshaled delegates to be invoked from signal handler context.  Provide
++	  support functions for Mono.Unix.UnixSignal, which supports both polling
++	  and blocking on signal emission.
++	* map.h: Flush (adds signal(3)-related prototypes).
++
+ 2008-01-05  Jonathan Pryor  <jpryor@novell.com>
+ 
+ 	* map.h, map.c: Flush; add new ST_NOEXEC, ST_REMOUNT, and ST_BIND MountFlags 
+Index: signal.c
+===================================================================
+--- signal.c	(revision 92060)
++++ signal.c	(working copy)
+@@ -3,18 +3,27 @@
+  *
+  * Authors:
+  *   Jonathan Pryor (jonpryor@vt.edu)
++ *   Jonathan Pryor (jpryor@novell.com)
+  *
+  * Copyright (C) 2004-2005 Jonathan Pryor
++ * Copyright (C) 2007 Novell, Inc.
+  */
+ 
+ #include <signal.h>
+ 
++#ifndef PLATFORM_WIN32
++#include <unistd.h>
++#include <stdlib.h>
++#include <string.h>
++#endif
++
+ #include "map.h"
+ #include "mph.h"
+ 
+ G_BEGIN_DECLS
+ 
+ typedef void (*mph_sighandler_t)(int);
++typedef struct Mono_Unix_UnixSignal_SignalInfo signal_info;
+ 
+ void*
+ Mono_Posix_Stdlib_SIG_DFL (void)
+@@ -42,6 +51,7 @@
+ }
+ 
+ #ifndef PLATFORM_WIN32
++
+ int
+ Mono_Posix_Syscall_psignal (int sig, const char* s)
+ {
+@@ -49,6 +59,110 @@
+ 	psignal (sig, s);
+ 	return errno == 0 ? 0 : -1;
+ }
++
++static signal_info* registered_signals;
++static int registered_signals_count;
++static int signal_write;
++
++static inline signal_info*
++get_info (int signum)
++{
++	int i;
++	for (i = 0; i < registered_signals_count; ++i)
++		if (registered_signals [i].signum == signum)
++			return &registered_signals [i];
++	return NULL;
++}
++
++void
++_mph_set_signal_write_fd (int fd)
++{
++	signal_write = fd;
++}
++
++static void
++default_handler (int signum)
++{
++	signal_info* h = get_info (signum);
++	int fd = 0;
++	if (h) {
++		++h->count;
++		if (h->write_fd == 0)
++			fd = signal_write;
++		else if (h->write_fd > 0)
++			fd = h->write_fd;
++	}
++	else {
++		fd = signal_write;
++	}
++	if (fd) {
++		char c = signum;
++		write (fd, &c, 1);
++	}
++}
++
++void*
++Mono_Unix_UnixSignal_install (int sig)
++{
++	signal_info* n = realloc (registered_signals, 
++			sizeof(signal_info)*(registered_signals_count+1));
++	if (n) {
++		signal_info* r;
++		registered_signals = n;
++		r = &registered_signals [registered_signals_count++];
++
++		r->signum   = sig;
++		r->count    = 0;
++		r->write_fd = 0;
++
++		if ((r->handler = signal (sig, default_handler)) == SIG_ERR) {
++			Mono_Posix_Signal_uninstall (sig);
++			return NULL;
++		}
++		return r;
++	}
++	return NULL;
++}
++
++void
++Mono_Unix_UnixSignal_uninstall (int sig)
++{
++	signal_info* h = get_info (sig);
++
++	if (h != NULL) {
++		int remove = h - registered_signals;
++		mph_sighandler_t handler = h->handler;
++		memmove (h, h+1, 
++				sizeof(signal_info) * (registered_signals_count-remove-1));
++		--registered_signals_count;
++		registered_signals = realloc (registered_signals, 
++				sizeof(signal_info)*(registered_signals_count));
++		signal (sig, handler);
++	}
++}
++
++void*
++Mono_Posix_Stdlib_signal (int signum, void* handler)
++{
++	signal_info* h = get_info (signum);
++	if (h) {
++		errno = EEXIST;
++		return SIG_ERR;
++	}
++	if (handler == SIG_DFL || handler == SIG_ERR || handler == SIG_IGN) {
++		return signal (signum, handler);
++	}
++	return signal (signum, default_handler);
++}
++
++#else /* ndef PLATFORM_WIN32 */
++
++void*
++Mono_Posix_Stdlib_signal (int signum, void* handler)
++{
++	return signal (signum, handler);
++}
++
+ #endif /* ndef PLATFORM_WIN32 */
+ 
+ 
+Index: map.h
+===================================================================
+--- map.h	(revision 92275)
++++ map.h	(working copy)
+@@ -1382,6 +1382,7 @@
+ struct Mono_Posix_Timeval;
+ struct Mono_Posix_Timezone;
+ struct Mono_Posix_Utimbuf;
++struct Mono_Unix_UnixSignal_SignalInfo;
+ 
+ /*
+  * Inferred Structure Declarations
+@@ -1397,6 +1398,7 @@
+  * Delegate Declarations
+  */
+ 
++typedef void (*SignalHandler) (int signal);
+ 
+ /*
+  * Structures
+@@ -1541,10 +1543,18 @@
+ Mono_Posix_ToUtimbuf (struct utimbuf *from, struct Mono_Posix_Utimbuf* to);
+ 
+ 
++struct Mono_Unix_UnixSignal_SignalInfo {
++	int   signum;
++	int   count;
++	int   write_fd;
++	void* handler;
++};
+ 
++
+ /*
+  * Functions
+  */
++void _mph_set_signal_write_fd (int signum);
+ char* helper_Mono_Posix_GetGroupName (int gid);
+ char* helper_Mono_Posix_GetUserName (int uid);
+ char* helper_Mono_Posix_readdir (void* dir);
+@@ -1587,6 +1597,7 @@
+ void* Mono_Posix_Stdlib_SIG_DFL (void);
+ void* Mono_Posix_Stdlib_SIG_ERR (void);
+ void* Mono_Posix_Stdlib_SIG_IGN (void);
++void* Mono_Posix_Stdlib_signal (int signum, void* handler);
+ void* Mono_Posix_Stdlib_stderr (void);
+ void* Mono_Posix_Stdlib_stdin (void);
+ void* Mono_Posix_Stdlib_stdout (void);
+@@ -1706,6 +1717,8 @@
+ int Mono_Posix_Syscall_WSTOPSIG (int status);
+ int Mono_Posix_Syscall_WTERMSIG (int status);
+ int Mono_Posix_ToStatvfs (void* source, struct Mono_Posix_Statvfs* destination);
++void* Mono_Unix_UnixSignal_install (int signum);
++void Mono_Unix_UnixSignal_uninstall (int signum);
+ int wexitstatus (int status);
+ int wifexited (int status);
+ int wifsignaled (int status);

@@ -1,0 +1,992 @@
+Index: System.Core-2008.csproj
+===================================================================
+--- System.Core-2008.csproj	(revision 103217)
++++ System.Core-2008.csproj	(working copy)
+@@ -74,6 +74,9 @@
+     <Compile Include="System.Linq.Expressions\TypeBinaryExpression.cs" />
+     <Compile Include="System.Linq.Expressions\UnaryExpression.cs" />
+     <Compile Include="System.Linq\Check.cs" />
++    <Compile Include="System.Linq\EnumerableAsQueryable.cs" />
++    <Compile Include="System.Linq\ExpressionTransformer.cs" />
++    <Compile Include="System.Linq\QueryableExpressionTransformer.cs" />
+     <Compile Include="System.Linq\QuickSort.cs" />
+     <Compile Include="System.Linq\SortSequenceContext.cs" />
+     <Compile Include="System.Linq\SortContext.cs" />
+Index: System.Core.dll.sources
+===================================================================
+--- System.Core.dll.sources	(revision 103217)
++++ System.Core.dll.sources	(working copy)
+@@ -15,6 +15,8 @@
+ System.Runtime.CompilerServices/StrongBox_T.cs
+ System.Linq/Check.cs
+ System.Linq/Enumerable.cs
++System.Linq/EnumerableAsQueryable.cs
++System.Linq/ExpressionTransformer.cs
+ System.Linq/Grouping.cs
+ System.Linq/IGrouping.cs
+ System.Linq/IOrderedQueryable.cs
+@@ -28,6 +30,7 @@
+ System.Linq/OrderedSequence.cs
+ System.Linq/Queryable.cs
+ System.Linq/QuickSort.cs
++System.Linq/QueryableExpressionTransformer.cs
+ System.Linq/SortContext.cs
+ System.Linq/SortDirection.cs
+ System.Linq/SortSequenceContext.cs
+Index: System.Core_test.dll.sources
+===================================================================
+--- System.Core_test.dll.sources	(revision 103217)
++++ System.Core_test.dll.sources	(working copy)
+@@ -2,6 +2,7 @@
+ System/TimeZoneInfo.AdjustmentRuleTest.cs
+ System/TimeZoneInfo.TransitionTimeTest.cs
+ System.Collections.Generic/HashSetTest.cs
++System.Linq/EnumerableAsQueryableTest.cs
+ System.Linq/EnumerableTest.cs
+ System.Linq/EnumerableMoreTest.cs
+ System.Linq.Expressions/ExpressionTest.cs
+Index: System.Linq/EnumerableAsQueryable.cs
+===================================================================
+--- System.Linq/EnumerableAsQueryable.cs	(revision 0)
++++ System.Linq/EnumerableAsQueryable.cs	(revision 0)
+@@ -0,0 +1,66 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Linq.Expressions;
++
++namespace System.Linq
++{
++	internal class EnumerableAsQueryable<TElement> : IQueryable<TElement>, IQueryProvider, IOrderedQueryable<TElement>
++	{		
++		Expression expression;
++
++		public EnumerableAsQueryable (Expression expression) {
++			this.expression = expression;
++		}
++
++		public Type ElementType {
++			get { return expression.Type; }
++		}
++
++		public Expression Expression {
++			get { return expression; }
++		}
++
++		public IQueryProvider Provider {
++			get { return this; }
++		}
++
++		public System.Collections.IEnumerator GetEnumerator () 
++		{			
++			return ((IEnumerable<TElement>)this).GetEnumerator ();
++		}
++
++		IEnumerator<TElement> IEnumerable<TElement>.GetEnumerator () 
++		{
++			return Execute<IEnumerable<TElement>> (Expression).GetEnumerator ();
++		}
++
++		public IQueryable CreateQuery (System.Linq.Expressions.Expression expression) 
++		{
++			return (IQueryable) Activator.CreateInstance (
++				typeof (EnumerableAsQueryable<>).MakeGenericType (expression.Type.GetGenericArguments()[0]), expression);			
++		}
++
++		public object Execute (System.Linq.Expressions.Expression expression) 
++		{
++			QueryableExpressionTransformer visitor = new QueryableExpressionTransformer ();
++			Expression body = visitor.Transform (expression);
++			LambdaExpression lambda = Expression.Lambda (body);			
++			return lambda.Compile ().DynamicInvoke();
++		}
++
++		public IQueryable<TElem> CreateQuery<TElem> (System.Linq.Expressions.Expression expression) 
++		{
++			return new EnumerableAsQueryable<TElem> (expression);
++		}
++
++		public TResult Execute<TResult> (System.Linq.Expressions.Expression expression) 
++		{
++			QueryableExpressionTransformer visitor = new QueryableExpressionTransformer ();
++			Expression body = visitor.Transform (expression);
++			Expression<Func<TResult>> lambda = Expression.Lambda<Func<TResult>> (body);
++			return lambda.Compile () ();
++		}
++	}
++}
+Index: System.Linq/ExpressionTransformer.cs
+===================================================================
+--- System.Linq/ExpressionTransformer.cs	(revision 0)
++++ System.Linq/ExpressionTransformer.cs	(revision 0)
+@@ -0,0 +1,293 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Linq.Expressions;
++using System.Text;
++using System.Collections.ObjectModel;
++
++namespace System.Linq
++{
++	abstract class ExpressionTransformer
++	{
++
++		protected ExpressionTransformer ()
++		{
++		}
++
++		public Expression Transform (Expression e)
++		{
++			return Visit (e);
++		}
++
++		protected virtual Expression Visit (Expression expression)
++		{
++			if (expression == null)
++				return null;
++
++			switch (expression.NodeType) {
++			case ExpressionType.Negate:
++			case ExpressionType.NegateChecked:
++			case ExpressionType.Not:
++			case ExpressionType.Convert:
++			case ExpressionType.ConvertChecked:
++			case ExpressionType.ArrayLength:
++			case ExpressionType.Quote:
++			case ExpressionType.TypeAs:
++			case ExpressionType.UnaryPlus:
++				return VisitUnary ((UnaryExpression) expression);
++			case ExpressionType.Add:
++			case ExpressionType.AddChecked:
++			case ExpressionType.Subtract:
++			case ExpressionType.SubtractChecked:
++			case ExpressionType.Multiply:
++			case ExpressionType.MultiplyChecked:
++			case ExpressionType.Divide:
++			case ExpressionType.Modulo:
++			case ExpressionType.Power:
++			case ExpressionType.And:
++			case ExpressionType.AndAlso:
++			case ExpressionType.Or:
++			case ExpressionType.OrElse:
++			case ExpressionType.LessThan:
++			case ExpressionType.LessThanOrEqual:
++			case ExpressionType.GreaterThan:
++			case ExpressionType.GreaterThanOrEqual:
++			case ExpressionType.Equal:
++			case ExpressionType.NotEqual:
++			case ExpressionType.Coalesce:
++			case ExpressionType.ArrayIndex:
++			case ExpressionType.RightShift:
++			case ExpressionType.LeftShift:
++			case ExpressionType.ExclusiveOr:
++				return VisitBinary ((BinaryExpression) expression);
++			case ExpressionType.TypeIs:
++				return VisitTypeIs ((TypeBinaryExpression) expression);
++			case ExpressionType.Conditional:
++				return VisitConditional ((ConditionalExpression) expression);
++			case ExpressionType.Constant:
++				return VisitConstant ((ConstantExpression) expression);
++			case ExpressionType.Parameter:
++				return VisitParameter ((ParameterExpression) expression);
++			case ExpressionType.MemberAccess:
++				return VisitMemberAccess ((MemberExpression) expression);
++			case ExpressionType.Call:
++				return VisitMethodCall ((MethodCallExpression) expression);
++			case ExpressionType.Lambda:
++				return VisitLambda ((LambdaExpression) expression);
++			case ExpressionType.New:
++				return VisitNew ((NewExpression) expression);
++			case ExpressionType.NewArrayInit:
++			case ExpressionType.NewArrayBounds:
++				return VisitNewArray ((NewArrayExpression) expression);
++			case ExpressionType.Invoke:
++				return VisitInvocation ((InvocationExpression) expression);
++			case ExpressionType.MemberInit:
++				return VisitMemberInit ((MemberInitExpression) expression);
++			case ExpressionType.ListInit:
++				return VisitListInit ((ListInitExpression) expression);
++			default:
++				throw new ArgumentException (string.Format ("Unhandled expression type: '{0}'", expression.NodeType));
++			}
++		}
++
++		protected virtual MemberBinding VisitBinding (MemberBinding binding)
++		{
++			switch (binding.BindingType) {
++			case MemberBindingType.Assignment:
++				return VisitMemberAssignment ((MemberAssignment) binding);				
++			case MemberBindingType.MemberBinding:
++				return VisitMemberMemberBinding ((MemberMemberBinding) binding);
++			case MemberBindingType.ListBinding:
++				return VisitMemberListBinding ((MemberListBinding) binding);
++			default:
++				throw new ArgumentException (string.Format ("Unhandled binding type '{0}'", binding.BindingType));
++			}
++		}
++
++		protected virtual ElementInit VisitElementInitializer (ElementInit initializer)
++		{
++			ReadOnlyCollection<Expression> transformed = VisitExpressionList (initializer.Arguments);
++			if (transformed != initializer.Arguments)
++				return Expression.ElementInit (initializer.AddMethod, transformed);
++			return initializer;
++		}
++
++		protected virtual UnaryExpression VisitUnary (UnaryExpression unary)
++		{
++			Expression transformedOperand = Visit (unary.Operand);
++			if (transformedOperand != unary.Operand)
++				return Expression.MakeUnary (unary.NodeType, transformedOperand, unary.Type, unary.Method);
++			return unary;
++		}
++
++		protected virtual BinaryExpression VisitBinary (BinaryExpression binary)
++		{
++			Expression left = Visit (binary.Left);
++			Expression right = Visit (binary.Right);
++			LambdaExpression conversion = VisitLambda (binary.Conversion);
++			if (left != binary.Left || right != binary.Right || conversion != binary.Conversion)
++				return Expression.MakeBinary (binary.NodeType, left, right, binary.IsLiftedToNull, binary.Method, conversion);
++			return binary;
++		}
++
++		protected virtual TypeBinaryExpression VisitTypeIs (TypeBinaryExpression type)
++		{
++			Expression inner = Visit (type.Expression);
++			if (inner != type.Expression)
++				return Expression.TypeIs (inner, type.TypeOperand);
++			return type;
++		}
++
++		protected virtual ConstantExpression VisitConstant (ConstantExpression constant)
++		{
++			return constant;
++		}
++
++		protected virtual ConditionalExpression VisitConditional (ConditionalExpression conditional)
++		{
++			Expression test = Visit (conditional.Test);
++			Expression ifTrue = Visit (conditional.IfTrue);
++			Expression ifFalse = Visit (conditional.IfFalse);
++			if (test != conditional.Test || ifTrue != conditional.IfTrue || ifFalse != conditional.IfFalse)
++				return Expression.Condition (test, ifTrue, ifFalse);
++			return conditional;
++		}
++
++		protected virtual ParameterExpression VisitParameter (ParameterExpression parameter)
++		{
++			return parameter;
++		}
++
++		protected virtual MemberExpression VisitMemberAccess (MemberExpression member)
++		{
++			Expression memberExp = Visit (member.Expression);
++			if (memberExp != member.Expression)
++				return Expression.MakeMemberAccess (memberExp, member.Member);
++			return member;
++		}
++
++		protected virtual MethodCallExpression VisitMethodCall (MethodCallExpression methodCall)
++		{
++			Expression instance = Visit (methodCall.Object);
++			ReadOnlyCollection<Expression> args = VisitExpressionList (methodCall.Arguments);
++			if (instance != methodCall.Object || args != methodCall.Arguments)
++				return Expression.Call (instance, methodCall.Method, args);
++			return methodCall;
++		}		
++
++		protected virtual ReadOnlyCollection<Expression> VisitExpressionList (ReadOnlyCollection<Expression> list)
++		{
++			return VisitExpressionList<Expression> (list, Visit);		
++		}
++
++		private ReadOnlyCollection<T> VisitExpressionList<T> (ReadOnlyCollection<T> list, Func<T,T> selector) where T :class
++		{
++			int index = 0;
++			T [] arr = null;
++			foreach (T e in list) {
++				T visited = selector (e);
++				if (visited != e || arr != null) {
++					if (arr == null)
++						arr = new T [list.Count];
++					arr [index] = visited;
++				}
++				index++;
++			}
++			if (arr != null)
++				return arr.ToReadOnlyCollection ();
++			return list;
++		}
++
++		protected virtual MemberAssignment VisitMemberAssignment (MemberAssignment assignment)
++		{
++			Expression inner = Visit (assignment.Expression);
++			if (inner != assignment.Expression)
++				return Expression.Bind (assignment.Member, inner);
++			return assignment;
++		}
++
++		protected virtual MemberMemberBinding VisitMemberMemberBinding (MemberMemberBinding binding)
++		{
++			ReadOnlyCollection<MemberBinding> bindingExp = VisitBindingList (binding.Bindings);
++			if (bindingExp != binding.Bindings)
++				return Expression.MemberBind (binding.Member, bindingExp);
++			return binding;
++		}
++
++		protected virtual MemberListBinding VisitMemberListBinding (MemberListBinding binding)
++		{
++			ReadOnlyCollection<ElementInit> initializers = 
++				VisitElementInitializerList (binding.Initializers);
++			if (initializers != binding.Initializers)
++				return Expression.ListBind (binding.Member, initializers);
++			return binding;
++		}
++
++		protected virtual ReadOnlyCollection<MemberBinding> VisitBindingList (ReadOnlyCollection<MemberBinding> list)
++		{
++			return VisitExpressionList<MemberBinding> (list, VisitBinding);
++		}
++
++		protected virtual ReadOnlyCollection<ElementInit> VisitElementInitializerList (ReadOnlyCollection<ElementInit> list)
++		{
++			return VisitExpressionList<ElementInit> (list, VisitElementInitializer);
++		}
++
++		protected virtual LambdaExpression VisitLambda (LambdaExpression lambda)
++		{
++			Expression body = Visit (lambda.Body);
++			ReadOnlyCollection<ParameterExpression> parameters = 
++				VisitExpressionList<ParameterExpression> (lambda.Parameters, VisitParameter);
++			if (body != lambda.Body || parameters != lambda.Parameters)
++				return Expression.Lambda (body, parameters.ToArray());
++			return lambda;
++		}
++
++		protected virtual NewExpression VisitNew (NewExpression nex)
++		{
++			ReadOnlyCollection<Expression> args = VisitExpressionList (nex.Arguments, Visit);
++			if (args != nex.Arguments)
++				return Expression.New (nex.Constructor, args);
++			return nex;
++		}
++
++		protected virtual MemberInitExpression VisitMemberInit (MemberInitExpression init)
++		{
++			NewExpression  newExp = VisitNew (init.NewExpression);
++			ReadOnlyCollection<MemberBinding> bindings = VisitBindingList (init.Bindings);
++			if (newExp != init.NewExpression || bindings != init.Bindings)
++				return Expression.MemberInit (newExp, bindings);
++			return init;
++		}
++
++		protected virtual ListInitExpression VisitListInit (ListInitExpression init)
++		{
++			NewExpression newExp = VisitNew (init.NewExpression);
++			ReadOnlyCollection<ElementInit> initializers = VisitElementInitializerList (init.Initializers);
++			if (newExp != init.NewExpression || initializers != init.Initializers)
++				return Expression.ListInit (newExp, initializers.ToArray());
++			return init;
++		}
++
++		protected virtual NewArrayExpression VisitNewArray (NewArrayExpression newArray)
++		{
++			ReadOnlyCollection<Expression> expressions = VisitExpressionList (newArray.Expressions);
++			if (expressions != newArray.Expressions) {
++				if (newArray.NodeType == ExpressionType.NewArrayBounds)
++					return Expression.NewArrayBounds (newArray.Type, expressions);
++				else
++					return Expression.NewArrayInit (newArray.Type, expressions);
++			}
++			return newArray;
++		}
++
++		protected virtual InvocationExpression VisitInvocation (InvocationExpression invocation)
++		{
++			ReadOnlyCollection<Expression> args = VisitExpressionList (invocation.Arguments);
++			Expression invocationExp = Visit (invocation.Expression);
++			if (args != invocation.Arguments || invocationExp != invocation.Expression)
++				return Expression.Invoke (invocationExp, args);
++			return invocation;
++		}
++	}
++}
+Index: System.Linq/Queryable.cs
+===================================================================
+--- System.Linq/Queryable.cs	(revision 103217)
++++ System.Linq/Queryable.cs	(working copy)
+@@ -144,7 +144,7 @@
+ 			if (queryable != null)
+ 				return queryable;
+ 
+-			throw new NotImplementedException ();
++			return new EnumerableAsQueryable<TElement> (new ConstantExpression (source, typeof (IQueryable<TElement>)));
+ 		}
+ 
+ 		[MonoTODO]
+Index: System.Linq/QueryableExpressionTransformer.cs
+===================================================================
+--- System.Linq/QueryableExpressionTransformer.cs	(revision 0)
++++ System.Linq/QueryableExpressionTransformer.cs	(revision 0)
+@@ -0,0 +1,144 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Linq.Expressions;
++using System.Reflection;
++using System.Runtime.CompilerServices;
++using System.Collections.ObjectModel;
++
++namespace System.Linq
++{
++	internal class QueryableExpressionTransformer : ExpressionTransformer
++	{		
++
++		internal QueryableExpressionTransformer () {}
++		
++		protected override MethodCallExpression VisitMethodCall (MethodCallExpression methodCall) 
++		{			
++			if ( IsQueryableExtension ( methodCall.Method ))
++			{
++				return ReplaceIQueryableMethod (methodCall);
++			}
++			return base.VisitMethodCall (methodCall);
++		}
++
++		protected override LambdaExpression VisitLambda (LambdaExpression lambda) 
++		{
++			return lambda;
++		}			
++
++		bool IsQueryableExtension (MethodInfo method) 
++		{
++			return	method.GetCustomAttributes(typeof(ExtensionAttribute), false).Count() > 0 &&					
++					typeof(IQueryable).IsAssignableFrom( method.GetParameters () [0].ParameterType );
++		}
++
++		MethodCallExpression ReplaceIQueryableMethod (MethodCallExpression oldCall)
++		{			
++			Expression target = null;
++			if (oldCall.Object != null){
++				target = Visit (oldCall.Object);
++			}			
++			MethodInfo newMethod = ReplaceIQueryableMethodInfo(oldCall.Method);
++
++			Expression [] args = new Expression [oldCall.Arguments.Count];
++			int counter = 0;
++			foreach (Expression e in oldCall.Arguments) {				
++				Type methodParam = newMethod.GetParameters() [counter].ParameterType;				
++				args [counter++] = ReplaceQuotedLambdaIfNeeded(Visit (e), methodParam);
++			}
++			ReadOnlyCollection<Expression> col = args.ToReadOnlyCollection();
++			MethodCallExpression newMethodCall = new MethodCallExpression (target, newMethod, col);
++			return newMethodCall;
++		}
++
++		static Expression ReplaceQuotedLambdaIfNeeded (Expression e, Type delegateType)
++		{
++			UnaryExpression unary = e as UnaryExpression;
++			if (unary != null) {
++				LambdaExpression lambda = unary.Operand as LambdaExpression;
++				if (lambda != null && lambda.Type == delegateType)
++					return lambda;
++			}
++			return e;
++		}
++
++		static MethodInfo ReplaceIQueryableMethodInfo (MethodInfo qm) 
++		{
++			Type typeToSearch = qm.DeclaringType == typeof (Queryable) ? typeof (Enumerable) : qm.DeclaringType;
++			MethodInfo result = GetMatchingMethod (qm, typeToSearch);			
++			if (result == null)
++				throw new InvalidOperationException (
++					string.Format("There is no method {0} on type {1} that matches the specified arguments", 
++						qm.Name, 
++						qm.DeclaringType.FullName));
++			return result;
++		}
++
++		static MethodInfo GetMatchingMethod (MethodInfo qm, Type fromType)
++		{
++			return (from em in fromType.GetMethods ()
++					where Match (em, qm)
++					select em.MakeGenericMethod (qm.GetGenericArguments ()))
++								 .FirstOrDefault ();
++		}
++
++		static bool Match (MethodInfo em, MethodInfo qm) {
++
++			if (em.GetCustomAttributes (typeof (ExtensionAttribute), false).Count() == 0)
++				return false;
++
++			if (em.Name != qm.Name)
++				return false;			
++
++			if (em.GetGenericArguments ().Length != qm.GetGenericArguments ().Length)
++				return false;			
++
++			Type [] parameters = (from p in qm.GetParameters () select p.ParameterType).ToArray ();
++			Type returnType = qm.ReturnType;
++			
++			if (parameters.Length != em.GetParameters ().Length)
++				return false;
++
++			MethodInfo instanceMethod = em;
++			if (qm.IsGenericMethod) {
++				if (!qm.IsGenericMethod)
++					return false;
++				if (em.GetParameters ().Length != qm.GetParameters ().Length)
++					return false;
++				Type [] genArgs = qm.GetGenericArguments ();
++				instanceMethod = em.MakeGenericMethod (genArgs);
++			}
++
++			Type [] enumerableParams = (from p in instanceMethod.GetParameters () select p.ParameterType).ToArray ();
++
++			if (enumerableParams [0] != ConvertParameter (parameters [0]))
++				return false;
++			for (int i = 1; i < enumerableParams.Length; ++i)
++				if (!ArgumentMatch(enumerableParams [i], parameters [i]))
++					return false;
++			if (!ArgumentMatch(instanceMethod.ReturnType, returnType))
++				return false;
++			return true;
++		}
++
++		static bool ArgumentMatch (Type enumerableParam, Type queryableParam)
++		{
++			return enumerableParam == queryableParam || enumerableParam == ConvertParameter (queryableParam);
++		}
++
++		static Type ConvertParameter (Type type) 
++		{
++			if (type.IsGenericType && type.GetGenericTypeDefinition () == typeof (IQueryable<>))
++				type = typeof (IEnumerable<>).MakeGenericType (type.GetGenericArguments ());
++			else if (type.IsGenericType && type.GetGenericTypeDefinition () == typeof (IOrderedQueryable<>))
++				type = typeof (IOrderedEnumerable<>).MakeGenericType (type.GetGenericArguments ());
++			else if (type.IsGenericType && type.GetGenericTypeDefinition () == typeof (Expression<>))
++				type = type.GetGenericArguments () [0];
++			else if (type == typeof (IQueryable))
++				type = typeof (System.Collections.IEnumerable);
++			return type;
++		}		
++	}
++}
+Index: Test/System.Linq/EnumerableAsQueryableTest.cs
+===================================================================
+--- Test/System.Linq/EnumerableAsQueryableTest.cs	(revision 0)
++++ Test/System.Linq/EnumerableAsQueryableTest.cs	(revision 0)
+@@ -0,0 +1,409 @@
++﻿using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using NUnit.Framework;
++using System.Linq.Expressions;
++using System.Runtime.CompilerServices;
++using System.Reflection;
++
++namespace MonoTests.System.Linq {
++
++	[TestFixture]
++	public class EnumerableAsQueryableTest {
++
++		int [] _array;
++		IQueryable<int> _src;
++
++		[SetUp]
++		public void MyTestCleanup ()
++		{
++			_array = new int [] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
++			_src = _array.AsQueryable<int> ();
++		}
++
++		[Test]
++		public void Aggregate () 
++		{
++			Assert.AreEqual (_src.Aggregate<int> ((n, m) => n + m), _array.Aggregate<int> ((n, m) => n + m));
++		}
++
++		[Test]
++		public void All ()
++		{
++			Assert.AreEqual (_src.All<int> ((n) => n < 11), _array.All<int> ((n) => n < 11));
++			Assert.AreEqual (_src.All<int> ((n) => n < 10), _array.All<int> ((n) => n < 10));
++		}
++
++		[Test]
++		public void Any ()
++		{
++			Assert.AreEqual (_src.Any<int> (i => i > 5), _array.Any<int> (i => i > 5));
++		}
++
++		[Test]
++		public void Average ()
++		{
++			Assert.AreEqual (_src.Average<int> ((n) => 11), _array.Average<int> ((n) => 11));
++		}		
++
++		[Test]
++		public void Concat ()
++		{
++			Assert.AreEqual (_src.Concat<int> (_src).Count (), _array.Concat<int> (_src).Count ());
++		}
++
++		[Test]
++		public void Contains ()
++		{
++
++			for (int i = 1; i < 20; ++i)
++				Assert.AreEqual (_src.Contains<int> (i), _array.Contains<int> (i));
++		}
++
++		[Test]
++		public void Count ()
++		{
++			Assert.AreEqual (_src.Count<int> (), _array.Count<int> ());
++		}
++
++
++		[Test]
++		public void Distinct ()
++		{
++			Assert.AreEqual (_src.Distinct<int> ().Count (), _array.Distinct<int> ().Count ());
++			Assert.AreEqual (_src.Distinct<int> (new CustomEqualityComparer ()).Count (), _array.Distinct<int> (new CustomEqualityComparer ()).Count ());
++		}
++
++		[Test]
++		public void ElementAt ()
++		{
++			for (int i = 0; i < 10; ++i)
++				Assert.AreEqual (_src.ElementAt<int> (i), _array.ElementAt<int> (i));			
++		}
++
++		[Test]
++		public void ElementAtOrDefault ()
++		{
++			for (int i = 0; i < 10; ++i)
++				Assert.AreEqual (_src.ElementAtOrDefault<int> (i), _array.ElementAtOrDefault<int> (i));
++			Assert.AreEqual (_src.ElementAtOrDefault<int> (100), _array.ElementAtOrDefault<int> (100));
++		}
++
++		[Test]
++		public void Except ()
++		{
++			int [] except = { 1, 2, 3 };
++			Assert.AreEqual (_src.Except<int> (except.AsQueryable ()).Count (), _array.Except<int> (except).Count ());
++		}
++
++		[Test]
++		public void First ()
++		{
++			Assert.AreEqual (_src.First<int> (), _array.First<int> ());
++		}
++
++		[Test]
++		public void FirstOrDefault ()
++		{
++			Assert.AreEqual (_src.FirstOrDefault<int> ((n) => n > 5), _array.FirstOrDefault<int> ((n) => n > 5));
++			Assert.AreEqual (_src.FirstOrDefault<int> ((n) => n > 10), _array.FirstOrDefault<int> ((n) => n > 10));
++		}
++
++		[Test]
++		public void GroupBy ()
++		{
++			IQueryable<IGrouping<bool, int>> grouping = _src.GroupBy<int, bool> ((n) => n > 5);
++			Assert.AreEqual (grouping.Count(), 2);
++			foreach (IGrouping<bool, int> group in grouping) 
++			{
++				Assert.AreEqual(group.Count(), 5);				
++			}
++		}
++
++		[Test]
++		public void Intersect ()
++		{
++			int [] subset = { 1, 2, 3 };
++			int[] intersection = _src.Intersect<int> (subset.AsQueryable()).ToArray();
++			Assert.AreEqual (subset, intersection);
++		}
++
++		[Test]
++		public void Last ()
++		{
++			Assert.AreEqual (_src.Last<int> ((n) => n > 1), _array.Last<int> ((n) => n > 1));			
++		}
++
++		[Test]
++		public void LastOrDefault ()
++		{
++			Assert.AreEqual (_src.LastOrDefault<int> (), _array.LastOrDefault<int> ());			
++		}
++
++		[Test]
++		public void LongCount ()
++		{
++			Assert.AreEqual (_src.LongCount<int> (), _array.LongCount<int> ());			
++		}
++
++		[Test]
++		public void Max ()
++		{
++			Assert.AreEqual (_src.Max<int> (), _array.Max<int> ());
++		}
++
++		[Test]
++		public void Min ()
++		{
++			Assert.AreEqual (_src.Min<int> (), _array.Min<int> ());			
++		}
++
++		[Test]
++		public void OfType ()
++		{
++			Assert.AreEqual (_src.OfType<int> ().Count (), _array.OfType<int> ().Count ());			
++		}
++
++		[Test]
++		public void OrderBy () 
++		{
++			int [] arr1 = _array.OrderBy<int, int> ((n) => n * -1).ToArray ();
++			int [] arr2 = _src.OrderBy<int, int> ((n) => n * -1).ToArray ();
++			Assert.AreEqual (arr1, arr2);
++		}
++
++		[Test]
++		public void OrderByDescending ()
++		{
++			int [] arr1 = _array.OrderBy<int, int> ((n) => n).ToArray ();
++			int [] arr2 = _src.OrderBy<int, int> ((n) => n).ToArray ();
++			Assert.AreEqual (arr1, arr2);
++		}
++
++		[Test]
++		public void Reverse ()
++		{
++			int [] arr1 = _array.Reverse<int> ().Reverse ().ToArray ();
++			int [] arr2 = _src.Reverse<int> ().Reverse ().ToArray ();
++			Assert.AreEqual (arr1, arr2);
++		}
++
++		[Test]
++		public void Select ()
++		{
++			int [] arr1 = _array.Select<int, int> ((n) => n - 1).ToArray ();
++			int [] arr2 = _src.Select<int, int> ((n) => n - 1).ToArray ();
++			Assert.AreEqual (arr1, arr2);		
++		}
++
++		[Test]
++		public void SelectMany ()
++		{
++			int [] arr1 = _array.SelectMany<int, int> ((n) => new int [] { n, n, n }).ToArray ();
++			int [] arr2 = _src.SelectMany<int, int> ((n) => new int [] { n, n, n }).ToArray ();
++			Assert.AreEqual (arr1, arr2);			
++		}
++
++		[Test]
++		public void SequenceEqual ()
++		{
++			Assert.IsTrue (_src.SequenceEqual<int> (_src));			
++		}
++
++		[Test]
++		public void Single ()
++		{
++			Assert.AreEqual (_src.Single (n => n == 10), 10);			
++		}
++
++		[Test]
++		public void SingleOrDefault ()
++		{
++			Assert.AreEqual (_src.SingleOrDefault (n => n == 10), 10);
++			Assert.AreEqual (_src.SingleOrDefault (n => n == 11), 0);
++		}
++
++		[Test]
++		public void Skip ()
++		{
++			int [] arr1 = _array.Skip<int> (5).ToArray ();
++			int [] arr2 = _src.Skip<int> (5).ToArray ();
++			Assert.AreEqual (arr1, arr2);			
++		}
++
++		[Test]
++		public void SkipWhile ()
++		{
++			int[] arr1 = _src.SkipWhile<int> ((n) => n < 6).ToArray();
++			int[] arr2 = _src.Skip<int> (5).ToArray();
++			Assert.AreEqual (arr1, arr2);			
++		}
++
++		[Test]
++		public void Sum ()
++		{
++			Assert.AreEqual (_src.Sum<int> ((n) => n), _array.Sum<int> ((n) => n));
++			Assert.AreEqual (_src.Sum<int> ((n) => n + 1), _array.Sum<int> ((n) => n + 1));	
++		}
++
++		[Test]
++		public void Take ()
++		{
++			int [] arr1 = _array.Take<int> (3).ToArray ();
++			int [] arr2 = _src.Take<int> (3).ToArray ();
++			Assert.AreEqual (arr1, arr2);
++		}
++
++
++		[Test]
++		public void TakeWhile () 
++		{
++			int [] arr1 = _array.TakeWhile<int> (n => n < 6).ToArray ();
++			int [] arr2 = _src.TakeWhile<int> (n => n < 6).ToArray ();
++			Assert.AreEqual (arr1, arr2);
++		}
++
++		[Test]
++		public void Union ()
++		{
++			int [] arr1 = _src.ToArray ();
++			int[] arr2 = _src.Union (_src).ToArray ();
++			Assert.AreEqual (arr1, arr2);
++
++			int [] arr = { 11,12,13};
++			Assert.AreEqual (_src.Union (arr).ToArray (), _array.Union (arr).ToArray ());
++			//int [] union = _src.Union (arr).ToArray ();
++			//Assert.AreEqual (union.Length, 13);
++			//for (int i = 0; i < 13; ++i)
++			//    Assert.AreEqual (union [i], i + 1);
++		}
++
++		[Test]
++		public void Where ()
++		{
++			int[] oddArray1 = _array.Where<int> ((n) => (n % 2) == 1).ToArray();
++			int [] oddArray2 = _src.Where<int> ((n) => (n % 2) == 1).ToArray ();
++			Assert.AreEqual (oddArray1, oddArray2);
++		}
++
++		[Test]
++		public void UserExtensionMethod ()
++		{
++			BindingFlags extensionFlags = BindingFlags.Static | BindingFlags.Public;			
++			MethodInfo method = (from m in typeof (Ext).GetMethods (extensionFlags)
++								 where (m.Name == "UserQueryableExt1" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
++								 select m).FirstOrDefault ().MakeGenericMethod (typeof (int));
++			Expression<Func<int, int>> exp = i => i;
++			Expression e = Expression.Equal (
++									Expression.Constant ("UserEnumerableExt1"),
++									Expression.Call (method, _src.Expression, Expression.Quote (exp)));
++			Assert.AreEqual (_src.Provider.Execute<bool> (e), true, "UserQueryableExt1");
++
++			method = (from m in typeof (Ext).GetMethods (extensionFlags)
++							   where (m.Name == "UserQueryableExt2" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
++							   select m).FirstOrDefault ().MakeGenericMethod (typeof (int));
++			e = Expression.Equal (
++									Expression.Constant ("UserEnumerableExt2"),
++									Expression.Call (method, _src.Expression, Expression.Quote (exp)));
++			Assert.AreEqual (_src.Provider.Execute<bool> (e), true, "UserQueryableExt2");
++		}
++
++		[Test]
++		[ExpectedException (typeof (InvalidOperationException))]
++		public void UserExtensionMethodNegative ()
++		{
++			BindingFlags extensionFlags = BindingFlags.Static | BindingFlags.Public;
++			MethodInfo method = (from m in typeof (Ext).GetMethods (extensionFlags)
++								 where (m.Name == "UserQueryableExt3" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
++								 select m).FirstOrDefault ().MakeGenericMethod (typeof (int));
++			Expression<Func<int, int>> exp = i => i;
++			Expression e = Expression.Call (method, _src.Expression, Expression.Quote (exp), Expression.Constant (10));
++			_src.Provider.Execute (e);
++		}
++
++		[Test]		
++		public void NonGenericMethod () {
++			BindingFlags extensionFlags = BindingFlags.Static | BindingFlags.Public;
++			MethodInfo method = (from m in typeof (Ext).GetMethods (extensionFlags)
++								 where (m.Name == "NonGenericMethod" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
++								 select m).FirstOrDefault ();
++			Expression<Func<int, int>> exp = i => i;
++			Expression e = Expression.Call (method, _src.Expression);
++			Assert.AreEqual (_src.Provider.Execute (e), "EnumerableNonGenericMethod", "NonGenericMethod");
++		}
++
++		[Test]
++		[ExpectedException(typeof(InvalidOperationException))]
++		public void InstantiatedGenericMethod () {
++			BindingFlags extensionFlags = BindingFlags.Static | BindingFlags.Public;
++			MethodInfo method = (from m in typeof (Ext).GetMethods (extensionFlags)
++								 where (m.Name == "InstantiatedGenericMethod" && m.GetParameters () [0].ParameterType.GetGenericTypeDefinition () == typeof (IQueryable<>))
++								 select m).FirstOrDefault ().MakeGenericMethod (typeof (int));
++			Expression<Func<int, int>> exp = i => i;
++			Expression e = Expression.Call (method, _src.Expression, Expression.Constant(0));
++			_src.Provider.Execute (e);
++		}
++	}
++
++	class CustomEqualityComparer : IEqualityComparer<int> {		
++
++		public bool Equals (int x, int y)
++		{
++			return true;			
++		}
++
++		public int GetHashCode (int obj)
++		{
++			return 0;
++		}		
++	}
++
++	public static class Ext {
++		
++		public static string UserQueryableExt1<T> (this IQueryable<T> e, Expression<Func<int, int>> ex)
++		{
++			return "UserQueryableExt1";
++		}
++
++		public static string UserQueryableExt2<T> (this IQueryable<T> e, Expression<Func<int, int>> ex)
++		{
++			return "UserQueryableExt2";
++		}
++
++		public static string UserQueryableExt3<T> (this IQueryable<T> e, Expression<Func<int, int>> ex, int dummy)
++		{
++			return "UserQueryableExt3";
++		}
++
++		public static string UserQueryableExt1<T> (this IEnumerable<T> e, Expression<Func<int, int>> ex)
++		{
++			return "UserEnumerableExt1";
++		}
++
++		public static string UserQueryableExt2<T> (this IEnumerable<T> e, Func<int, int> ex)
++		{
++			return "UserEnumerableExt2";
++		}
++
++		public static string NonGenericMethod (this IQueryable<int> iq) 
++		{
++			return "QueryableNonGenericMethod";
++		}
++
++		public static string NonGenericMethod (this IEnumerable<int> iq) 
++		{
++			return "EnumerableNonGenericMethod";
++		}
++
++		public static string InstantiatedGenericMethod<T> (this IQueryable<int> iq, T t) 
++		{
++			return "QueryableInstantiatedGenericMethod";
++		}
++
++		public static string InstantiatedGenericMethod (this IEnumerable<int> ie, int t) 
++		{
++			return "EnumerableInstantiatedGenericMethod";
++		}
++	}
++}

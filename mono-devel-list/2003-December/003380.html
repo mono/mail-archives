@@ -1,0 +1,197 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] Async bugs with Sockets
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Async%20bugs%20with%20Sockets&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="003377.html">
+   <LINK REL="Next"  HREF="003384.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] Async bugs with Sockets</H1>
+    <B>Brad Fitzpatrick</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20Async%20bugs%20with%20Sockets&In-Reply-To="
+       TITLE="[Mono-devel-list] Async bugs with Sockets">brad at danga.com
+       </A><BR>
+    <I>Sat Dec 27 20:09:29 EST 2003</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="003377.html">[Mono-devel-list] Re: Fwd: Re: Question regarding the bug 52399
+</A></li>
+        <LI>Next message: <A HREF="003384.html">[Mono-devel-list] Re: [PATCH] Async bugs with Sockets
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3380">[ date ]</a>
+              <a href="thread.html#3380">[ thread ]</a>
+              <a href="subject.html#3380">[ subject ]</a>
+              <a href="author.html#3380">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I'm writing a reverse-proxy load balancer and so far it's been
+amazingly easy with hardly any code, but I've been bitten by these two
+bugs:
+
+(Sorry, I can't reach bugzilla.ximian.com for the past couple days)
+
+
+Bug #1:
+
+None of the async methods in Socket.cs catch exceptions in the Worker
+thread and return them to the caller thread during the End* methods.
+
+
+Consider this simple example:
+
+        public static void Main ()
+        {
+            IPAddress ipOne = IPAddress.Parse(&quot;10.5.2.1&quot;);   // something bogus
+            IPEndPoint ipEP = new IPEndPoint(ipOne, 23483);  // something bogus
+            Socket pSock = new Socket(ipEP.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+
+            IAsyncResult ar = pSock.BeginConnect(ipEP, null, null);
+
+            try {
+                pSock.EndConnect(ar);  // should raise an exception because connect was bogus
+            } catch {
+                Console.WriteLine(&quot;connect error&quot;);
+                return;
+            }
+        }
+
+With Mono:
+
+$ ./AsyncErrorDemo2.exe
+
+Unhandled Exception: System.Net.Sockets.SocketException: Connection refused
+in (unmanaged) /usr/local/lib/libmono.so.0(mono_raise_exception+0x1f) [0x4008f15f]
+in (unmanaged) /usr/local/lib/libmono.so.0 [0x400afac5]
+in &lt;0x00028&gt; (wrapper managed-to-native) System.Net.Sockets.Socket:Connect_internal (intptr,System.Net.SocketAddress)
+in &lt;0x0004e&gt; System.Net.Sockets.Socket:Connect (System.Net.EndPoint)
+in &lt;0x0006c&gt; .Worker:Connect ()
+in &lt;0x00044&gt; (wrapper delegate-invoke) System.MulticastDelegate:invoke_void ()
+
+(Couldn't catch it)
+
+
+With .NET:
+
+$ ./AsyncErrorDemo2.exe
+connect error
+
+(correct)
+
+
+Proposed fix:
+
+In mcs-0.29/class/System/System.Net.Sockets/Socket.cs, add a member to
+SocketAsyncResult to hold the exception.  Then all the methods in the
+Worker class wrap their synchronous methods with try/catch, saving the
+exception in their SocketAsyncResult result.  Then the Socket.End* methods
+rethrow that exception if present.
+
+How do I go about submitting such a fix?  Are there subsystem maintainers,
+or do I just submit a patch to bugzilla/this list?  (I'm a mono hacker newbie)
+
+
+
+Bug #2:
+
+Socket.BeginConnect() is documented on MSDN to throw an exception
+synchronously if the socket isn't connected:
+
+   &quot;BeginSend will throw an exception if you do not first call Accept,
+    BeginAccept, Connect, or BeginConnect.&quot;
+
+And indeed:
+
+        public static void Main ()
+        {
+            IAsyncResult ar;
+
+            Console.WriteLine(&quot;demo start&quot;);
+
+            IPAddress ipOne = IPAddress.Parse(&quot;10.0.0.1&quot;);
+            IPEndPoint ipEP = new IPEndPoint(ipOne, 80);
+            Socket pSock = new Socket(ipEP.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+
+            byte[] buf = { 1, 1, 1 };
+            ar = pSock.BeginSend(buf, 0, buf.Length, SocketFlags.None, null, null);
+
+            int rv = -1;
+            try {
+                Console.WriteLine(&quot;demo middle (before EndSend)&quot;);
+                rv = pSock.EndSend(ar);
+                Console.WriteLine(&quot;EndSend() = {0}&quot;, rv);
+            } catch (Exception e) {
+                Console.WriteLine(&quot;exception: &quot; + e.ToString());
+            }
+
+            Console.WriteLine(&quot;demo end&quot;);
+
+        }
+
+
+Mono: (wrong)
+
+demo start
+
+Unhandled Exception: System.Net.Sockets.SocketException: The socket has been shut down
+in &lt;0x00102&gt; System.Net.Sockets.Socket:Send (byte[],int,int,System.Net.Sockets.SocketFlags)
+in &lt;0x00056&gt; .Worker:Send ()
+in &lt;0x00044&gt; (wrapper delegate-invoke) System.MulticastDelegate:invoke_void ()
+
+demo middle (before EndSend)
+
+&lt;... hangs, because worker thread is dead ...&gt;
+
+
+.NET:  (Correct)
+
+$ ./AsyncErrorDemo2.exe
+demo start
+
+Unhandled Exception: System.Net.Sockets.SocketException: A request to send or receive data was disallowed because the socket is not connected and (when sending on a datagram socket using a sendto call) no address was supplied
+   at System.Net.Sockets.Socket.BeginSend(Byte[] buffer, Int32 offset, Int32 size, SocketFlags socketFlags, AsyncCallback callback, Object state)
+   at Danga.AsyncErrorDemo2.Main()
+
+
+Also seems easy to fix.
+
+
+So, what's the best way to get fixes for these in?  I'm willing to do
+any legwork, unit tests, etc.  Just tell me what hoops to jump through
+and who to talk to.  I'm loving C# and Mono and want to help.
+
+
+-- 
+Brad Fitzpatrick
+<A HREF="http://www.danga.com/">http://www.danga.com/</A>
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">brad at danga.com</A>
+
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="003377.html">[Mono-devel-list] Re: Fwd: Re: Question regarding the bug 52399
+</A></li>
+	<LI>Next message: <A HREF="003384.html">[Mono-devel-list] Re: [PATCH] Async bugs with Sockets
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3380">[ date ]</a>
+              <a href="thread.html#3380">[ thread ]</a>
+              <a href="subject.html#3380">[ subject ]</a>
+              <a href="author.html#3380">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

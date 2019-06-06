@@ -1,0 +1,906 @@
+Index: mono/mono/metadata/ChangeLog
+===================================================================
+--- mono/mono/metadata/ChangeLog	(revision 63068)
++++ mono/mono/metadata/ChangeLog	(working copy)
+@@ -1,3 +1,10 @@
++2006-07-27  Jonathan Chambers  <joncham@gmail.com>
++
++	* object.c (mono_remote_class_vtable): Need to create proxy vtable
++	entries for __ComObject type in addition to ComImport types.
++	* marshal.c: Added support for marshalling COM RCWs. Fixed warning
++	about hash table.
++	
+ 2006-07-27  Miguel de Icaza  <miguel@novell.com>
+ 
+ 	* image.c (load_modules): Use the implmap table to find out which
+Index: mono/mono/metadata/object.c
+===================================================================
+--- mono/mono/metadata/object.c	(revision 63068)
++++ mono/mono/metadata/object.c	(working copy)
+@@ -1278,7 +1278,7 @@
+ 		MonoClass *klass;
+ 		type = ((MonoReflectionType *)rp->class_to_proxy)->type;
+ 		klass = mono_class_from_mono_type (type);
+-		if (MONO_CLASS_IS_IMPORT(klass) && !mono_class_vtable (mono_domain_get (), klass)->remote)
++		if ((MONO_CLASS_IS_IMPORT(klass) || klass == mono_defaults.com_object_class) && !mono_class_vtable (mono_domain_get (), klass)->remote)
+ 			remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_COMINTEROP);
+ 		else
+ 			remote_class->default_vtable = mono_class_proxy_vtable (domain, remote_class, MONO_REMOTING_TARGET_UNKNOWN);
+Index: mono/mono/metadata/marshal.c
+===================================================================
+--- mono/mono/metadata/marshal.c	(revision 63068)
++++ mono/mono/metadata/marshal.c	(working copy)
+@@ -2865,22 +2865,22 @@
+ {
+ 	MonoMethod *res;
+ 	GHashTable *cache;
++	MonoMethodBuilder *mb;
++	MonoMethodSignature *sig, *csig;
++
+ 	g_assert (method);
+ 
+ 	cache = method->klass->image->cominterop_wrapper_cache;
+ 	if ((res = mono_marshal_find_in_cache (cache, method)))
+ 		return res;
+ 
++	sig = mono_method_signature (method);
++	mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_COMINTEROP);
++
+ 	/* if method klass is import, that means method
+ 	 * is really a com call. let interop system emit it.
+ 	*/
+ 	if (MONO_CLASS_IS_IMPORT(method->klass)) {
+-		MonoMethodBuilder *mb;
+-		MonoMethodSignature *sig, *csig;
+-
+-		sig = mono_method_signature (method);
+-		mb = mono_mb_new (method->klass, method->name, MONO_WRAPPER_COMINTEROP);
+-
+ 		/* FIXME: we have to call actual class .ctor
+ 		 * instead of just __ComObject .ctor.
+ 		 */
+@@ -2947,18 +2947,20 @@
+ 			mono_mb_emit_byte (mb, CEE_RET);
+ 		}
+ 		
+-		csig = signature_dup (method->klass->image, sig);
+-		csig->pinvoke = 0;
+-		res = mono_mb_create_and_cache (cache, method,
+-										mb, csig, csig->param_count + 16);
+-		mono_mb_free (mb);
+-		return res;
++		
+ 	}
+ 	/* Does this case ever get hit? */
+ 	else {
+-		g_assert(0);
+-		return NULL;
++		char *msg = g_strdup ("non imported interfaces on \
++			imported classes is not yet implemented.");
++		mono_mb_emit_exception (mb, "NotSupportedException", msg);
+ 	}
++	csig = signature_dup (method->klass->image, sig);
++	csig->pinvoke = 0;
++	res = mono_mb_create_and_cache (cache, method,
++									mb, csig, csig->param_count + 16);
++	mono_mb_free (mb);
++	return res;
+ }
+ 
+ /**
+@@ -5714,8 +5716,39 @@
+ 		else if (spec && (spec->native == MONO_NATIVE_IUNKNOWN ||
+ 			spec->native == MONO_NATIVE_IDISPATCH ||
+ 			spec->native == MONO_NATIVE_INTERFACE)) {
+-			char *msg = g_strdup ("Marshalling of COM Objects is not yet implemented.");
+-			mono_mb_emit_exception_marshal_directive (mb, msg);
++			mono_mb_emit_ptr (mb, 0);
++			mono_mb_emit_stloc (mb, conv_arg);
++
++			if (t->byref) {
++				/* we dont need any conversions for out parameters */
++				if (t->attrs & PARAM_ATTRIBUTE_OUT)
++					break;
++				else {
++					char *msg = g_strdup_printf ("non out object references are no implemented");
++					MonoException *exc = mono_get_exception_not_implemented (msg);
++					g_warning (msg);
++					g_free (msg);
++					mono_raise_exception (exc);
++
++				}
++			} else {
++				static MonoMethod* GetInterface = NULL;
++				
++				if (!GetInterface)
++					GetInterface = mono_class_get_method_from_name (mono_defaults.com_object_class, "GetInterface", 1);
++				mono_mb_emit_ldarg (mb, argnum);
++				mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoTransparentProxy, rp));
++				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++				/* load the RCW from the ComInteropProxy*/
++				mono_mb_emit_ldflda (mb, G_STRUCT_OFFSET (MonoComInteropProxy, com_object));
++				mono_mb_emit_byte (mb, CEE_LDIND_REF);
++
++				mono_mb_emit_ptr (mb, t);
++				mono_mb_emit_icall (mb, type_from_handle);
++				mono_mb_emit_managed_call (mb, GetInterface, NULL);
++				mono_mb_emit_stloc (mb, conv_arg);
++			}
+ 		}
+ 		else if (klass->delegate) {
+ 			g_assert (!t->byref);
+@@ -5828,9 +5861,34 @@
+ 		if (spec && (spec->native == MONO_NATIVE_IUNKNOWN ||
+ 			spec->native == MONO_NATIVE_IDISPATCH ||
+ 			spec->native == MONO_NATIVE_INTERFACE)) {
+-			char *msg = g_strdup ("Marshalling of COM Objects is not yet implemented.");
+-			mono_mb_emit_exception_marshal_directive (mb, msg);
+-			break;
++			if (t->byref && (t->attrs & PARAM_ATTRIBUTE_OUT)) {
++				static MonoClass* com_interop_proxy_class = NULL;
++				static MonoMethod* com_interop_proxy_get_proxy = NULL;
++				static MonoMethod* get_transparent_proxy = NULL;
++				int real_proxy;
++				com_interop_proxy_class = mono_class_from_name (mono_defaults.corlib, "Mono.Interop", "ComInteropProxy");
++				com_interop_proxy_get_proxy = mono_class_get_method_from_name_flags (com_interop_proxy_class, "GetProxy", 2, METHOD_ATTRIBUTE_PRIVATE);
++				get_transparent_proxy = mono_class_get_method_from_name (mono_defaults.real_proxy_class, "GetTransparentProxy", 0);
++
++				real_proxy = mono_mb_add_local (mb, &com_interop_proxy_class->byval_arg);
++
++				mono_mb_emit_ldloc (mb, conv_arg);
++				mono_mb_emit_ptr (mb, &mono_defaults.com_object_class->byval_arg);
++				mono_mb_emit_icall (mb, type_from_handle);
++				mono_mb_emit_managed_call (mb, com_interop_proxy_get_proxy, NULL);
++				mono_mb_emit_stloc (mb, real_proxy);
++
++				
++				mono_mb_emit_ldarg (mb, argnum);
++				mono_mb_emit_ldloc (mb, real_proxy);
++				mono_mb_emit_managed_call (mb, get_transparent_proxy, NULL);
++				if (klass && klass != mono_defaults.object_class) {
++					mono_mb_emit_byte (mb, CEE_CASTCLASS);
++					mono_mb_emit_i4 (mb, mono_mb_add_data (mb, klass));
++				}
++				mono_mb_emit_byte (mb, CEE_STIND_REF);
++			}
++				break;
+ 		}
+ 		if (klass == mono_defaults.stringbuilder_class) {
+ 			gboolean need_free;
+@@ -9136,8 +9194,9 @@
+ ves_icall_System_ComObject_Finalizer(MonoComObject* obj)
+ {
+ 	g_assert(obj);
+-	g_assert(obj->itf_hash);
+-	g_hash_table_foreach_remove (obj->itf_hash, cominterop_finalizer, NULL);
++	if (obj->itf_hash)
++		g_hash_table_foreach_remove (obj->itf_hash, cominterop_finalizer, NULL);
++	obj->itf_hash = NULL;
+ }
+ 
+ #define MONO_IUNKNOWN_INTERFACE_SLOT 0
+@@ -9151,7 +9210,7 @@
+ 
+ 	klass = mono_class_from_mono_type (type->type);
+ 
+-	return g_hash_table_lookup (obj->itf_hash, klass->interface_id);
++	return g_hash_table_lookup (obj->itf_hash, (gpointer)klass->interface_id);
+ }
+ 
+ void
+@@ -9163,14 +9222,15 @@
+ 
+ 	klass = mono_class_from_mono_type (type->type);
+ 
+-	g_hash_table_insert (obj->itf_hash, klass->interface_id, pItf);
++	g_hash_table_insert (obj->itf_hash, (gpointer)klass->interface_id, pItf);
+ }
+ 
+ gpointer
+ ves_icall_System_ComObject_GetIUnknown (MonoComObject* obj)
+ {
+ 	g_assert(obj);
+-	g_assert(obj->itf_hash);
++	if (!obj->itf_hash)
++		return NULL;
+ 	return g_hash_table_lookup (obj->itf_hash, MONO_IUNKNOWN_INTERFACE_SLOT);
+ }
+ 
+Index: mono/mono/tests/cominterop.cs
+===================================================================
+--- mono/mono/tests/cominterop.cs	(revision 63068)
++++ mono/mono/tests/cominterop.cs	(working copy)
+@@ -92,115 +92,150 @@
+     [DllImport ("libtest")]
+     public static extern int mono_test_marshal_com_object_ref_count (IntPtr pUnk);
+ 
+-	public static int Main() {
++	public static int Main ()
++	{
++		int i = Main2 ();
++		Console.WriteLine (i);
++		return i;
++	}
++	public static int Main2() {
+ 
+         bool isWindows = !(((int)Environment.OSVersion.Platform == 4) || 
+             ((int)Environment.OSVersion.Platform == 128));
+-        if (isWindows) {
+-            #region BSTR Tests
++		if (isWindows) {
++			#region BSTR Tests
+ 
+-            string str;
+-            if (mono_test_marshal_bstr_in ("mono_test_marshal_bstr_in") != 0)
+-                return 1;
+-            if (mono_test_marshal_bstr_out (out str) != 0 || str != "mono_test_marshal_bstr_out")
+-                return 2;
++			string str;
++			if (mono_test_marshal_bstr_in ("mono_test_marshal_bstr_in") != 0)
++				return 1;
++			if (mono_test_marshal_bstr_out (out str) != 0 || str != "mono_test_marshal_bstr_out")
++				return 2;
+ 
+-            #endregion // BSTR Tests
++			#endregion // BSTR Tests
+ 
+-            #region VARIANT Tests
++			#region VARIANT Tests
+ 
+-            object obj;
+-            if (mono_test_marshal_variant_in_sbyte ((sbyte)100) != 0)
+-                return 3;
+-            if (mono_test_marshal_variant_in_byte ((byte)100) != 0)
+-                return 4;
+-            if (mono_test_marshal_variant_in_short ((short)314) != 0)
+-                return 5;
+-            if (mono_test_marshal_variant_in_ushort ((ushort)314) != 0)
+-                return 6;
+-            if (mono_test_marshal_variant_in_int ((int)314) != 0)
+-                return 7;
+-            if (mono_test_marshal_variant_in_uint ((uint)314) != 0)
+-                return 8;
+-            if (mono_test_marshal_variant_in_long ((long)314) != 0)
+-                return 9;
+-            if (mono_test_marshal_variant_in_ulong ((ulong)314) != 0)
+-                return 10;
+-            if (mono_test_marshal_variant_in_float ((float)3.14) != 0)
+-                return 11;
+-            if (mono_test_marshal_variant_in_double ((double)3.14) != 0)
+-                return 12;
+-            if (mono_test_marshal_variant_in_bstr ("PI") != 0)
+-                return 13;
+-            if (mono_test_marshal_variant_out_sbyte (out obj) != 0 || (sbyte)obj != 100)
+-                return 14;
+-            if (mono_test_marshal_variant_out_byte (out obj) != 0 || (byte)obj != 100)
+-                return 15;
+-            if (mono_test_marshal_variant_out_short (out obj) != 0 || (short)obj != 314)
+-                return 16;
+-            if (mono_test_marshal_variant_out_ushort (out obj) != 0 || (ushort)obj != 314)
+-                return 17;
+-            if (mono_test_marshal_variant_out_int (out obj) != 0 || (int)obj != 314)
+-                return 18;
+-            if (mono_test_marshal_variant_out_uint (out obj) != 0 || (uint)obj != 314)
+-                return 19;
+-            if (mono_test_marshal_variant_out_long (out obj) != 0 || (long)obj != 314)
+-                return 20;
+-            if (mono_test_marshal_variant_out_ulong (out obj) != 0 || (ulong)obj != 314)
+-                return 21;
+-            if (mono_test_marshal_variant_out_float (out obj) != 0 || ((float)obj - 3.14) / 3.14 > .001)
+-                return 22;
+-            if (mono_test_marshal_variant_out_double (out obj) != 0 || ((double)obj - 3.14) / 3.14 > .001)
+-                return 23;
+-            if (mono_test_marshal_variant_out_bstr (out obj) != 0 || (string)obj != "PI")
+-                return 24;
++			object obj;
++			if (mono_test_marshal_variant_in_sbyte ((sbyte)100) != 0)
++				return 3;
++			if (mono_test_marshal_variant_in_byte ((byte)100) != 0)
++				return 4;
++			if (mono_test_marshal_variant_in_short ((short)314) != 0)
++				return 5;
++			if (mono_test_marshal_variant_in_ushort ((ushort)314) != 0)
++				return 6;
++			if (mono_test_marshal_variant_in_int ((int)314) != 0)
++				return 7;
++			if (mono_test_marshal_variant_in_uint ((uint)314) != 0)
++				return 8;
++			if (mono_test_marshal_variant_in_long ((long)314) != 0)
++				return 9;
++			if (mono_test_marshal_variant_in_ulong ((ulong)314) != 0)
++				return 10;
++			if (mono_test_marshal_variant_in_float ((float)3.14) != 0)
++				return 11;
++			if (mono_test_marshal_variant_in_double ((double)3.14) != 0)
++				return 12;
++			if (mono_test_marshal_variant_in_bstr ("PI") != 0)
++				return 13;
++			if (mono_test_marshal_variant_out_sbyte (out obj) != 0 || (sbyte)obj != 100)
++				return 14;
++			if (mono_test_marshal_variant_out_byte (out obj) != 0 || (byte)obj != 100)
++				return 15;
++			if (mono_test_marshal_variant_out_short (out obj) != 0 || (short)obj != 314)
++				return 16;
++			if (mono_test_marshal_variant_out_ushort (out obj) != 0 || (ushort)obj != 314)
++				return 17;
++			if (mono_test_marshal_variant_out_int (out obj) != 0 || (int)obj != 314)
++				return 18;
++			if (mono_test_marshal_variant_out_uint (out obj) != 0 || (uint)obj != 314)
++				return 19;
++			if (mono_test_marshal_variant_out_long (out obj) != 0 || (long)obj != 314)
++				return 20;
++			if (mono_test_marshal_variant_out_ulong (out obj) != 0 || (ulong)obj != 314)
++				return 21;
++			if (mono_test_marshal_variant_out_float (out obj) != 0 || ((float)obj - 3.14) / 3.14 > .001)
++				return 22;
++			if (mono_test_marshal_variant_out_double (out obj) != 0 || ((double)obj - 3.14) / 3.14 > .001)
++				return 23;
++			if (mono_test_marshal_variant_out_bstr (out obj) != 0 || (string)obj != "PI")
++				return 24;
+ 
+-            #endregion // VARIANT Tests
+-        }
+-#if NOT_YET
+-        #region Marshal COM Interop Tests
++			#endregion // VARIANT Tests
+ 
+-        IntPtr pUnk;
+-        if (mono_test_marshal_com_object_create (out pUnk) != 0)
+-            return 25;
++			#region Marshal COM Interop Tests
+ 
+-        if (mono_test_marshal_com_object_ref_count (pUnk) != 1)
+-            return 26;
++			IntPtr pUnk;
++			if (mono_test_marshal_com_object_create (out pUnk) != 0)
++				return 25;
+ 
+-        if (Marshal.AddRef(pUnk) != 2)
+-            return 27;
++			if (mono_test_marshal_com_object_ref_count (pUnk) != 1)
++				return 26;
+ 
+-        if (mono_test_marshal_com_object_ref_count (pUnk) != 2)
+-            return 28;
++			if (Marshal.AddRef (pUnk) != 2)
++				return 27;
+ 
+-        if (Marshal.Release (pUnk) != 1)
+-            return 29;
++			if (mono_test_marshal_com_object_ref_count (pUnk) != 2)
++				return 28;
+ 
+-        if (mono_test_marshal_com_object_ref_count (pUnk) != 1)
+-            return 30;
++			if (Marshal.Release (pUnk) != 1)
++				return 29;
+ 
+-        object com_obj = Marshal.GetObjectForIUnknown (pUnk);
++			if (mono_test_marshal_com_object_ref_count (pUnk) != 1)
++				return 30;
+ 
+-        if (com_obj == null)
+-            return 31;
++			object com_obj = Marshal.GetObjectForIUnknown (pUnk);
+ 
+-        IMath imath = com_obj as IMath;
++			if (com_obj == null)
++				return 31;
+ 
+-        if (imath == null)
+-            return 32;
++			IMath imath = com_obj as IMath;
+ 
+-        if (imath.Add(20, 10) != 30)
+-            return 33;
++			if (imath == null)
++				return 32;
+ 
+-        if (imath.Subtract (20, 10) != 10)
+-            return 34;
++			if (imath.Add (20, 10) != 30)
++				return 33;
+ 
+-        //if (mono_test_marshal_com_object_destroy (pUnk) != 0)
+-        //    return 31;
++			if (imath.Subtract (20, 10) != 10)
++				return 34;
+ 
+-        #endregion // Marshal COM Interop Tests
+-#endif
++			IMath same1, same2;
++			imath.Same (out same1);
++			imath.Same (out same2);
++			if (same1 != same2)
++				return 35;
+ 
++			if (!same1.Equals (same2))
++				return 36;
++
++			IMath diff1, diff2;
++			imath.Different (out diff1);
++			imath.Different (out diff2);
++			if (diff1 == diff2)
++				return 37;
++
++			if (diff1.Equals (diff2))
++				return 38;
++
++			// same1 & same2 share a RCW
++			if (Marshal.ReleaseComObject (same1) != 1)
++				return 39;
++
++			if (Marshal.ReleaseComObject (same2) != 0)
++				return 40;
++
++
++			if (Marshal.ReleaseComObject (diff1) != 0 ||
++				Marshal.ReleaseComObject (diff2) != 0)
++				return 41;
++
++
++			//if (mono_test_marshal_com_object_destroy (pUnk) != 0)
++			//    return 31;
++			#endregion // Marshal COM Interop Tests
++		}
++
+         return 0;
+ 	}
+ 
+@@ -212,6 +247,10 @@
+         [MethodImplAttribute (MethodImplOptions.InternalCall,MethodCodeType=MethodCodeType.Runtime)]
+         int Add (int a, int b);
+         [MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
+-        int Subtract (int a, int b);
++		int Subtract (int a, int b);
++		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
++		int Same ([MarshalAs(UnmanagedType.Interface)] out IMath imath);
++		[MethodImplAttribute (MethodImplOptions.InternalCall, MethodCodeType = MethodCodeType.Runtime)]
++		int Different ([MarshalAs (UnmanagedType.Interface)] out IMath imath);
+     }
+-}
+\ No newline at end of file
++}
+Index: mono/mono/tests/ChangeLog
+===================================================================
+--- mono/mono/tests/ChangeLog	(revision 63068)
++++ mono/mono/tests/ChangeLog	(working copy)
+@@ -1,3 +1,10 @@
++2006-07-27  Jonathan Chambers  <joncham@gmail.com>
++
++	* cominterop.cs: Added COM Interop object marshalling tests; 
++	enabled on windows only.
++	* libtest.c: Added COM Interop object marshalling tests; 
++	enabled on windows only.
++	
+ 2006-07-27  Zoltan Varga  <vargaz@gmail.com>
+ 
+ 	* libtest.c: Add a newline at the EOF.
+Index: mono/mono/tests/libtest.c
+===================================================================
+--- mono/mono/tests/libtest.c	(revision 63068)
++++ mono/mono/tests/libtest.c	(working copy)
+@@ -2040,10 +2040,6 @@
+ 	return 0;
+ }
+ 
+-#endif
+-
+-#ifdef NOT_YET
+-
+ #ifdef _MSC_VER
+ #define COM_STDCALL __stdcall
+ #else
+@@ -2059,6 +2055,8 @@
+ 	int (COM_STDCALL *Release)(MonoComObject* pUnk);
+ 	int (COM_STDCALL *Add)(MonoComObject* pUnk, int a, int b, int* c);
+ 	int (COM_STDCALL *Subtract)(MonoComObject* pUnk, int a, int b, int* c);
++	int (COM_STDCALL *Same)(MonoComObject* pUnk, MonoComObject* *pOut);
++	int (COM_STDCALL *Different)(MonoComObject* pUnk, MonoComObject* *pOut);
+ } MonoIUnknown;
+ 
+ struct MonoComObject
+@@ -2095,20 +2093,43 @@
+ 	return 0;
+ }
+ 
++static void create_com_object (MonoComObject** pOut);
++static MonoComObject* same_com_object = NULL;
++
++int COM_STDCALL Same(MonoComObject* pUnk, MonoComObject** pOut)
++{
++	if (!same_com_object)
++		create_com_object (&same_com_object);
++	*pOut = same_com_object;
++	return 0;
++}
++
++int COM_STDCALL Different(MonoComObject* pUnk, MonoComObject** pOut)
++{
++	create_com_object (pOut);
++	return 0;
++}
++
++static void create_com_object (MonoComObject** pOut)
++{
++	*pOut = g_new0 (MonoComObject, 1);
++	(*pOut)->vtbl = g_new0 (MonoIUnknown, 1);
++
++	(*pOut)->m_ref = 1;
++	(*pOut)->vtbl->QueryInterface = MonoQueryInterface;
++	(*pOut)->vtbl->AddRef = MonoAddRef;
++	(*pOut)->vtbl->Release = MonoRelease;
++	(*pOut)->vtbl->Add = Add;
++	(*pOut)->vtbl->Subtract = Subtract;
++	(*pOut)->vtbl->Same = Same;
++	(*pOut)->vtbl->Different = Different;
++}
++
+ STDCALL int
+ mono_test_marshal_com_object_create(MonoComObject* *pUnk)
+ {
+-	*pUnk = g_new0 (MonoComObject, 1);
+-	(*pUnk)->vtbl = g_new0 (MonoIUnknown, 1);
++	create_com_object (pUnk);
+ 
+-	(*pUnk)->m_ref = 1;
+-	(*pUnk)->vtbl->QueryInterface = MonoQueryInterface;
+-	(*pUnk)->vtbl->AddRef = MonoAddRef;
+-	(*pUnk)->vtbl->Release = MonoRelease;
+-	(*pUnk)->vtbl->Add = Add;
+-	(*pUnk)->vtbl->Subtract = Subtract;
+-
+-
+ 	return 0;
+ }
+ 
+Index: mcs/class/corlib/Mono.Interop/ComInteropProxy.cs
+===================================================================
+--- mcs/class/corlib/Mono.Interop/ComInteropProxy.cs	(revision 63068)
++++ mcs/class/corlib/Mono.Interop/ComInteropProxy.cs	(working copy)
+@@ -4,7 +4,7 @@
+ // Authors:
+ //   Jonathan Chambers <joncham@gmail.com>
+ //
+-// Copyright (C) 2006 Novell (http://www.novell.com)
++// Copyright (C) 2006 Jonathan Chambers
+ //
+ 
+ //
+@@ -29,33 +29,106 @@
+ //
+ 
+ using System;
++using System.Collections;
+ using System.Reflection;
+ using System.Runtime.CompilerServices;
+ using System.Runtime.Remoting;
+ using System.Runtime.Remoting.Messaging;
+ using System.Runtime.Remoting.Proxies;
++using System.Runtime.InteropServices;
+ 
+ 
+ namespace Mono.Interop
+ {
++	internal struct ComInteropProxyEntry
++	{
++		public int refcount;
++		public WeakReference weakref;
++
++		public ComInteropProxyEntry (int refcount, WeakReference weak)
++		{
++			this.refcount = refcount;
++			this.weakref = weak;
++		}
++	}
++
+ 	internal class ComInteropProxy : RealProxy, IRemotingTypeInfo
+     {
+         #region Sync with object-internals.h
+ 		private __ComObject com_object;
+         #endregion
+-        private string type_name;
++		private string type_name;
++		static Hashtable iunknown_hashtable;
++
++		static ComInteropProxy ()
++		{
++			iunknown_hashtable = new Hashtable ();
++		}
++
+ 		public ComInteropProxy (Type t)
+ 			: base (t)
+ 		{
+-			com_object = __ComObject.CreateRCW (t);
++			com_object = new __ComObject (t);
++			iunknown_hashtable.Add (com_object.IUnknown, new ComInteropProxyEntry (1, new WeakReference(this)));
+ 		}
+ 
+         internal ComInteropProxy (IntPtr pUnk)
+-            : base (typeof (__ComObject))
++            : this (pUnk, typeof (__ComObject))
+         {
+-            com_object = new __ComObject(pUnk);
+-        }
++		}
+ 
++		internal ComInteropProxy (IntPtr pUnk, Type t)
++			: base (t)
++		{
++			com_object = new __ComObject (pUnk);
++			iunknown_hashtable.Add (com_object.IUnknown, new ComInteropProxyEntry (1, new WeakReference (this)));
++		}
++
++		internal static int ReleaseComObject (__ComObject co)
++		{
++			if (co == null)
++				throw new ArgumentNullException ("co");
++			int refcount = -1;
++			IntPtr pUnk = co.IUnknown;
++			object obj = iunknown_hashtable[pUnk];
++			if (obj != null) {
++				ComInteropProxyEntry entry = (ComInteropProxyEntry)obj;
++				refcount = entry.refcount - 1;
++				if (refcount == 0) {
++					iunknown_hashtable.Remove (pUnk);
++					ComInteropProxy proxy = (ComInteropProxy)entry.weakref.Target;
++					if (proxy != null && proxy.com_object != null)
++						proxy.com_object.Finalizer ();
++				}
++				else {
++					iunknown_hashtable[pUnk] = new ComInteropProxyEntry (refcount, entry.weakref);
++				}
++			}
++			return refcount;
++		}
++
++		internal static ComInteropProxy GetProxy (IntPtr pItf, Type t)
++		{
++			IntPtr ppv;
++			Guid iid = __ComObject.IID_IUnknown;
++			int hr = Marshal.QueryInterface (pItf, ref iid, out ppv);
++			Marshal.ThrowExceptionForHR (hr);
++			object obj = iunknown_hashtable[ppv];
++			if (obj == null) {
++				return new ComInteropProxy (ppv);
++			}
++			else {
++				ComInteropProxyEntry entry = ((ComInteropProxyEntry)obj);
++				WeakReference weak_ref = entry.weakref;
++				object target = weak_ref.Target;
++				if (target == null) {
++					return new ComInteropProxy (ppv);
++				}
++				iunknown_hashtable[ppv] = new ComInteropProxyEntry (entry.refcount + 1, weak_ref);
++				return ((ComInteropProxy)target);
++			}
++		}
++
+ 		public override IMessage Invoke (IMessage msg)
+ 		{
+ 			Console.WriteLine ("Invoke");
+Index: mcs/class/corlib/Mono.Interop/ChangeLog
+===================================================================
+--- mcs/class/corlib/Mono.Interop/ChangeLog	(revision 63068)
++++ mcs/class/corlib/Mono.Interop/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-07-27  Jonathan Chambers  <joncham@gmail.com>
++
++	* ComInteropProxy.cs: Added support for marshalling objects.
++	
+ 2006-07-15  Jonathan Chambers  <joncham@gmail.com>
+ 
+ 	* ComInteropProxy.cs: Added.
+Index: mcs/class/corlib/System/ChangeLog
+===================================================================
+--- mcs/class/corlib/System/ChangeLog	(revision 63068)
++++ mcs/class/corlib/System/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-07-27  Jonathan Chambers  <joncham@gmail.com>
++
++	* __ComObject.cs: Added support for marshalling objects.
++	
+ 2006-07-24  Atsushi Enomoto  <atsushi@ximian.com>
+ 
+ 	* Char.cs : implemented utf32 conversion methods thus fixed bug #78856.
+Index: mcs/class/corlib/System/__ComObject.cs
+===================================================================
+--- mcs/class/corlib/System/__ComObject.cs	(revision 63068)
++++ mcs/class/corlib/System/__ComObject.cs	(working copy)
+@@ -8,6 +8,7 @@
+ //
+ // Copyright (C) 2004 Novell (http://www.novell.com)
+ // Copyright (C) 2005 Kornél Pál
++// Copyright (C) 2006 Jonathan Chambers
+ //
+ 
+ //
+@@ -31,6 +32,7 @@
+ // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ //
+ 
++using Mono.Interop;
+ using System.Collections;
+ using System.Runtime.InteropServices;
+ using System.Runtime.CompilerServices;
+@@ -62,15 +64,20 @@
+ 		static bool coinitialized;
+ 
+ 		[MethodImplAttribute (MethodImplOptions.InternalCall)]
+-		extern void Finalizer ();
++		internal extern void Finalizer ();
+ 
+ 		~__ComObject ()
+ 		{
++			ComInteropProxy.ReleaseComObject (this);
+ 			Finalizer ();
+ 		}
+ 
+ 		public __ComObject ()
+ 		{
++		}
++
++		internal __ComObject (Type t)
++		{
+ 			// call CoInitialize once per thread
+ 			if (!coinitialized) {
+ 				CoInitialize (IntPtr.Zero);
+@@ -80,21 +87,19 @@
+ 			hashtable = new Hashtable ();
+ 
+ 			IntPtr ppv;
+-			int hr = CoCreateInstance (GetType ().GUID, IntPtr.Zero, 0x1 | 0x4 | 0x10, IID_IUnknown, out ppv);
++			int hr = CoCreateInstance (t.GUID, IntPtr.Zero, 0x1 | 0x4 | 0x10, IID_IUnknown, out ppv);
+ 			Marshal.ThrowExceptionForHR (hr);
+ 
+ 			SetIUnknown (ppv);
+ 		}
+ 
+-        public __ComObject (IntPtr pItf)
+-        {
+-            hashtable = new Hashtable ();
+-
+-            IntPtr ppv;
+-            Guid iid = IID_IUnknown;
++		internal __ComObject (IntPtr pItf)
++		{
++			hashtable = new Hashtable ();
++			IntPtr ppv;
++			Guid iid = IID_IUnknown;
+ 			int hr = Marshal.QueryInterface (pItf, ref iid, out ppv);
+ 			Marshal.ThrowExceptionForHR (hr);
+-
+ 			SetIUnknown (ppv);
+         }
+ 
+@@ -123,6 +128,9 @@
+ 
+ 		internal IntPtr GetInterface(Type t)
+ 		{
++			// this is needed later and checks to see if we are
++			// a valid RCW
++			IntPtr pUnk = IUnknown;
+ 			IntPtr pItf = FindInterface (t);
+ 			if (pItf != IntPtr.Zero) {
+ 				return pItf;
+@@ -130,7 +138,7 @@
+ 
+ 			Guid iid = t.GUID;
+ 			IntPtr ppv;
+-			int hr = Marshal.QueryInterface (GetIUnknown(), ref iid, out ppv);
++			int hr = Marshal.QueryInterface (pUnk, ref iid, out ppv);
+ 			Marshal.ThrowExceptionForHR (hr);
+ 			CacheInterface (t, ppv);
+ 			return ppv;
+@@ -140,7 +148,10 @@
+ 		{
+ 			get
+ 			{
+-				return GetIUnknown();
++				IntPtr pUnk = GetIUnknown();
++				if (pUnk == IntPtr.Zero)
++					throw new InvalidComObjectException ("COM object that has been separated from its underlying RCW cannot be used.");
++				return pUnk;
+ 			}
+ 		}
+ 
+@@ -160,6 +171,25 @@
+ 			}
+ 		}
+ 
++		public override bool Equals (object obj)
++		{
++			if (obj == null)
++				return false;
++
++			__ComObject co = obj as __ComObject;
++			if ((object)co == null)
++				return false;
++
++			return (IUnknown == co.IUnknown);
++		}
++
++		public override int GetHashCode ()
++		{
++			// not what MS seems to do, 
++			// but IUnknown is identity in COM
++			return IUnknown.ToInt32 ();
++		}
++
+ 		[DllImport ("ole32.dll", CallingConvention = CallingConvention.StdCall)]
+ 		static extern int CoInitialize (IntPtr pvReserved);
+ 
+Index: mcs/class/corlib/System.Runtime.InteropServices/ChangeLog
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/ChangeLog	(revision 63068)
++++ mcs/class/corlib/System.Runtime.InteropServices/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2006-07-27  Jonathan Chambers  <joncham@gmail.com>
++
++	* Marshal.cs: Implemented CreateWrapperOfType and ReleaseComObject.
++	
+ 2006-07-15  Jonathan Chambers  <joncham@gmail.com>
+ 
+ 	* Marshal.cs: Begin implementing COM Interop. Implemented
+Index: mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs
+===================================================================
+--- mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(revision 63068)
++++ mcs/class/corlib/System.Runtime.InteropServices/Marshal.cs	(working copy)
+@@ -153,9 +153,20 @@
+ 			copy_from_unmanaged (source, startIndex, destination, length);
+ 		}
+ 
+-		[MonoTODO]
+ 		public static object CreateWrapperOfType (object o, Type t) {
+-			throw new NotImplementedException ();
++			__ComObject co = o as __ComObject;
++			if (co == null)
++				throw new ArgumentException ("o must derive from __ComObject", "o");
++			if (t == null)
++				throw new ArgumentNullException ("t");
++
++			Type[] itfs = o.GetType ().GetInterfaces ();
++			foreach (Type itf in itfs) {
++				if (itf.IsImport && co.GetInterface (itf) == IntPtr.Zero)
++					throw new InvalidCastException ();
++			}
++
++			return ComInteropProxy.GetProxy (co.IUnknown, t).GetTransparentProxy ();
+ 		}
+ 
+ 		[MethodImplAttribute(MethodImplOptions.InternalCall)]
+@@ -354,7 +365,7 @@
+ 		}
+ 
+ 		public static object GetObjectForIUnknown (IntPtr pUnk) {
+-            ComInteropProxy proxy = new ComInteropProxy (pUnk);
++			ComInteropProxy proxy = ComInteropProxy.GetProxy (pUnk, typeof(__ComObject));
+             return proxy.GetTransparentProxy ();
+ 		}
+ 
+@@ -380,7 +391,7 @@
+ 
+         public static object GetTypedObjectForIUnknown (IntPtr pUnk, Type t)
+         {
+-            ComInteropProxy proxy = new ComInteropProxy (pUnk);
++			ComInteropProxy proxy = new ComInteropProxy (pUnk, t);
+             __ComObject co = (__ComObject)proxy.GetTransparentProxy ();
+             foreach (Type itf in t.GetInterfaces ()) {
+                 if ((itf.Attributes & TypeAttributes.Import) == TypeAttributes.Import) {
+@@ -601,9 +612,13 @@
+         [MethodImplAttribute (MethodImplOptions.InternalCall)]
+         public extern static int Release (IntPtr pUnk);
+ 
+-		[MonoTODO]
+ 		public static int ReleaseComObject (object o) {
+-			throw new NotImplementedException ();
++			if (o == null)
++				throw new ArgumentException ("o");
++			__ComObject co = o as __ComObject;
++			if (co == null)
++				throw new ArgumentException ("o");
++			return ComInteropProxy.ReleaseComObject (co);
+ 		}
+ 
+ #if NET_2_0

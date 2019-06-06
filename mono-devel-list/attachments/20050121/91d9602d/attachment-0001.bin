@@ -1,0 +1,312 @@
+Index: metadata/reflection.h
+===================================================================
+--- metadata/reflection.h	(revision 39305)
++++ metadata/reflection.h	(working copy)
+@@ -107,9 +107,12 @@
+ guint32 mono_declsec_flags_from_class (MonoClass *klass);
+ guint32 mono_declsec_flags_from_assembly (MonoAssembly *assembly);
+ 
++/* this structure MUST be kept in synch with RuntimeDeclSecurityEntry
++ * located in /mcs/class/corlib/System.Security/SecurityFrame.cs */
+ typedef struct {
+ 	char *blob;				/* pointer to metadata blob */
+ 	guint32 size;				/* size of the metadata blob */
++	guint32 index;
+ } MonoDeclSecurityEntry;
+ 
+ typedef struct {
+Index: metadata/security-manager.c
+===================================================================
+--- metadata/security-manager.c	(revision 39305)
++++ metadata/security-manager.c	(working copy)
+@@ -13,6 +13,9 @@
+ /* Internal stuff */
+ 
+ static MonoSecurityManager secman;
++static MonoBoolean mono_security_manager_activated = FALSE;
++static MonoBoolean mono_security_manager_enabled = TRUE;
++static MonoBoolean mono_security_manager_execution = TRUE;
+ 
+ 
+ /* Public stuff */
+@@ -40,3 +43,53 @@
+ 
+ 	return &secman;
+ }
++
++/*
++ * Note: The security manager is activate once when executing the Mono. This 
++ * is not meant to be a turn on/off runtime switch.
++ */
++void
++mono_activate_security_manager (void)
++{
++	mono_security_manager_activated = TRUE;
++}
++
++gboolean
++mono_is_security_manager_active (void)
++{
++	return mono_security_manager_activated;
++}
++
++MonoBoolean
++ves_icall_System_Security_SecurityManager_get_SecurityEnabled (void)
++{
++	if (!mono_security_manager_activated)
++		return FALSE;
++	return mono_security_manager_enabled;
++}
++
++void
++ves_icall_System_Security_SecurityManager_set_SecurityEnabled (MonoBoolean value)
++{
++	/* value can be changed only if the security manager is activated */
++	if (mono_security_manager_activated) {
++		mono_security_manager_enabled = value;
++	}
++}
++
++MonoBoolean
++ves_icall_System_Security_SecurityManager_get_CheckExecutionRights (void)
++{
++	if (!mono_security_manager_activated)
++		return FALSE;
++	return mono_security_manager_execution;
++}
++
++void
++ves_icall_System_Security_SecurityManager_set_CheckExecutionRights (MonoBoolean value)
++{
++	/* value can be changed only id the security manager is activated */
++	if (mono_security_manager_activated) {
++		mono_security_manager_execution = value;
++	}
++}
+Index: metadata/security-manager.h
+===================================================================
+--- metadata/security-manager.h	(revision 39305)
++++ metadata/security-manager.h	(working copy)
+@@ -34,7 +34,16 @@
+ 
+ 
+ /* Initialization/utility functions */
++void mono_activate_security_manager (void);
++gboolean mono_is_security_manager_active (void);
+ MonoSecurityManager* mono_security_manager_get_methods (void);
+ 
+ 
++/* internal calls */
++MonoBoolean ves_icall_System_Security_SecurityManager_get_SecurityEnabled (void);
++void ves_icall_System_Security_SecurityManager_set_SecurityEnabled (MonoBoolean value);
++MonoBoolean ves_icall_System_Security_SecurityManager_get_CheckExecutionRights (void);
++void ves_icall_System_Security_SecurityManager_set_CheckExecutionRights (MonoBoolean value);
++
++
+ #endif /* _MONO_METADATA_SECURITY_MANAGER_H_ */
+Index: metadata/icall.c
+===================================================================
+--- metadata/icall.c	(revision 39305)
++++ metadata/icall.c	(working copy)
+@@ -52,6 +52,7 @@
+ #include <mono/metadata/security.h>
+ #include <mono/metadata/mono-config.h>
+ #include <mono/metadata/cil-coff.h>
++#include <mono/metadata/security-manager.h>
+ #include <mono/io-layer/io-layer.h>
+ #include <mono/utils/strtod.h>
+ #include <mono/utils/monobitset.h>
+@@ -6495,6 +6496,13 @@
+ 	{"IsAuthenticodePresent", ves_icall_System_Security_Policy_Evidence_IsAuthenticodePresent}
+ };
+ 
++static const IcallEntry securitymanager_icalls [] = {
++	{"get_CheckExecutionRights", ves_icall_System_Security_SecurityManager_get_CheckExecutionRights},
++	{"get_SecurityEnabled", ves_icall_System_Security_SecurityManager_get_SecurityEnabled},
++	{"set_CheckExecutionRights", ves_icall_System_Security_SecurityManager_set_CheckExecutionRights},
++	{"set_SecurityEnabled", ves_icall_System_Security_SecurityManager_set_SecurityEnabled}
++};
++
+ /* proto
+ static const IcallEntry array_icalls [] = {
+ };
+@@ -6575,6 +6583,7 @@
+ 	{"System.Security.Principal.WindowsIdentity", identity_icalls, G_N_ELEMENTS (identity_icalls)},
+ 	{"System.Security.Principal.WindowsImpersonationContext", impersonation_icalls, G_N_ELEMENTS (impersonation_icalls)},
+ 	{"System.Security.Principal.WindowsPrincipal", principal_icalls, G_N_ELEMENTS (principal_icalls)},
++	{"System.Security.SecurityManager", securitymanager_icalls, G_N_ELEMENTS (securitymanager_icalls)},
+ 	{"System.String", string_icalls, G_N_ELEMENTS (string_icalls)},
+ 	{"System.Text.Encoding", encoding_icalls, G_N_ELEMENTS (encoding_icalls)},
+ 	{"System.Threading.Interlocked", interlocked_icalls, G_N_ELEMENTS (interlocked_icalls)},
+Index: metadata/reflection.c
+===================================================================
+--- metadata/reflection.c	(revision 39305)
++++ metadata/reflection.c	(working copy)
+@@ -9087,6 +9087,7 @@
+ 		case SECURITY_ACTION_DEMAND:
+ 			if (!actions->demand.blob) {
+ 				const char *blob = mono_metadata_blob_heap (image, cols [MONO_DECL_SECURITY_PERMISSIONSET]);
++				actions->demand.index = cols [MONO_DECL_SECURITY_PERMISSIONSET];
+ 				actions->demand.blob = (char*) (blob + 2);
+ 				actions->demand.size = mono_metadata_decode_blob_size (blob, &blob);
+ 				result = TRUE;
+@@ -9095,6 +9096,7 @@
+ 		case SECURITY_ACTION_NONCASDEMAND:
+ 			if (!actions->noncasdemand.blob) {
+ 				const char *blob = mono_metadata_blob_heap (image, cols [MONO_DECL_SECURITY_PERMISSIONSET]);
++				actions->noncasdemand.index = cols [MONO_DECL_SECURITY_PERMISSIONSET];
+ 				actions->noncasdemand.blob = (char*) (blob + 2);
+ 				actions->noncasdemand.size = mono_metadata_decode_blob_size (blob, &blob);
+ 				result = TRUE;
+@@ -9103,6 +9105,7 @@
+ 		case SECURITY_ACTION_DEMANDCHOICE:
+ 			if (!actions->demandchoice.blob) {
+ 				const char *blob = mono_metadata_blob_heap (image, cols [MONO_DECL_SECURITY_PERMISSIONSET]);
++				actions->demandchoice.index = cols [MONO_DECL_SECURITY_PERMISSIONSET];
+ 				actions->demandchoice.blob = (char*) (blob + 2);
+ 				actions->demandchoice.size = mono_metadata_decode_blob_size (blob, &blob);
+ 				result = TRUE;
+@@ -9130,10 +9133,11 @@
+ 	if (!image->tables [MONO_TABLE_DECLSECURITY].rows)
+ 		return FALSE;
+ 
+-	memset (demands, 0, sizeof (MonoDeclSecurityActions));
+-
+ 	/* First we look for method-level attributes */
+ 	if (method->flags & METHOD_ATTRIBUTE_HAS_SECURITY) {
++		mono_class_init (method->klass);
++		memset (demands, 0, sizeof (MonoDeclSecurityActions));
++
+ 		guint32 idx = find_method_index (method);
+ 		idx <<= MONO_HAS_DECL_SECURITY_BITS;
+ 		idx |= MONO_HAS_DECL_SECURITY_METHODDEF;
+@@ -9144,6 +9148,10 @@
+ 	/* Here we use (or create) the class declarative cache to look for demands */
+ 	flags = mono_declsec_flags_from_class (method->klass);
+ 	if (flags & (MONO_DECLSEC_FLAG_DEMAND | MONO_DECLSEC_FLAG_NONCAS_DEMAND | MONO_DECLSEC_FLAG_DEMAND_CHOICE)) {
++		if (!result) {
++			mono_class_init (method->klass);
++			memset (demands, 0, sizeof (MonoDeclSecurityActions));
++		}
+ 		guint32 idx = mono_metadata_token_index (method->klass->type_token);
+ 		idx <<= MONO_HAS_DECL_SECURITY_BITS;
+ 		idx |= MONO_HAS_DECL_SECURITY_TYPEDEF;
+Index: mini/mini.c
+===================================================================
+--- mini/mini.c	(revision 39305)
++++ mini/mini.c	(working copy)
+@@ -402,6 +402,14 @@
+ 
+ #define NEW_LDTOKENCONST(cfg,dest,image,token) NEW_AOTCONST_TOKEN ((cfg), (dest), MONO_PATCH_INFO_LDTOKEN, (image), (token), STACK_PTR)
+ 
++#define NEW_DECLSECCONST(cfg,dest,image,entry) do { \
++		if (cfg->compile_aot) { \
++			NEW_AOTCONST_TOKEN (cfg, dest, MONO_PATCH_INFO_DECLSEC, image, (entry).index, STACK_OBJ); \
++		} else { \
++			NEW_PCONST (cfg, args [0], (entry).blob); \
++		} \
++	} while (0)
++
+ #define NEW_DOMAINCONST(cfg,dest) do { \
+                if (cfg->opt & MONO_OPT_SHARED) { \
+                        NEW_TEMPLOAD (cfg, dest, mono_get_domainvar (cfg)->inst_c0); \
+@@ -3198,7 +3206,7 @@
+ 
+ 		if (actions.demand.blob) {
+ 			/* Add code for SecurityAction.Demand */
+-			NEW_PCONST (cfg, args [0], actions.demand.blob);
++			NEW_DECLSECCONST (cfg, args[0], image, actions.demand);
+ 			NEW_ICONST (cfg, args [1], actions.demand.size);
+ 			/* Calls static void SecurityManager.InternalDemand (byte* permissions, int size); */
+ 			mono_emit_method_call_spilled (cfg, init_localsbb, secman->demand, secman->demand->signature, args, ip, NULL);
+@@ -3206,14 +3214,14 @@
+ 		if (actions.noncasdemand.blob) {
+ 			/* CLR 1.x uses a .noncasdemand (but 2.x doesn't) */
+ 			/* For Mono we re-route non-CAS Demand to Demand (as the managed code must deal with it anyway) */
+-			NEW_PCONST (cfg, args [0], actions.noncasdemand.blob);
++			NEW_DECLSECCONST (cfg, args[0], image, actions.noncasdemand);
+ 			NEW_ICONST (cfg, args [1], actions.noncasdemand.size);
+ 			/* Calls static void SecurityManager.InternalDemand (byte* permissions, int size); */
+ 			mono_emit_method_call_spilled (cfg, init_localsbb, secman->demand, secman->demand->signature, args, ip, NULL);
+ 		}
+ 		if (actions.demandchoice.blob) {
+ 			/* New in 2.0, Demand must succeed for one of the permissions (i.e. not all) */
+-			NEW_PCONST (cfg, args [0], actions.demandchoice.blob);
++			NEW_DECLSECCONST (cfg, args[0], image, actions.demandchoice);
+ 			NEW_ICONST (cfg, args [1], actions.demandchoice.size);
+ 			/* Calls static void SecurityManager.InternalDemandChoice (byte* permissions, int size); */
+ 			mono_emit_method_call_spilled (cfg, init_localsbb, secman->demandchoice, secman->demandchoice->signature, args, ip, NULL);
+@@ -7233,6 +7241,9 @@
+ 		target = handle;
+ 		break;
+ 	}
++	case MONO_PATCH_INFO_DECLSEC:
++		target = (mono_metadata_blob_heap (patch_info->data.token->image, patch_info->data.token->token) + 2);
++		break;
+ 	case MONO_PATCH_INFO_BB_OVF:
+ 	case MONO_PATCH_INFO_EXC_OVF:
+ 	case MONO_PATCH_INFO_GOT_OFFSET:
+Index: mini/mini.h
+===================================================================
+--- mini/mini.h	(revision 39305)
++++ mini/mini.h	(working copy)
+@@ -418,6 +418,7 @@
+ 	MONO_PATCH_INFO_EXC_OVF,
+ 	MONO_PATCH_INFO_WRAPPER,
+ 	MONO_PATCH_INFO_GOT_OFFSET,
++	MONO_PATCH_INFO_DECLSEC,
+ 	MONO_PATCH_INFO_NONE
+ } MonoJumpInfoType;
+ 
+Index: mini/aot.c
+===================================================================
+--- mini/aot.c	(revision 39305)
++++ mini/aot.c	(working copy)
+@@ -867,6 +867,7 @@
+ 					goto cleanup;
+ 				ji->data.token = mono_jump_info_token_new (mp, image, MONO_TOKEN_STRING + decode_value (p, &p));
+ 				break;
++			case MONO_PATCH_INFO_DECLSEC:
+ 			case MONO_PATCH_INFO_LDTOKEN:
+ 			case MONO_PATCH_INFO_TYPE_FROM_HANDLE:
+ 				image = load_image (aot_module, decode_value (p, &p));
+@@ -1522,6 +1523,7 @@
+ 			encode_value (patch_info->data.token->token - MONO_TOKEN_STRING, p, &p);
+ 			break;
+ 		}
++		case MONO_PATCH_INFO_DECLSEC:
+ 		case MONO_PATCH_INFO_LDTOKEN:
+ 		case MONO_PATCH_INFO_TYPE_FROM_HANDLE:
+ 			encode_value (get_image_index (acfg, patch_info->data.token->image), p, &p);
+Index: mini/driver.c
+===================================================================
+--- mini/driver.c	(revision 39305)
++++ mini/driver.c	(working copy)
+@@ -37,6 +37,7 @@
+ #include <mono/metadata/verify.h>
+ #include <mono/metadata/mono-debug.h>
+ #include <mono/metadata/mono-debug-debugger.h>
++#include <mono/metadata/security-manager.h>
+ #include <mono/os/gc_wrapper.h>
+ 
+ #include "mini.h"
+@@ -718,6 +719,7 @@
+ 			enable_debugging = TRUE;
+ 		} else if (strcmp (argv [i], "--security") == 0) {
+ 			mono_use_security_manager = TRUE;
++			mono_activate_security_manager ();
+ 		} else {
+ 			fprintf (stderr, "Unknown command line option: '%s'\n", argv [i]);
+ 			return 1;
+@@ -749,11 +751,6 @@
+ 			exit (1);
+ 	}
+ 
+-	if (mono_compile_aot && mono_use_security_manager) {
+-		mono_use_security_manager = FALSE;
+-		g_warning ("Current security manager implementation isn't compatible with AOT - disabling security manager.");
+-	}
+-
+ 	mono_set_defaults (mini_verbose, opt);
+ 	domain = mini_init (argv [i]);
+ 	

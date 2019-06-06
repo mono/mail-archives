@@ -1,0 +1,237 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-devel-list] RE: [Gc] Segmentation fault with &quot;GC_ENABLE_INCREMENTAL&quot;
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20RE%3A%20%5BGc%5D%20Segmentation%20fault%20with%20%22GC_ENABLE_INCREMENTAL%22&In-Reply-To=">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="001601.html">
+   <LINK REL="Next"  HREF="001602.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-devel-list] RE: [Gc] Segmentation fault with &quot;GC_ENABLE_INCREMENTAL&quot;</H1>
+    <B>Boehm, Hans</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-devel-list%5D%20RE%3A%20%5BGc%5D%20Segmentation%20fault%20with%20%22GC_ENABLE_INCREMENTAL%22&In-Reply-To="
+       TITLE="[Mono-devel-list] RE: [Gc] Segmentation fault with &quot;GC_ENABLE_INCREMENTAL&quot;">hans_boehm at hp.com
+       </A><BR>
+    <I>Mon Jul 21 18:59:47 EDT 2003</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="001601.html">[Mono-devel-list] mono-debug-debugger.c patch for non-GCC
+</A></li>
+        <LI>Next message: <A HREF="001602.html">[Mono-devel-list] patch as interp.c needs metadata_section initialized
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1609">[ date ]</a>
+              <a href="thread.html#1609">[ thread ]</a>
+              <a href="subject.html#1609">[ subject ]</a>
+              <a href="author.html#1609">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>For the incremental GC to work correctly, every page in the heap needs to either be
+protected or marked dirty, since we need to keep track of all pointer writes.
+Normally pages are unprotected only in response to a write fault, which can be
+caused by either client or mutator.  The collector
+explicitly unprotects a page and marks it dirty to optimize certain cases.
+
+This mechanism does not work with system calls that write to the heap,
+since OS kernels don't treat those the same as ordinary writes.  Typically the
+system call fails rather than invoking the handler.  Most seriously,
+there is often no way to recover from a write fault generated during a system call.
+One could argue that this is a misdesign in the kernel interface; but it has a long
+history and all sorts of code expects it to work the way it does.
+
+Possible ways to deal with this:
+
+1) Provide a &quot;dirty bit&quot; facility in the kernel that does the right thing.
+This would also eliminate the signal handling overhead.
+No doubt impractical, especially in the short term, except on the one or two
+platforms for which it currently exists.
+
+2) Change Mono so that it doesn't write to the heap in a system call, e.g. by 
+having the system call write to the stack first and then copying.  Expensive.
+Probably fine for system calls that write small amounts of data.
+
+3) Explicitly unprotect memory before issuing a system call that writes to
+the heap.  See the GC_begin_syscall(), GC_end_syscall(), GC_unprotect_range()
+calls.  This doesn't really work very well for multithreaded code, since
+you need to hold the GC lock during the system call, which is very bad if the
+call is e.g. a blocking read(). 
+
+4) Make sure that all system call writes go to heap blocks allocated with
+GC_malloc_atomic().  Since system calls rarely write pointers, this can
+usually be arranged.  Enable incremental collection only if
+GC_incremental_protection_needs() &amp; (GC_PROTECTS_PTRFREE_HEAP | GC_PROTECTS_STATIC_DATA | GC_PROTECTS_STACK)
+is zero.  This should be the case on X86 with a standard collector configuration.
+On other architectures you may need to adjust HBLKSIZE in the collector to match the
+page size to make this work.  
+
+I would try for a combination of (2) and (4).
+
+Hans
+
+&gt;<i> -----Original Message-----
+</I>&gt;<i> From: Okehee Goh [mailto:<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">ogoh at asu.edu</A>]
+</I>&gt;<i> Sent: Friday, July 18, 2003 1:31 PM
+</I>&gt;<i> To: Boehm, Hans; '<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">gc at linux.hpl.hp.com</A>'; 
+</I>&gt;<i> <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">mono-devel-list at lists.ximian.com</A>
+</I>&gt;<i> Subject: RE: [Gc] Segmentation fault with &quot;GC_ENABLE_INCREMENTAL&quot;
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i>  Hello Dr.Boehm,
+</I>&gt;<i>  Thank you so much for your reply.
+</I>&gt;<i>  I am looking at libgc that comes with Mono-0.25. I'd like to 
+</I>&gt;<i> understand it
+</I>&gt;<i> firmly.
+</I>&gt;<i> 
+</I>&gt;<i>  The memory protection during an incremental GC in BoehmGC6.1 
+</I>&gt;<i> seems to be
+</I>&gt;<i> enabled such that
+</I>&gt;<i>    (1) SIGSEV is associated to trigger GC_write_fault_handler at
+</I>&gt;<i> GC_dirty_init(), and GC_write_fault_handler() records pages 
+</I>&gt;<i> that violate a
+</I>&gt;<i> write protection,
+</I>&gt;<i>    (2) a heap is protected as just read-only during incremental GC at
+</I>&gt;<i> GC_read_dirty() which is called at stopped_mark(),
+</I>&gt;<i>    (3) dirty pages are re-visited again at mark_some()...
+</I>&gt;<i> ( os_dep.c is very complicating to support various platforms. 
+</I>&gt;<i> I followed
+</I>&gt;<i> functions for MPROTECT_VDB for my system, i386 and Linux)
+</I>&gt;<i> 
+</I>&gt;<i>  If so, some system calls from Mono, that attempt to write on 
+</I>&gt;<i> a protected
+</I>&gt;<i> heap can cause SIGSEV even though they are nothing to do with 
+</I>&gt;<i> application's
+</I>&gt;<i> memory writing that must be caught for Write Barrier.
+</I>&gt;<i>  But, why aren't they trapped by GC_write_fault_handler()?
+</I>&gt;<i>  And also could you give any advice about what to check or 
+</I>&gt;<i> what to do to
+</I>&gt;<i> support the current implementation for an incremental GC with Mono?
+</I>&gt;<i> 
+</I>&gt;<i>  This is another question.
+</I>&gt;<i>  At the end of GC_write_fault_handler(), it releases the 
+</I>&gt;<i> protection of the
+</I>&gt;<i> page that violates a write protection after recording the 
+</I>&gt;<i> page as a dirty
+</I>&gt;<i> page. But, I couldn't find where the protection for other pages  are
+</I>&gt;<i> released before starting an application(mutator).
+</I>&gt;<i> 
+</I>&gt;<i>  Thank you so much in advance.
+</I>&gt;<i> 
+</I>&gt;<i>  Regards,
+</I>&gt;<i> 
+</I>&gt;<i>  Okehee
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> -----Original Message-----
+</I>&gt;<i> From: Boehm, Hans [mailto:<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">hans_boehm at hp.com</A>]
+</I>&gt;<i> Sent: Wednesday, July 16, 2003 3:45 PM
+</I>&gt;<i> To: 'Okehee Goh'; '<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">gc at linux.hpl.hp.com</A>'; <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">ximian-mono-list at ximian.com</A>
+</I>&gt;<i> Subject: RE: [Gc] Segmentation fault with &quot;GC_ENABLE_INCREMENTAL&quot;
+</I>&gt;<i> 
+</I>&gt;<i> 
+</I>&gt;<i> Unless Mono specifically supports this by being careful about 
+</I>&gt;<i> where system
+</I>&gt;<i> calls can write, this is unlikely to work.
+</I>&gt;<i> 
+</I>&gt;<i> It will almost certainly fail if any system calls (e.g. 
+</I>&gt;<i> &quot;read&quot;) write to
+</I>&gt;<i> heap sections allocated with GC_malloc, though sometimes 
+</I>&gt;<i> sections allocated
+</I>&gt;<i> with GC_malloc_atomic are OK.  There are vague plans to hide 
+</I>&gt;<i> all of this and
+</I>&gt;<i> make this directly usable in gcj, but I don't think it has 
+</I>&gt;<i> happened there
+</I>&gt;<i> yet, either.
+</I>&gt;<i> 
+</I>&gt;<i> I assume you're doing this because you saw unacceptable pause 
+</I>&gt;<i> times without
+</I>&gt;<i> incremental collection?  Other things that might help a bit are:
+</I>&gt;<i> 
+</I>&gt;<i> 1) Making sure that pointer-free objects (e.g. bitmaps, 
+</I>&gt;<i> arrays of numbers)
+</I>&gt;<i> are known by the collector to be pointer-free.  I don't know 
+</I>&gt;<i> whether Mono
+</I>&gt;<i> already does this, or whether you are allocating any other 
+</I>&gt;<i> objects to which
+</I>&gt;<i> this might apply.
+</I>&gt;<i> 
+</I>&gt;<i> 2) If you are running on a dual processor (or possibly 
+</I>&gt;<i> &quot;hyperthreaded&quot; P4),
+</I>&gt;<i> turn on the parallel GC.
+</I>&gt;<i> 
+</I>&gt;<i> Hans
+</I>&gt;<i> 
+</I>&gt;<i> &gt; -----Original Message-----
+</I>&gt;<i> &gt; From: Okehee Goh [mailto:<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">ogoh at asu.edu</A>]
+</I>&gt;<i> &gt; Sent: Wednesday, July 16, 2003 2:11 PM
+</I>&gt;<i> &gt; To: '<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">gc at linux.hpl.hp.com</A>'; <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">ximian-mono-list at ximian.com</A>
+</I>&gt;<i> &gt; Subject: [Gc] Segmentation fault with &quot;GC_ENABLE_INCREMENTAL&quot;
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;  Hello,
+</I>&gt;<i> &gt;  I run Mono-0.25 with &quot;GC_ENABLE_INCREMENTAL&quot; to enable an
+</I>&gt;<i> &gt; incremental GC.
+</I>&gt;<i> &gt;  But it just gave a segmentation fault.
+</I>&gt;<i> &gt;  One of documents regarding Boehm's GC says that the
+</I>&gt;<i> &gt; incremental GC can
+</I>&gt;<i> &gt; cause &quot;unintended system call failure.&quot;
+</I>&gt;<i> &gt;  (Refer to the following..)
+</I>&gt;<i> &gt;  Is there anybody who didn't encounter this problem? My
+</I>&gt;<i> &gt; system is Linux
+</I>&gt;<i> &gt; kernel 2.4 and i686.
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;   ---
+</I>&gt;<i> &gt;  GC_ENABLE_INCREMENTAL - Turn on incremental collection at
+</I>&gt;<i> &gt; startup. Note
+</I>&gt;<i> &gt; that,
+</I>&gt;<i> &gt; depending on platform and collector configuration, this
+</I>&gt;<i> &gt; may involve write protecting pieces of the heap to
+</I>&gt;<i> &gt; track modifications. These pieces may include pointerfree
+</I>&gt;<i> &gt; objects or not. Although this is intended to be
+</I>&gt;<i> &gt; transparent, it may cause unintended system call failures.
+</I>&gt;<i> &gt; Use with caution.
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;  Any suggestion will be appreciated.
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;  Regards,
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt;  Okehee
+</I>&gt;<i> &gt;
+</I>&gt;<i> &gt; _______________________________________________
+</I>&gt;<i> &gt; Gc mailing list
+</I>&gt;<i> &gt; <A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">Gc at linux.hpl.hp.com</A>
+</I>&gt;<i> &gt; <A HREF="http://linux.hpl.hp.com/cgi-bin/mailman/listinfo/gc">http://linux.hpl.hp.com/cgi-bin/mailman/listinfo/gc</A>
+</I>&gt;<i> &gt;
+</I>&gt;<i> 
+</I>
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="001601.html">[Mono-devel-list] mono-debug-debugger.c patch for non-GCC
+</A></li>
+	<LI>Next message: <A HREF="001602.html">[Mono-devel-list] patch as interp.c needs metadata_section initialized
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1609">[ date ]</a>
+              <a href="thread.html#1609">[ thread ]</a>
+              <a href="subject.html#1609">[ subject ]</a>
+              <a href="author.html#1609">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

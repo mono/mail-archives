@@ -1,0 +1,212 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-dev] New error handling framework for mono
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20New%20error%20handling%20framework%20for%20mono&In-Reply-To=8cca42d80908180652l650a9f8bq56ca304d892d96ad%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="032794.html">
+   <LINK REL="Next"  HREF="032804.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-dev] New error handling framework for mono</H1>
+    <B>Paolo Molaro</B> 
+    <A HREF="mailto:mono-devel-list%40lists.ximian.com?Subject=%5BMono-dev%5D%20New%20error%20handling%20framework%20for%20mono&In-Reply-To=8cca42d80908180652l650a9f8bq56ca304d892d96ad%40mail.gmail.com"
+       TITLE="[Mono-dev] New error handling framework for mono">lupus at ximian.com
+       </A><BR>
+    <I>Tue Aug 18 10:43:48 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="032794.html">[Mono-dev] New error handling framework for mono
+</A></li>
+        <LI>Next message: <A HREF="032804.html">[Mono-dev] New error handling framework for mono
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32795">[ date ]</a>
+              <a href="thread.html#32795">[ thread ]</a>
+              <a href="subject.html#32795">[ subject ]</a>
+              <a href="author.html#32795">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 08/18/09 Rodrigo Kumpera wrote:
+&gt;<i> &gt; Still open is how this would be integrated on 2.6
+</I>
+I think we should keep this internal for 2.6 and expose it in 2.8 wth
+the other API changes, once we have gained experience with the new API.
+
+&gt;<i> and if functions should
+</I>&gt;<i> &gt; error out if passed an already set error object.
+</I>
+I think as a general rule the called function should set the
+error code to OK. We already have this pattern (like in
+mono_image_open ()) and we should keep it.
+Once we have called a function that can and does result in an error, it
+is pointless to continue execution.
+
+A comment about the use of TLS data that was raised in the thread:
+*) we use that pattern already in mono and it has been proved to be
+a huge source of bugs
+*) it introduces issues when an additional error happens while handling
+the first one (info is either overwritten and lost or you have to
+manually keep track of it)
+
+The first one is reason enough to avoid doing the same mistake twice.
+
+&gt;<i> --- a/mono/metadata/Makefile.am
+</I>&gt;<i> +++ b/mono/metadata/Makefile.am
+</I>&gt;<i> @@ -160,6 +160,9 @@ libmonoruntime_la_SOURCES = \
+</I>&gt;<i>  	threadpool-internals.h	\
+</I>&gt;<i>  	verify.c		\
+</I>&gt;<i>  	verify-internals.h	\
+</I>&gt;<i> +	mono-error.c	\
+</I>&gt;<i> +	mono-error.h	\
+</I>&gt;<i> +	mono-error-internal.h	\
+</I>
+This should be in mono/utils, so we can use it also in the code there.
+
+&gt;<i> --- /dev/null
+</I>&gt;<i> +++ b/mono/metadata/mono-error-internals.h
+</I>&gt;<i> +void
+</I>&gt;<i> +mono_error_set_type_load (MonoError *error, MonoClass *klass, char *msg_format, ...) MONO_INTERNAL;
+</I>&gt;<i> +
+</I>&gt;<i> +void
+</I>&gt;<i> +mono_error_set_type_load2 (MonoError *error, char *type_name, char *assembly_name, char *msg_format, ...) MONO_INTERNAL;
+</I>
+&quot;load2&quot; is ugly, use something like mono_error_set_type_load_name,
+instead. The other one could be called mono_error_set_type_load_class to
+keep more symmetry in the naming.
+
+&gt;<i> +MonoException*
+</I>&gt;<i> +mono_error_prepare_exception (MonoError *error, MonoDomain *domain) MONO_INTERNAL;
+</I>
+This is one function where you could actually start using the new
+mechanism, adding a MonoError *error_out as the last argument.
+
+&gt;<i> --- /dev/null
+</I>&gt;<i> +++ b/mono/metadata/mono-error.c
+</I>&gt;<i> @@ -0,0 +1,253 @@
+</I>&gt;<i> +
+</I>&gt;<i> +#define mono_error_get_message(E) (((E)-&gt;flags &amp; MONO_ERROR_ON_SIGNAL_CONTEXT) ? (E)-&gt;message : (E)-&gt;full_message)
+</I>
+I don't like MONO_ERROR_ON_SIGNAL_CONTEXT: most code is not going to
+know in what mode it was called in. Simply always use the message
+buffer.
+
+&gt;<i> +void
+</I>&gt;<i> +mono_error_init (MonoError *error, unsigned short flags)
+</I>
+The common usage will be without any flags, so I would have the simpler
+	void mono_error_init (MonoError *error)
+and
+	void mono_error_init_flags (MonoError *error, unsigned short flags)
+in the case we actually want to set the non-default flags.
+
+&gt;<i> +void
+</I>&gt;<i> +mono_error_cleanup (MonoError *error)
+</I>&gt;<i> +{
+</I>&gt;<i> +	if (error-&gt;flags &amp; MONO_ERROR_ON_SIGNAL_CONTEXT) //no memory was allocated
+</I>&gt;<i> +		return;
+</I>
+A flag that tells the code the strings are to be freed is more
+general-purpouse than MONO_ERROR_ON_SIGNAL_CONTEXT, IMHO.
+
+&gt;<i> +void
+</I>&gt;<i> +mono_error_set_assembly_name (MonoError *error, char *assembly_name)
+</I>
+It's a good idea to have the string arguments be const char*.
+
+&gt;<i> +void
+</I>&gt;<i> +mono_error_set_assembly_load (MonoError *error, char *assembly_name, char *msg_format, ...)
+</I>&gt;<i> +{
+</I>&gt;<i> +	va_list args;
+</I>&gt;<i> +	error-&gt;error_code = MONO_EXCEPTION_FILE_NOT_FOUND;
+</I>
+File not found is not the only failure case for an assembly load, we
+should be more flexible here. Think of a bad image, for example, but
+also of an out of memory issue.
+
+&gt;<i> --- /dev/null
+</I>&gt;<i> +++ b/mono/metadata/mono-error.h
+</I>&gt;<i> @@ -0,0 +1,35 @@
+</I>&gt;<i> +#ifndef __MONO_ERROR_H__
+</I>&gt;<i> +#define __MONO_ERROR_H__
+</I>&gt;<i> +
+</I>&gt;<i> +#include &lt;mono/metadata/class.h&gt;
+</I>&gt;<i> +#include &lt;mono/metadata/metadata.h&gt;
+</I>&gt;<i> +
+</I>&gt;<i> +/*Don't allocate memory or call signal unsafe functions*/
+</I>&gt;<i> +#define MONO_ERROR_ON_SIGNAL_CONTEXT 0x0001
+</I>
+We should use an enum for the flags.
+
+&gt;<i> +typedef struct {
+</I>&gt;<i> +	unsigned short error_code; //MONO_EXCEPTION_*
+</I>&gt;<i> +    unsigned short flags; //MONO_ERROR_*
+</I>&gt;<i> +
+</I>&gt;<i> +	char *type_name;
+</I>&gt;<i> +	char *assembly_name;
+</I>&gt;<i> +	char *member_name;
+</I>&gt;<i> +	MonoClass *klass;
+</I>&gt;<i> +	char *full_message;
+</I>&gt;<i> +	gpointer padding [4];
+</I>&gt;<i> +    char message [128];
+</I>
+The field names should be clearly marked as &quot;don't touch&quot;, except
+maybe error_code. Names like hidden_1, hidden_2 etch should work.
+Also use void* as the type.
+In the internal code at the top of the file you can then do:
+
+#define type_name ((char*)hidden_1)
+
+to keep the code readable. It's kind of an hack.
+An alternative is to have a separate struct with the correct types and
+names and cast to it on public function entry.
+
+Thanks, looking forward an updated patch!
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at debian.org</A>                                     debian/rules
+<A HREF="http://lists.ximian.com/mailman/listinfo/mono-devel-list">lupus at ximian.com</A>                             Monkeys do it better
+</PRE>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="032794.html">[Mono-dev] New error handling framework for mono
+</A></li>
+	<LI>Next message: <A HREF="032804.html">[Mono-dev] New error handling framework for mono
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#32795">[ date ]</a>
+              <a href="thread.html#32795">[ thread ]</a>
+              <a href="subject.html#32795">[ subject ]</a>
+              <a href="author.html#32795">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/mono-devel-list">More information about the Mono-devel-list
+mailing list</a><br>
+</body></html>

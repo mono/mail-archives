@@ -1,0 +1,183 @@
+Index: metadata/object.c
+===================================================================
+--- metadata/object.c	(revision 114992)
++++ metadata/object.c	(working copy)
+@@ -446,7 +446,7 @@
+ }
+ 
+ static gpointer
+-default_remoting_trampoline (MonoMethod *method, MonoRemotingTarget target)
++default_remoting_trampoline (MonoDomain *domain, MonoMethod *method, MonoRemotingTarget target)
+ {
+ 	g_error ("remoting not installed");
+ 	return NULL;
+@@ -1939,8 +1939,7 @@
+ 		MonoMethod *cm;
+ 		    
+ 		if ((cm = class->vtable [i]))
+-			pvt->vtable [i] = mono_method_signature (cm)->generic_param_count
+-				? cm : arch_create_remoting_trampoline (cm, target_type);
++			pvt->vtable [i] = arch_create_remoting_trampoline (domain, cm, target_type);
+ 		else
+ 			pvt->vtable [i] = NULL;
+ 	}
+@@ -1952,7 +1951,7 @@
+ 			gpointer iter = NULL;
+ 			while ((m = mono_class_get_methods (k, &iter)))
+ 				if (!pvt->vtable [m->slot])
+-					pvt->vtable [m->slot] = mono_method_signature (m)->generic_param_count ? m : arch_create_remoting_trampoline (m, target_type);
++					pvt->vtable [m->slot] = arch_create_remoting_trampoline (domain, m, target_type);
+ 		}
+ 	}
+ 
+@@ -1991,7 +1990,7 @@
+ 			iter = NULL;
+ 			j = 0;
+ 			while ((cm = mono_class_get_methods (interf, &iter)))
+-				pvt->vtable [slot + j++] = mono_method_signature (cm)->generic_param_count ? cm : arch_create_remoting_trampoline (cm, target_type);
++				pvt->vtable [slot + j++] = arch_create_remoting_trampoline (domain, cm, target_type);
+ 			
+ 			slot += mono_class_num_methods (interf);
+ 		}
+Index: metadata/class-internals.h
+===================================================================
+--- metadata/class-internals.h	(revision 114992)
++++ metadata/class-internals.h	(working copy)
+@@ -734,7 +734,7 @@
+ 
+ typedef gpointer (*MonoTrampoline)       (MonoMethod *method);
+ typedef gpointer (*MonoJumpTrampoline)       (MonoDomain *domain, MonoMethod *method, gboolean add_sync_wrapper);
+-typedef gpointer (*MonoRemotingTrampoline)       (MonoMethod *method, MonoRemotingTarget target);
++typedef gpointer (*MonoRemotingTrampoline)       (MonoDomain *domain, MonoMethod *method, MonoRemotingTarget target);
+ typedef gpointer (*MonoDelegateTrampoline)       (MonoClass *klass);
+ 
+ typedef gpointer (*MonoLookupDynamicToken) (MonoImage *image, guint32 token, gboolean valid_token, MonoClass **handle_class, MonoGenericContext *context);
+Index: mini/method-to-ir.c
+===================================================================
+--- mini/method-to-ir.c	(revision 114992)
++++ mini/method-to-ir.c	(working copy)
+@@ -6007,7 +6007,8 @@
+ 				INLINE_FAILURE;
+ 
+ #if MONO_ARCH_HAVE_GENERALIZED_IMT_THUNK
+-				if (!(cmethod->klass->flags & TYPE_ATTRIBUTE_INTERFACE)) {
++				if (!(cmethod->klass->flags & TYPE_ATTRIBUTE_INTERFACE) &&
++						cmethod->wrapper_type == MONO_WRAPPER_NONE) {
+ 					g_assert (!imt_arg);
+ 					if (context_used) {
+ 						imt_arg = emit_get_rgctx_method (cfg, context_used,
+Index: mini/mini.c
+===================================================================
+--- mini/mini.c	(revision 114992)
++++ mini/mini.c	(working copy)
+@@ -14177,11 +14177,16 @@
+  * Returns: a pointer to the newly created code 
+  */
+ static gpointer
+-mono_jit_create_remoting_trampoline (MonoMethod *method, MonoRemotingTarget target)
++mono_jit_create_remoting_trampoline (MonoDomain *domain, MonoMethod *method, MonoRemotingTarget target)
+ {
+ 	MonoMethod *nm;
+ 	guint8 *addr = NULL;
+ 
++	if ((method->flags & METHOD_ATTRIBUTE_VIRTUAL) && mono_method_signature (method)->generic_param_count) {
++		return mono_arch_create_specific_trampoline (method, MONO_TRAMPOLINE_GENERIC_VIRTUAL_REMOTING,
++			domain, NULL);
++	}
++
+ 	if ((method->flags & METHOD_ATTRIBUTE_ABSTRACT) || 
+ 	    (mono_method_signature (method)->hasthis && (method->klass->marshalbyref || method->klass == mono_defaults.object_class))) {
+ 		nm = mono_marshal_get_remoting_invoke_for_target (method, target);
+Index: mini/mini.h
+===================================================================
+--- mini/mini.h	(revision 114992)
++++ mini/mini.h	(working copy)
+@@ -801,6 +801,7 @@
+ 	MONO_TRAMPOLINE_AOT_PLT,
+ 	MONO_TRAMPOLINE_DELEGATE,
+ 	MONO_TRAMPOLINE_RESTORE_STACK_PROT,
++	MONO_TRAMPOLINE_GENERIC_VIRTUAL_REMOTING,
+ 	MONO_TRAMPOLINE_NUM
+ } MonoTrampolineType;
+ 
+@@ -1416,6 +1417,7 @@
+ MonoClass*        mono_find_delegate_trampoline_by_addr (gconstpointer addr) MONO_INTERNAL;
+ guint32           mono_find_rgctx_lazy_fetch_trampoline_by_addr (gconstpointer addr) MONO_INTERNAL;
+ gpointer          mono_magic_trampoline (gssize *regs, guint8 *code, MonoMethod *m, guint8* tramp) MONO_INTERNAL;
++gpointer          mono_generic_virtual_remoting_trampoline (gssize *regs, guint8 *code, MonoMethod *m, guint8 *tramp) MONO_INTERNAL;
+ gpointer          mono_delegate_trampoline (gssize *regs, guint8 *code, gpointer *tramp_data, guint8* tramp) MONO_INTERNAL;
+ gpointer          mono_aot_trampoline (gssize *regs, guint8 *code, guint8 *token_info, 
+ 									   guint8* tramp) MONO_INTERNAL;
+Index: mini/mini-amd64.h
+===================================================================
+--- mini/mini-amd64.h	(revision 114994)
++++ mini/mini-amd64.h	(working copy)
+@@ -292,7 +292,7 @@
+ #define MONO_ARCH_HAVE_NOTIFY_PENDING_EXC 1
+ #define MONO_ARCH_ENABLE_NORMALIZE_OPCODES 1
+ #define MONO_ARCH_ENABLE_GLOBAL_RA 1
+-/* #define MONO_ARCH_HAVE_GENERALIZED_IMT_THUNK 1 */
++#define MONO_ARCH_HAVE_GENERALIZED_IMT_THUNK 1
+ 
+ #define MONO_ARCH_AOT_SUPPORTED 1
+ 
+Index: mini/mini-trampolines.c
+===================================================================
+--- mini/mini-trampolines.c	(revision 114992)
++++ mini/mini-trampolines.c	(working copy)
+@@ -365,6 +365,38 @@
+ 	return addr;
+ }
+ 
++gpointer
++mono_generic_virtual_remoting_trampoline (gssize *regs, guint8 *code, MonoMethod *m, guint8 *tramp)
++{
++	MonoGenericContext context = { NULL, NULL };
++	MonoMethod *declaring;
++	gpointer addr;
++
++	g_assert (m->is_generic);
++
++	if (m->is_inflated)
++		declaring = mono_method_get_declaring_generic_method (m);
++	else
++		declaring = m;
++
++	if (m->klass->generic_class)
++		context.class_inst = m->klass->generic_class->context.class_inst;
++	else
++		g_assert (!m->klass->generic_container);
++
++	context.method_inst = (MonoGenericInst*)mono_arch_find_imt_method ((gpointer*)regs, code);
++
++	m = mono_class_inflate_generic_method (declaring, &context);
++	m = mono_marshal_get_remoting_invoke_with_check (m);
++
++	addr = mono_compile_method (m);
++	g_assert (addr);
++
++	mono_debugger_trampoline_compiled (m, addr);
++
++	return addr;
++}
++
+ /*
+  * mono_aot_trampoline:
+  *
+@@ -625,6 +657,8 @@
+ #endif
+ 	case MONO_TRAMPOLINE_RESTORE_STACK_PROT:
+ 		return mono_altstack_restore_prot;
++	case MONO_TRAMPOLINE_GENERIC_VIRTUAL_REMOTING:
++		return mono_generic_virtual_remoting_trampoline;
+ 	default:
+ 		g_assert_not_reached ();
+ 		return NULL;
+@@ -652,6 +686,7 @@
+ 	mono_trampoline_code [MONO_TRAMPOLINE_DELEGATE] = mono_arch_create_trampoline_code (MONO_TRAMPOLINE_DELEGATE);
+ #endif
+ 	mono_trampoline_code [MONO_TRAMPOLINE_RESTORE_STACK_PROT] = mono_arch_create_trampoline_code (MONO_TRAMPOLINE_RESTORE_STACK_PROT);
++	mono_trampoline_code [MONO_TRAMPOLINE_GENERIC_VIRTUAL_REMOTING] = mono_arch_create_trampoline_code (MONO_TRAMPOLINE_GENERIC_VIRTUAL_REMOTING);
+ }
+ 
+ void

@@ -1,0 +1,262 @@
+Index: libgc/darwin_stop_world.c
+===================================================================
+--- libgc/darwin_stop_world.c	(revision 131900)
++++ libgc/darwin_stop_world.c	(working copy)
+@@ -2,6 +2,12 @@
+ 
+ # if defined(GC_DARWIN_THREADS)
+ 
++#include "mono/utils/mono-compiler.h"
++
++#ifdef MONO_DEBUGGER_SUPPORTED
++#include "include/libgc-mono-debugger.h"
++#endif
++
+ /* From "Inside Mac OS X - Mach-O Runtime Architecture" published by Apple
+    Page 49:
+    "The space beneath the stack pointer, where a new stack frame would normally
+@@ -682,4 +688,18 @@
+   GC_use_mach_handler_thread = 1;
+ }
+ 
++#ifdef MONO_DEBUGGER_SUPPORTED
++GCThreadFunctions *gc_thread_vtable = NULL;
++
++void *
++GC_mono_debugger_get_stack_ptr (void)
++{
++	GC_thread me;
++
++	me = GC_lookup_thread (pthread_self ());
++	return &me->stop_info.stack_ptr;
++}
++
+ #endif
++
++#endif
+Index: libgc/include/private/gc_priv.h
+===================================================================
+--- libgc/include/private/gc_priv.h	(revision 131900)
++++ libgc/include/private/gc_priv.h	(working copy)
+@@ -1966,10 +1966,14 @@
+ #      define SIG_SUSPEND SIGPWR
+ #    endif
+ #   else  /* !GC_LINUX_THREADS */
+-#     if defined(_SIGRTMIN)
+-#       define SIG_SUSPEND _SIGRTMIN + 6
+-#     else
+-#       define SIG_SUSPEND SIGRTMIN + 6
++#	  if defined(__MACH__)
++#		define SIG_SUSPEND SIGUSR1 + 6
++#	  else
++#       if defined(_SIGRTMIN)
++#         define SIG_SUSPEND _SIGRTMIN + 6
++#       else
++#         define SIG_SUSPEND SIGRTMIN + 6
++#		endif
+ #     endif       
+ #   endif
+ #  endif /* !SIG_SUSPEND */
+Index: libgc/include/private/darwin_stop_world.h
+===================================================================
+--- libgc/include/private/darwin_stop_world.h	(revision 131900)
++++ libgc/include/private/darwin_stop_world.h	(working copy)
+@@ -10,6 +10,12 @@
+ 
+ struct thread_stop_info {
+     mach_port_t mach_thread;
++
++    int	signal;
++    word last_stop_count;	/* GC_last_stop_count value when thread	*/
++    				/* last successfully handled a suspend	*/
++    				/* signal.				*/
++    ptr_t stack_ptr;  		/* Valid only when stopped.      	*/
+ };
+ 
+ struct GC_mach_thread {
+Index: libgc/pthread_support.c
+===================================================================
+--- libgc/pthread_support.c	(revision 131900)
++++ libgc/pthread_support.c	(working copy)
+@@ -1009,8 +1009,13 @@
+ #     endif
+       t -> flags = DETACHED | MAIN_THREAD;
+ #ifdef MONO_DEBUGGER_SUPPORTED
+-      if (gc_thread_vtable && gc_thread_vtable->thread_created)
++     if (gc_thread_vtable && gc_thread_vtable->thread_created)
++#     ifdef GC_DARWIN_THREADS
++        gc_thread_vtable->thread_created (mach_thread_self (), &t->stop_info.stack_ptr);
++#     else
+         gc_thread_vtable->thread_created (pthread_self (), &t->stop_info.stack_ptr);
++#     endif
++
+ #endif
+ 
+     GC_stop_init();
+Index: mono/mini/mini.c
+===================================================================
+--- mono/mini/mini.c	(revision 131900)
++++ mono/mini/mini.c	(working copy)
+@@ -111,6 +111,15 @@
+ #define mono_jit_unlock() LeaveCriticalSection (&jit_mutex)
+ static CRITICAL_SECTION jit_mutex;
+ 
++void mono_jit_init_lock() {
++	static int isInited = 0;
++	if(!isInited)
++	{
++		InitializeCriticalSection (&jit_mutex);
++		isInited = 1;
++	}
++}
++
+ static MonoCodeManager *global_codeman = NULL;
+ 
+ /* FIXME: Make this static again */
+@@ -4674,7 +4683,7 @@
+ 	if (!default_opt_set)
+ 		default_opt = mono_parse_default_optimizations (NULL);
+ 
+-	InitializeCriticalSection (&jit_mutex);
++	mono_jit_init_lock();
+ 
+ 	if (!global_codeman)
+ 		global_codeman = mono_code_manager_new ();
+Index: mono/mini/mini.h
+===================================================================
+--- mono/mini/mini.h	(revision 131900)
++++ mono/mini/mini.h	(working copy)
+@@ -1295,6 +1295,7 @@
+ MonoLMF * mono_get_lmf                      (void) MONO_INTERNAL;
+ MonoLMF** mono_get_lmf_addr                 (void) MONO_INTERNAL;
+ void      mono_jit_thread_attach            (MonoDomain *domain);
++void	  mono_jit_init_lock                () MONO_INTERNAL;
+ guint32   mono_get_jit_tls_key              (void) MONO_INTERNAL;
+ gint32    mono_get_jit_tls_offset           (void) MONO_INTERNAL;
+ gint32    mono_get_lmf_tls_offset           (void) MONO_INTERNAL;
+Index: mono/mini/mdb-debug-info32-darwin.s
+===================================================================
+--- mono/mini/mdb-debug-info32-darwin.s	(revision 0)
++++ mono/mini/mdb-debug-info32-darwin.s	(revision 0)
+@@ -0,0 +1,10 @@
++.text
++.globl		_MONO_DEBUGGER__debugger_info
++.globl		_MONO_DEBUGGER__notification_function	
++_MONO_DEBUGGER__notification_function:
++		int3
++		ret
++.section	.mdb_debug_info, "aw"
++.globl		_MONO_DEBUGGER__debugger_info_ptr
++_MONO_DEBUGGER__debugger_info_ptr:
++		.long	_MONO_DEBUGGER__debugger_info
+Index: mono/mini/Info.plist
+===================================================================
+--- mono/mini/Info.plist	(revision 0)
++++ mono/mini/Info.plist	(revision 0)
+@@ -0,0 +1,16 @@
++<plist version="1.0">
++<dict>
++    <key>CFBundleDevelopmentRegion</key>
++    <string>English</string>
++    <key>CFBundleIdentifier</key>
++    <string>com.novell.mono</string>
++    <key>CFBundleInfoDictionaryVersion</key>
++    <string>6.0</string>
++    <key>CFBundleName</key>
++    <string>mono</string>
++    <key>CFBundleVersion</key>
++    <string>0.3</string>
++	<key>SecTaskAccess</key>
++	<string>allowed</string>
++</dict>
++</plist>
+Index: mono/mini/Makefile.am
+===================================================================
+--- mono/mini/Makefile.am	(revision 131900)
++++ mono/mini/Makefile.am	(working copy)
+@@ -116,8 +116,13 @@
+ 	-lm	\
+ 	$(MONO_DTRACE_OBJECT)
+ 
++if PLATFORM_DARWIN
+ mono_LDFLAGS = \
++	$(static_flags) -export-dynamic $(monobinldflags) -sectcreate __TEXT __info_plist Info.plist
++else
++mono_LDFLAGS = \
+ 	$(static_flags) -export-dynamic $(monobinldflags)
++endif
+ 
+ if DTRACE_G_REQUIRED
+ 
+@@ -304,6 +309,9 @@
+ 	basic-simd.cs
+ 
+ if MONO_DEBUGGER_SUPPORTED
++if PLATFORM_DARWIN
++mono_debugger_arch_sources = mdb-debug-info32-darwin.s
++else
+ if AMD64
+ mono_debugger_arch_sources = mdb-debug-info64.s
+ else
+@@ -311,6 +319,7 @@
+ mono_debugger_arch_sources = mdb-debug-info32.s
+ endif
+ endif
++endif
+ mono_debugger_sources = debug-debugger.c debug-debugger.h $(mono_debugger_arch_sources)
+ else
+ mono_debugger_sources =
+Index: mono/mini/driver.c
+===================================================================
+--- mono/mini/driver.c	(revision 131900)
++++ mono/mini/driver.c	(working copy)
+@@ -1521,6 +1521,7 @@
+ 		enable_debugging = TRUE;
+ 
+ #ifdef MONO_DEBUGGER_SUPPORTED
++		mono_jit_init_lock();
+ 		mono_debug_init (MONO_DEBUG_FORMAT_DEBUGGER);
+ 		mono_debugger_init ();
+ #else
+Index: mono/mini/debug-debugger.c
+===================================================================
+--- mono/mini/debug-debugger.c	(revision 131900)
++++ mono/mini/debug-debugger.c	(working copy)
+@@ -398,8 +398,11 @@
+ static void
+ debugger_gc_thread_created (pthread_t thread, void *stack_ptr)
+ {
++#ifndef __MACH__
++/* threaded debugging not supported yet on OS X */
+ 	mono_debugger_event (MONO_DEBUGGER_EVENT_GC_THREAD_CREATED,
+ 			     (guint64) (gsize) stack_ptr, thread);
++#endif			     
+ }
+ 
+ static void
+Index: mono/tests/tests-config
+===================================================================
+--- mono/tests/tests-config	(revision 131900)
++++ mono/tests/tests-config	(working copy)
+@@ -1,5 +1,5 @@
+ <configuration>
+-	<dllmap dll="cygwin1.dll" target="libc.so.6" />
+-	<dllmap dll="libc" target="libc.so.6" />
++	<dllmap dll="cygwin1.dll" target="libc.dylib" />
++	<dllmap dll="libc" target="libc.dylib" />
+ </configuration>
+ 
+Index: configure.in
+===================================================================
+--- configure.in	(revision 131900)
++++ configure.in	(working copy)
+@@ -2107,6 +2107,9 @@
+ 		*-*-*linux*)
+ 			mono_debugger_supported=yes
+ 			;;
++		*86-apple-darwin*)
++			mono_debugger_supported=yes
++			;;		
+ 		esac
+ 	fi
+ fi

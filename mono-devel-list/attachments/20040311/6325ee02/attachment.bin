@@ -1,0 +1,400 @@
+Two small things:
+
+1) isinst and castclass are optimized for sealed classes. Since
+we dont have to account for the class being a child class, we just
+compare obj->vtable->klass.
+
+2) if you are doing cmp (isinst (obj, 0)), do an optimized version with
+branches.
+
+The following is a good test case:
+
+using System;
+
+public class Test {
+
+	public static int Main (string[] args) {
+		const int repeat = 1;
+		
+		int t0 = Environment.TickCount;
+		
+		object a = new Test ();
+		
+		for (int i = 0; i < (repeat * 5000); i++) {
+			for (int j = 0; j < 100000; j++)
+				if (!(a is Test))
+					return 1;
+		}
+		
+				
+		int tf = Environment.TickCount;
+		
+		Console.WriteLine ("Test; true  : {0} ms", tf - t0);
+		
+		a = "a";
+		
+		t0 = Environment.TickCount;
+		for (int i = 0; i < (repeat * 5000); i++) {
+			for (int j = 0; j < 100000; j++)
+				if ((a is Test))
+					return 1;
+		}
+		tf = Environment.TickCount;
+		Console.WriteLine ("Test; false  : {0} ms", tf - t0);
+		
+		t0 = Environment.TickCount;
+		for (int i = 0; i < (repeat * 5000); i++) {
+			for (int j = 0; j < 100000; j++)
+				if (!(a is string))
+					return 1;
+		}
+		tf = Environment.TickCount;
+		Console.WriteLine ("String; true  : {0} ms", tf - t0);
+		
+		
+		a = new Test ();
+		t0 = Environment.TickCount;
+		for (int i = 0; i < (repeat * 5000); i++) {
+			for (int j = 0; j < 100000; j++)
+				if ((a is string))
+					return 1;
+		}
+		tf = Environment.TickCount;
+		Console.WriteLine ("String; false  : {0} ms", tf - t0);
+		
+		a = null;
+		t0 = Environment.TickCount;
+		for (int i = 0; i < (repeat * 5000); i++) {
+			for (int j = 0; j < 100000; j++)
+				if ((a is string))
+					return 1;
+		}
+		tf = Environment.TickCount;
+		Console.WriteLine ("String; null  : {0} ms", tf - t0);
+		
+		a = "a";
+		t0 = Environment.TickCount;
+		for (int i = 0; i < (repeat * 5000); i++) {
+			for (int j = 0; j < 100000; j++)
+				if ((a is A))
+					return 1;
+		}
+		tf = Environment.TickCount;
+		Console.WriteLine ("A; deep  : {0} ms", tf - t0);
+		
+		return 0;
+	}
+}
+
+class A : B {}
+class B : C {}
+class C : D {}
+class D : E {}
+class E : F {}
+class F : G {}
+class G : H {}
+class H {}
+
+
+results:
+[benm@Ben tmp]$ mono t.exe
+Test; true  : 6758 ms
+Test; false  : 7350 ms
+String; true  : 7357 ms
+String; false  : 7398 ms
+String; null  : 3984 ms
+A; deep  : 6793 ms
+
+[benm@Ben tmp]$ /devel/mono/mono/mini/mono t.exe
+Test; true  : 6750 ms (same)
+Test; false  : 7366 ms (same)
+String; true  : 3984 ms (due to 1)
+String; false  : 4289 ms (due to 1)
+String; null  : 2849 ms (due to 2)
+A; deep  : 5668 ms (due to 2)
+
+Index: inssel.brg
+===================================================================
+RCS file: /cvs/public/mono/mono/mini/inssel.brg,v
+retrieving revision 1.35
+diff -u -r1.35 inssel.brg
+--- inssel.brg	5 Mar 2004 03:46:51 -0000	1.35
++++ inssel.brg	12 Mar 2004 03:58:46 -0000
+@@ -216,14 +216,22 @@
+ 
+ #define	MONO_EMIT_NEW_CLASSCONST(cfg,dr,imm) MONO_EMIT_NEW_AOTCONST(cfg,dr,imm,MONO_PATCH_INFO_CLASS)
+ 
++#define MONO_NEW_LABEL(cfg,inst) do { \
++		(inst) = mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoInst));	\
++		(inst)->opcode = OP_LABEL;	\
++	} while (0)
++
++#define MONO_NEW_LABEL_FROM_BLOCK(cfg,inst,targetbb) do { \
++		MONO_NEW_LABEL (cfg,inst); \
++	        (inst)->next = (targetbb)->code; \
++		(inst)->inst_c0 = (targetbb)->native_offset; \
++	        (targetbb)->code = (inst); \
++	} while (0);
++
+ #define	MONO_EMIT_NEW_BRANCH_BLOCK(cfg,op,targetbb) do { \
+                 MonoInst *inst; \
+         	MonoInst *target_label; \
+-		target_label = mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoInst));	\
+-		target_label->opcode = OP_LABEL;	\
+-	        target_label->next = (targetbb)->code; \
+-		target_label->inst_c0 = (targetbb)->native_offset; \
+-	        (targetbb)->code = target_label; \
++		MONO_NEW_LABEL_FROM_BLOCK (cfg, target_label, targetbb); \
+ 		inst = mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoInst));	\
+ 		inst->opcode = op;	\
+ 		inst->inst_i0 = target_label;	\
+@@ -240,13 +248,10 @@
+ 	        mono_bblock_add_inst ((cfg)->cbb, inst); \
+ 	} while (0)
+ 
+-#define MONO_NEW_LABEL(cfg,inst) do { \
+-		(inst) = mono_mempool_alloc0 ((cfg)->mempool, sizeof (MonoInst));	\
+-		(inst)->opcode = OP_LABEL;	\
+-	} while (0)
+ 
+ /* we need to kludge state because monoburg puts this stuff before the definition of MBState */
+ void mini_emit_virtual_call (MonoCompile *s, void *state, MonoInst *tree, int novirt_op, int virtop);
++void mini_emit_test_isinst (MonoCompile *s, void *state, MonoInst *tree, MonoBasicBlock *false_target, MonoBasicBlock *true_target);
+ void mini_emit_isninst_cast (MonoCompile *s, int klass_reg, MonoClass *klass, MonoInst *false_target, MonoInst *true_target);
+ void mini_emit_isninst_iface_cast (MonoCompile *s, int vtable_reg, MonoClass *klass, MonoInst *false_target, MonoInst *true_target);
+ void mini_emit_isninst_iface_class_cast (MonoCompile *s, int klass_reg, MonoClass *klass, MonoInst *false_target, MonoInst *true_target);
+@@ -1240,7 +1245,26 @@
+ 
+ # object related opcodes 
+ 
+-reg: CEE_ISINST (reg) {
++#
++# if (!(foo is Bar))
++#
++stmt: CEE_BEQ (OP_COMPARE (CEE_ISINST (reg), OP_ICONST)) {
++	mini_emit_test_isinst (s, state, state->left->left->tree, tree->inst_true_bb, tree->inst_false_bb);
++} cost {
++	MBCOND (state->left->right->tree->inst_c0 == 0);
++	
++	return 10;
++}
++
++stmt: CEE_BNE_UN (OP_COMPARE (CEE_ISINST (reg), OP_ICONST)) {
++	mini_emit_test_isinst (s, state, state->left->left->tree, tree->inst_false_bb, tree->inst_true_bb);
++} cost {
++	MBCOND (state->left->right->tree->inst_c0 == 0);
++	
++	return 10;
++}
++
++reg: CEE_ISINST (reg) "20" {
+      	MonoClass *klass = tree->inst_newa_class;
+ 	MonoInst *object_is_null, *end_label, *false_label;
+ 	int obj_reg = state->left->reg1;
+@@ -1961,26 +1985,142 @@
+ 	mono_bblock_add_inst (cfg->cbb, tree);
+ }
+ 
++/*
++ * Emits
++ * if (src is klass)
++ *    goto true_target;
++ * else
++ *    goto false_target;
++ */
++void
++mini_emit_test_isinst (MonoCompile *s, void *st, MonoInst *tree, MonoBasicBlock *false_block, MonoBasicBlock *true_block)
++{
++	MBState *state = st;
++	MonoClass *klass = tree->inst_newa_class;
++	MonoInst *true_target, *false_target;
++	int obj_reg = state->left->reg1;
++	int vtable_reg = mono_regstate_next_int (s->rs);
++	
++	MONO_NEW_LABEL_FROM_BLOCK (s, true_target, true_block);
++	MONO_NEW_LABEL_FROM_BLOCK (s, false_target, false_block);
++	
++	MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, obj_reg, 0);
++	MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BEQ, false_target);
++
++	if (klass->flags & TYPE_ATTRIBUTE_INTERFACE) {
++		MONO_EMIT_NEW_LOAD_MEMBASE (s, vtable_reg, obj_reg, G_STRUCT_OFFSET (MonoObject, vtable));
++		mini_emit_isninst_iface_cast (s, vtable_reg, klass, false_target, true_target);
++	} else {
++		int klass_reg = mono_regstate_next_int (s->rs);
++
++		MONO_EMIT_NEW_LOAD_MEMBASE (s, vtable_reg, obj_reg, G_STRUCT_OFFSET (MonoObject, vtable));
++		MONO_EMIT_NEW_LOAD_MEMBASE (s, klass_reg, vtable_reg, G_STRUCT_OFFSET (MonoVTable, klass));
++
++		if (klass->rank) {
++			int rank_reg = mono_regstate_next_int (s->rs);
++			int eclass_reg = mono_regstate_next_int (s->rs);
++
++			MONO_EMIT_NEW_LOAD_MEMBASE (s, rank_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, rank));
++			MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, rank_reg, klass->rank);
++			MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BNE_UN, false_target);
++			MONO_EMIT_NEW_LOAD_MEMBASE (s, eclass_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, cast_class));
++			if (klass->cast_class == mono_defaults.object_class) {
++				int parent_reg = mono_regstate_next_int (s->rs);
++				int const_reg;
++				MONO_EMIT_NEW_LOAD_MEMBASE (s, parent_reg, eclass_reg, G_STRUCT_OFFSET (MonoClass, parent));
++				if (mono_compile_aot) {
++					const_reg = mono_regstate_next_int (s->rs);
++					MONO_EMIT_NEW_CLASSCONST (s, const_reg, mono_defaults.enum_class->parent);
++					MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, parent_reg, const_reg);
++				} else {
++					MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, parent_reg, mono_defaults.enum_class->parent);
++				}
++				MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BNE_UN, true_target);
++				if (mono_compile_aot) {
++					MONO_EMIT_NEW_CLASSCONST (s, const_reg, mono_defaults.enum_class);
++					MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, eclass_reg, const_reg);
++				} else {
++					MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, eclass_reg, mono_defaults.enum_class);
++				}
++				MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BEQ, true_target);
++			} else if (klass->cast_class == mono_defaults.enum_class->parent) {
++				int const_reg;
++				
++				if (mono_compile_aot) {
++					const_reg = mono_regstate_next_int (s->rs);
++					MONO_EMIT_NEW_CLASSCONST (s, const_reg, mono_defaults.enum_class->parent);
++					MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, eclass_reg, const_reg);
++				} else {
++					MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, eclass_reg, mono_defaults.enum_class->parent);
++				}
++				MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BEQ, true_target);
++				if (mono_compile_aot) {
++					MONO_EMIT_NEW_CLASSCONST (s, const_reg, mono_defaults.enum_class);
++					MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, eclass_reg, const_reg);
++				} else {
++					MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, eclass_reg, mono_defaults.enum_class);
++				}
++				MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BEQ, true_target);
++			} else if (klass->cast_class == mono_defaults.enum_class) {
++				if (mono_compile_aot) {
++					int const_reg = mono_regstate_next_int (s->rs);
++					MONO_EMIT_NEW_CLASSCONST (s, const_reg, mono_defaults.enum_class);
++					MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, eclass_reg, const_reg);
++				} else {
++					MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, eclass_reg, mono_defaults.enum_class);
++				}
++				MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BEQ, true_target);
++			} else if (klass->cast_class->flags & TYPE_ATTRIBUTE_INTERFACE) {
++				mini_emit_isninst_iface_class_cast (s, eclass_reg, klass->cast_class, false_target, true_target);
++			} else {
++				if ((klass->rank == 1) && (klass->byval_arg.type == MONO_TYPE_SZARRAY)) {
++					/* Check that the object is a vector too */
++					int bounds_reg = mono_regstate_next_int (s->rs);
++					MONO_EMIT_NEW_LOAD_MEMBASE (s, bounds_reg, obj_reg, G_STRUCT_OFFSET (MonoArray, bounds));
++					MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, bounds_reg, 0);
++					MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BNE_UN, false_target);
++				}
++				mini_emit_isninst_cast (s, eclass_reg, klass->cast_class, false_target, true_target);
++			}
++		} else {
++			mini_emit_isninst_cast (s, klass_reg, klass, false_target, true_target);
++		}
++	}
++	
++	/* fall thru to false */
++	MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BR, false_target);
++}
++
+ void 
+ mini_emit_isninst_cast (MonoCompile *s, int klass_reg, MonoClass *klass, MonoInst *false_target, MonoInst *true_target)
+ {
+ 	int idepth_reg = mono_regstate_next_int (s->rs);
+ 	int stypes_reg = mono_regstate_next_int (s->rs);
+ 	int stype = mono_regstate_next_int (s->rs);
+-
+-	if (klass->idepth > MONO_DEFAULT_SUPERTABLE_SIZE) {
+-		MONO_EMIT_NEW_LOAD_MEMBASE (s, idepth_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, idepth));
+-		MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, idepth_reg, klass->idepth);
+-		MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BLT_UN, false_target);
+-	}
+-	MONO_EMIT_NEW_LOAD_MEMBASE (s, stypes_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, supertypes));
+-	MONO_EMIT_NEW_LOAD_MEMBASE (s, stype, stypes_reg, ((klass->idepth - 1) * SIZEOF_VOID_P));
+-	if (mono_compile_aot) {
+-		int const_reg = mono_regstate_next_int (s->rs);
+-		MONO_EMIT_NEW_CLASSCONST (s, const_reg, klass);
+-		MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, stype, const_reg);
++	
++	if (klass->flags & TYPE_ATTRIBUTE_SEALED) {
++		if (mono_compile_aot) {
++			int const_reg = mono_regstate_next_int (s->rs);
++			MONO_EMIT_NEW_CLASSCONST (s, const_reg, klass);
++			MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, klass_reg, const_reg);
++		} else {
++			MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, klass_reg, klass);
++		}
+ 	} else {
+-		MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, stype, klass);
++		if (klass->idepth > MONO_DEFAULT_SUPERTABLE_SIZE) {
++			MONO_EMIT_NEW_LOAD_MEMBASE (s, idepth_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, idepth));
++			MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, idepth_reg, klass->idepth);
++			MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BLT_UN, false_target);
++		}
++		MONO_EMIT_NEW_LOAD_MEMBASE (s, stypes_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, supertypes));
++		MONO_EMIT_NEW_LOAD_MEMBASE (s, stype, stypes_reg, ((klass->idepth - 1) * SIZEOF_VOID_P));
++		if (mono_compile_aot) {
++			int const_reg = mono_regstate_next_int (s->rs);
++			MONO_EMIT_NEW_CLASSCONST (s, const_reg, klass);
++			MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, stype, const_reg);
++		} else {
++			MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, stype, klass);
++		}
+ 	}
+ 	MONO_EMIT_NEW_BRANCH_LABEL (s, CEE_BEQ, true_target);
+ }
+@@ -2016,23 +2156,34 @@
+ void 
+ mini_emit_castclass (MonoCompile *s, int klass_reg, MonoClass *klass)
+ {
+-	int idepth_reg = mono_regstate_next_int (s->rs);
+-	int stypes_reg = mono_regstate_next_int (s->rs);
+-	int stype = mono_regstate_next_int (s->rs);
+-
+-	if (klass->idepth > MONO_DEFAULT_SUPERTABLE_SIZE) {
+-		MONO_EMIT_NEW_LOAD_MEMBASE (s, idepth_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, idepth));
+-		MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, idepth_reg, klass->idepth);
+-		MONO_EMIT_NEW_COND_EXC (s, LT_UN, "InvalidCastException");
+-	}
+-	MONO_EMIT_NEW_LOAD_MEMBASE (s, stypes_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, supertypes));
+-	MONO_EMIT_NEW_LOAD_MEMBASE (s, stype, stypes_reg, ((klass->idepth - 1) * SIZEOF_VOID_P));
+-	if (mono_compile_aot) {
+-		int const_reg = mono_regstate_next_int (s->rs);
+-		MONO_EMIT_NEW_CLASSCONST (s, const_reg, klass);
+-		MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, stype, const_reg);
++	if (klass->flags & TYPE_ATTRIBUTE_SEALED) {
++		if (mono_compile_aot) {
++			int const_reg = mono_regstate_next_int (s->rs);
++			MONO_EMIT_NEW_CLASSCONST (s, const_reg, klass);
++			MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, klass_reg, const_reg);
++		} else {
++			MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, klass_reg, klass);
++		}
+ 	} else {
+-		MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, stype, klass);
++		int idepth_reg = mono_regstate_next_int (s->rs);
++		int stypes_reg = mono_regstate_next_int (s->rs);
++		int stype = mono_regstate_next_int (s->rs);
++	
++		if (klass->idepth > MONO_DEFAULT_SUPERTABLE_SIZE) {
++			MONO_EMIT_NEW_LOAD_MEMBASE (s, idepth_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, idepth));
++			MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, idepth_reg, klass->idepth);
++			MONO_EMIT_NEW_COND_EXC (s, LT_UN, "InvalidCastException");
++		}
++		MONO_EMIT_NEW_LOAD_MEMBASE (s, stypes_reg, klass_reg, G_STRUCT_OFFSET (MonoClass, supertypes));
++		MONO_EMIT_NEW_LOAD_MEMBASE (s, stype, stypes_reg, ((klass->idepth - 1) * SIZEOF_VOID_P));
++		if (mono_compile_aot) {
++			int const_reg = mono_regstate_next_int (s->rs);
++			MONO_EMIT_NEW_CLASSCONST (s, const_reg, klass);
++			MONO_EMIT_NEW_BIALU (s, OP_COMPARE, -1, stype, const_reg);
++		} else {
++			MONO_EMIT_NEW_BIALU_IMM (s, OP_COMPARE_IMM, -1, stype, klass);
++		}
++		
+ 	}
+ 	MONO_EMIT_NEW_COND_EXC (s, NE_UN, "InvalidCastException");
+ }

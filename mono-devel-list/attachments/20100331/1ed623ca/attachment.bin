@@ -1,0 +1,153 @@
+diff --git a/mono/mini/ChangeLog b/mono/mini/ChangeLog
+index 4c844b0..7f8fdd0 100755
+--- a/mono/mini/ChangeLog
++++ b/mono/mini/ChangeLog
+@@ -1,3 +1,13 @@
++2010-03-31 Rodrigo Kumpera  <rkumpera@novell.com>
++
++	* aot-compiler.c (emit_exception_debug_info): Encode try holes
++	information.
++
++	* aot-runtime.c (decode_exception_debug_info): Decode try holes
++	information.
++
++	* mini.h: Increase AOT version.
++
+ 2010-03-30 Rodrigo Kumpera  <rkumpera@novell.com>
+ 
+ 	* mini-exceptions.c: Introduce mono_walk_stack_full, which
+diff --git a/mono/mini/aot-compiler.c b/mono/mini/aot-compiler.c
+index 28944ce..a62bcd5 100644
+--- a/mono/mini/aot-compiler.c
++++ b/mono/mini/aot-compiler.c
+@@ -3248,7 +3248,7 @@ emit_exception_debug_info (MonoAotCompile *acfg, MonoCompile *cfg)
+ 	use_unwind_ops = cfg->unwind_ops != NULL;
+ #endif
+ 
+-	flags = (jinfo->has_generic_jit_info ? 1 : 0) | (use_unwind_ops ? 2 : 0) | (header->num_clauses ? 4 : 0) | (seq_points ? 8 : 0) | (cfg->compile_llvm ? 16 : 0);
++	flags = (jinfo->has_generic_jit_info ? 1 : 0) | (use_unwind_ops ? 2 : 0) | (header->num_clauses ? 4 : 0) | (seq_points ? 8 : 0) | (cfg->compile_llvm ? 16 : 0) | (jinfo->has_try_block_holes ? 32 : 0);
+ 
+ 	encode_value (flags, p, &p);
+ 
+@@ -3267,6 +3267,12 @@ emit_exception_debug_info (MonoAotCompile *acfg, MonoCompile *cfg)
+ 		encode_value (jinfo->used_regs, p, &p);
+ 	}
+ 
++	/*Encode the number of holes before the number of clauses to make decoding easier*/
++	if (jinfo->has_try_block_holes) {
++		MonoTryBlockHoleTableJitInfo *table = mono_jit_info_get_try_block_hole_table_info (jinfo);
++		encode_value (table->num_holes, p, &p);
++	}
++
+ 	/* Exception table */
+ 	if (cfg->compile_llvm) {
+ 		/* The assembly might be CIL stripped so emit the data ourselves */
+@@ -3327,6 +3333,16 @@ emit_exception_debug_info (MonoAotCompile *acfg, MonoCompile *cfg)
+ 		encode_method_ref (acfg, jinfo->method, p, &p);
+ 	}
+ 
++	if (jinfo->has_try_block_holes) {
++		MonoTryBlockHoleTableJitInfo *table = mono_jit_info_get_try_block_hole_table_info (jinfo);
++		for (i = 0; i < table->num_holes; ++i) {
++			MonoTryBlockHoleJitInfo *hole = &table->holes [i];
++			encode_value (hole->clause, p, &p);
++			encode_value (hole->length, p, &p);
++			encode_value (hole->offset, p, &p);
++		}
++	}
++
+ 	if (seq_points) {
+ 		int il_offset, native_offset, last_il_offset, last_native_offset, j;
+ 
+diff --git a/mono/mini/aot-runtime.c b/mono/mini/aot-runtime.c
+index 327bf27..f15bee6 100644
+--- a/mono/mini/aot-runtime.c
++++ b/mono/mini/aot-runtime.c
+@@ -1933,10 +1933,10 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
+ 	int i, buf_len;
+ 	MonoJitInfo *jinfo;
+ 	guint used_int_regs, flags;
+-	gboolean has_generic_jit_info, has_dwarf_unwind_info, has_clauses, has_seq_points;
++	gboolean has_generic_jit_info, has_dwarf_unwind_info, has_clauses, has_seq_points, has_try_block_holes;
+ 	gboolean from_llvm;
+ 	guint8 *p;
+-	int generic_info_size;
++	int generic_info_size, try_holes_info_size, num_holes;
+ 
+ 	/* Load the method info from the AOT file */
+ 
+@@ -1947,6 +1947,8 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
+ 	has_clauses = (flags & 4) != 0;
+ 	has_seq_points = (flags & 8) != 0;
+ 	from_llvm = (flags & 16) != 0;
++	has_try_block_holes = (flags & 32) != 0;
++
+ 	if (has_dwarf_unwind_info) {
+ 		guint32 offset;
+ 
+@@ -1961,12 +1963,18 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
+ 	else
+ 		generic_info_size = 0;
+ 
++	if (has_try_block_holes) {
++		num_holes = decode_value (p, &p);
++		try_holes_info_size = sizeof (MonoTryBlockHoleTableJitInfo) + num_holes * sizeof (MonoTryBlockHoleJitInfo);
++	} else {
++		num_holes = try_holes_info_size = 0;
++	}
+ 	/* Exception table */
+ 	if (has_clauses) {
+ 		int num_clauses = decode_value (p, &p);
+ 
+ 		jinfo = 
+-			mono_domain_alloc0 (domain, MONO_SIZEOF_JIT_INFO + (sizeof (MonoJitExceptionInfo) * num_clauses) + generic_info_size);
++			mono_domain_alloc0 (domain, MONO_SIZEOF_JIT_INFO + (sizeof (MonoJitExceptionInfo) * num_clauses) + generic_info_size + try_holes_info_size);
+ 		jinfo->num_clauses = num_clauses;
+ 
+ 		for (i = 0; i < num_clauses; ++i) {
+@@ -1997,7 +2005,7 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
+ 		}
+ 	}
+ 	else {
+-		jinfo = mono_domain_alloc0 (domain, MONO_SIZEOF_JIT_INFO + generic_info_size);
++		jinfo = mono_domain_alloc0 (domain, MONO_SIZEOF_JIT_INFO + generic_info_size + try_holes_info_size);
+ 	}
+ 
+  	if (from_llvm) {
+@@ -2036,6 +2044,23 @@ decode_exception_debug_info (MonoAotModule *amodule, MonoDomain *domain,
+ 		jinfo->method = decode_method_ref_2 (amodule, p, &p);
+ 	}
+ 
++	if (has_try_block_holes) {
++		MonoTryBlockHoleTableJitInfo *table;
++
++		jinfo->has_try_block_holes = 1;
++
++		table = mono_jit_info_get_try_block_hole_table_info (jinfo);
++		g_assert (table);
++
++		table->num_holes = (guint16)num_holes;
++		for (i = 0; i < num_holes; ++i) {
++			MonoTryBlockHoleJitInfo *hole = &table->holes [i];
++			hole->clause = decode_value (p, &p);
++			hole->length = decode_value (p, &p);
++			hole->offset = decode_value (p, &p);
++		}
++	}
++
+ 	if (has_seq_points) {
+ 		MonoSeqPointInfo *seq_points;
+ 		int il_offset, native_offset, last_il_offset, last_native_offset, j;
+diff --git a/mono/mini/mini.h b/mono/mini/mini.h
+index dcf5a49..7a063c7 100644
+--- a/mono/mini/mini.h
++++ b/mono/mini/mini.h
+@@ -95,7 +95,7 @@ typedef gint64 mgreg_t;
+ #endif
+ 
+ /* Version number of the AOT file format */
+-#define MONO_AOT_FILE_VERSION "67"
++#define MONO_AOT_FILE_VERSION "68"
+ 
+ //TODO: This is x86/amd64 specific.
+ #define mono_simd_shuffle_mask(a,b,c,d) ((a) | ((b) << 2) | ((c) << 4) | ((d) << 6))

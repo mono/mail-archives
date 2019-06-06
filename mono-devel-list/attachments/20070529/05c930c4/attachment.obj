@@ -1,0 +1,246 @@
+Index: darwin_stop_world.c
+===================================================================
+--- darwin_stop_world.c	(revision 78083)
++++ darwin_stop_world.c	(working copy)
+@@ -2,6 +2,18 @@
+ 
+ # if defined(GC_DARWIN_THREADS)
+ 
++/* work around a dlopen issue (bug #75390), undefs to avoid warnings with redefinitions */
++#undef PACKAGE_BUGREPORT
++#undef PACKAGE_NAME
++#undef PACKAGE_STRING
++#undef PACKAGE_TARNAME
++#undef PACKAGE_VERSION
++#include "mono/utils/mono-compiler.h"
++
++#if defined(MONO_DEBUGGER_SUPPORTED)
++#include "include/libgc-mono-debugger.h"
++#endif
++
+ /* From "Inside Mac OS X - Mach-O Runtime Architecture" published by Apple
+    Page 49:
+    "The space beneath the stack pointer, where a new stack frame would normally
+@@ -283,7 +295,7 @@
+ static struct GC_mach_thread GC_mach_threads[THREAD_TABLE_SZ];
+ static int GC_mach_threads_count;
+ 
+-void GC_stop_init() {
++void darwin_stop_init() {
+   int i;
+ 
+   for (i = 0; i < THREAD_TABLE_SZ; i++) {
+@@ -293,6 +305,16 @@
+   GC_mach_threads_count = 0;
+ }
+ 
++void GC_stop_init()
++{
++#ifdef MONO_DEBUGGER_SUPPORTED
++    if (gc_thread_vtable && gc_thread_vtable->initialize)
++	gc_thread_vtable->initialize ();
++    else
++#endif
++	darwin_stop_init ();
++}
++
+ /* returns true if there's a thread in act_list that wasn't in old_list */
+ int GC_suspend_thread_list(thread_act_array_t act_list, int count, 
+ 			   thread_act_array_t old_list, int old_count) {
+@@ -372,9 +394,7 @@
+   return changed;
+ }
+ 
+-
+-/* Caller holds allocation lock.	*/
+-void GC_stop_world()
++void darwin_stop_world()
+ {
+   int i, changes;
+     GC_thread p;
+@@ -383,24 +403,14 @@
+     kern_return_t kern_result;
+     thread_act_array_t act_list, prev_list;
+     mach_msg_type_number_t listcount, prevcount;
+-    
++	
+ #   if DEBUG_THREADS
+       GC_printf1("Stopping the world from 0x%lx\n", mach_thread_self());
+ #   endif
+ 
+     /* clear out the mach threads list table */
+-    GC_stop_init(); 
+-       
+-    /* Make sure all free list construction has stopped before we start. */
+-    /* No new construction can start, since free list construction is	*/
+-    /* required to acquire and release the GC lock before it starts,	*/
+-    /* and we have the lock.						*/
+-#   ifdef PARALLEL_MARK
+-      GC_acquire_mark_lock();
+-      GC_ASSERT(GC_fl_builder_count == 0);
+-      /* We should have previously waited for it to become zero. */
+-#   endif /* PARALLEL_MARK */
+-
++    darwin_stop_init(); 
++	
+       /* Loop stopping threads until you have gone over the whole list
+ 	 twice without a new one appearing. thread_create() won't
+ 	 return (and thus the thread stop) until the new thread
+@@ -446,9 +456,6 @@
+       }
+ #   endif
+     
+-#   ifdef PARALLEL_MARK
+-      GC_release_mark_lock();
+-#   endif
+     #if DEBUG_THREADS
+       GC_printf1("World stopped from 0x%lx\n", my_thread);
+     #endif
+@@ -456,9 +463,33 @@
+ 	  mach_port_deallocate(my_task, my_thread);
+ }
+ 
++/* Caller holds allocation lock.	*/
++void GC_stop_world()
++{
++    /* Make sure all free list construction has stopped before we start. */
++    /* No new construction can start, since free list construction is	*/
++    /* required to acquire and release the GC lock before it starts,	*/
++    /* and we have the lock.						*/
++#   ifdef PARALLEL_MARK
++      GC_acquire_mark_lock();
++      GC_ASSERT(GC_fl_builder_count == 0);
++      /* We should have previously waited for it to become zero. */
++#   endif /* PARALLEL_MARK */
++    //++GC_stop_count;
++#ifdef MONO_DEBUGGER_SUPPORTED
++    if (gc_thread_vtable && gc_thread_vtable->stop_world)
++	gc_thread_vtable->stop_world ();
++    else
++#endif
++	darwin_stop_world ();
++#   ifdef PARALLEL_MARK
++      GC_release_mark_lock();
++#   endif
++}
++
+ /* Caller holds allocation lock, and has held it continuously since	*/
+ /* the world stopped.							*/
+-void GC_start_world()
++void darwin_start_world()
+ {
+   task_t my_task = current_task();
+   mach_port_t my_thread = mach_thread_self();
+@@ -520,9 +551,44 @@
+ #   endif
+ }
+ 
++void GC_start_world()
++{
++#ifdef MONO_DEBUGGER_SUPPORTED
++    if (gc_thread_vtable && gc_thread_vtable->start_world)
++	gc_thread_vtable->start_world();
++    else
++#endif
++	darwin_start_world ();
++}
++
+ void GC_darwin_register_mach_handler_thread(mach_port_t thread) {
+   GC_mach_handler_thread = thread;
+   GC_use_mach_handler_thread = 1;
+ }
+ 
++#ifdef MONO_DEBUGGER_SUPPORTED
++
++GCThreadFunctions *gc_thread_vtable = NULL;
++
++void
++GC_mono_debugger_add_all_threads (void)
++{
++    GC_thread p;
++    int i;
++
++    if (gc_thread_vtable && gc_thread_vtable->thread_created) {
++	for (i = 0; i < THREAD_TABLE_SZ; i++) {
++	    for (p = GC_threads[i]; p != 0; p = p -> next) {
++		gc_thread_vtable->thread_created (p->id, &p->stop_info.stack_ptr);
++	    }
++	}
++    }
++}
++
+ #endif
++
++#else
++
++#warning "GC_DARWIN_THREADS not defined"
++
++#endif
+Index: include/private/darwin_stop_world.h
+===================================================================
+--- include/private/darwin_stop_world.h	(revision 78083)
++++ include/private/darwin_stop_world.h	(working copy)
+@@ -10,6 +10,7 @@
+ 
+ struct thread_stop_info {
+     mach_port_t mach_thread;
++	ptr_t stack_ptr;  		/* Valid only when stopped.      	*/
+ };
+ 
+ struct GC_mach_thread {
+Index: pthread_support.c
+===================================================================
+--- pthread_support.c	(revision 78083)
++++ pthread_support.c	(working copy)
+@@ -974,6 +974,8 @@
+ {
+ #   ifndef GC_DARWIN_THREADS
+       int dummy;
++#	else
++      int dummy;
+ #   endif
+     GC_thread t;
+ 
+@@ -989,6 +991,7 @@
+       t = GC_new_thread(pthread_self());
+ #     ifdef GC_DARWIN_THREADS
+          t -> stop_info.mach_thread = mach_thread_self();
++		 t -> stop_info.stack_ptr = (ptr_t)(&dummy);
+ #     else
+          t -> stop_info.stack_ptr = (ptr_t)(&dummy);
+ #     endif
+@@ -1122,6 +1125,8 @@
+ #   else
+ #   ifndef GC_DARWIN_THREADS
+ 	me -> stop_info.stack_ptr = (ptr_t)GC_approx_sp();
++#	else
++#warning "add support for stop_info.stack_ptr"
+ #   endif
+ #   endif
+ #   ifdef IA64
+@@ -1135,6 +1140,8 @@
+ #   else
+ 	me -> stop_info.stack_ptr -= SP_SLOP;
+ #   endif
++#	else
++#warning "add support for stop_info.stack_ptr"
+ #   endif
+     me -> thread_blocked = TRUE;
+     UNLOCK();
+@@ -1274,6 +1281,7 @@
+     GC_in_thread_creation = FALSE;
+ #ifdef GC_DARWIN_THREADS
+     me -> stop_info.mach_thread = mach_thread_self();
++	me -> stop_info.stack_ptr = 0;
+ #else
+     me -> stop_info.stack_ptr = 0;
+ #endif
+@@ -1287,6 +1295,8 @@
+ 		                & ~(GC_page_size - 1));
+ #	  ifndef GC_DARWIN_THREADS
+         me -> stop_info.stack_ptr = me -> stack_end - 0x10;
++#	  else
++#warning "add support for stop_info.stack_ptr"
+ #	  endif
+ 	/* Needs to be plausible, since an asynchronous stack mark	*/
+ 	/* should not crash.						*/

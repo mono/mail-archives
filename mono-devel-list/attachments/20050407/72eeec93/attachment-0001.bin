@@ -1,0 +1,610 @@
+Index: socket-io.h
+===================================================================
+--- socket-io.h	(revision 42615)
++++ socket-io.h	(working copy)
+@@ -157,6 +157,8 @@
+ 	MonoBoolean completed;
+ 	MonoDelegate *real_callback;
+ 	gint error;
++	gint operation;
++	MonoAsyncResult *ares;
+ } MonoSocketAsyncResult;
+ 
+ typedef struct
+@@ -193,9 +195,6 @@
+ extern MonoBoolean ves_icall_System_Net_Dns_GetHostName_internal(MonoString **h_name);
+ extern MonoBoolean ves_icall_System_Net_Sockets_Socket_Poll_internal (SOCKET sock, gint mode, gint timeout, gint32 *error);
+ 
+-extern void ves_icall_System_Net_Sockets_Socket_AsyncReceive (MonoSocketAsyncResult *ares, gint *error);
+-extern void ves_icall_System_Net_Sockets_Socket_AsyncSend (MonoSocketAsyncResult *ares, gint *error);
+-
+ extern void mono_network_init(void);
+ extern void mono_network_cleanup(void);
+ 
+Index: threadpool.c
+===================================================================
+--- threadpool.c	(revision 42615)
++++ threadpool.c	(working copy)
+@@ -6,7 +6,7 @@
+  *   Gonzalo Paniagua Javier (gonzalo@ximian.com)
+  *
+  * (C) 2001-2003 Ximian, Inc.
+- * (c) 2004 Novell, Inc. (http://www.novell.com)
++ * (c) 2004,2005 Novell, Inc. (http://www.novell.com)
+  */
+ 
+ #include <config.h>
+@@ -28,9 +28,17 @@
+ #include <mono/metadata/file-io.h>
+ #include <mono/metadata/monitor.h>
+ #include <mono/metadata/marshal.h>
++#include <mono/metadata/socket-io.h>
+ #include <mono/io-layer/io-layer.h>
+ #include <mono/os/gc_wrapper.h>
++#include <errno.h>
++#include <sys/time.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <string.h>
+ 
++#include <mono/utils/mono-poll.h>
++
+ #include "threadpool.h"
+ 
+ /* maximum number of worker threads */
+@@ -51,6 +59,18 @@
+ 
+ static CRITICAL_SECTION ares_lock;
+ 
++typedef struct {
++	CRITICAL_SECTION io_lock; /* access to sock_to_state */
++	int inited;
++	int pipe [2];
++	GHashTable *sock_to_state;
++
++	HANDLE new_sem; /* access to newpfd and write side of the pipe */
++	mono_pollfd *newpfd;
++} SocketIOData;
++
++static SocketIOData socket_io_data;
++
+ /* we append a job */
+ static HANDLE job_added;
+ 
+@@ -66,10 +86,332 @@
+ 
+ static void async_invoke_thread (gpointer data);
+ static void append_job (MonoAsyncResult *ar);
++static void start_thread_or_queue (MonoAsyncResult *ares);
+ 
+ static GList *async_call_queue = NULL;
+ 
++#define INIT_POLLFD(a, b, c) {(a)->fd = b; (a)->events = c; (a)->revents = 0;}
++enum {
++	AIO_FIRST,
++	AIO_ACCEPT = 0,
++	AIO_CONNECT,
++	AIO_RECEIVE,
++	AIO_RECEIVEFROM,
++	AIO_SEND,
++	AIO_SENDTO,
++	AIO_LAST
++};
++
+ static void
++socket_io_cleanup (SocketIOData *data)
++{
++	if (data->inited == 0)
++		return;
++
++	EnterCriticalSection (&data->io_lock);
++	data->inited = 0;
++	close (data->pipe [0]);
++	data->pipe [0] = -1;
++	close (data->pipe [1]);
++	data->pipe [1] = -1;
++	CloseHandle (data->new_sem);
++	data->new_sem = NULL;
++	g_hash_table_destroy (data->sock_to_state);
++	data->sock_to_state = NULL;
++	LeaveCriticalSection (&data->io_lock);
++}
++
++static int
++get_event_from_state (MonoSocketAsyncResult *state)
++{
++	switch (state->operation) {
++	case AIO_ACCEPT:
++	case AIO_RECEIVE:
++	case AIO_RECEIVEFROM:
++		return MONO_POLLIN;
++	case AIO_SEND:
++	case AIO_SENDTO:
++	case AIO_CONNECT:
++		return MONO_POLLOUT;
++	default: /* Should never happen */
++		g_print ("socket_io_add: unknown value in switch!!!\n");
++		return 0;
++	}
++}
++
++static int
++get_events_from_list (GSList *list)
++{
++	MonoSocketAsyncResult *state;
++	int events = 0;
++
++	while (list && list->data) {
++		state = (MonoSocketAsyncResult *) list->data;
++		events |= get_event_from_state (state);
++		list = list->next;
++	}
++
++	return events;
++}
++
++static GSList *
++process_io_event (GSList *list, int event)
++{
++	MonoSocketAsyncResult *state;
++	GSList *oldlist;
++
++	oldlist = list;
++	state = NULL;
++	while (list) {
++		state = (MonoSocketAsyncResult *) list->data;
++		if (get_event_from_state (state) == event)
++			break;
++		list = list->next;
++	}
++
++	if (list != NULL) {
++		oldlist = g_slist_remove_link (oldlist, list);
++		g_slist_free_1 (list);
++		start_thread_or_queue (state->ares);
++	}
++
++	return oldlist;
++}
++
++static int
++mark_bad_fds (mono_pollfd *pfds, int nfds)
++{
++	int i, ret;
++	mono_pollfd *pfd;
++	int count = 0;
++
++	for (i = 0; i < nfds; i++) {
++		pfd = &pfds [i];
++		if (pfd->fd == -1)
++			continue;
++
++		ret = mono_poll (pfds, 1, 0);
++		if (ret == -1 && errno == EBADF) {
++			pfd->revents |= POLLNVAL;
++			count++;
++		} else if (ret == 1) {
++			count++;
++		}
++	}
++
++	return count;
++}
++
++#undef DEBUG_IO
++static void
++socket_io_main (gpointer p)
++{
++#define INITIAL_POLLFD_SIZE	1024
++#define POLL_ERRORS (MONO_POLLERR | MONO_POLLHUP | MONO_POLLNVAL)
++	SocketIOData *data = p;
++	mono_pollfd *pfds;
++	gint maxfd = 1;
++	gint allocated;
++	gint i;
++	MonoThread *thread;
++
++ 
++	thread = mono_thread_current ();
++	thread->threadpool_thread = TRUE;
++	thread->state |= ThreadState_Background;
++
++	allocated = INITIAL_POLLFD_SIZE;
++	pfds = g_new0 (mono_pollfd, allocated);
++	INIT_POLLFD (pfds, data->pipe [0], MONO_POLLIN);
++	for (i = 1; i < allocated; i++)
++		INIT_POLLFD (&pfds [i], -1, 0);
++
++	while (1) {
++		int nsock = 0;
++		mono_pollfd *pfd;
++		char one [1];
++		GSList *list;
++
++		do {
++			if (nsock == -1) {
++				if ((thread->state & ThreadState_StopRequested) != 0)
++					mono_thread_interruption_checkpoint ();
++			}
++
++			nsock = mono_poll (pfds, maxfd, -1);
++		} while (nsock == -1 && errno == EINTR);
++
++		/* 
++		 * Apart from EINTR, we only check EBADF, for the rest:
++		 *  EINVAL: mono_poll() 'protects' us from descriptor
++		 *      numbers above the limit if using select() by marking
++		 *      then as MONO_POLLERR.  If a system poll() is being
++		 *      used, the number of descriptor we're passing will not
++		 *      be over sysconf(_SC_OPEN_MAX), as the error would have
++		 *      happened when opening.
++		 *
++		 *  EFAULT: we own the memory pointed by pfds.
++		 *  ENOMEM: we're doomed anyway
++		 *
++		 */
++
++		if (nsock == -1 && errno == EBADF) {
++			pfds->revents = 0; /* Just in case... */
++			nsock = mark_bad_fds (pfds, maxfd);
++		}
++
++		if ((pfds->revents & POLL_ERRORS) != 0) {
++			/* We're supposed to die now, as the pipe has been closed */
++			g_free (pfds);
++			socket_io_cleanup (data);
++			return;
++		}
++
++		/* Got a new socket */
++		if ((pfds->revents & MONO_POLLIN) != 0) {
++			for (i = 1; i < allocated; i++) {
++				pfd = &pfds [i];
++				if (pfd->fd == -1 || pfd->fd == data->newpfd->fd)
++					break;
++			}
++
++			if (i == allocated) {
++				mono_pollfd *oldfd;
++
++				oldfd = pfds;
++				i = allocated;
++				allocated = allocated * 2;
++				pfds = g_renew (mono_pollfd, oldfd, allocated);
++				g_free (oldfd);
++				for (; i < allocated; i++)
++					INIT_POLLFD (&pfds [i], -1, 0);
++			}
++
++			read (data->pipe [0], one, 1);
++			INIT_POLLFD (&pfds [i], data->newpfd->fd, data->newpfd->events);
++			ReleaseSemaphore (data->new_sem, 1, NULL);
++			if (i >= maxfd)
++				maxfd = i + 1;
++			nsock--;
++		}
++
++		if (nsock == 0)
++			continue;
++
++		EnterCriticalSection (&data->io_lock);
++		if (data->inited == 0) {
++			g_free (pfds);
++			return; /* cleanup called */
++		}
++
++		for (i = 1; i < maxfd && nsock > 0; i++) {
++			pfd = &pfds [i];
++			if (pfd->fd == -1 || pfd->revents == 0)
++				continue;
++
++			nsock--;
++			list = g_hash_table_lookup (data->sock_to_state, GINT_TO_POINTER (pfd->fd));
++			if (list != NULL && (pfd->revents & (MONO_POLLIN | POLL_ERRORS)) != 0) {
++				list = process_io_event (list, MONO_POLLIN);
++			}
++
++			if (list != NULL && (pfd->revents & (MONO_POLLOUT | POLL_ERRORS)) != 0) {
++				list = process_io_event (list, MONO_POLLOUT);
++			}
++
++			if (list != NULL) {
++				g_hash_table_replace (data->sock_to_state, GINT_TO_POINTER (pfd->fd), list);
++				pfd->events = get_events_from_list (list);
++			} else {
++				g_hash_table_remove (data->sock_to_state, GINT_TO_POINTER (pfd->fd));
++				pfd->fd = -1;
++				if (i == maxfd - 1)
++					maxfd--;
++			}
++		}
++		LeaveCriticalSection (&data->io_lock);
++	}
++}
++#undef DEBUG_IO
++
++static void
++socket_io_init (SocketIOData *data)
++{
++	if (pipe (data->pipe) != 0) {
++		int err = errno;
++		perror ("mono");
++		g_assert (err);
++	}
++
++	data->sock_to_state = g_hash_table_new (g_direct_hash, g_direct_equal);
++	data->new_sem = CreateSemaphore (NULL, 1, 1, NULL);
++	mono_thread_create (mono_get_root_domain (), socket_io_main, data);
++}
++
++static void
++socket_io_add (MonoAsyncResult *ares, MonoSocketAsyncResult *state)
++{
++	int events;
++	char msg [1];
++	GSList *list;
++	SocketIOData *data = &socket_io_data;
++
++	state->ares = ares;
++	if (InterlockedCompareExchange (&data->inited, -1, -1) == 0) {
++		EnterCriticalSection (&data->io_lock);
++		if (0 == data->inited) {
++			socket_io_init (data);
++			data->inited = 1;
++		}
++		LeaveCriticalSection (&data->io_lock);
++	}
++
++	WaitForSingleObject (data->new_sem, INFINITE);
++	if (data->newpfd == NULL)
++		data->newpfd = g_new0 (mono_pollfd, 1);
++
++	EnterCriticalSection (&data->io_lock);
++	list = g_hash_table_lookup (data->sock_to_state, GINT_TO_POINTER (state->handle));
++	if (list == NULL) {
++		list = g_slist_alloc ();
++		list->data = state;
++	} else {
++		list = g_slist_append (list, state);
++	}
++
++	events = get_events_from_list (list);
++	INIT_POLLFD (data->newpfd, GPOINTER_TO_INT (state->handle), events);
++	g_hash_table_replace (data->sock_to_state, GINT_TO_POINTER (state->handle), list);
++	LeaveCriticalSection (&data->io_lock);
++	*msg = (char) state->operation;
++	write (data->pipe [1], msg, 1);
++}
++
++static gboolean
++socket_io_filter (MonoObject *target, MonoObject *state)
++{
++	gint op;
++	MonoSocketAsyncResult *sock_res = (MonoSocketAsyncResult *) state;
++	MonoClass *klass;
++
++	if (target == NULL || state == NULL)
++		return FALSE;
++
++	klass = target->vtable->klass;
++	if (strcmp (klass->name, "SocketAsyncCall") ||
++	    klass->nested_in == NULL ||
++	    strcmp (klass->nested_in->name_space, "System.Net.Sockets") ||
++	    strcmp (klass->nested_in->name, "Socket"))
++		return FALSE;
++
++	op = sock_res->operation;
++	if (op < AIO_FIRST || op >= AIO_LAST)
++		return FALSE;
++
++	return TRUE;
++}
++
++static void
+ mono_async_invoke (MonoAsyncResult *ares)
+ {
+ 	ASyncCall *ac = (ASyncCall *)ares->data;
+@@ -91,7 +433,6 @@
+ 
+ 	/* notify listeners */
+ 	mono_monitor_enter ((MonoObject *) ares);
+-	
+ 	if (ares->handle != NULL) {
+ 		ac->wait_event = ((MonoWaitHandle *) ares->handle)->handle;
+ 		SetEvent (ac->wait_event);
+@@ -113,6 +454,7 @@
+ 		return;
+ 
+ 	MONO_GC_REGISTER_ROOT (ares_htable);
++	InitializeCriticalSection (&socket_io_data.io_lock);
+ 	InitializeCriticalSection (&ares_lock);
+ 	ares_htable = mono_g_hash_table_new (NULL, NULL);
+ 	job_added = CreateSemaphore (NULL, 0, 0x7fffffff, NULL);
+@@ -133,7 +475,6 @@
+ 	MonoDomain *domain = mono_domain_get ();
+ 	MonoAsyncResult *ares;
+ 	ASyncCall *ac;
+-	int busy, worker;
+ 
+ #ifdef HAVE_BOEHM_GC
+ 	ac = GC_MALLOC (sizeof (ASyncCall));
+@@ -156,20 +497,34 @@
+ 	EnterCriticalSection (&ares_lock);
+ 	mono_g_hash_table_insert (ares_htable, ares, ares);
+ 	LeaveCriticalSection (&ares_lock);
+-	
++
++	if (socket_io_filter (target, state)) {
++		socket_io_add (ares, (MonoSocketAsyncResult *) state);
++		return ares;
++	}
++
++	start_thread_or_queue (ares);
++	return ares;
++}
++
++static void
++start_thread_or_queue (MonoAsyncResult *ares)
++{
++	int busy, worker;
++	MonoDomain *domain;
++
+ 	busy = (int) InterlockedCompareExchange (&busy_worker_threads, 0, -1);
+ 	worker = (int) InterlockedCompareExchange (&mono_worker_threads, 0, -1); 
+ 	if (worker <= ++busy &&
+ 	    worker < mono_max_worker_threads) {
+ 		InterlockedIncrement (&mono_worker_threads);
+ 		InterlockedIncrement (&busy_worker_threads);
++		domain = ((MonoObject *) ares)->vtable->domain;
+ 		mono_thread_create (domain, async_invoke_thread, ares);
+ 	} else {
+ 		append_job (ares);
+ 		ReleaseSemaphore (job_added, 1, NULL);
+ 	}
+-
+-	return ares;
+ }
+ 
+ MonoObject *
+@@ -225,6 +580,8 @@
+ 	LeaveCriticalSection (&mono_delegate_section);
+ 	if (job_added)
+ 		ReleaseSemaphore (job_added, release, NULL);
++
++	socket_io_cleanup (&socket_io_data);
+ }
+ 
+ static void
+Index: icall.c
+===================================================================
+--- icall.c	(revision 42615)
++++ icall.c	(working copy)
+@@ -562,6 +562,7 @@
+ 	MonoClass *src_class;
+ 	MonoClass *dest_class;
+ 	int i;
++	gboolean char_int16;
+ 
+ 	MONO_ARCH_SAVE_REGS;
+ 
+@@ -606,7 +607,13 @@
+ 		return TRUE;
+ 	}
+ 
+-	if (src_class != dest_class) {
++	/* Check if we're copying a char[] <==> (u)short[] */
++	char_int16 = (src_class == mono_defaults.int16_class || src_class == mono_defaults.uint16_class ||
++				src_class == mono_defaults.char_class);
++	char_int16 = (char_int16 && (dest_class == mono_defaults.int16_class || dest_class == mono_defaults.uint16_class ||
++				dest_class == mono_defaults.char_class));
++
++	if (!char_int16 && src_class != dest_class) {
+ 		if (dest_class->valuetype || dest_class->enumtype || src_class->valuetype || src_class->enumtype)
+ 			return FALSE;
+ 
+@@ -6296,8 +6303,6 @@
+ 
+ static const IcallEntry socket_icalls [] = {
+ 	{"Accept_internal(intptr,int&)", ves_icall_System_Net_Sockets_Socket_Accept_internal},
+-	{"AsyncReceiveInternal", ves_icall_System_Net_Sockets_Socket_AsyncReceive},
+-	{"AsyncSendInternal", ves_icall_System_Net_Sockets_Socket_AsyncSend},
+ 	{"Available_internal(intptr,int&)", ves_icall_System_Net_Sockets_Socket_Available_internal},
+ 	{"Bind_internal(intptr,System.Net.SocketAddress,int&)", ves_icall_System_Net_Sockets_Socket_Bind_internal},
+ 	{"Blocking_internal(intptr,bool,int&)", ves_icall_System_Net_Sockets_Socket_Blocking_internal},
+Index: socket-io.c
+===================================================================
+--- socket-io.c	(revision 42615)
++++ socket-io.c	(working copy)
+@@ -2362,92 +2362,6 @@
+ 	return(TRUE);
+ }
+ 
+-
+-/* Async interface */
+-#ifndef USE_AIO
+-void
+-ves_icall_System_Net_Sockets_Socket_AsyncReceive (MonoSocketAsyncResult *ares, gint *error)
+-{
+-	MONO_ARCH_SAVE_REGS;
+-
+-	*error = ERROR_NOT_SUPPORTED;
+-}
+-
+-void
+-ves_icall_System_Net_Sockets_Socket_AsyncSend (MonoSocketAsyncResult *ares, gint *error)
+-{
+-	MONO_ARCH_SAVE_REGS;
+-
+-	*error = ERROR_NOT_SUPPORTED;
+-}
+-#else
+-static void
+-wsa_overlapped_callback (guint32 error, guint32 numbytes, gpointer result)
+-{
+-	MonoSocketAsyncResult *ares = (MonoSocketAsyncResult *) result;
+-	MonoThread *thread;
+- 
+-	ares->completed = TRUE;
+-	ares->error = error;
+-	ares->total = numbytes;
+-
+-	if (ares->callback != NULL) {
+-		gpointer p [1];
+-
+-		*p = ares;
+-		thread = mono_thread_attach (mono_object_domain (ares));
+-		mono_runtime_invoke (ares->callback->method_info->method, NULL, p, NULL);
+-
+-		mono_thread_detach (thread);
+-	}
+-
+-	if (ares->wait_handle != NULL)
+-		SetEvent (ares->wait_handle->handle);
+-}
+-
+-void
+-ves_icall_System_Net_Sockets_Socket_AsyncReceive (MonoSocketAsyncResult *ares, gint *error)
+-{
+-	gint32 bytesread;
+-
+-	MONO_ARCH_SAVE_REGS;
+-
+-	if (_wapi_socket_async_read (ares->handle,
+-					mono_array_addr (ares->buffer, gchar, ares->offset),
+-					ares->size,
+-					&bytesread,
+-					ares,
+-					wsa_overlapped_callback) == FALSE) {
+-		*error = WSAGetLastError ();
+-	} else {
+-		*error = 0;
+-		ares->completed_synch = TRUE;
+-		wsa_overlapped_callback (0, bytesread, ares);
+-	}
+-}
+-
+-void
+-ves_icall_System_Net_Sockets_Socket_AsyncSend (MonoSocketAsyncResult *ares, gint *error)
+-{
+-	gint32 byteswritten;
+-
+-	MONO_ARCH_SAVE_REGS;
+-
+-	if (_wapi_socket_async_write (ares->handle,
+-					mono_array_addr (ares->buffer, gchar, ares->offset),
+-					ares->size,
+-					&byteswritten,
+-					ares,
+-					wsa_overlapped_callback) == FALSE) {
+-		*error = WSAGetLastError ();
+-	} else {
+-		*error = 0;
+-		ares->completed_synch = TRUE;
+-		wsa_overlapped_callback (0, byteswritten, ares);
+-	}
+-}
+-#endif /* USE_AIO */
+-
+ void mono_network_init(void)
+ {
+ 	WSADATA wsadata;

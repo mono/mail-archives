@@ -1,0 +1,429 @@
+Index: System.Data/DataRow.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataRow.cs,v
+retrieving revision 1.34
+diff -u -r1.34 DataRow.cs
+--- System.Data/DataRow.cs	17 Mar 2003 17:35:06 -0000	1.34
++++ System.Data/DataRow.cs	21 Mar 2003 08:57:20 -0000
+@@ -36,6 +36,7 @@
+ 		private string rowError;
+ 		private DataRowState rowState;
+ 		internal int xmlRowID = 0;
++		private bool editing = false;
+ 
+ 		#endregion
+ 
+@@ -50,18 +51,19 @@
+ 			_table = builder.Table;
+ 
+ 			original = null; 
+-			proposed = null;
+ 			current = new object[_table.Columns.Count];
+ 			// initialize to DBNull.Value
+-			for(int c = 0; c < _table.Columns.Count; c++) {
++			for (int c = 0; c < _table.Columns.Count; c++) {
+ 				current[c] = DBNull.Value;
+ 			}
++			proposed = new object[_table.Columns.Count];
++			Array.Copy (current, proposed, _table.Columns.Count);
++			//proposed = null;
++			//BeginEdit ();
+ 
+ 			columnErrors = new string[_table.Columns.Count];
+ 			rowError = String.Empty;
+ 
+-			//rowState = DataRowState.Unchanged;
+-
+ 			//on first creating a DataRow it is always detached.
+ 			rowState = DataRowState.Detached;
+ 		}
+@@ -84,14 +86,12 @@
+ 		/// Gets or sets the data stored in the column specified by name.
+ 		/// </summary>
+ 		public object this[string columnName] {
+-			[MonoTODO] //FIXME: will return different values depending on DataRowState
+-			get { return this[columnName, DataRowVersion.Current]; }
+-			[MonoTODO]
++			get { return this[columnName, DataRowVersion.Default]; }
+ 			set {
+-				DataColumn column = _table.Columns[columnName];
+-				if (column == null)
++				int columnIndex = _table.Columns.IndexOf (columnName);
++				if (columnIndex == -1)
+ 					throw new IndexOutOfRangeException ();
+-				this[column] = value;
++				this[columnIndex] = value;
+ 			}
+ 		}
+ 
+@@ -99,52 +99,12 @@
+ 		/// Gets or sets the data stored in specified DataColumn
+ 		/// </summary>
+ 		public object this[DataColumn column] {
+-			[MonoTODO] //FIXME: will return different values depending on DataRowState
+-			get { return this[column, DataRowVersion.Current]; } 
+-								
+-			[MonoTODO]
++			get { return this[column, DataRowVersion.Default]; } 
+ 			set {
+-				object v = null;
+-
+-				if (column == null)
+-					throw new ArgumentNullException (Locale.GetText ("'column' argument cannot be null."));
+ 				int columnIndex = _table.Columns.IndexOf (column);
+ 				if (columnIndex == -1)
+-					throw new ArgumentException ();
+-				if (rowState == DataRowState.Deleted)
+-					throw new DeletedRowInaccessibleException ();
+-
+-				_table.ChangingDataColumn (this, column, value);
+-
+-				//MS Implementation doesn't seem to create the proposed or original
+-				//set of values when a datarow has just been created or added to the
+-				//DataTable and AcceptChanges() has not been called yet.
+-
+-				if(rowState == DataRowState.Detached || rowState == DataRowState.Added) {
+-					v = SetColumnValue (value, columnIndex);
+-					current[columnIndex] = v;
+-					_table.ChangedDataColumn (this, column, v);
+-				}
+-				else {
+-					BeginEdit ();  // implicitly called
+-
+-					v = SetColumnValue (value, columnIndex);
+-					proposed[columnIndex] = v;
+-					_table.ChangedDataColumn (this, column, v);
+-
+-					rowState = DataRowState.Modified;
+-					current [columnIndex] = proposed[columnIndex];
+-					proposed[columnIndex] = null;
+-
+-					//EndEdit ();
+-				}
+-
+-				//Don't know if this is the rigth thing to do,
+-				//but it fixes my test. I believe the MS docs only say this
+-				//method is implicitly called when calling AcceptChanges()
+-
+-				//EndEdit (); // is this the right thing to do?
+-
++					throw new ArgumentException ("The column does not belong to this table.");
++				this[columnIndex] = value;
+ 			}
+ 		}
+ 
+@@ -152,14 +112,21 @@
+ 		/// Gets or sets the data stored in column specified by index.
+ 		/// </summary>
+ 		public object this[int columnIndex] {
+-			[MonoTODO] //FIXME: not always supposed to return current
+-			get { return this[columnIndex, DataRowVersion.Current]; }
+-			[MonoTODO]
++			get { return this[columnIndex, DataRowVersion.Default]; }
+ 			set {
+-				DataColumn column = _table.Columns[columnIndex]; //FIXME: will throw
+-				if (column == null)  
++				if (columnIndex < 0 || columnIndex > _table.Columns.Count)
+ 					throw new IndexOutOfRangeException ();
+-				this[column] = value;
++				if (rowState == DataRowState.Deleted)
++					throw new DeletedRowInaccessibleException ();
++				DataColumn column = _table.Columns[columnIndex];
++				_table.ChangingDataColumn (this, column, value);
++				
++				bool orginalEditing = editing;
++				if (!orginalEditing) BeginEdit ();  // implicitly called
++				object v = SetColumnValue (value, columnIndex);
++				proposed[columnIndex] = v;
++				_table.ChangedDataColumn (this, column, v);
++				if (!orginalEditing) EndEdit ();
+ 			}
+ 		}
+ 
+@@ -167,12 +134,11 @@
+ 		/// Gets the specified version of data stored in the named column.
+ 		/// </summary>
+ 		public object this[string columnName, DataRowVersion version] {
+-			[MonoTODO]
+ 			get {
+-				DataColumn column = _table.Columns[columnName]; //FIXME: will throw
+-				if (column == null) 
++				int columnIndex = _table.Columns.IndexOf (columnName);
++				if (columnIndex == -1)
+ 					throw new IndexOutOfRangeException ();
+-				return this[column, version];
++				return this[columnIndex, version];
+ 			}
+ 		}
+ 
+@@ -181,31 +147,10 @@
+ 		/// </summary>
+ 		public object this[DataColumn column, DataRowVersion version] {
+ 			get {
+-				if (column == null)
+-					throw new ArgumentNullException ();	
+-
+ 				int columnIndex = _table.Columns.IndexOf (column);
+-
+ 				if (columnIndex == -1)
+-					throw new ArgumentException ();
+-
+-				if (version == DataRowVersion.Default)
+-					return column.DefaultValue;
+-
+-				if (!HasVersion (version))
+-					throw new VersionNotFoundException (Locale.GetText ("There is no " + version.ToString () + " data to access."));
+-
+-				switch (version)
+-				{
+-					case DataRowVersion.Proposed:
+-						return proposed[columnIndex];
+-					case DataRowVersion.Current:
+-					       	return current[columnIndex];
+-					case DataRowVersion.Original:
+-						return original[columnIndex];
+-					default:
+-						throw new ArgumentException ();
+-				}
++					throw new ArgumentException ("The column does not belong to this table.");
++				return this[columnIndex, version];
+ 			}
+ 		}
+ 
+@@ -214,12 +159,43 @@
+ 		/// retrieve.
+ 		/// </summary>
+ 		public object this[int columnIndex, DataRowVersion version] {
+-			[MonoTODO]
+ 			get {
+-				DataColumn column = _table.Columns[columnIndex]; //FIXME: throws
+-				if (column == null) 
++				if (columnIndex < 0 || columnIndex > _table.Columns.Count)
+ 					throw new IndexOutOfRangeException ();
+-				return this[column, version];
++				// FIXME: Can change the storage of Detached rows so that we don't need to hardcode?
++				//if (rowState == DataRowState.Detached && version == DataRowVersion.Proposed)
++				//version = DataRowVersion.Default;
++				// Non-existent version
++				if (rowState == DataRowState.Detached && version == DataRowVersion.Current || !HasVersion (version))
++					throw new VersionNotFoundException (Locale.GetText ("There is no " + version.ToString () + " data to access."));
++				// Accessing deleted rows
++				if (rowState == DataRowState.Deleted && version != DataRowVersion.Original)
++					throw new DeletedRowInaccessibleException ("Deleted row information cannot be accessed through the row.");
++				switch (version) {
++				case DataRowVersion.Default:
++					switch (rowState) {
++					case DataRowState.Added:
++					case DataRowState.Modified:
++					case DataRowState.Unchanged:
++						if (editing) return proposed[columnIndex];
++						return current[columnIndex];
++					case DataRowState.Detached:
++						// FIXME: Same hardcode problem as above
++						//if (proposed != null)
++						return proposed[columnIndex];
++						//return current[columnIndex];
++					default:
++						return current[columnIndex];
++					}
++				case DataRowVersion.Proposed:
++					return proposed[columnIndex];
++				case DataRowVersion.Current:
++					return current[columnIndex];
++				case DataRowVersion.Original:
++					return original[columnIndex];
++				default:
++					throw new ArgumentException ();
++				}
+ 			}
+ 		}
+ 
+@@ -250,9 +226,7 @@
+ 					newItems[i] = SetColumnValue (v, i);
+ 				}
+ 
+-				//FIXME: BeginEdit() not correct 
+-				BeginEdit ();  // implicitly called
+-				rowState = DataRowState.Modified;
++				BeginEdit ();
+ 				proposed = newItems;
+ 				EndEdit ();
+ 			}
+@@ -398,8 +372,17 @@
+ 
+ 		//FIXME?: Couldn't find a way to set the RowState when adding the DataRow
+ 		//to a Datatable so I added this method. Delete if there is a better way.
+-		internal DataRowState RowStateInternal {
+-			set { rowState = value;}
++		internal void AttachRow() {
++			current = proposed;
++			proposed = null;
++			rowState = DataRowState.Added;
++		}
++
++		//FIXME?: Couldn't find a way to set the RowState when removing the DataRow
++		//from a Datatable so I added this method. Delete if there is a better way.
++		internal void DetachRow() {
++			proposed = null;
++			rowState = DataRowState.Detached;
+ 		}
+ 
+ 		/// <summary>
+@@ -429,56 +412,37 @@
+ 		[MonoTODO]
+ 		public void AcceptChanges () 
+ 		{
+-			
+-			if(rowState == DataRowState.Added)
+-			{
+-				//Instantiate original and proposed values so that we can call
+-				//EndEdit()
+-				this.BeginEdit();
+-			}
+-
+-			this.EndEdit ();
+-
+-			switch (rowState)
+-			{
+-				case DataRowState.Added:
+-				case DataRowState.Detached:
+-				case DataRowState.Modified:
+-					rowState = DataRowState.Unchanged;
+-					break;
+-				case DataRowState.Deleted:
+-					_table.Rows.Remove (this); //FIXME: this should occur in end edit
+-					break;
++			EndEdit(); // in case it hasn't been called
++			switch (rowState) {
++			case DataRowState.Added:
++			case DataRowState.Detached:
++			case DataRowState.Modified:
++				rowState = DataRowState.Unchanged;
++				break;
++			case DataRowState.Deleted:
++				_table.Rows.Remove (this);
++				break;
+ 			}
+-
+-			//MS implementation assigns the Proposed values
+-			//to both current and original and keeps original after calling AcceptChanges
+-			//Copy proposed to original in this.EndEdit()
+-			//original = null;
++			// Accept from detached
++			if (original == null)
++				original = new object[_table.Columns.Count];
++			Array.Copy (current, original, _table.Columns.Count);
+ 		}
+ 
+ 		/// <summary>
+ 		/// Begins an edit operation on a DataRow object.
+ 		/// </summary>
+ 		[MonoTODO]
+-		public void BeginEdit() 
++		public void BeginEdit () 
+ 		{
+ 			if (rowState == DataRowState.Deleted)
+ 				throw new DeletedRowInaccessibleException ();
+-
+-			if (!HasVersion (DataRowVersion.Proposed))
+-			{
++			if (!HasVersion (DataRowVersion.Proposed)) {
+ 				proposed = new object[_table.Columns.Count];
+ 				Array.Copy (current, proposed, _table.Columns.Count);
+ 			}
+ 			//TODO: Suspend validation
+-
+-			//FIXME: this doesn't happen on begin edit
+-			if (!HasVersion (DataRowVersion.Original))
+-			{
+-				original = new object[_table.Columns.Count];
+-				Array.Copy (current, original, _table.Columns.Count);
+-			}
++			editing = true;
+ 		}
+ 
+ 		/// <summary>
+@@ -487,13 +451,11 @@
+ 		[MonoTODO]
+ 		public void CancelEdit () 
+ 		{
+-			//FIXME: original doesn't get erased on CancelEdit
+ 			//TODO: Events
+-			if (HasVersion (DataRowVersion.Proposed))
+-			{
+-				original = null;
++			if (HasVersion (DataRowVersion.Proposed)) {
+ 				proposed = null;
+-				rowState = DataRowState.Unchanged;
++				if (rowState == DataRowState.Modified)
++				    rowState = DataRowState.Unchanged;
+ 			}
+ 		}
+ 
+@@ -532,21 +494,19 @@
+ 		[MonoTODO]
+ 		public void EndEdit () 
+ 		{
++			editing = false;
++			if (rowState == DataRowState.Detached)
++				return;
+ 			if (HasVersion (DataRowVersion.Proposed))
+ 			{
+-				rowState = DataRowState.Modified;
++				if (rowState == DataRowState.Unchanged)
++					rowState = DataRowState.Modified;
+ 				
+ 				//Calling next method validates UniqueConstraints
+ 				//and ForeignKeys.
+ 				_table.Rows.ValidateDataRowInternal(this);
+ 				
+ 				Array.Copy (proposed, current, _table.Columns.Count);
+-				
+-				//FIXME: MS implementation assigns the proposed values to
+-				//the original values. Should this be done here or on the
+-				//AcceptChanges() method?
+-				Array.Copy (proposed, original, _table.Columns.Count);
+-
+ 				proposed = null;
+ 			}
+ 		}
+Index: System.Data/DataRowCollection.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data/DataRowCollection.cs,v
+retrieving revision 1.15
+diff -u -r1.15 DataRowCollection.cs
+--- System.Data/DataRowCollection.cs	18 Feb 2003 15:09:50 -0000	1.15
++++ System.Data/DataRowCollection.cs	21 Mar 2003 08:57:20 -0000
+@@ -61,7 +61,7 @@
+ 			//TODO: AutoIncrement
+ 			//TODO: validation
+ 			list.Add (row);
+-			row.RowStateInternal = DataRowState.Added;
++			row.AttachRow ();
+ 			row.Table.ChangedDataRow (row, DataRowAction.Add);
+ 		}
+ 
+@@ -134,6 +134,7 @@
+ 		public void Remove (DataRow row) 
+ 		{
+ 			list.Remove (row);
++			row.DetachRow ();
+ 			table.DeletedDataRow (row, DataRowAction.Delete);
+ 		}
+ 
+Index: System.Data.Common/DbDataAdapter.cs
+===================================================================
+RCS file: /cvs/public/mcs/class/System.Data/System.Data.Common/DbDataAdapter.cs,v
+retrieving revision 1.26
+diff -u -r1.26 DbDataAdapter.cs
+--- System.Data.Common/DbDataAdapter.cs	17 Mar 2003 12:18:58 -0000	1.26
++++ System.Data.Common/DbDataAdapter.cs	21 Mar 2003 08:57:20 -0000
+@@ -437,7 +437,7 @@
+ 						string dsColumnName = parameter.SourceColumn;
+ 						DataColumnMapping mapping = columnMappings [parameter.SourceColumn];
+ 						if (mapping != null) dsColumnName = mapping.DataSetColumn;
+-						DataRowVersion rowVersion = DataRowVersion.Proposed;
++						DataRowVersion rowVersion = DataRowVersion.Default;
+ 
+ 						// Parameter version is ignored for non-update commands
+ 						if (statementType == StatementType.Update) 
