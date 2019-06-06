@@ -1,0 +1,727 @@
+Index: docbrowser/GeckoHtmlRender.cs
+===================================================================
+--- docbrowser/GeckoHtmlRender.cs	(revision 49918)
++++ docbrowser/GeckoHtmlRender.cs	(working copy)
+@@ -37,19 +37,23 @@
+ 	public GeckoHtmlRender (RootTree help_tree) 
+ 	{
+ 		this.help_tree = help_tree;
+-		html_panel = new WebControl("/tmp/monodoc", "MonodocGecko"); //FIXME
++		tmpPath = Path.Combine (Path.GetTempPath(), "monodoc");
++		html_panel = new WebControl (tmpPath, "MonodocGecko"); 
+ 		html_panel.Show(); //due to Gecko bug
+ 		html_panel.OpenUri += OnOpenUri;
+ 		html_panel.LinkMsg += OnLinkMsg;
+ 		panel = new Viewport();
+ 		panel.Add (html_panel);
+ 		cache_imgs = new Hashtable();
+-		tmpPath = Path.Combine (Path.GetTempPath(), "monodoc");
+ 	}
+ 
+ 	protected void OnOpenUri (object o, OpenUriArgs args)
+ 	{
+ 		url = CheckUrl (args.AURI);
++		// if the file is cached on disk, return
++		if (url.StartsWith ("file:///")) 
++			return;
++		
+ 		if (UrlClicked != null)
+ 			UrlClicked (this, new EventArgs());
+ 		args.RetVal = true; //this prevents Gecko to continue processing
+@@ -82,12 +86,26 @@
+ 	/* NOT ALREADY IMPLEMENTED */
+ 	public void SelectAll() {}
+ 
++	static int tmp_file = 0;
+ 	public void Render (string html_code) 
+ 	{
+ 		string r = ProcessImages (html_code);
+-		html_panel.OpenStream ("file:///", "text/html");
+-		html_panel.AppendData (r);
+-		html_panel.CloseStream ();
++		// if the html code is too big, write it down to a tmp file
++		if (((uint) r.Length) > 50000) {
++			string filename = (tmp_file++) + ".html";
++			string filepath = Path.Combine (tmpPath, filename);
++			using (FileStream file = new FileStream (filepath, FileMode.Create)) {
++				StreamWriter sw = new StreamWriter (file);
++				sw.Write (r);
++				sw.Close ();
++			}
++			html_panel.LoadUrl (filepath);
++		} else {
++			html_panel.OpenStream ("file:///", "text/html");
++			html_panel.AppendData (r);
++			html_panel.CloseStream ();
++		}
++
+ 	}
+ 
+ 	// Substitute the src of the images with the appropriate path
+Index: docbrowser/ChangeLog
+===================================================================
+--- docbrowser/ChangeLog	(revision 49918)
++++ docbrowser/ChangeLog	(working copy)
+@@ -1,3 +1,12 @@
++2005-09-16 Mario Sopena <mario.sopena@gmail.com>
++	* GeckoHtmlRender.cs: add a woraround for the bug 245960 of gtkmozembed
++	* browser.cs: search panels are created programatically. A new panel
++	appears when the index are not found that let build new index
++	* ProgressPanel.cs: added. New panel widget that allow perform a
++	programable task (used for building the index)
++	* browser.glade: remove the search panels
++	* Makefile.am: add the new ProgressPanel.cs
++
+ 2005-09-08 Rafael Ferreira <raf@ophion.org>, Mario Sopena <mario.sopena@gmail.com>
+ 
+ 	Landed monodoc's simple printing subsystem
+Index: docbrowser/browser.cs
+===================================================================
+--- docbrowser/browser.cs	(revision 49918)
++++ docbrowser/browser.cs	(working copy)
+@@ -118,7 +118,7 @@
+ 	[Glade.Widget] TreeView bookmark_tree;
+ 	[Glade.Widget] public Statusbar statusbar;
+ 	[Glade.Widget] public Button back_button, forward_button;
+-	[Glade.Widget] Entry index_entry;
++	public Entry index_entry;
+ 	[Glade.Widget] CheckMenuItem editing1;
+ 	[Glade.Widget] CheckMenuItem showinheritedmembers;
+ 	[Glade.Widget] CheckMenuItem comments1;
+@@ -148,20 +148,22 @@
+ 	//
+ 	// Accessed from the IndexBrowser class
+ 	//
+-	[Glade.Widget] internal Box search_box;
+-	[Glade.Widget] internal Frame matches;
++	internal VBox search_box;
++	internal Frame matches;
++	[Glade.Widget] internal VBox index_vbox;
+ 	
+ 	Gdk.Pixbuf monodoc_pixbuf;
+ 
+ 	//
+ 	// Used for searching
+ 	//
+-	[Glade.Widget] Entry search_term;
+-	[Glade.Widget] TreeView search_tree;
+-	[Glade.Widget] ScrolledWindow scrolledwindow_search;
++	Entry search_term;
++	TreeView search_tree;
+ 	TreeStore search_store;
+ 	SearchableIndex search_index;
+ 	string highlight_text;
++	[Glade.Widget] VBox search_vbox;
++	ProgressPanel ppanel;
+ 	
+         //
+ 	// Left-hand side Browsers
+@@ -278,18 +280,11 @@
+ 		//
+ 		search_index = help_tree.GetSearchIndex();
+ 		if (search_index == null) {
+-			search_term.Editable = false;
+-			Gtk.Label l = new Gtk.Label ("<b>No search index found</b>\n\n" +
+-					     "as root, run:\n\n    monodoc --make-search-index\n\nto create the index");
+-			l.UseMarkup = true;
+-			l.Show ();
+-			scrolledwindow_search.Remove (search_tree);
+-			scrolledwindow_search.Add (l);
++			ppanel = new ProgressPanel ("<b>No Search index found</b>", "Generate", RootTree.MakeSearchIndex, CreateSearchPanel); 
++			search_vbox.Add (ppanel);
++			search_vbox.Show ();
+ 		} else {
+-			search_store = new TreeStore (typeof (string));
+-			search_tree.Model = search_store;
+-			search_tree.AppendColumn ("Searches", new CellRendererText(), "text", 0);
+-			search_tree.Selection.Changed += new EventHandler (ShowSearchResult);
++			CreateSearchPanel ();
+ 		}
+ 		bookList = new ArrayList ();
+ 
+@@ -299,6 +294,57 @@
+ 		MainWindow.ShowAll();
+ 	}
+ 
++	// Initianlizes the search index
++	void CreateSearchPanel ()
++	{
++		//get the search index
++		if (search_index == null) {
++			search_index = help_tree.GetSearchIndex();
++			//restore widgets
++			search_vbox.Remove (ppanel);
++		}
++		//
++		// Create the search panel
++		//
++		VBox vbox1 = new VBox (false, 0);
++		search_vbox.PackStart (vbox1);
++		
++		// title
++		HBox hbox1 = new HBox (false, 3);
++		hbox1.BorderWidth = 3;
++		Image icon = new Image (Stock.Find, IconSize.Menu);
++		Label look_for_label = new Label ("Search for:");
++		look_for_label.Justify = Justification.Left;
++		look_for_label.Xalign = 0;
++		hbox1.PackEnd (look_for_label, true, true, 0);
++		hbox1.PackEnd (icon, false, true, 0);
++		hbox1.ShowAll ();
++		vbox1.PackStart (hbox1, false, true, 0);
++
++		// entry
++		search_term = new Entry ();
++		search_term.Activated += OnSearchActivated;
++		vbox1.PackStart (search_term, false, true, 0);
++		
++		// treeview
++		ScrolledWindow scrolledwindow_search = new ScrolledWindow ();
++		scrolledwindow_search.HscrollbarPolicy = PolicyType.Automatic;
++		scrolledwindow_search.VscrollbarPolicy = PolicyType.Always;
++		vbox1.PackStart (scrolledwindow_search, true, true, 0);
++		search_tree = new TreeView ();
++		search_tree.HeadersVisible = false;
++		scrolledwindow_search.AddWithViewport (search_tree);
++		
++		//prepare the treeview
++		search_store = new TreeStore (typeof (string));
++		search_tree.Model = search_store;
++		search_tree.AppendColumn ("Searches", new CellRendererText(), "text", 0);
++		search_tree.Selection.Changed += new EventHandler (ShowSearchResult);
++
++		vbox1.ShowAll ();
++		search_vbox.ShowAll ();
++	}	
++			
+ 	// Adds a Tab and Activates it
+ 	void AddTab() 
+ 	{
+@@ -686,7 +732,7 @@
+ 			HoldCtrl = true;
+ 			break;
+ 		case Gdk.Key.Page_Up:
+-			if (HoldCtrl)
++			if (HoldCtrl) 
+ 				tabs_nb.PrevPage();
+ 			break;
+ 		case Gdk.Key.Page_Down:
+@@ -774,7 +820,7 @@
+ 	//
+ 	// Invoked when the index_entry Entry line content changes
+ 	//
+-	void OnIndexEntryChanged (object sender, EventArgs a)
++	public void OnIndexEntryChanged (object sender, EventArgs a)
+ 	{
+ 		if (index_browser != null)
+ 			index_browser.SearchClosest (index_entry.Text);
+@@ -783,7 +829,7 @@
+ 	//
+ 	// Invoked when the user presses enter on the index_entry
+ 	//
+-	void OnIndexEntryActivated (object sender, EventArgs a)
++	public void OnIndexEntryActivated (object sender, EventArgs a)
+ 	{
+ 		if (index_browser != null)
+ 			index_browser.LoadSelected ();
+@@ -793,7 +839,7 @@
+ 	// Invoked when the user presses a key on the index_entry
+ 	//
+ 
+-	void OnIndexEntryKeyPress (object o, KeyPressEventArgs args)
++	public void OnIndexEntryKeyPress (object o, KeyPressEventArgs args)
+ 	{
+ 		args.RetVal = true;
+ 
+@@ -830,7 +876,7 @@
+ 	//
+ 	// For the accel keystroke
+ 	//
+-	void OnIndexEntryFocused (object sender, EventArgs a)
++	public void OnIndexEntryFocused (object sender, EventArgs a)
+ 	{
+ 		nb.Page = 1;
+ 	}
+@@ -1791,28 +1837,80 @@
+ 	public static IndexBrowser MakeIndexBrowser (Browser browser)
+ 	{
+ 		IndexReader ir = browser.help_tree.GetIndex ();
+-		if (ir == null){
+-			Gtk.Label l = new Gtk.Label ("<b>No index found</b>\n\n" +
+-					     "as root, run:\n\n    monodoc --make-index\n\nto create the index");
+-			l.UseMarkup = true;
+-			l.Show ();
+-			browser.search_box.PackStart (l);
+-			return null;
++		if (ir == null) {
++			return new IndexBrowser (browser);
+ 		}
+ 
+ 		return new IndexBrowser (browser, ir);
+ 	}
+ 
++	ProgressPanel ppanel;
++	IndexBrowser (Browser parent)
++	{
++			browser = parent;
++			ppanel = new ProgressPanel ("<b>No index found</b>", "Generate", RootTree.MakeIndex, NewIndexCreated); 
++			browser.index_vbox.Add (ppanel);
++			browser.index_vbox.Show ();
++	}
++
++	void NewIndexCreated ()
++	{
++		index_reader = browser.help_tree.GetIndex ();
++		//restore widgets
++		browser.index_vbox.Remove (ppanel);
++		CreateWidget ();
++		browser.index_vbox.ShowAll ();
++	}
++	
+ 	IndexBrowser (Browser parent, IndexReader ir)
+ 	{
+ 		browser = parent;
+ 		index_reader = ir;
+ 
++		CreateWidget ();
++	}
++
++	void CreateWidget () {
++		//
++		// Create the widget
++		//
++		Frame frame1 = new Frame ();
++		VBox vbox1 = new VBox (false, 0);
++		frame1.Add (vbox1);
++
++		// title
++		HBox hbox1 = new HBox (false, 3);
++		hbox1.BorderWidth = 3;
++		Image icon = new Image (Stock.Index, IconSize.Menu);
++		Label look_for_label = new Label ("Look for:");
++		look_for_label.Justify = Justification.Left;
++		look_for_label.Xalign = 0;
++		hbox1.PackEnd (look_for_label, true, true, 0);
++		hbox1.PackEnd (icon, false, true, 0);
++		hbox1.ShowAll ();
++		vbox1.PackStart (hbox1, false, true, 0);
++
++		// entry
++		vbox1.PackStart (new HSeparator (), false, true, 0);
++		browser.index_entry = new Entry ();
++		browser.index_entry.Activated += browser.OnIndexEntryActivated;
++		browser.index_entry.Changed += browser.OnIndexEntryChanged;
++		browser.index_entry.FocusInEvent += browser.OnIndexEntryFocused;
++		browser.index_entry.KeyPressEvent += browser.OnIndexEntryKeyPress;
++		vbox1.PackStart (browser.index_entry, false, true, 0);
++		vbox1.PackStart (new HSeparator (), false, true, 0);
++
++		//search results
++		browser.search_box = new VBox ();
++		vbox1.PackStart (browser.search_box, true, true, 0);
++		vbox1.ShowAll ();
++
++		
+ 		//
+ 		// Setup the widget
+ 		//
+ 		index_list = new BigList (index_reader);
+-		index_list.SetSizeRequest (100, 400);
++		//index_list.SetSizeRequest (100, 400);
+ 
+ 		index_list.ItemSelected += new ItemSelected (OnIndexSelected);
+ 		index_list.ItemActivated += new ItemActivated (OnIndexActivated);
+@@ -1827,6 +1925,7 @@
+ 		//
+ 		// Setup the matches.
+ 		//
++		browser.matches = new Frame ();
+ 		match_model = new MatchModel (this);
+ 		browser.matches.Hide ();
+ 		match_list = new BigList (match_model);
+@@ -1840,6 +1939,9 @@
+ 		
+ 		browser.matches.Add (box2);
+ 		index_list.SetSizeRequest (100, 200);
++
++		browser.index_vbox.PackStart (frame1);
++		browser.index_vbox.PackEnd (browser.matches);
+ 	}
+ 
+ 	//
+Index: docbrowser/ProgressPanel.cs
+===================================================================
+--- docbrowser/ProgressPanel.cs	(revision 0)
++++ docbrowser/ProgressPanel.cs	(revision 0)
+@@ -0,0 +1,76 @@
++//
++// ProgressPanel.cs: A panel with a progress bar and a button
++//
++// Author: Mario Sopena
++// 
++
++using System;
++using Gtk;
++using System.Threading;
++ 
++namespace Monodoc {
++	
++class ProgressPanel : VBox {
++	
++	// Delegates called when starting and finishing
++	public delegate void StartWorkDelegate ();
++	public StartWorkDelegate StartWork;
++	public delegate void FinishWorkDelegate ();
++	public FinishWorkDelegate FinishWork;
++
++	ProgressBar pb;
++	ThreadNotify notify;
++	uint timer; 
++
++	public ProgressPanel (string message, string button, StartWorkDelegate StartWork, FinishWorkDelegate FinishWork)
++	{
++			Gtk.Label l = new Gtk.Label (message);
++			l.UseMarkup = true;
++			l.Show ();
++			PackStart (l);
++			
++			pb = new ProgressBar ();
++			pb.Show ();
++			PackEnd (pb, false, false, 3);
++
++			Button b = new Button (button);
++			b.Show ();
++			b.Clicked += new EventHandler (OnStartWorking);
++			PackEnd (b, false, false, 3);
++
++			this.StartWork = StartWork;
++			this.FinishWork = FinishWork;
++	}
++
++	void OnStartWorking (object sender, EventArgs a)
++	{
++		Button b = (Button) sender;
++		b.Sensitive = false;
++		// start a timer to update the progress bar
++		timer = Gtk.Timeout.Add ( (uint) 100, new Function (DoUpdateProgressbar));
++		
++		Thread thr = new Thread (new ThreadStart (Work));
++	    thr.Start ();
++		notify = new ThreadNotify (new ReadyEvent (Finished));
++		
++	}
++
++	void Work ()
++	{
++		StartWork ();
++		notify.WakeupMain ();
++	}
++	
++	void Finished ()
++	{
++		Gtk.Timeout.Remove (timer);
++		FinishWork ();
++	}
++
++	bool DoUpdateProgressbar ()
++	{
++		pb.Pulse ();
++		return true;
++	}
++}
++}
+Index: docbrowser/browser.glade
+===================================================================
+--- docbrowser/browser.glade	(revision 49918)
++++ docbrowser/browser.glade	(working copy)
+@@ -587,168 +587,6 @@
+ 		      <property name="homogeneous">False</property>
+ 		      <property name="spacing">3</property>
+ 
+-		      <child>
+-			<widget class="GtkFrame" id="frame1">
+-			  <property name="visible">True</property>
+-			  <property name="label_xalign">0</property>
+-			  <property name="label_yalign">0.5</property>
+-			  <property name="shadow_type">GTK_SHADOW_IN</property>
+-
+-			  <child>
+-			    <widget class="GtkVBox" id="vbox5">
+-			      <property name="visible">True</property>
+-			      <property name="homogeneous">False</property>
+-			      <property name="spacing">0</property>
+-
+-			      <child>
+-				<widget class="GtkEventBox" id="index_eb">
+-				  <property name="visible">True</property>
+-				  <property name="visible_window">True</property>
+-				  <property name="above_child">False</property>
+-
+-				  <child>
+-				    <widget class="GtkHBox" id="hbox9">
+-				      <property name="border_width">3</property>
+-				      <property name="visible">True</property>
+-				      <property name="homogeneous">False</property>
+-				      <property name="spacing">3</property>
+-
+-				      <child>
+-					<widget class="GtkImage" id="image47">
+-					  <property name="visible">True</property>
+-					  <property name="stock">gtk-index</property>
+-					  <property name="icon_size">1</property>
+-					  <property name="xalign">0.5</property>
+-					  <property name="yalign">0.5</property>
+-					  <property name="xpad">0</property>
+-					  <property name="ypad">0</property>
+-					</widget>
+-					<packing>
+-					  <property name="padding">0</property>
+-					  <property name="expand">False</property>
+-					  <property name="fill">True</property>
+-					</packing>
+-				      </child>
+-
+-				      <child>
+-					<widget class="GtkLabel" id="label">
+-					  <property name="visible">True</property>
+-					  <property name="label" translatable="yes">_Look for:</property>
+-					  <property name="use_underline">True</property>
+-					  <property name="use_markup">False</property>
+-					  <property name="justify">GTK_JUSTIFY_LEFT</property>
+-					  <property name="wrap">False</property>
+-					  <property name="selectable">False</property>
+-					  <property name="xalign">0</property>
+-					  <property name="yalign">0.5</property>
+-					  <property name="xpad">0</property>
+-					  <property name="ypad">0</property>
+-					  <property name="mnemonic_widget">index_entry</property>
+-					</widget>
+-					<packing>
+-					  <property name="padding">0</property>
+-					  <property name="expand">True</property>
+-					  <property name="fill">True</property>
+-					</packing>
+-				      </child>
+-				    </widget>
+-				  </child>
+-				</widget>
+-				<packing>
+-				  <property name="padding">0</property>
+-				  <property name="expand">False</property>
+-				  <property name="fill">False</property>
+-				</packing>
+-			      </child>
+-
+-			      <child>
+-				<widget class="GtkHSeparator" id="hseparator2">
+-				  <property name="visible">True</property>
+-				</widget>
+-				<packing>
+-				  <property name="padding">0</property>
+-				  <property name="expand">False</property>
+-				  <property name="fill">True</property>
+-				</packing>
+-			      </child>
+-
+-			      <child>
+-				<widget class="GtkEntry" id="index_entry">
+-				  <property name="visible">True</property>
+-				  <property name="can_focus">True</property>
+-				  <property name="editable">True</property>
+-				  <property name="visibility">True</property>
+-				  <property name="max_length">0</property>
+-				  <property name="text" translatable="yes"></property>
+-				  <property name="has_frame">False</property>
+-				  <property name="invisible_char" translatable="yes">*</property>
+-				  <property name="activates_default">False</property>
+-				  <signal name="changed" handler="OnIndexEntryChanged" last_modification_time="Wed, 09 Jul 2003 02:56:48 GMT"/>
+-				  <signal name="activate" handler="OnIndexEntryActivated" last_modification_time="Wed, 09 Jul 2003 02:58:39 GMT"/>
+-				  <signal name="focus_in_event" handler="OnIndexEntryFocused" last_modification_time="Mon, 25 Aug 2003 04:33:55 GMT"/>
+-				  <signal name="key_press_event" handler="OnIndexEntryKeyPress" last_modification_time="Wed, 27 Aug 2003 16:57:06 GMT"/>
+-				</widget>
+-				<packing>
+-				  <property name="padding">0</property>
+-				  <property name="expand">False</property>
+-				  <property name="fill">True</property>
+-				</packing>
+-			      </child>
+-
+-			      <child>
+-				<widget class="GtkHSeparator" id="hseparator1">
+-				  <property name="visible">True</property>
+-				</widget>
+-				<packing>
+-				  <property name="padding">0</property>
+-				  <property name="expand">False</property>
+-				  <property name="fill">True</property>
+-				</packing>
+-			      </child>
+-
+-			      <child>
+-				<widget class="GtkVBox" id="search_box">
+-				  <property name="visible">True</property>
+-				  <property name="homogeneous">False</property>
+-				  <property name="spacing">0</property>
+-
+-				  <child>
+-				    <placeholder/>
+-				  </child>
+-				</widget>
+-				<packing>
+-				  <property name="padding">0</property>
+-				  <property name="expand">True</property>
+-				  <property name="fill">True</property>
+-				</packing>
+-			      </child>
+-			    </widget>
+-			  </child>
+-			</widget>
+-			<packing>
+-			  <property name="padding">0</property>
+-			  <property name="expand">True</property>
+-			  <property name="fill">True</property>
+-			</packing>
+-		      </child>
+-
+-		      <child>
+-			<widget class="GtkFrame" id="matches">
+-			  <property name="visible">True</property>
+-			  <property name="label_xalign">0</property>
+-			  <property name="label_yalign">0.5</property>
+-			  <property name="shadow_type">GTK_SHADOW_IN</property>
+-
+-			  <child>
+-			    <placeholder/>
+-			  </child>
+-			</widget>
+-			<packing>
+-			  <property name="padding">0</property>
+-			  <property name="expand">True</property>
+-			  <property name="fill">True</property>
+-			</packing>
+-		      </child>
+ 		    </widget>
+ 		    <packing>
+ 		      <property name="tab_expand">False</property>
+@@ -813,107 +651,6 @@
+ 		      <property name="visible">True</property>
+ 		      <property name="homogeneous">False</property>
+ 		      <property name="spacing">0</property>
+-
+-		      <child>
+-			<widget class="GtkHBox" id="hbox35">
+-			  <property name="border_width">3</property>
+-			  <property name="visible">True</property>
+-			  <property name="homogeneous">False</property>
+-			  <property name="spacing">3</property>
+-
+-			  <child>
+-			    <widget class="GtkImage" id="image133">
+-			      <property name="visible">True</property>
+-			      <property name="stock">gtk-find</property>
+-			      <property name="icon_size">1</property>
+-			      <property name="xalign">0.5</property>
+-			      <property name="yalign">0.5</property>
+-			      <property name="xpad">0</property>
+-			      <property name="ypad">0</property>
+-			    </widget>
+-			    <packing>
+-			      <property name="padding">0</property>
+-			      <property name="expand">False</property>
+-			      <property name="fill">True</property>
+-			    </packing>
+-			  </child>
+-
+-			  <child>
+-			    <widget class="GtkLabel" id="label66">
+-			      <property name="visible">True</property>
+-			      <property name="label" translatable="yes">_Search for:</property>
+-			      <property name="use_underline">True</property>
+-			      <property name="use_markup">False</property>
+-			      <property name="justify">GTK_JUSTIFY_LEFT</property>
+-			      <property name="wrap">False</property>
+-			      <property name="selectable">False</property>
+-			      <property name="xalign">0</property>
+-			      <property name="yalign">0.5</property>
+-			      <property name="xpad">0</property>
+-			      <property name="ypad">0</property>
+-			      <property name="mnemonic_widget">index_entry</property>
+-			    </widget>
+-			    <packing>
+-			      <property name="padding">0</property>
+-			      <property name="expand">True</property>
+-			      <property name="fill">True</property>
+-			    </packing>
+-			  </child>
+-			</widget>
+-			<packing>
+-			  <property name="padding">0</property>
+-			  <property name="expand">False</property>
+-			  <property name="fill">False</property>
+-			</packing>
+-		      </child>
+-
+-		      <child>
+-			<widget class="GtkEntry" id="search_term">
+-			  <property name="visible">True</property>
+-			  <property name="can_focus">True</property>
+-			  <property name="editable">True</property>
+-			  <property name="visibility">True</property>
+-			  <property name="max_length">0</property>
+-			  <property name="text" translatable="yes"></property>
+-			  <property name="has_frame">True</property>
+-			  <property name="invisible_char" translatable="yes">*</property>
+-			  <property name="activates_default">False</property>
+-			  <signal name="activate" handler="OnSearchActivated" last_modification_time="Wed, 13 Jul 2005 23:36:43 GMT"/>
+-			</widget>
+-			<packing>
+-			  <property name="padding">3</property>
+-			  <property name="expand">False</property>
+-			  <property name="fill">True</property>
+-			</packing>
+-		      </child>
+-
+-		      <child>
+-			<widget class="GtkScrolledWindow" id="scrolledwindow_search">
+-			  <property name="visible">True</property>
+-			  <property name="can_focus">True</property>
+-			  <property name="hscrollbar_policy">GTK_POLICY_ALWAYS</property>
+-			  <property name="vscrollbar_policy">GTK_POLICY_ALWAYS</property>
+-			  <property name="shadow_type">GTK_SHADOW_IN</property>
+-			  <property name="window_placement">GTK_CORNER_TOP_LEFT</property>
+-			  <signal name="row_activated" handler="ShowSearchResult"/>
+-
+-			  <child>
+-			    <widget class="GtkTreeView" id="search_tree">
+-			      <property name="visible">True</property>
+-			      <property name="can_focus">True</property>
+-			      <property name="headers_visible">False</property>
+-			      <property name="rules_hint">False</property>
+-			      <property name="reorderable">False</property>
+-			      <property name="enable_search">True</property>
+-			    </widget>
+-			  </child>
+-			</widget>
+-			<packing>
+-			  <property name="padding">0</property>
+-			  <property name="expand">True</property>
+-			  <property name="fill">True</property>
+-			</packing>
+-		      </child>
+ 		    </widget>
+ 		    <packing>
+ 		      <property name="tab_expand">False</property>
+Index: docbrowser/Makefile.am
+===================================================================
+--- docbrowser/Makefile.am	(revision 49918)
++++ docbrowser/Makefile.am	(working copy)
+@@ -24,7 +24,8 @@
+ 	$(srcdir)/Contributions.cs	\
+ 	$(srcdir)/XmlNodeWriter.cs	\
+ 	$(srcdir)/GtkHtmlHtmlRender.cs	\
+-	$(srcdir)/IHtmlRender.cs	
++	$(srcdir)/IHtmlRender.cs	\
++	$(srcdir)/ProgressPanel.cs
+ 
+ 
+ geckorender_sources = \

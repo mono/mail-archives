@@ -1,0 +1,583 @@
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 66435)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,21 @@
++2006-10-08  Joshua Tauberer  <jit@occams.info>
++
++	* monodocer.cs: Track which members have been seen in the XML file
++	  not by putting MemberInfos into a hashtable, which seems to
++	  not always work right, but instead by their (string) signature.
++	  - Get custom attribute data with the new 2.0 CustomAttributeData
++	  classes, so that we can reconstruct what the constructor actually
++	  looked like.
++	  - Hide System.Runtime.InteropServices.Out attributes since it is
++	  fake and already in the RefType XML attribute.
++	* monodocs2html.cs: Don't override the default XSLT URI resolver anymore.
++	* stylesheet.xsl: Get the index.xml document at the start while we're
++	  sure we have the right base path (the XML document being transformed).
++	  - Display inherited members in a type's member list when the base type
++	  is documented in the same monodocer document set.
++	  - Make sure there's a space between a method's parameters and return
++	  value type in the member list.
++
+ 2006-10-06  Jonathan Pryor  <jonpryor@vt.edu>
+ 
+ 	* overview.xsl: When generating a Namespace/index.html file, we should
+Index: monodocer.cs
+===================================================================
+--- monodocer.cs	(revision 66435)
++++ monodocer.cs	(working copy)
+@@ -461,10 +461,11 @@
+ 		if (!ignoremembers)
+ 		foreach (XmlElement oldmember in basefile.SelectNodes("Type/Members/Member")) {
+ 			MemberInfo oldmember2 = GetMember(type, oldmember);
++ 			string sig = oldmember2 != null ? MakeMemberSignature(oldmember2) : null;
+ 			
+ 			// Interface implementations and overrides are deleted from the docs
+ 			// unless the overrides option is given.
+-			if (oldmember2 != null && !IsNew(oldmember2))
++			if (oldmember2 != null && (!IsNew(oldmember2) || sig == null))
+ 				oldmember2 = null;
+ 			
+ 			// Deleted (or signature changed)
+@@ -490,15 +491,18 @@
+ 			// Update signature information
+ 			UpdateMember(oldmember, oldmember2);
+ 			
+-			seenmembers[oldmember2] = 1;
++			seenmembers[sig] = 1;
+ 		}
+ 		
+ 		if (!IsDelegate(type) && !ignoremembers) {
+ 			XmlNode members = basefile.SelectSingleNode("Type/Members");
+ 			foreach (MemberInfo m in type.GetMembers(BindingFlags.Public|BindingFlags.NonPublic|BindingFlags.Static|BindingFlags.Instance|BindingFlags.DeclaredOnly)) {
+ 				if (m is Type) continue;
+-				if (seenmembers.ContainsKey(m)) continue;
+ 				
++				string sig = MakeMemberSignature(m);
++				if (sig == null) continue;
++				if (seenmembers.ContainsKey(sig)) continue;
++				
+ 				// To be nice on diffs, members/properties/events that are overrides or are interface implementations
+ 				// are not added in.
+ 				if (!IsNew(m)) continue;
+@@ -1046,9 +1050,20 @@
+ 				n.ParentNode.RemoveChild(n);
+ 	}
+ 	
+-	private static void MakeAttributes(XmlElement root, ICustomAttributeProvider attributes, bool assemblyAttributes) {
+-		object[] at = attributes.GetCustomAttributes(false);
+-		if (at.Length == 0) {
++	private static void MakeAttributes(XmlElement root, object attributes, bool assemblyAttributes) {
++		System.Collections.Generic.IList<CustomAttributeData> at;
++		if (attributes is Assembly)
++			at = CustomAttributeData.GetCustomAttributes((Assembly)attributes);
++		else if (attributes is MemberInfo)
++			at = CustomAttributeData.GetCustomAttributes((MemberInfo)attributes);
++		else if (attributes is Module)
++			at = CustomAttributeData.GetCustomAttributes((Module)attributes);
++		else if (attributes is ParameterInfo)
++			at = CustomAttributeData.GetCustomAttributes((ParameterInfo)attributes);
++		else
++			throw new ArgumentException("unsupported type: " + attributes.GetType().ToString());
++	
++		if (at.Count == 0) {
+ 			ClearElement(root, "Attributes");
+ 			return;
+ 		}
+@@ -1060,36 +1075,30 @@
+ 		else
+ 			e = root.OwnerDocument.CreateElement("Attributes");
+ 		
+-		foreach (Attribute a in at) {
+-			if (GetTypeVisibility(a.GetType().Attributes) == null) continue; // hide non-visible attributes
++		foreach (CustomAttributeData a in at) {
++			if (GetTypeVisibility(a.Constructor.DeclaringType.Attributes) == null) continue; // hide non-visible attributes
+ 			
+-			//if (assemblyAttributes && a.GetType().FullName.StartsWith("System.Reflection.")) continue;
+-			if (a.GetType().FullName == "System.Reflection.AssemblyKeyFileAttribute" || a.GetType().FullName == "System.Reflection.AssemblyDelaySignAttribute") continue; // hide security-related attributes
++			if (a.Constructor.DeclaringType == typeof(System.Reflection.AssemblyKeyFileAttribute) || a.Constructor.DeclaringType == typeof(System.Reflection.AssemblyDelaySignAttribute)) continue; // hide security-related attributes
++			if (a.Constructor.DeclaringType == typeof(System.Runtime.InteropServices.OutAttribute)) continue; // hide this because it is given in RefType attribute
+ 			
+ 			b = true;
+ 			
+-			// There's no way to reconstruct how the attribute's constructor was called,
+-			// so as a substitute, just list the value of all of the attribute's public fields.
+-			
+ 			ArrayList fields = new ArrayList();
+-			foreach (PropertyInfo f in a.GetType().GetProperties(BindingFlags.Public|BindingFlags.Instance)) {
+-				if (f.Name == "TypeId") continue;
+-				
+-				object v = f.GetValue(a, null);
+-				if (v == null) v = "null";
+-				else if (v is string) v = "\"" + v + "\"";
+-				else if (v is Type) v = "typeof(" + GetCSharpFullName ((Type)v) + ")";
+-				else if (v is Enum) v = v.GetType().FullName + "." + v.ToString().Replace(", ", "|");
+-					
+-				fields.Add(f.Name + "=" + v);
++
++			foreach (CustomAttributeTypedArgument f in a.ConstructorArguments) {
++				fields.Add(MakeAttributesValueString(f.Value));
+ 			}
++			foreach (CustomAttributeNamedArgument f in a.NamedArguments) {
++				fields.Add(f.MemberInfo.Name + "=" + MakeAttributesValueString(f.TypedValue.Value));
++			}
++
+ 			string a2 = String.Join(", ", (string[])fields.ToArray(typeof(string)));
+ 			if (a2 != "") a2 = "(" + a2 + ")";
+ 			
+ 			XmlElement ae = root.OwnerDocument.CreateElement("Attribute");
+ 			e.AppendChild(ae);
+ 			
+-			string name = a.GetType().FullName;
++			string name = a.Constructor.DeclaringType.FullName;
+ 			if (name.EndsWith("Attribute")) name = name.Substring(0, name.Length-"Attribute".Length);
+ 			WriteElementText(ae, "AttributeName", name + a2);
+ 		}
+@@ -1102,6 +1111,15 @@
+ 		NormalizeWhitespace(e);
+ 	}
+ 	
++	private static string MakeAttributesValueString(object v) {
++		if (v == null) return "null";
++		else if (v is string) return "\"" + v + "\"";
++		else if (v is bool) return (bool)v ? "true" : "false";
++		else if (v is Type) return "typeof(" + GetCSharpFullName ((Type)v) + ")";
++		else if (v is Enum) return v.GetType().FullName + "." + v.ToString().Replace(", ", "|");
++		else return v.ToString();
++	}
++	
+ 	private static void MakeParameters(XmlElement root, ParameterInfo[] parameters) {
+ 		XmlElement e = WriteElement(root, "Parameters");
+ 		e.RemoveAll();
+Index: monodocs2html.cs
+===================================================================
+--- monodocs2html.cs	(revision 66435)
++++ monodocs2html.cs	(working copy)
+@@ -189,8 +189,8 @@
+ 	}
+ 	
+ 	private class MyXmlResolver : XmlUrlResolver {
+-		public override Uri ResolveUri(Uri baseUri, string relativeUri) {
++		/*public override Uri ResolveUri(Uri baseUri, string relativeUri) {
+ 			return base.ResolveUri(new Uri("file://" + new DirectoryInfo(opts.source).FullName + "/"), relativeUri);
+-		}
++		}*/
+ 	}
+ }
+Index: stylesheet.xsl
+===================================================================
+--- stylesheet.xsl	(revision 66435)
++++ stylesheet.xsl	(working copy)
+@@ -16,6 +16,8 @@
+ 	<xsl:param name="language" select="'C#'"/>
+ 	<xsl:param name="ext" select="'xml'"/>
+ 	<xsl:param name="basepath" select="'./'"/>
++	
++	<xsl:variable name="Index" select="document('../index.xml', .)"/>
+ 
+ 	<!-- The namespace that the current type belongs to. -->
+ 	<xsl:variable name="TypeNamespace" select="substring(/Type/@FullName, 1, string-length(/Type/@FullName) - string-length(/Type/@Name) - 1)"/>		
+@@ -747,8 +749,8 @@
+ 				</xsl:call-template>
+ 			</xsl:variable>
+ 			<xsl:variable name="T" select="$type"/>
+-			<xsl:variable name="typeentry" select="document('index.xml')/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name,'.',@Name) = $T]" />
+-			<xsl:for-each select="document('index.xml')/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name, '.', @Name)]">
++			<xsl:variable name="typeentry" select="$Index/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name,'.',@Name) = $T]" />
++			<xsl:for-each select="$Index/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name, '.', @Name)]">
+ 			</xsl:for-each>
+ 			<a>
+ 				<xsl:attribute name="href">
+@@ -810,16 +812,22 @@
+ 		<xsl:param name="type" />
+ 		<xsl:param name="local-suffix" />
+ 		<xsl:param name="remote" />
++		<xsl:param name="xmltarget" select='0'/>
+ 		<!-- Search for type in the index.xml file. -->
+-		<xsl:variable name="typeentry" select="document('index.xml')/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name,'.',translate(@Name, '+', '.')) = $type]"/>
++		<xsl:variable name="typeentry" select="$Index/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name,'.',translate(@Name, '+', '.')) = $type]"/>
+ 		
+ 		<xsl:choose>
+ 			<xsl:when test="count($typeentry)">
+ 				<xsl:value-of select="concat($basepath,$typeentry/parent::Namespace/@Name, '/', $typeentry/@Name)"/>
+ 				<xsl:text>.</xsl:text>
+-				<xsl:value-of select="$ext" />
++				<xsl:if test="$xmltarget=0"><xsl:value-of select="$ext" /></xsl:if>
++				<xsl:if test="$xmltarget=1">xml</xsl:if>
+ 				<xsl:value-of select="$local-suffix" />
+ 			</xsl:when>
++
++			<!-- documentation not available, return empty string -->
++			<xsl:when test="$xmltarget = 1">--not-available--</xsl:when>
++
+ 			<xsl:when test="starts-with($type, 'System.') or 
+ 				starts-with($type, 'Cairo.') or starts-with ($type, 'Commons.Xml.') or
+ 				starts-with($type, 'Mono.GetOptions.') or starts-with($type,'Mono.Math.') or
+@@ -1138,6 +1146,48 @@
+ 		<tt><xsl:value-of select="@langword"/></tt>
+ 	</xsl:template>
+ 	
++	<xsl:template name="GetInheritedMembers">
++		<xsl:param name="declaringtype"/>
++		<xsl:param name="listmembertype"/>
++		<xsl:param name="showprotected"/>
++		<xsl:param name="showstatic" select='1'/>
++
++		<Members Name="{$declaringtype/@Name}" FullName="{$declaringtype/@FullName}">
++
++		<!-- Get all members in this type that are of listmembertype and are either
++			protected or not protected according to showprotected. -->
++		<xsl:copy-of select="$declaringtype/Members/Member
++			[(MemberType=$listmembertype or ($listmembertype='Operator' and MemberType='Method'))]
++			[$showprotected=contains(concat(' ',MemberSignature[@Language='C#']/@Value),' protected ')]
++			[($listmembertype='Method' and not(starts-with(@MemberName,'op_')))
++				or ($listmembertype='Operator' and starts-with(@MemberName,'op_'))
++				or (not($listmembertype='Method') and not($listmembertype='Operator'))]
++			[$showstatic or not(contains(MemberSignature[@Language='C#']/@Value,' static '))]
++			"/>
++			
++		</Members>
++
++		<xsl:if test="not($listmembertype='Constructor') and count($declaringtype/Base/BaseTypeName)=1">
++			<xsl:variable name="basedocsfile">
++				<xsl:call-template name="GetLinkTarget">
++					<xsl:with-param name="type" select="$declaringtype/Base/BaseTypeName" />
++					<xsl:with-param name="local-suffix" />
++					<xsl:with-param name="remote"/>
++					<xsl:with-param name="xmltarget" select='1'/>
++				</xsl:call-template>
++			</xsl:variable>
++
++			<xsl:if test="not($basedocsfile='--not-available--')">
++				<xsl:call-template name="GetInheritedMembers">
++					<xsl:with-param name="listmembertype" select="$listmembertype"/>
++					<xsl:with-param name="showprotected" select="$showprotected"/>
++					<xsl:with-param name="declaringtype" select="document($basedocsfile,.)/Type"/>
++					<xsl:with-param name="showstatic" select='0'/>
++				</xsl:call-template>
++			</xsl:if>
++		</xsl:if>
++	</xsl:template>
++	
+ 	<!-- Lists the members in the current Type node.
+ 		 Only lists members of type listmembertype.
+ 		 Displays the signature in siglanguage.
+@@ -1148,22 +1198,31 @@
+ 		<xsl:param name="showprotected"/>
+ 
+ 		<!-- get name and namespace of current type -->
++		<xsl:variable name="TypeFullName" select="@FullName"/>
+ 		<xsl:variable name="TypeName" select="@Name"/>		
+ 		<xsl:variable name="TypeNamespace" select="substring-before(@FullName, concat('.',@Name))"/>
+-
+-		<!-- Get all members in this type that are of listmembertype and are either
+-			protected or not protected according to showprotected. -->
++		
++		<xsl:variable name="MEMBERS">
++			<xsl:call-template name="GetInheritedMembers">
++				<xsl:with-param name="listmembertype" select="$listmembertype"/>
++				<xsl:with-param name="showprotected" select="$showprotected"/>
++				<xsl:with-param name="declaringtype" select="."/>
++			</xsl:call-template>
++		</xsl:variable>
++		
++		<!--
+ 		<xsl:variable name="MEMBERS" select="
+-			Members/Member
++			$ALLMEMBERS/Member
+ 			[(MemberType=$listmembertype or ($listmembertype='Operator' and MemberType='Method'))]
+ 			[$showprotected=contains(MemberSignature[@Language='C#']/@Value,'protected')]
+ 			[($listmembertype='Method' and not(starts-with(@MemberName,'op_')))
+ 				or ($listmembertype='Operator' and starts-with(@MemberName,'op_'))
+ 				or (not($listmembertype='Method') and not($listmembertype='Operator'))]
+ 			"/>
+-
++		-->
++		
+ 		<!-- if there aren't any, skip this -->
+-		<xsl:if test="count($MEMBERS)">
++		<xsl:if test="count($MEMBERS/Member)">
+ 
+ 		<!-- header -->
+ 		<h3>
+@@ -1174,7 +1233,7 @@
+ 		<div class="SubsectionBox">
+ 		<table class="MembersListing">
+ 
+-		<xsl:for-each select="$MEMBERS">
++		<xsl:for-each select="$MEMBERS/Member">
+ 			<!--<xsl:sort select="contains(MemberSignature[@Language='C#']/@Value,' static ')" data-type="text"/>-->
+ 			<xsl:sort select="@MemberName = 'op_Implicit' or @MemberName = 'op_Explicit'"/>
+ 			<xsl:sort select="@MemberName" data-type="text"/>
+@@ -1182,11 +1241,31 @@
+ 			<xsl:sort select="Parameters/Parameter/@Type"/>
+ 			
+ 			<xsl:variable name="linkid">
++				<xsl:if test="not(parent::Members/@FullName = $TypeFullName)">
++					<xsl:call-template name="GetLinkTarget">
++						<xsl:with-param name="type" select="parent::Members/@FullName" />
++						<xsl:with-param name="local-suffix"/>
++						<xsl:with-param name="remote"/>
++						<xsl:with-param name="empty-if-this" select="1"/>
++					</xsl:call-template>
++				</xsl:if>
++
++				<xsl:text>#</xsl:text>
+ 				<xsl:call-template name="GetLinkId" >
+-					<xsl:with-param name="type" select="../.." />
++					<xsl:with-param name="type" select="parent::Members" />
+ 					<xsl:with-param name="member" select="." />
+ 				</xsl:call-template>
+ 			</xsl:variable>
++			
++			<xsl:variable name="isinherited">
++				<xsl:if test="not(parent::Members/@FullName = $TypeFullName)">
++					(<i>Inherited from
++					<xsl:call-template name="maketypelink">
++						<xsl:with-param name="type" select="parent::Members/@FullName"/>
++						<xsl:with-param name="wrt" select="$TypeNamespace"/>
++					</xsl:call-template>.</i>)
++				</xsl:if>
++			</xsl:variable>
+ 
+ 			<tr valign="top">
+ 
+@@ -1197,9 +1276,9 @@
+ 					<td>
+ 					<div>
+ 					<b>
+-					<a href="#{$linkid}">
++					<a href="{$linkid}">
+ 						<xsl:call-template name="GetConstructorName">
+-							<xsl:with-param name="type" select="../.." />
++							<xsl:with-param name="type" select="parent::Members" />
+ 							<xsl:with-param name="ctor" select="." />
+ 						</xsl:call-template>
+ 					</a>
+@@ -1231,7 +1310,7 @@
+ 
+ 					<!-- link to member page -->
+ 					<b>
+-					<a href="#{$linkid}">
++					<a href="{$linkid}">
+ 						<xsl:value-of select="@MemberName"/>
+ 					</a>
+ 					</b>
+@@ -1284,6 +1363,8 @@
+ 
+ 					<!-- description -->
+ 					<xsl:apply-templates select="Docs/summary" mode="notoppara"/>
++					
++					<xsl:copy-of select="$isinherited"/>
+ 					</td>
+ 				</xsl:when>
+ 
+@@ -1302,7 +1383,7 @@
+ 
+ 					<!-- link to method page -->
+ 					<b>
+-					<a href="#{$linkid}">
++					<a href="{$linkid}">
+ 						<xsl:value-of select="@MemberName"/>
+ 					</a>
+ 					</b>
+@@ -1324,7 +1405,7 @@
+ 					<!-- return type -->
+ 					<xsl:if test="not(ReturnValue/ReturnType='System.Void')">
+ 						<nobr>
+-						<xsl:text>:</xsl:text>
++						<xsl:text> : </xsl:text>
+ 						<xsl:apply-templates select="ReturnValue/ReturnType" mode="typelink"><xsl:with-param name="wrt" select="$TypeNamespace"/></xsl:apply-templates>
+ 						</nobr>
+ 					</xsl:if>
+@@ -1332,6 +1413,7 @@
+ 					<!-- description -->
+ 					<div>
+ 						<xsl:apply-templates select="Docs/summary" mode="notoppara"/>
++						<xsl:copy-of select="$isinherited"/>
+ 					</div>
+ 					</td>
+ 				</xsl:when>
+@@ -1343,7 +1425,7 @@
+ 					<xsl:choose>
+ 					<xsl:when test="@MemberName='op_Implicit' or @MemberName='op_Explicit'">
+ 						<b>
+-						<a href="#{$linkid}">
++						<a href="{$linkid}">
+ 							<xsl:text>Conversion</xsl:text>
+ 							<xsl:choose>
+ 							<xsl:when test="ReturnValue/ReturnType = //Type/@FullName">
+@@ -1369,14 +1451,14 @@
+ 					</xsl:when>
+ 					<xsl:when test="count(Parameters/Parameter)=1">
+ 						<b>
+-						<a href="#{$linkid}">
++						<a href="{$linkid}">
+ 							<xsl:value-of select="substring-after(@MemberName, 'op_')"/>
+ 						</a>
+ 						</b>
+ 					</xsl:when>
+ 					<xsl:otherwise>
+ 						<b>
+-						<a href="#{$linkid}">
++						<a href="{$linkid}">
+ 							<xsl:value-of select="substring-after(@MemberName, 'op_')"/>
+ 						</a>
+ 						</b>
+@@ -1405,7 +1487,7 @@
+ 				
+ 				<xsl:otherwise>
+ 					<!-- Other types: just provide a link -->
+-					<a href="#{$linkid}">
++					<a href="{$linkid}">
+ 						<xsl:value-of select="@MemberName"/>
+ 					</a>
+ 				</xsl:otherwise>
+@@ -1420,6 +1502,7 @@
+ 		</div>
+ 
+ 		</xsl:if>
++
+ 	</xsl:template>
+ 
+ 	<xsl:template name="GetLinkName">
+Index: DocTest/en.expected/index.xml
+===================================================================
+--- DocTest/en.expected/index.xml	(revision 66435)
++++ DocTest/en.expected/index.xml	(working copy)
+@@ -3,7 +3,7 @@
+     <Assembly Name="DocTest" Version="0.0.0.0">
+       <Attributes>
+         <Attribute>
+-          <AttributeName>System.Runtime.CompilerServices.RuntimeCompatibility(WrapNonExceptionThrows=True)</AttributeName>
++          <AttributeName>System.Runtime.CompilerServices.RuntimeCompatibility(WrapNonExceptionThrows=true)</AttributeName>
+         </Attribute>
+       </Attributes>
+     </Assembly>
+Index: DocTest/en.expected/Mono.DocTest/Widget.xml
+===================================================================
+--- DocTest/en.expected/Mono.DocTest/Widget.xml	(revision 66435)
++++ DocTest/en.expected/Mono.DocTest/Widget.xml	(working copy)
+@@ -14,7 +14,7 @@
+   </Interfaces>
+   <Attributes>
+     <Attribute>
+-      <AttributeName>System.Reflection.DefaultMember(MemberName="Item")</AttributeName>
++      <AttributeName>System.Reflection.DefaultMember("Item")</AttributeName>
+     </Attribute>
+   </Attributes>
+   <Members>
+@@ -159,13 +159,7 @@
+       </ReturnValue>
+       <Parameters>
+         <Parameter Name="c" Type="System.Char" />
+-        <Parameter Name="f" Type="System.Single&amp;" RefType="out">
+-          <Attributes>
+-            <Attribute>
+-              <AttributeName>System.Runtime.InteropServices.Out</AttributeName>
+-            </Attribute>
+-          </Attributes>
+-        </Parameter>
++        <Parameter Name="f" Type="System.Single&amp;" RefType="out" />
+         <Parameter Name="v" Type="Mono.DocTest.DocValueType&amp;" RefType="ref" />
+       </Parameters>
+       <Docs>
+Index: DocTest/html.expected/Mono.DocTest.Generic/MyList`1.html
+===================================================================
+--- DocTest/html.expected/Mono.DocTest.Generic/MyList`1.html	(revision 66435)
++++ DocTest/html.expected/Mono.DocTest.Generic/MyList`1.html	(working copy)
+@@ -98,7 +98,7 @@
+               <td>
+                 <b>
+                   <a href="#M:Mono.DocTest.Generic.MyList`1.GetHelper`2">GetHelper&lt;U,V&gt;</a>
+-                </b>()<nobr>:<a href="../Mono.DocTest.Generic/MyList`1+Helper`2.html">MyList&lt;T&gt;.Helper&lt;U,V&gt;</a></nobr><div>To be added.</div></td>
++                </b>()<nobr> : <a href="../Mono.DocTest.Generic/MyList`1+Helper`2.html">MyList&lt;T&gt;.Helper&lt;U,V&gt;</a></nobr><div>To be added.</div></td>
+             </tr>
+             <tr valign="top">
+               <td>
+@@ -129,7 +129,7 @@
+               </td>
+               <td>
+                 <b>
+-                  <a href="#M:Mono.DocTest.Generic.MyList`1.UseHelper`2(Mono.DocTest.Generic.MyList{`1}.Helper{``1,``2})">UseHelper&lt;U,V&gt;</a>
++                  <a href="#M:Mono.DocTest.Generic.MyList`1.UseHelper`2(Mono.DocTest.Generic.MyList{T}.Helper{``1,``2})">UseHelper&lt;U,V&gt;</a>
+                 </b>(<a href="../Mono.DocTest.Generic/MyList`1+Helper`2.html">MyList&lt;T&gt;.Helper&lt;U,V&gt;</a>)<div>To be added.</div></td>
+             </tr>
+           </table>
+Index: DocTest/html.expected/Mono.DocTest.Generic/MyList`2.html
+===================================================================
+--- DocTest/html.expected/Mono.DocTest.Generic/MyList`2.html	(revision 66435)
++++ DocTest/html.expected/Mono.DocTest.Generic/MyList`2.html	(working copy)
+@@ -159,7 +159,7 @@
+               <td>
+                 <b>
+                   <a href="#M:Mono.DocTest.Generic.MyList`2.Contains(A)">Contains</a>
+-                </b>(<a href="javascript:alert(&quot;Documentation not found.&quot;)">A</a>)<nobr>:<a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Boolean">bool</a></nobr><div>To be added.</div></td>
++                </b>(<a href="javascript:alert(&quot;Documentation not found.&quot;)">A</a>)<nobr> : <a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Boolean">bool</a></nobr><div>To be added.</div></td>
+             </tr>
+             <tr valign="top">
+               <td>
+@@ -183,7 +183,7 @@
+               <td>
+                 <b>
+                   <a href="#M:Mono.DocTest.Generic.MyList`2.GetEnumerator">GetEnumerator</a>
+-                </b>()<nobr>:<a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Collections.Generic.IEnumerator`1">System.Collections.Generic.IEnumerator&lt;A&gt;</a></nobr><div>To be added.</div></td>
++                </b>()<nobr> : <a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Collections.Generic.IEnumerator`1">System.Collections.Generic.IEnumerator&lt;A&gt;</a></nobr><div>To be added.</div></td>
+             </tr>
+             <tr valign="top">
+               <td>
+@@ -191,7 +191,7 @@
+               <td>
+                 <b>
+                   <a href="#M:Mono.DocTest.Generic.MyList`2.MoveNext">MoveNext</a>
+-                </b>()<nobr>:<a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Boolean">bool</a></nobr><div>To be added.</div></td>
++                </b>()<nobr> : <a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Boolean">bool</a></nobr><div>To be added.</div></td>
+             </tr>
+             <tr valign="top">
+               <td>
+@@ -199,7 +199,7 @@
+               <td>
+                 <b>
+                   <a href="#M:Mono.DocTest.Generic.MyList`2.Remove(A)">Remove</a>
+-                </b>(<a href="javascript:alert(&quot;Documentation not found.&quot;)">A</a>)<nobr>:<a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Boolean">bool</a></nobr><div>To be added.</div></td>
++                </b>(<a href="javascript:alert(&quot;Documentation not found.&quot;)">A</a>)<nobr> : <a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Boolean">bool</a></nobr><div>To be added.</div></td>
+             </tr>
+             <tr valign="top">
+               <td>
+Index: DocTest/html.expected/Mono.DocTest/Widget.html
+===================================================================
+--- DocTest/html.expected/Mono.DocTest/Widget.html	(revision 66435)
++++ DocTest/html.expected/Mono.DocTest/Widget.html	(working copy)
+@@ -49,7 +49,7 @@
+             <table class="InnerSignatureTable" cellpadding="10" cellspacing="0" width="100%">
+               <tr>
+                 <td>
+-                  <div>[System.Reflection.DefaultMember(MemberName="Item")]</div>public class  <b>Widget</b> :
++                  <div>[System.Reflection.DefaultMember("Item")]</div>public class  <b>Widget</b> :
+ 		
+ 								<a href="../Mono.DocTest/IProcess.html">IProcess</a></td>
+               </tr>
+@@ -460,7 +460,7 @@
+           </hr>
+         </div>
+         <h3 id="M:Mono.DocTest.Widget.M1(System.Char,System.Single@,Mono.DocTest.DocValueType@)" class="MemberName">M1 Method</h3>
+-        <div class="MemberSignature">public <a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Void">void</a> <b>M1</b> (<a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Char">char</a> c, [System.Runtime.InteropServices.Out] <i>out</i> <a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Single">float</a> f, <i>ref</i> <a href="../Mono.DocTest/DocValueType.html">DocValueType</a> v)</div>
++        <div class="MemberSignature">public <a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Void">void</a> <b>M1</b> (<a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Char">char</a> c, <i>out</i> <a href="http://www.go-mono.com/docs/monodoc.ashx?link=T:System.Single">float</a> f, <i>ref</i> <a href="../Mono.DocTest/DocValueType.html">DocValueType</a> v)</div>
+         <div class="MemberBox">
+           <p>To be added.</p>
+           <h4 class="Subsection">Parameters</h4>
+Index: DocTest/html.expected/Mono.DocTest/UseLists.html
+===================================================================
+--- DocTest/html.expected/Mono.DocTest/UseLists.html	(revision 66435)
++++ DocTest/html.expected/Mono.DocTest/UseLists.html	(working copy)
+@@ -87,7 +87,7 @@
+               <td>
+                 <b>
+                   <a href="#M:Mono.DocTest.UseLists.GetValues`1(T)">GetValues&lt;T&gt;</a>
+-                </b>(<a href="javascript:alert(&quot;Documentation not found.&quot;)">T</a>)<nobr>:<a href="../Mono.DocTest.Generic/MyList`1.html">Mono.DocTest.Generic.MyList&lt;T&gt;</a></nobr><div>To be added.</div></td>
++                </b>(<a href="javascript:alert(&quot;Documentation not found.&quot;)">T</a>)<nobr> : <a href="../Mono.DocTest.Generic/MyList`1.html">Mono.DocTest.Generic.MyList&lt;T&gt;</a></nobr><div>To be added.</div></td>
+             </tr>
+             <tr valign="top">
+               <td>

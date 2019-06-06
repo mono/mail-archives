@@ -1,0 +1,2007 @@
+Index: defaulttemplate.xsl
+===================================================================
+--- defaulttemplate.xsl	(revision 65831)
++++ defaulttemplate.xsl	(working copy)
+@@ -41,6 +41,8 @@
+ 					.MembersListing td { margin: 0px; border: 1px solid black; padding: .25em }
+ 					
+ 					.TypesListing td { margin: 0px;  padding: .25em }
++					.InnerSignatureTable tr { background-color: #f2f2f2; }
++					.TypePermissionsTable tr { background-color: #f2f2f2; }
+ 					
+ 				</style>
+ 				
+@@ -53,9 +55,9 @@
+ 		<div class="CollectionTitle">
+ 			<xsl:apply-templates select="CollectionTitle/node()"/>
+ 		</div>
+-		<div class="PageTitle">
++		<h1 class="PageTitle">
+ 			<xsl:apply-templates select="PageTitle/node()"/>
+-		</div>
++		</h1>
+ 		
+ 		<p class="Summary">
+ 			<xsl:apply-templates select="Summary/node()"/>
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 65831)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,21 @@
++2006-09-30  Jonathan Pryor  <jonpryor@vt.edu>
++
++	* Makefile.am: Build with gmcs; add `-debug' to compile lines.
++	* monodocer.cs: Major overhaul for Generics support.  Documentation
++	  generated follows the pattern used in CLILibraryTypes.xml from ECMA-335.
++	  - Remove some warnings about unused variables.
++	  - Don't assume that Type.FullName is always what we want, but instead
++	    build a C# typename from the Type information.  This is needed to nicely
++	    deal with generics, as the FullName for Foo<int> would be
++	    Foo[[System.Int32, mscorlib]], while we really want Foo<int>.
++	  - For index.xml files, insert a File attribute, as the Type name won't
++	    match the filename for generic types (Foo<T> is the file Foo`1.xml).
++	  - For GetMember(), remove generic parameters before using Type.GetMember()
++	    with the member name.
++	  - Code refactoring so that <param/> and <typeparam/> generation & updating
++	    is consistent.
++	  - Properly use `this' for method name on indexers.
++
+ 2006-04-01  Joshua Tauberer  <tauberer@for.net>
+ 
+ 	* monodocs2html.cs: Skip files that are missing.
+Index: monodocer.cs
+===================================================================
+--- monodocer.cs	(revision 65831)
++++ monodocer.cs	(working copy)
+@@ -147,12 +147,12 @@
+ 		Assembly assembly = null;
+ 		try {
+ 			assembly = Assembly.LoadFile (name);
+-		} catch (System.IO.FileNotFoundException e) { }
++		} catch (System.IO.FileNotFoundException) { }
+ 
+ 		if (assembly == null) {
+ 			try {
+ 				assembly = Assembly.LoadWithPartialName (name);
+-			} catch (Exception e) { }
++			} catch (Exception) { }
+ 		}
+ 			
+ 		if (assembly == null)
+@@ -402,10 +402,12 @@
+ 				nsnode.SetAttribute("Name", type.Namespace);
+ 				index_types.AppendChild(nsnode);
+ 			}
+-			XmlElement typenode = (XmlElement)nsnode.SelectSingleNode("Type[@Name='" + typename + "']");
++			string doc_typename = GetDocTypeName (type);
++			XmlElement typenode = (XmlElement)nsnode.SelectSingleNode("Type[@Name='" + doc_typename + "']");
+ 			if (typenode == null) {
+ 				typenode = index_types.OwnerDocument.CreateElement("Type");
+-				typenode.SetAttribute("Name", typename);
++				typenode.SetAttribute("Name", doc_typename);
++				typenode.SetAttribute("File", typename);
+ 				nsnode.AppendChild(typenode);
+ 			}
+ 				
+@@ -427,8 +429,8 @@
+ 			foreach (System.IO.FileInfo typefile in nsdir.GetFiles("*.xml")) {
+ 				if (!goodfiles.ContainsKey(nsdir.Name + "/" + typefile.Name)) {
+ 					string newname = typefile.FullName + ".remove";
+-					try { System.IO.File.Delete(newname); } catch (Exception e) { }
+-					try { typefile.MoveTo(newname); } catch (Exception e) { }					
++					try { System.IO.File.Delete(newname); } catch (Exception) { }
++					try { typefile.MoveTo(newname); } catch (Exception) { }					
+ 					Console.Error.WriteLine("Class no longer present; file renamed: " + nsdir.Name + "/" + typefile.Name);
+ 				}
+ 			}
+@@ -439,8 +441,10 @@
+ 	{
+ 		// Look for type nodes that no longer correspond to types
+ 		foreach (XmlElement typenode in index_types.SelectNodes("Namespace/Type")) {
+-			string fulltypename = ((XmlElement)typenode.ParentNode).GetAttribute("Name") + "/" + typenode.GetAttribute("Name") + ".xml";
+-			if (!goodfiles.ContainsKey(fulltypename))
++			string dirname = ((XmlElement)typenode.ParentNode).GetAttribute("Name") + "/";
++			string typename = typenode.GetAttribute ("Name") + ".xml";
++			string filename = typenode.GetAttribute ("File") + ".xml";
++			if (!goodfiles.ContainsKey(dirname + typename) && !goodfiles.ContainsKey (dirname + filename))
+ 				typenode.ParentNode.RemoveChild(typenode);
+ 		}
+ 	}
+@@ -585,9 +589,16 @@
+ 		ArrayList memberparams = new ArrayList();
+ 		foreach (XmlElement param in member.SelectNodes("Parameters/Parameter"))
+ 			memberparams.Add(param.GetAttribute("Type"));
++
++		string memberName = member.GetAttribute ("MemberName");
++		do {
++			int idx = memberName.IndexOf ("<");
++			if (idx != -1)
++				memberName = memberName.Substring (0, idx);
++		} while (false);
+ 		
+ 		// Loop through all members in this type with the same name
+-		MemberInfo[] mis = type.GetMember(member.GetAttribute("MemberName"), BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
++		MemberInfo[] mis = type.GetMember(memberName, BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+ 		foreach (MemberInfo mi in mis) {
+ 			if (mi is Type) continue;
+ 			if (GetMemberType(mi) != membertype) continue;
+@@ -597,7 +608,8 @@
+ 
+ 			if (mi is MethodInfo) {
+ 				// Casting operators can overload based on return type.
+-				if (returntype != ((MethodInfo)mi).ReturnType.FullName) continue;
++				if (returntype != GetDocTypeFullName (((MethodInfo)mi).ReturnType)) 
++					continue;
+ 			}
+ 
+ 			ParameterInfo[] pis = null;
+@@ -609,11 +621,14 @@
+ 			if (pis == null)
+ 				pis = new ParameterInfo[0];
+ 				
+-			if (pis.Length != memberparams.Count) continue;			
++			if (pis.Length != memberparams.Count) continue;
+ 			
+ 			bool good = true;
+ 			for (int i = 0; i < pis.Length; i++)
+-				if (pis[i].ParameterType.FullName != (string)memberparams[i]) { good = false; break; }
++				if (GetDocParameterType (pis[i].ParameterType) != (string)memberparams[i]) {
++					good = false;
++					break;
++				}
+ 			if (!good) continue;
+ 
+ 			return mi;
+@@ -628,12 +643,10 @@
+ 		string typesig = MakeTypeSignature(type);
+ 		if (typesig == null) return null; // not publicly visible
+ 		
+-		string typename = type.FullName.Substring(type.Namespace == "" ? 0 : type.Namespace.Length+1);
+-
+ 		XmlDocument doc = new XmlDocument();
+ 		XmlElement root = doc.CreateElement("Type");
+-		root.SetAttribute("Name", typename);
+-		root.SetAttribute("FullName", type.FullName);
++		root.SetAttribute("Name", GetDocTypeName (type));
++		root.SetAttribute("FullName", GetDocTypeFullName (type));
+ 		
+ 		UpdateType(root, type, true);
+ 		
+@@ -665,7 +678,7 @@
+ 		NormalizeWhitespace(ass);
+ 		
+ 		if (type.BaseType != null) {
+-			string basetypename = type.BaseType.FullName;
++			string basetypename = GetDocTypeFullName (type.BaseType);
+ 			if (basetypename == "System.MulticastDelegate") basetypename = "System.Delegate";
+ 			WriteElementText(root, "Base/BaseTypeName", basetypename);
+ 		} else {
+@@ -679,7 +692,7 @@
+ 			ArrayList interface_names = new ArrayList();
+ 			foreach (Type i in type.GetInterfaces())
+ 				if ((type.BaseType == null || Array.IndexOf(type.BaseType.GetInterfaces(), i) == -1) && InterfaceNotFromAnother(i, type.GetInterfaces()))
+-					interface_names.Add(i.FullName);
++					interface_names.Add(GetDocTypeFullName (i));
+ 			interface_names.Sort();
+ 
+ 			XmlElement interfaces = WriteElement(root, "Interfaces");
+@@ -734,14 +747,23 @@
+ 			WriteElementText(me, "MemberValue", fieldValue);
+ 		
+ 		ParameterInfo[] paraminfo = null;
++		Type[] genericParams = null;
+ 		Type returntype = null;
+ 		bool returnisreturn = true; // the name of the node is 'return', vs 'value'
+ 		bool addremarks = true;
+ 		
+-		if (mi is MethodInfo || mi is ConstructorInfo)
++		if (mi is MethodInfo || mi is ConstructorInfo) {
+ 			paraminfo = ((MethodBase)mi).GetParameters();
+-		else if (mi is PropertyInfo)
++			try {
++				genericParams = ((MethodBase)mi).GetGenericArguments ();
++			}
++			catch (NotSupportedException) {
++				genericParams = null;
++			}
++		}
++		else if (mi is PropertyInfo) {
+ 			paraminfo = ((PropertyInfo)mi).GetIndexParameters();
++		}
+ 			
+ 		if (mi is MethodInfo) {
+ 			returntype = ((MethodInfo)mi).ReturnType;
+@@ -756,7 +778,7 @@
+ 
+ 		string slashdocsig = MakeSlashDocMemberSig(mi);
+ 
+-		MakeDocNode(me, paraminfo, returntype, returnisreturn, addremarks, slashdocsig);
++		MakeDocNode(me, genericParams, paraminfo, returntype, returnisreturn, addremarks, slashdocsig);
+ 		
+ 	}
+ 	
+@@ -824,42 +846,125 @@
+ 	
+ 	private static void MakeDocNode(Type type, XmlElement e, bool addremarks) {
+ 		ParameterInfo[] parameters = null;
++		Type[] genericParams = type.GetGenericArguments ();
++		if (type.DeclaringType != null) {
++			Type[] declGenParams = type.DeclaringType.GetGenericArguments ();
++			if (declGenParams != null && genericParams.Length == declGenParams.Length) {
++				genericParams = null;
++			}
++			else if (declGenParams != null) {
++				Type[] nestedParams = new Type [genericParams.Length - declGenParams.Length];
++				for (int i = 0; i < nestedParams.Length; ++i) {
++					nestedParams [i] = genericParams [i+declGenParams.Length];
++				}
++				genericParams = nestedParams;
++			}
++		}
+ 		Type returntype = null;
+ 		if (IsDelegate(type)) {
+ 			parameters = type.GetMethod("Invoke").GetParameters();
+ 			returntype = type.GetMethod("Invoke").ReturnType;
+ 		}
+-		MakeDocNode(parameters, returntype, true, e, addremarks, "T:" + type.FullName);
++		MakeDocNode(genericParams, parameters, returntype, true, e, addremarks, "T:" + GetDocTypeFullName (type));
+ 	}
+ 	
+-	private static void MakeDocNode(XmlElement root, ParameterInfo[] parameters, Type returntype, bool returnisreturn, bool addremarks, string slashdocsig) {
++	private static void MakeDocNode(XmlElement root, Type[] genericParams, ParameterInfo[] parameters, Type returntype, bool returnisreturn, bool addremarks, string slashdocsig) {
+ 		XmlElement e = WriteElement(root, "Docs");
+-		MakeDocNode(parameters, returntype, returnisreturn, e, addremarks, slashdocsig);
++		MakeDocNode(genericParams, parameters, returntype, returnisreturn, e, addremarks, slashdocsig);
+ 	}
+ 	
+-	private static void MakeDocNode(ParameterInfo[] parameters, Type returntype, bool returnisreturn, XmlElement e, bool addremarks, string slashdocname) {
++	private static void MakeDocNode(Type[] genericParams, ParameterInfo[] parameters, Type returntype, bool returnisreturn, XmlElement e, bool addremarks, string slashdocname) {
+ 		WriteElementInitialText(e, "summary", "To be added.");
+ 		
+ 		if (parameters != null) {
+-			XmlNode[] paramnodes = new XmlNode[parameters.Length];
++			string[] values = new string [parameters.Length];
++			for (int i = 0; i < values.Length; ++i)
++				values [i] = parameters [i].Name;
++			UpdateParameters (e, "param", values);
++		}
++
++		if (genericParams != null) {
++			string[] values = new string [genericParams.Length];
++			for (int i = 0; i < values.Length; ++i)
++				values [i] = genericParams [i].Name;
++			UpdateParameters (e, "typeparam", values);
++		}
++
++		string retnodename = null;
++		if (returntype != null && returntype != typeof(void)) {
++			retnodename = returnisreturn ? "returns" : "value";
++			string retnodename_other = !returnisreturn ? "returns" : "value";
+ 			
++			// If it has a returns node instead of a value node, change its name.
++			XmlElement retother = (XmlElement)e.SelectSingleNode(retnodename_other);
++			if (retother != null) {
++				XmlElement retnode = e.OwnerDocument.CreateElement(retnodename);
++				foreach (XmlNode node in retother)
++					retnode.AppendChild(node.CloneNode(true));
++				e.ReplaceChild(retnode, retother);
++			} else {
++				WriteElementInitialText(e, retnodename, "To be added.");
++			}
++		} else {
++			ClearElement(e, "returns");
++			ClearElement(e, "value");
++		}
++
++		if (addremarks)
++			WriteElementInitialText(e, "remarks", "To be added.");
++		
++		if (slashdocs != null && slashdocname != null) {
++			XmlElement elem = (XmlElement)slashdocs.SelectSingleNode("doc/members/member[@name='" + slashdocname + "']");
++			if (elem != null) {
++				XmlElement xsummary = (XmlElement)elem.SelectSingleNode("summary");
++				if (xsummary != null)
++					WriteElementText(e, "summary", xsummary.InnerText);
++
++				XmlElement xremarks = (XmlElement)elem.SelectSingleNode("remarks");
++				if (xremarks != null)
++					WriteElementText(e, "remarks", xremarks.InnerText);
++				else if (xsummary != null)
++					ClearElement(e, "remarks");
++
++				if (retnodename != null) {
++					XmlElement xreturns = (XmlElement)elem.SelectSingleNode(retnodename);
++					if (xreturns != null)
++						WriteElementText(e, retnodename, xreturns.InnerText);
++				}
++				
++				foreach (XmlElement p in elem.SelectNodes("param")) {
++					XmlElement p2 = (XmlElement)e.SelectSingleNode("param[@name='" + p.GetAttribute("name") + "']");
++					if (p2 != null)
++						p2.InnerText = p.InnerText;
++				}
++			}
++		}
++		
++		NormalizeWhitespace(e);
++	}
++
++	private static void UpdateParameters (XmlElement e, string element, string[] values)
++	{	
++		if (values != null) {
++			XmlNode[] paramnodes = new XmlNode[values.Length];
++			
+ 			// Some documentation had param nodes with leading spaces.
+-			foreach (XmlElement paramnode in e.SelectNodes("param")){
++			foreach (XmlElement paramnode in e.SelectNodes(element)){
+ 				paramnode.SetAttribute("name", paramnode.GetAttribute("name").Trim());
+ 			}
+ 			
+ 			// If a member has only one parameter, we can track changes to
+ 			// the name of the parameter easily.
+-			if (parameters.Length == 1) {
+-				int c = e.SelectNodes("param").Count;
++			if (values.Length == 1) {
++				int c = e.SelectNodes(element).Count;
+ 				if (c == 1) {
+-					UpdateParameterName (e, (XmlElement) e.SelectSingleNode("param"), parameters[0].Name);
++					UpdateParameterName (e, (XmlElement) e.SelectSingleNode(element), values [0]);
+ 				} else if (c > 1) {
+-					foreach (XmlElement paramnode in e.SelectNodes("param")) {
++					foreach (XmlElement paramnode in e.SelectNodes(element)) {
+ 						if (paramnode.InnerText.StartsWith("To be added"))
+ 							paramnode.ParentNode.RemoveChild(paramnode);
+ 						else
+-							UpdateParameterName (e, paramnode, parameters[0].Name);
++							UpdateParameterName (e, paramnode, values [0]);
+ 					}
+ 				}
+ 			}
+@@ -869,15 +974,15 @@
+ 			// Pick out existing and still-valid param nodes, and
+ 			// create nodes for parameters not in the file.
+ 			Hashtable seenParams = new Hashtable();
+-			for (int pi = 0; pi < parameters.Length; pi++) {
+-				ParameterInfo p = parameters[pi];
+-				seenParams[p.Name] = pi;
++			for (int pi = 0; pi < values.Length; pi++) {
++				string p = values [pi];
++				seenParams[p] = pi;
+ 				
+-				paramnodes[pi] = e.SelectSingleNode("param[@name='" + p.Name + "']");
++				paramnodes[pi] = e.SelectSingleNode(element + "[@name='" + p + "']");
+ 				if (paramnodes[pi] != null) continue;
+ 				
+-				XmlElement pe = e.OwnerDocument.CreateElement("param");
+-				pe.SetAttribute("name", p.Name);
++				XmlElement pe = e.OwnerDocument.CreateElement(element);
++				pe.SetAttribute("name", p);
+ 				pe.InnerText = "To be added.";
+ 				paramnodes[pi] = pe;
+ 				reinsert = true;
+@@ -885,7 +990,7 @@
+ 
+ 			// Remove parameters that no longer exist and check all params are in the right order.
+ 			int idx = 0;
+-			foreach (XmlElement paramnode in e.SelectNodes("param")) {
++			foreach (XmlElement paramnode in e.SelectNodes(element)) {
+ 				string name = paramnode.GetAttribute("name");
+ 				if (!seenParams.ContainsKey(name)) {
+ 					if (!delete && !paramnode.InnerText.StartsWith("To be added")) {
+@@ -905,11 +1010,11 @@
+ 			
+ 			// Re-insert the parameter nodes at the top of the doc section.
+ 			if (reinsert)
+-				for (int pi = parameters.Length-1; pi >= 0; pi--)
++				for (int pi = values.Length-1; pi >= 0; pi--)
+ 					e.PrependChild(paramnodes[pi]);
+ 		} else {
+ 			// Clear all existing param nodes
+-			foreach (XmlNode paramnode in e.SelectNodes("param")) {
++			foreach (XmlNode paramnode in e.SelectNodes(element)) {
+ 				if (!delete && !paramnode.InnerText.StartsWith("To be added")) {
+ 					Console.Error.WriteLine("The following param node can only be deleted if the --delete option is given:");
+ 					Console.Error.WriteLine(paramnode.OuterXml);
+@@ -918,58 +1023,6 @@
+ 				}
+ 			}
+ 		}
+-		
+-		string retnodename = null;
+-		if (returntype != null && returntype != typeof(void)) {
+-			retnodename = returnisreturn ? "returns" : "value";
+-			string retnodename_other = !returnisreturn ? "returns" : "value";
+-			
+-			// If it has a returns node instead of a value node, change its name.
+-			XmlElement retother = (XmlElement)e.SelectSingleNode(retnodename_other);
+-			if (retother != null) {
+-				XmlElement retnode = e.OwnerDocument.CreateElement(retnodename);
+-				foreach (XmlNode node in retother)
+-					retnode.AppendChild(node.CloneNode(true));
+-				e.ReplaceChild(retnode, retother);
+-			} else {
+-				WriteElementInitialText(e, retnodename, "To be added.");
+-			}
+-		} else {
+-			ClearElement(e, "returns");
+-			ClearElement(e, "value");
+-		}
+-
+-		if (addremarks)
+-			WriteElementInitialText(e, "remarks", "To be added.");
+-		
+-		if (slashdocs != null && slashdocname != null) {
+-			XmlElement elem = (XmlElement)slashdocs.SelectSingleNode("doc/members/member[@name='" + slashdocname + "']");
+-			if (elem != null) {
+-				XmlElement xsummary = (XmlElement)elem.SelectSingleNode("summary");
+-				if (xsummary != null)
+-					WriteElementText(e, "summary", xsummary.InnerText);
+-
+-				XmlElement xremarks = (XmlElement)elem.SelectSingleNode("remarks");
+-				if (xremarks != null)
+-					WriteElementText(e, "remarks", xremarks.InnerText);
+-				else if (xsummary != null)
+-					ClearElement(e, "remarks");
+-
+-				if (retnodename != null) {
+-					XmlElement xreturns = (XmlElement)elem.SelectSingleNode(retnodename);
+-					if (xreturns != null)
+-						WriteElementText(e, retnodename, xreturns.InnerText);
+-				}
+-				
+-				foreach (XmlElement p in elem.SelectNodes("param")) {
+-					XmlElement p2 = (XmlElement)e.SelectSingleNode("param[@name='" + p.GetAttribute("name") + "']");
+-					if (p2 != null)
+-						p2.InnerText = p.InnerText;
+-				}
+-			}
+-		}
+-		
+-		NormalizeWhitespace(e);
+ 	}
+ 
+ 	private static void UpdateParameterName (XmlElement docs, XmlElement pe, string newName)
+@@ -1026,7 +1079,7 @@
+ 				object v = f.GetValue(a, null);
+ 				if (v == null) v = "null";
+ 				else if (v is string) v = "\"" + v + "\"";
+-				else if (v is Type) v = "typeof(" + ((Type)v).FullName + ")";
++				else if (v is Type) v = "typeof(" + GetCSharpFullName ((Type)v) + ")";
+ 				else if (v is Enum) v = v.GetType().FullName + "." + v.ToString().Replace(", ", "|");
+ 					
+ 				fields.Add(f.Name + "=" + v);
+@@ -1057,7 +1110,7 @@
+ 			XmlElement pe = root.OwnerDocument.CreateElement("Parameter");
+ 			e.AppendChild(pe);
+ 			pe.SetAttribute("Name", p.Name);
+-			pe.SetAttribute("Type", p.ParameterType.FullName);
++			pe.SetAttribute("Type", GetDocParameterType (p.ParameterType));
+ 			if (p.ParameterType.IsByRef) {
+ 				if (p.IsOut) pe.SetAttribute("RefType", "out");
+ 				else pe.SetAttribute("RefType", "ref");
+@@ -1081,10 +1134,15 @@
+ 		else throw new ArgumentException();
+ 	}
+ 
++	private static string GetDocParameterType (Type type)
++	{
++		return GetDocTypeFullName (type).Replace ("@", "&");
++	}
++
+ 	private static void MakeReturnValue(XmlElement root, Type type, ICustomAttributeProvider attributes) {
+ 		XmlElement e = WriteElement(root, "ReturnValue");
+ 		e.RemoveAll();
+-		WriteElementText(e, "ReturnType", type.FullName);
++		WriteElementText(e, "ReturnType", GetDocTypeFullName (type));
+ 		if (attributes != null)
+ 			MakeAttributes(root, attributes, false);
+ 	}
+@@ -1126,12 +1184,35 @@
+ 		if (mi.Name.StartsWith("raise_")) return null;
+ 		
+ 		XmlElement me = doc.CreateElement("Member");
+-		me.SetAttribute("MemberName", mi.Name);
++		me.SetAttribute("MemberName", GetMemberName (mi));
+ 		
+ 		UpdateMember(me, mi);
+ 		
+ 		return me;
+ 	}
++
++	private static string GetMemberName (MemberInfo mi)
++	{
++		MethodBase mb = mi as MethodBase;
++		if (mb == null)
++			return mi.Name;
++		try {
++			StringBuilder sb = new StringBuilder ();
++			sb.Append (mi.Name);
++			Type[] typeParams = mb.GetGenericArguments ();
++			if (typeParams.Length > 0) {
++				sb.Append ("<");
++				sb.Append (typeParams [0].Name);
++				for (int i = 1; i < typeParams.Length; ++i)
++					sb.Append (",").Append (typeParams [i].Name);
++				sb.Append (">");
++			}
++			return sb.ToString ();
++		}
++		catch (NotSupportedException) {
++			return mi.Name;
++		}
++	}
+ 	
+ 	static bool IsDelegate(Type type) {
+ 		return typeof(System.Delegate).IsAssignableFrom (type) && !type.IsAbstract;
+@@ -1184,10 +1265,10 @@
+ 			sig.Append("delegate ");
+ 			MethodInfo invoke = type.GetMethod ("Invoke");
+ 			string arguments = GetMethodParameters(invoke.GetParameters());
+-			string return_value = ConvertCTSName(invoke.ReturnType.FullName);
++			string return_value = GetCSharpFullName (invoke.ReturnType);
+ 			sig.Append(return_value);
+ 			sig.Append(" ");
+-			sig.Append(type.Name);
++			sig.Append(GetCSharpName (type));
+ 			sig.Append("(");
+ 			sig.Append(arguments);
+ 			sig.Append(");");
+@@ -1196,7 +1277,7 @@
+ 		
+ 		sig.Append(GetTypeKind(type));
+ 		sig.Append(" ");
+-		sig.Append(type.Name);
++		sig.Append(GetCSharpName (type));
+ 
+ 		if (!type.IsValueType && !type.IsEnum) {
+ 			Type basetype = type.BaseType;
+@@ -1206,14 +1287,14 @@
+ 			ArrayList interface_names = new ArrayList();
+ 			foreach (Type i in type.GetInterfaces())
+ 				if ((type.BaseType == null || Array.IndexOf(type.BaseType.GetInterfaces(), i) == -1) && InterfaceNotFromAnother(i, type.GetInterfaces()))
+-					interface_names.Add(i.FullName);
++					interface_names.Add(GetCSharpFullName (i));
+ 			interface_names.Sort();
+ 			
+ 			if (basetype != null || interface_names.Count > 0)
+ 				sig.Append(" : ");
+ 			
+ 			if (basetype != null) {
+-				sig.Append(basetype.FullName);
++				sig.Append(GetCSharpFullName (basetype));
+ 				if (interface_names.Count > 0)
+ 					sig.Append(", ");
+ 			}
+@@ -1242,7 +1323,7 @@
+ 		if (visibility == null) return null;
+ 		if (field.DeclaringType.IsEnum) return field.Name;
+ 		
+-		string type = ConvertCTSName (field.FieldType.FullName);
++		string type = GetCSharpFullName (field.FieldType);
+ 		
+ 		string modifiers = String.Empty;
+ 		if (field.IsStatic && !field.IsLiteral) modifiers += " static";
+@@ -1277,10 +1358,7 @@
+ 				if (parameter.IsOut) sb.Append("out ");
+ 				else sb.Append("ref ");
+ 			}
+-			string param = parameter.ParameterType.FullName;
+-			if (parameter.ParameterType.IsByRef)
+-				param = param.Substring (0, param.Length - 1);
+-			param = ConvertCTSName(param);			
++			string param = GetCSharpFullName (parameter.ParameterType).Replace ("@", "");
+ 			sb.Append (param);
+ 			sb.Append (" ");
+ 			sb.Append (parameter.Name);
+@@ -1291,8 +1369,9 @@
+ 	}
+ 
+ 	static string MakeMethodSignature (MethodInfo method) {
+-		string visibility = GetMethodVisibility (method);
+-		if (visibility == null)
++		StringBuilder sb = new StringBuilder ();
++		sb.Append (GetMethodVisibility (method));
++		if (sb.Length == 0)
+ 				return null;
+ 		
+ 		string modifiers = String.Empty;
+@@ -1305,19 +1384,30 @@
+ 		if (method.IsFinal) modifiers += " sealed";
+ 		if (modifiers == " virtual sealed") modifiers = "";
+ 
++		sb.Append (modifiers);
++
+ 		// Special signature for destructors.
+ 		if (method.Name == "Finalize" && method.GetParameters().Length == 0)
+ 			return "~" + method.DeclaringType.Name + " ();";	
+ 
+-		string return_type = ConvertCTSName (method.ReturnType.FullName);
+-		string parameters = GetMethodParameters (method.GetParameters());
++		sb.Append (" ").Append (GetCSharpFullName (method.ReturnType));
++		sb.Append (" ").Append (method.Name);
++		try {
++			Type[] args = method.GetGenericArguments ();
++			if (args.Length > 0) {
++				sb.Append ("<");
++				sb.Append (args [0].Name);
++				for (int i = 1; i < args.Length; ++i)
++					sb.Append (",").Append (args [i].Name);
++				sb.Append (">");
++			}
++		}
++		catch (NotSupportedException) {
++			/* ignore */
++		}
++		sb.Append (" (").Append (GetMethodParameters (method.GetParameters())).Append (");");
+ 
+-		string method_name = method.Name;
+-		
+-		// operators, default accessors need name rewriting
+-
+-		return String.Format ("{0}{1} {2} {3} ({4});",
+-						visibility, modifiers, return_type, method_name, parameters);
++		return sb.ToString ();
+ 	}
+ 
+ 	static string MakeConstructorSignature (ConstructorInfo constructor) {
+@@ -1325,7 +1415,7 @@
+ 		if (visibility == null)
+ 			return null;
+ 
+-		string name = constructor.DeclaringType.Name;
++		string name = GetTypeName (constructor.DeclaringType.Name);
+ 		string parameters = GetMethodParameters (constructor.GetParameters());
+ 
+ 		return String.Format ("{0} {1} ({2});",
+@@ -1357,10 +1447,16 @@
+ 		if (method.IsFinal) modifiers += " sealed";
+ 		if (modifiers == " virtual sealed") modifiers = "";
+ 	
++		MemberInfo[] defs = property.DeclaringType.GetDefaultMembers ();
+ 		string name = property.Name;
++		foreach (MemberInfo mi in defs) {
++			if (mi == property) {
++				name = "this";
++				break;
++			}
++		}
+ 	
+-		string type_name = property.PropertyType.FullName;
+-		type_name = ConvertCTSName (type_name);
++		string type_name = GetCSharpFullName (property.PropertyType);
+ 		
+ 		string parameters = GetMethodParameters (property.GetIndexParameters());
+ 		if (parameters != "") parameters = "[" + parameters + "]";		
+@@ -1408,7 +1504,7 @@
+ 		if (modifiers == " virtual sealed") modifiers = "";
+ 		
+ 		string name = ev.Name;
+-		string type = ConvertCTSName(ev.EventHandlerType.FullName);
++		string type = GetCSharpFullName (ev.EventHandlerType);
+ 
+ 		return String.Format ("{0}{1} event {2} {3};",
+ 						visibility, modifiers, type, name);
+@@ -1433,62 +1529,21 @@
+ 	}
+ 
+ 	// Converts a fully .NET qualified type name into a C#-looking one
+-	static string ConvertCTSName (string type) {
+-		if (type.EndsWith ("[]"))
+-			return ConvertCTSName(type.Substring(0, type.Length - 2).TrimEnd()) + "[]";
+-
+-		if (type.EndsWith ("&"))
+-			return ConvertCTSName(type.Substring(0, type.Length - 1).TrimEnd()) + "&";
+-
+-		if (type.EndsWith ("*"))
+-			return ConvertCTSName(type.Substring(0, type.Length - 1).TrimEnd()) + "*";
+-
+-		if (!type.StartsWith ("System."))
+-				return type;
+-		
+-		switch (type) {
+-		case "System.Byte": return "byte";
+-		case "System.SByte": return "sbyte";
+-		case "System.Int16": return "short";
+-		case "System.Int32": return "int";
+-		case "System.Int64": return "long";
+-
+-		case "System.UInt16": return "ushort";
+-		case "System.UInt32": return "uint";
+-		case "System.UInt64": return "ulong";
+-
+-		case "System.Single":  return "float";
+-		case "System.Double":  return "double";
+-		case "System.Decimal": return "decimal";
+-		case "System.Boolean": return "bool";
+-		case "System.Char":    return "char";
+-		case "System.Void":    return "void";
+-		case "System.String":  return "string";
+-		case "System.Object":  return "object";
+-		}
+-		
+-		// Types in the system namespace just get their type name returned.
+-		if (type.StartsWith("System.")) {
+-			string sysname = type.Substring(7);
+-			if (sysname.IndexOf(".") == -1)
+-				return sysname;
+-		}
+-
+-		return type;
+-	}
+-	
+ 	private static string MakeSlashDocMemberSig(MemberInfo m) {
+-		string typename = m.DeclaringType.FullName;
++		string typename = GetCSharpFullName (m.DeclaringType);
+ 		string memname = m.Name;
+ 		
+-		if (m is ConstructorInfo)
++		if (m is ConstructorInfo) {
+ 			return "C:" + typename + ".#ctor(" + MakeSlashDocMemberSigArgs(((ConstructorInfo)m).GetParameters()) + ")";
+-		if (m is MethodInfo)
++		}
++		if (m is MethodInfo) {
+ 			return "M:" + typename + "." + memname + MakeSlashDocMemberSigArgs(((MethodInfo)m).GetParameters()) + MakeSlashDocMemberSigReturn((MethodInfo)m);
++		}
+ 		if (m is PropertyInfo && ((PropertyInfo)m).GetIndexParameters().Length == 0)
+ 			return "P:" + typename + "." + memname;
+-		if (m is PropertyInfo && ((PropertyInfo)m).GetIndexParameters().Length > 0)
++		if (m is PropertyInfo && ((PropertyInfo)m).GetIndexParameters().Length > 0) {
+ 			return "P:" + typename + "." + memname + MakeSlashDocMemberSigArgs(((PropertyInfo)m).GetIndexParameters());
++		}
+ 		if (m is FieldInfo)
+ 			return "F:" + typename + "." + memname;
+ 		if (m is EventInfo)
+@@ -1498,18 +1553,149 @@
+ 	
+ 	private static string MakeSlashDocMemberSigReturn(MethodInfo m) {
+ 		if (m.Name != "op_Implicit" && m.Name != "op_Explicit") return "";
+-		return "~" + m.ReturnType.FullName;
++		return "~" + GetCSharpFullName (m.ReturnType);
+ 	}
+ 	
+ 	private static string MakeSlashDocMemberSigArgs(ParameterInfo[] ps) {
+-		string ret = "";
++		StringBuilder buf = new StringBuilder ();
+ 		foreach (ParameterInfo p in ps) {
+-			if (ret != "") ret += ",";
+-			ret += p.ParameterType.FullName.Replace("&", "@");
++			if (buf.Length > 0)
++				buf.Append (",");
++			FillDocTypeName (p.ParameterType, buf, true, true, '+', true);
+ 		}
+-		if (ret != "")
+-			ret = "(" + ret + ")";
+-		return ret;
++		if (buf.Length > 0)
++			return "(" + buf.ToString () + ")";
++		return "";
+ 	}
+ 
++	private static StringBuilder FillDocTypeName (Type type, StringBuilder buf, bool includeNamespace, bool includeDeclType, char declSep, bool csharp)
++	{
++		if (type == null)
++			throw new ArgumentNullException ("type");
++		if (type.IsArray) {
++			FillDocTypeName (type.GetElementType(), buf, includeNamespace, 
++				includeDeclType, declSep, csharp).Append ("[");
++			int rank = type.GetArrayRank ();
++			if (rank > 1)
++				buf.Append (new string (',', rank-1));
++			return buf.Append ("]");
++		}
++		if (type.IsByRef) {
++			return FillDocTypeName (type.GetElementType(), buf, 
++				includeNamespace, includeDeclType, declSep, csharp).Append ("@");
++		}
++		if (type.IsPointer) {
++			return FillDocTypeName (type.GetElementType(), buf, 
++				includeNamespace, includeDeclType, declSep, csharp).Append ("*");
++		}
++		if (type.IsGenericParameter)
++			return buf.Append (type.Name);
++		if (!type.IsGenericType) {
++			string t = type.FullName;
++			if (!csharp || !t.StartsWith ("System.")) {
++				if (includeNamespace)
++					buf.Append (type.Namespace).Append (".");
++				if (type.DeclaringType != null && includeDeclType)
++					buf.Append (type.DeclaringType.Name).Append (declSep);
++				return buf.Append (type.Name);
++			}
++			
++			switch (t) {
++			case "System.Byte":    return buf.Append ("byte");
++			case "System.SByte":   return buf.Append ("sbyte");
++			case "System.Int16":   return buf.Append ("short");
++			case "System.Int32":   return buf.Append ("int");
++			case "System.Int64":   return buf.Append ("long");
++
++			case "System.UInt16":  return buf.Append ("ushort");
++			case "System.UInt32":  return buf.Append ("uint");
++			case "System.UInt64":  return buf.Append ("ulong");
++
++			case "System.Single":  return buf.Append ("float");
++			case "System.Double":  return buf.Append ("double");
++			case "System.Decimal": return buf.Append ("decimal");
++			case "System.Boolean": return buf.Append ("bool");
++			case "System.Char":    return buf.Append ("char");
++			case "System.Void":    return buf.Append ("void");
++			case "System.String":  return buf.Append ("string");
++			case "System.Object":  return buf.Append ("object");
++			}
++			
++			// Types in the system namespace just get their type name returned.
++			if (includeNamespace && t.StartsWith("System.")) {
++				string sysname = t.Substring(7);
++				if (sysname.IndexOf(".") == -1)
++					return buf.Append (sysname);
++			}
++
++			return buf.Append (includeNamespace ? t : type.Name);
++		}
++		if (includeNamespace)
++			buf.Append (type.Namespace).Append (".");
++		Type[] genArgs = type.GetGenericArguments ();
++		int genArg = 0;
++		if (type.DeclaringType != null) {
++			if (includeDeclType) {
++				buf.Append (GetTypeName (type.DeclaringType.Name));
++				if (type.DeclaringType.IsGenericType) {
++					buf.Append ("<");
++					int max = type.DeclaringType.GetGenericArguments ().Length;
++					FillDocTypeName (genArgs [genArg++], buf, includeNamespace, 
++							includeDeclType, declSep, csharp);
++					while (genArg < max) {
++						buf.Append (",");
++						FillDocTypeName (genArgs [genArg++], buf, includeNamespace, 
++								includeDeclType, declSep, csharp);
++					}
++					buf.Append (">");
++				}
++				buf.Append (declSep);
++			}
++			else
++				genArg = type.DeclaringType.IsGenericType 
++					? type.DeclaringType.GetGenericArguments ().Length
++					: 0;
++		}
++		buf.Append (GetTypeName (type.Name));
++		if (genArg < genArgs.Length) {
++			buf.Append ("<");
++			FillDocTypeName (genArgs [genArg++], buf, includeNamespace, 
++					includeDeclType, declSep, csharp);
++			while (genArg < genArgs.Length) {
++				buf.Append (",");
++				FillDocTypeName (genArgs [genArg++], buf, includeNamespace, 
++						includeDeclType, declSep, csharp);
++			}
++			buf.Append (">");
++		}
++		return buf;
++	}
++
++	private static string GetDocTypeName (Type type)
++	{
++		return FillDocTypeName (type, new StringBuilder (), false, true, '+', false).ToString ();
++	}
++
++	private static string GetDocTypeFullName (Type type)
++	{
++		return FillDocTypeName (type, new StringBuilder (), true, true, '+', false).ToString ();
++	}
++
++	private static string GetCSharpName (Type type)
++	{
++		return FillDocTypeName (type, new StringBuilder (), false, true, '.', true).ToString ();
++	}
++
++	private static string GetCSharpFullName (Type type)
++	{
++		return FillDocTypeName (type, new StringBuilder (), true, true, '.', true).ToString ();
++	}
++
++	private static string GetTypeName (string name)
++	{
++		int n = name.IndexOf ("`");
++		if (n >= 0)
++			return name.Substring (0, n);
++		return name;
++	}
+ }
+Index: monodocs2html.cs
+===================================================================
+--- monodocs2html.cs	(revision 65831)
++++ monodocs2html.cs	(working copy)
+@@ -112,11 +112,12 @@
+ 			
+ 			foreach (XmlElement ty in ns.SelectNodes("Type")) {
+ 				string typename = ty.GetAttribute("Name");
++				string typefilebase = ty.GetAttribute("File");
+ 				
+ 				if (opts.onlytype != null && !(nsname + "." + typename).StartsWith(opts.onlytype))
+ 					continue;
+ 
+-				string typefile = opts.source + "/" + nsname + "/" + typename + ".xml";
++				string typefile = opts.source + "/" + nsname + "/" + typefilebase + ".xml";
+ 				if (!File.Exists(typefile)) continue;
+ 
+ 				XmlDocument typexml = new XmlDocument();
+@@ -124,7 +125,7 @@
+ 				
+ 				Console.WriteLine(nsname + "." + typename);
+ 				
+-				Generate(typexml, stylesheet, typeargs, opts.dest + "/" + nsname + "/" + typename + "." + opts.ext, template);
++				Generate(typexml, stylesheet, typeargs, opts.dest + "/" + nsname + "/" + typefilebase + "." + opts.ext, template);
+ 			}
+ 		}
+ 	}
+Index: stylesheet.xsl
+===================================================================
+--- stylesheet.xsl	(revision 65831)
++++ stylesheet.xsl	(working copy)
+@@ -19,6 +19,7 @@
+ 
+ 	<!-- The namespace that the current type belongs to. -->
+ 	<xsl:variable name="TypeNamespace" select="substring(/Type/@FullName, 1, string-length(/Type/@FullName) - string-length(/Type/@Name) - 1)"/>		
++	<xsl:variable name="mono-docs">http://www.go-mono.com/docs/monodoc.ashx?link=</xsl:variable>
+ 
+ 	<!-- THE MAIN RENDERING TEMPLATE -->
+ 
+@@ -37,6 +38,10 @@
+ 		
+ 		<PageTitle>
+ 			<xsl:value-of select="@Name"/>
++			<xsl:text xml:space="preserve"> </xsl:text>
++			<xsl:if test="count(Docs/typeparam) &gt; 0">Generic</xsl:if>
++			<xsl:text xml:space="preserve"> </xsl:text>
++			<xsl:call-template name="GetTypeDescription" />
+ 		</PageTitle>
+ 		
+ 		<!--
+@@ -66,7 +71,7 @@
+ 			<table class="SignatureTable" cellspacing="0" width="100%">
+ 			<tr><td>
+ 				<table class="InnerSignatureTable" cellpadding="10" cellspacing="0" width="100%">
+-				<tr bgcolor="#f2f2f2"><td>
++				<tr><td>
+ 					<xsl:choose>
+ 					<xsl:when test="$language='C#'">
+ 
+@@ -190,7 +195,7 @@
+ 
+ 			<!-- MEMBER LISTING -->
+ 			<xsl:if test="not(Base/BaseTypeName='System.Delegate' or Base/BaseTypeName='System.MulticastDelegate' or Base/BaseTypeName='System.Enum')">
+-				<div class="Section">Members</div>
++				<h2 class="Section">Members</h2>
+ 	
+ 				<div class="SectionBox">
+ 				
+@@ -268,27 +273,39 @@
+ 			<xsl:if test="not(Base/BaseTypeName='System.Delegate' or Base/BaseTypeName='System.MulticastDelegate' or Base/BaseTypeName='System.Enum')">
+ 			<xsl:variable name="Type" select="."/>
+ 			
+-			<div class="Section">Member Details</div>
++			<h2 class="Section">Member Details</h2>
+ 			
+ 			<div class="SectionBox">
+ 
+ 			<xsl:for-each select="Members/Member">
+ 			
+-				<a name="member_{generate-id(.)}"></a>
++				<xsl:variable name="linkid">
++					<xsl:call-template name="GetLinkId">
++						<xsl:with-param name="type" select="../.." />
++						<xsl:with-param name="member" select="." />
++					</xsl:call-template>
++				</xsl:variable>
+ 
+-				<div class="MemberName">
++				<h3 id="{$linkid}" class="MemberName">
+ 					<xsl:choose>
+-					<xsl:when test="MemberType='Constructor'">
+-						<xsl:value-of select="$Type/@Name"/> Constructor
+-					</xsl:when>
+-					<xsl:when test="@MemberName='op_Implicit' or @MemberName='op_Explicit'">
+-						Conversion
+-					</xsl:when>
+-					<xsl:otherwise>
+-						<xsl:value-of select="@MemberName"/>
+-					</xsl:otherwise>
++						<xsl:when test="MemberType='Constructor'">
++							<xsl:call-template name="GetConstructorName">
++								<xsl:with-param name="type" select="../.." />
++								<xsl:with-param name="ctor" select="." />
++							</xsl:call-template>
++						</xsl:when>
++						<xsl:when test="@MemberName='op_Implicit' or @MemberName='op_Explicit'">
++							<xsl:text>Conversion</xsl:text>
++						</xsl:when>
++						<xsl:otherwise>
++							<xsl:value-of select="@MemberName"/>
++						</xsl:otherwise>
+ 					</xsl:choose>
+-				</div>
++					<xsl:text xml:space="preserve"> </xsl:text>
++					<xsl:if test="count(Docs/typeparam) &gt; 0">Generic</xsl:if>
++					<xsl:text xml:space="preserve"> </xsl:text>
++					<xsl:value-of select="MemberType" />
++				</h3>
+ 					
+ 				<div class="MemberSignature">
+ 					<!-- recreate the signature -->
+@@ -298,7 +315,7 @@
+ 					</xsl:call-template>
+ 
+ 					<xsl:if test="MemberType = 'Event'">
+-						event
++						<xsl:text>event</xsl:text>
+ 
+ 						<xsl:if test="ReturnValue/ReturnType=''">
+ 							<xsl:value-of select="substring-before(substring-after(MemberSignature[@Language='C#']/@Value, 'event '), concat(' ', @MemberName))"/>
+@@ -308,13 +325,15 @@
+ 					<!-- return value (comes out "" where not applicable/available) -->
+ 					<xsl:choose>
+ 					<xsl:when test="@MemberName='op_Implicit'">
+-						implicit operator
++						<xsl:text>implicit operator</xsl:text>
+ 					</xsl:when>
+ 					<xsl:when test="@MemberName='op_Explicit'">
+-						explicit operator
++						<xsl:text>explicit operator</xsl:text>
+ 					</xsl:when>
+ 					<xsl:otherwise>
+-						<xsl:apply-templates select="ReturnValue/ReturnType" mode="typelink"><xsl:with-param name="wrt" select="$TypeNamespace"/></xsl:apply-templates>
++						<xsl:apply-templates select="ReturnValue/ReturnType" mode="typelink">
++							<xsl:with-param name="wrt" select="$TypeNamespace"/>
++						</xsl:apply-templates>
+ 					</xsl:otherwise>					
+ 					</xsl:choose>
+ 
+@@ -326,12 +345,19 @@
+ 					
+ 					<!-- Constructors get the name of the class -->
+ 					<xsl:when test="MemberType='Constructor'">
+-						<b><xsl:value-of select="$Type/@Name"/></b>
++						<b>
++							<xsl:call-template name="GetConstructorName">
++								<xsl:with-param name="type" select="../.." />
++								<xsl:with-param name="ctor" select="." />
++							</xsl:call-template>
++						</b>
+ 					</xsl:when>
+ 					
+ 					<!-- Conversion operators get the return type -->
+ 					<xsl:when test="@MemberName='op_Implicit' or @MemberName='op_Explicit'">
+-						<xsl:apply-templates select="ReturnValue/ReturnType" mode="typelink"><xsl:with-param name="wrt" select="$TypeNamespace"/></xsl:apply-templates>
++						<xsl:apply-templates select="ReturnValue/ReturnType" mode="typelink">
++							<xsl:with-param name="wrt" select="$TypeNamespace"/>
++						</xsl:apply-templates>
+ 					</xsl:when>
+ 					
+ 					<!-- Regular operators get their symbol -->
+@@ -359,6 +385,11 @@
+ 					<xsl:when test="@MemberName='op_LessThan'">&lt;</xsl:when>
+ 					<xsl:when test="@MemberName='op_GreaterThanOrEqual'">&gt;=</xsl:when>
+ 					<xsl:when test="@MemberName='op_LessThanOrEqual'">&lt;=</xsl:when>
++
++					<xsl:when test="MemberType='Property' and count(Parameters/Parameter) &gt; 0">
++						<!-- C# only permits indexer properties to have arguments -->
++						<xsl:text>this</xsl:text>
++					</xsl:when>
+ 					
+ 					<!-- Everything else just gets its name -->
+ 					<xsl:otherwise>
+@@ -390,9 +421,9 @@
+ 
+ 					<xsl:if test="MemberType='Property'">
+ 						<xsl:value-of select="' '"/>
+-						{
++						<xsl:text>{</xsl:text>
+ 						<xsl:value-of select="substring-before(substring-after(MemberSignature[@Language='C#']/@Value, '{'), '}')"/>
+-						}
++						<xsl:text>}</xsl:text>
+ 					</xsl:if>
+ 				</div>
+ 				
+@@ -417,7 +448,8 @@
+ 				</p>
+ 
+ 				<xsl:if test="Attributes/Attribute">
+-					<p>Attributes:
++					<p>
++					<xsl:text>Attributes:</xsl:text>
+ 					<xsl:for-each select="Attributes/Attribute">
+ 						<xsl:if test="not(position()=1)">, </xsl:if>
+ 						<xsl:value-of select="AttributeName"/>
+@@ -444,6 +476,25 @@
+ 		</Page>
+ 	</xsl:template>
+ 
++	<xsl:template name="GetConstructorName">
++		<xsl:param name="type" />
++		<xsl:param name="ctor" />
++
++		<xsl:choose>
++			<xsl:when test="contains($type/@Name, '&lt;')">
++				<xsl:value-of select="substring-before ($type/@Name, '&lt;')" />
++				<xsl:if test="contains ($ctor/@MemberName, '&lt;')">
++					<xsl:value-of select="$typename" />
++					<xsl:text>&lt;</xsl:text>
++					<xsl:value-of select="string-after ($ctor/@MemberName, '&lt;')" />
++				</xsl:if>
++			</xsl:when>
++			<xsl:otherwise>
++				<xsl:value-of select="$type/@Name" />
++			</xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++
+ 	<xsl:template name="ShowParameter">
+ 		<xsl:param name="Param"/>
+ 		<xsl:param name="TypeNamespace"/>
+@@ -451,13 +502,16 @@
+ 
+ 		<xsl:if test="not($prototype)">
+ 			<xsl:for-each select="$Param/Attributes/Attribute[not(Exclude='1') and not(AttributeName='ParamArrayAttribute' or AttributeName='System.ParamArray')]">
+-				[<xsl:value-of select="AttributeName"/>]
++				<xsl:text>[</xsl:text>
++				<xsl:value-of select="AttributeName"/>
++				<xsl:text>]</xsl:text>
+ 				<xsl:value-of select="' '"/>
+ 			</xsl:for-each>
+ 		</xsl:if>
+ 
+ 		<xsl:if test="count($Param/Attributes/Attribute/AttributeName[.='ParamArrayAttribute' or .='System.ParamArray'])">
+-			<b>params</b> <xsl:value-of select="' '"/>
++			<b>params</b>
++			<xsl:value-of select="' '"/>
+ 		</xsl:if>
+ 
+ 		<xsl:if test="$Param/@RefType">
+@@ -467,7 +521,9 @@
+ 		</xsl:if>
+ 
+ 		<!-- parameter type link -->
+-		<xsl:apply-templates select="$Param/@Type" mode="typelink"><xsl:with-param name="wrt" select="$TypeNamespace"/></xsl:apply-templates>
++		<xsl:apply-templates select="$Param/@Type" mode="typelink">
++			<xsl:with-param name="wrt" select="$TypeNamespace"/>
++		</xsl:apply-templates>
+ 
+ 		<xsl:if test="not($prototype)">
+ 			<!-- hard space -->
+@@ -485,7 +541,7 @@
+ 		<!-- alt member: not sure what these are for, actually -->
+ 
+ 		<xsl:if test="count(Docs/altmember)">
+-			<div class="Subsection">See Also</div>
++			<h4 class="Subsection">See Also</h4>
+ 			<div class="SubsectionBox">
+ 			<xsl:for-each select="Docs/altmember">
+ 				<div><xsl:apply-templates select="@cref" mode="cref"/></div>
+@@ -495,8 +551,21 @@
+ 
+ 		<!-- parameters & return & value -->
+ 
++		<xsl:if test="count(Docs/typeparam)">
++			<h4 class="Subsection">Type Parameters</h4>
++			<div class="SubsectionBox">
++			<dl>
++			<xsl:for-each select="Docs/typeparam">
++				<dt><i><xsl:value-of select="@name"/></i></dt>
++				<dd>
++					<xsl:apply-templates select="." mode="notoppara"/>
++				</dd>
++			</xsl:for-each>
++			</dl>
++			</div>
++		</xsl:if>
+ 		<xsl:if test="count(Docs/param)">
+-			<div class="Subsection">Parameters</div>
++			<h4 class="Subsection">Parameters</h4>
+ 			<div class="SubsectionBox">
+ 			<dl>
+ 			<xsl:for-each select="Docs/param">
+@@ -509,13 +578,13 @@
+ 			</div>
+ 		</xsl:if>
+ 		<xsl:if test="count(Docs/returns)">
+-			<div class="Subsection">Returns</div>
++			<h4 class="Subsection">Returns</h4>
+ 			<div class="SubsectionBox">
+ 				<xsl:apply-templates select="Docs/returns" mode="notoppara"/>
+ 			</div>
+ 		</xsl:if>
+ 		<xsl:if test="count(Docs/value)">
+-			<div class="Subsection">Value</div>
++			<h4 class="Subsection">Value</h4>
+ 			<div class="SubsectionBox">
+ 				<xsl:apply-templates select="Docs/value" mode="notoppara"/>
+ 			</div>
+@@ -524,7 +593,7 @@
+ 		<!-- thread safety -->
+ 
+ 		<xsl:if test="count(ThreadingSafetyStatement)">
+-			<div class="Subsection">Thread Safety</div>
++			<h4 class="Subsection">Thread Safety</h4>
+ 			<div class="SubsectionBox">
+ 			<xsl:apply-templates select="ThreadingSafetyStatement" mode="notoppara"/>
+ 			</div>
+@@ -534,14 +603,18 @@
+ 		<!-- permissions -->
+ 
+ 		<xsl:if test="count(Docs/permission)">
+-			<div>Permissions</div>
++			<h4>Permissions</h4>
+ 			<div class="SubsectionBox">
+ 			<table class="TypePermissionsTable" border="1" cellpadding="6">
+-			<tr bgcolor="#f2f2f2"><th>Type</th><th>Reason</th></tr>
++			<tr><th>Type</th><th>Reason</th></tr>
+ 			<xsl:for-each select="Docs/permission">
+ 				<tr valign="top">
+-				<td><xsl:apply-templates select="@cref" mode="typelink"><xsl:with-param name="wrt" select="$TypeNamespace"/></xsl:apply-templates></td>
+ 				<td>
++					<xsl:apply-templates select="@cref" mode="typelink">
++						<xsl:with-param name="wrt" select="$TypeNamespace"/>
++					</xsl:apply-templates>
++				</td>
++				<td>
+ 					<xsl:apply-templates select="." mode="notoppara"/>
+ 				</td>
+ 				</tr>
+@@ -553,14 +626,18 @@
+ 		<!-- method/property/constructor exceptions -->
+ 
+ 		<xsl:if test="count(Docs/exception)">
+-			<div class="Subsection">Exceptions</div>
++			<h4 class="Subsection">Exceptions</h4>
+ 			<div class="SubsectionBox">
+ 			<table class="ExceptionsTable">
+ 			<tr><th>Type</th><th>Condition</th></tr>
+ 			<xsl:for-each select="Docs/exception">
+ 				<tr valign="top">
+-				<td><xsl:apply-templates select="@cref" mode="typelink"><xsl:with-param name="wrt" select="$TypeNamespace"/></xsl:apply-templates></td>
+ 				<td>
++					<xsl:apply-templates select="@cref" mode="typelink">
++						<xsl:with-param name="wrt" select="$TypeNamespace"/>
++					</xsl:apply-templates>
++				</td>
++				<td>
+ 					<xsl:apply-templates select="." mode="notoppara"/>
+ 				</td>
+ 				</tr>
+@@ -572,7 +649,7 @@
+ 		<!-- remarks -->
+ 
+ 		<xsl:if test="count(Docs/remarks)">
+-			<div class="Subsection">Remarks</div>
++			<h4 class="Subsection">Remarks</h4>
+ 			<div class="SubsectionBox">
+ 			<xsl:apply-templates select="Docs/remarks" mode="notoppara"/>
+ 			</div>
+@@ -668,23 +745,26 @@
+ 
+ 		<xsl:otherwise>
+ 			
++			<xsl:variable name="escaped-type">
++				<xsl:call-template name="GetEscapedTypeName">
++					<xsl:with-param name="typename" select="$type" />
++				</xsl:call-template>
++			</xsl:variable>
+ 			<xsl:variable name="T" select="$type"/>
++			<xsl:variable name="typeentry" select="document('index.xml')/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name,'.',@Name) = $T]" />
++			<xsl:for-each select="document('index.xml')/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name, '.', @Name)]">
++			</xsl:for-each>
+ 			<a>
+-				<!-- Search for type in the index.xml file. -->
+-				<xsl:variable name="typeentry" select="document('index.xml')/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name,'.',@Name) = $T]"/>
+-				
+ 				<xsl:attribute name="href">
+-				<xsl:choose>
+-					<xsl:when test="count($typeentry)">
+-						<xsl:value-of select="concat($basepath,$typeentry/parent::Namespace/@Name, '/', $typeentry/@Name)"/>.<xsl:value-of select="$ext"/>
+-					</xsl:when>
+-					<xsl:when test="starts-with($T, 'System.')">
+-						http://mono.ximian.com:8080/monodoc.ashx?link=T:<xsl:value-of select="$T"/>
+-					</xsl:when>
+-					<xsl:otherwise>
+-						javascript:alert("Documentation not found.")
+-					</xsl:otherwise>
+-				</xsl:choose>
++					<xsl:call-template name="GetLinkTarget">
++						<xsl:with-param name="type" select="$escaped-type" />
++						<xsl:with-param name="local-suffix" />
++						<xsl:with-param name="remote">
++							<xsl:value-of select="$mono-docs" />
++							<xsl:text>T:</xsl:text>
++							<xsl:value-of select="$escaped-type" />
++						</xsl:with-param>
++					</xsl:call-template>
+ 				</xsl:attribute>
+ 	
+ 				<!-- use C#-style names -->
+@@ -729,22 +809,137 @@
+ 		</xsl:otherwise>
+ 		</xsl:choose>
+ 	</xsl:template>
++
++	<xsl:template name="GetLinkTarget">
++		<xsl:param name="type" />
++		<xsl:param name="local-suffix" />
++		<xsl:param name="remote" />
++		<!-- Search for type in the index.xml file. -->
++		<xsl:variable name="typeentry" select="document('index.xml')/Overview/Types/Namespace/Type[concat(parent::Namespace/@Name,'.',translate(@File, '+', '.')) = $type]"/>
++		
++		<xsl:choose>
++			<xsl:when test="count($typeentry)">
++				<xsl:value-of select="concat($basepath,$typeentry/parent::Namespace/@Name, '/', $typeentry/@File)"/>
++				<xsl:text>.</xsl:text>
++				<xsl:value-of select="$ext" />
++				<xsl:value-of select="$local-suffix" />
++			</xsl:when>
++			<xsl:when test="starts-with($type, 'System.') or 
++				starts-with($type, 'Cairo.') or starts-with ($type, 'Commons.Xml.') or
++				starts-with($type, 'Mono.GetOptions.') or starts-with($type,'Mono.Math.') or
++				starts-with($type, 'Mono.Posix.') or starts-with($type, 'Mono.Remoting.') or
++				starts-with($type, 'Mono.Security.') or starts-with($type, 'Mono.Unix.') or
++				starts-with($type, 'Mono.Xml.')">
++				<xsl:value-of select="$remote" />
++			</xsl:when>
++			<xsl:otherwise>javascript:alert("Documentation not found.")</xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
+ 	
+ 	<xsl:template name="memberlinkprefix">
++		<xsl:param name="member" />
+ 		<xsl:choose>
+-			<xsl:when test="MemberType='Constructor'">C</xsl:when>
+-			<xsl:when test="MemberType='Method'">M</xsl:when>
+-			<xsl:when test="MemberType='Property'">P</xsl:when>
+-			<xsl:when test="MemberType='Field'">F</xsl:when>
+-			<xsl:when test="MemberType='Event'">F</xsl:when>
++			<xsl:when test="$member/MemberType='Constructor'">C</xsl:when>
++			<xsl:when test="$member/MemberType='Method'">M</xsl:when>
++			<xsl:when test="$member/MemberType='Property'">P</xsl:when>
++			<xsl:when test="$member/MemberType='Field'">F</xsl:when>
++			<xsl:when test="$member/MemberType='Event'">E</xsl:when>
+ 		</xsl:choose>
+ 	</xsl:template>
+ 
++	<xsl:template name="makememberlink">
++		<xsl:param name="cref"/>
++
++		<xsl:variable name="fullname">
++			<xsl:choose>
++				<xsl:when test="starts-with($cref, 'C:')">
++					<xsl:value-of select="substring($cref, 3)" />
++				</xsl:when>
++				<xsl:otherwise>
++					<xsl:call-template name="GetTypeName">
++						<xsl:with-param name="type" select="substring($cref, 3)"/>
++					</xsl:call-template>
++				</xsl:otherwise>
++			</xsl:choose>
++		</xsl:variable>
++
++		<xsl:variable name="memberName">
++			<xsl:choose>
++				<xsl:when test="starts-with($cref, 'C:')"></xsl:when>
++				<xsl:otherwise>
++					<xsl:text>.</xsl:text>
++					<xsl:call-template name="GetMemberName">
++						<xsl:with-param name="type" select="substring($cref, 3)" />
++					</xsl:call-template>
++				</xsl:otherwise>
++			</xsl:choose>
++		</xsl:variable>
++
++		<xsl:variable name="escaped-type">
++			<xsl:call-template name="GetEscapedTypeName">
++				<xsl:with-param name="typename" select="$type" />
++			</xsl:call-template>
++		</xsl:variable>
++		<xsl:variable name="T" select="$fullname"/>
++		<a>
++			<xsl:attribute name="href">
++				<xsl:call-template name="GetLinkTarget">
++					<xsl:with-param name="type" select="$escaped-type" />
++					<xsl:with-param name="local-suffix">#<xsl:value-of select="$cref" /></xsl:with-param>
++					<xsl:with-param name="remote">
++						<xsl:value-of select="$mono-docs" />
++						<xsl:value-of select="$cref" />
++					</xsl:with-param>
++				</xsl:call-template>
++			</xsl:attribute>
++			<xsl:value-of select="concat($fullname, $memberName)" />
++		</a>
++	</xsl:template>
++
++	<xsl:template name="GetTypeName">
++		<xsl:param name="type" />
++		<xsl:variable name="prefix" select="substring-before($type, '.')" />
++		<xsl:variable name="suffix" select="substring-after($type, '.')" />
++		<xsl:choose>
++			<xsl:when test="not(contains($suffix, '.'))">
++				<xsl:value-of select="$prefix" />
++			</xsl:when>
++			<xsl:otherwise>
++				<xsl:value-of select="$prefix" />
++				<xsl:text>.</xsl:text>
++				<xsl:call-template name="GetTypeName">
++					<xsl:with-param name="type" select="$suffix" />
++				</xsl:call-template>
++			</xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++
++	<xsl:template name="GetMemberName">
++		<xsl:param name="type" />
++		<xsl:variable name="prefix" select="substring-before($type, '.')" />
++		<xsl:variable name="suffix" select="substring-after($type, '.')" />
++		<xsl:choose>
++			<xsl:when test="not(contains($suffix, '.'))">
++				<xsl:value-of select="$suffix" />
++			</xsl:when>
++			<xsl:otherwise>
++				<xsl:call-template name="GetMemberName">
++					<xsl:with-param name="type" select="$suffix" />
++				</xsl:call-template>
++			</xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++	
+ 	<!-- Transforms the contents of the selected node containing a cref into a hyperlink. -->
+ 	<xsl:template match="*|@*" mode="cref">
++		<xsl:call-template name="makememberlink">
++			<xsl:with-param name="cref" select="."/>
++		</xsl:call-template>
++		<!--
+ 		<a>
+ 			<xsl:attribute name="href"><xsl:value-of select="."/></xsl:attribute>
+ 			<xsl:value-of select="substring-after(., ':')"/></a>
++			-->
+ 	</xsl:template>
+ 
+ 	<xsl:template name="membertypeplural">
+@@ -901,22 +1096,22 @@
+ 	</xsl:template>
+ 
+ 	<xsl:template match="list[@type='bullet']">
+-		<UL>
++		<ul>
+ 			<xsl:for-each select="item">
+-				<LI>
++				<li>
+ 					<xsl:apply-templates select="term" mode="notoppara"/>
+-				</LI>
++				</li>
+ 			</xsl:for-each>
+-		</UL>
++		</ul>
+ 	</xsl:template>
+ 	<xsl:template match="list[@type='number']">
+-		<OL>
++		<ol>
+ 			<xsl:for-each select="item">
+-				<LI>
++				<li>
+ 					<xsl:apply-templates select="term" mode="notoppara"/>
+-				</LI>
++				</li>
+ 			</xsl:for-each>
+-		</OL>
++		</ol>
+ 	</xsl:template>
+ 
+ 	<xsl:template match="list">
+@@ -935,7 +1130,9 @@
+ 			</xsl:call-template>
+ 		</xsl:when>
+ 		<xsl:otherwise>
+-			<xsl:value-of select="substring-after(@cref, ':')"/>
++			<xsl:call-template name="makememberlink">
++				<xsl:with-param name="cref" select="@cref"/>
++			</xsl:call-template>
+ 		</xsl:otherwise>
+ 		</xsl:choose>
+ 	</xsl:template>
+@@ -973,13 +1170,13 @@
+ 		<xsl:if test="count($MEMBERS)">
+ 
+ 		<!-- header -->
+-		<div class="Subsection" style="margin-bottom: .75em">
++		<h3>
+ 			<xsl:if test="$showprotected">Protected </xsl:if>
+ 			<xsl:call-template name="membertypeplural"><xsl:with-param name="name" select="$listmembertype"/></xsl:call-template>
+-			</div>
++			</h3>
+ 
+ 		<div class="SubsectionBox">
+-		<table Class="MembersListing">
++		<table class="MembersListing">
+ 
+ 		<xsl:for-each select="$MEMBERS">
+ 			<!--<xsl:sort select="contains(MemberSignature[@Language='C#']/@Value,' static ')" data-type="text"/>-->
+@@ -988,7 +1185,12 @@
+ 			<xsl:sort select="count(Parameters/Parameter)"/>
+ 			<xsl:sort select="Parameters/Parameter/@Type"/>
+ 			
+-			<xsl:variable name="linkname" select="generate-id(.)"/>
++			<xsl:variable name="linkid">
++				<xsl:call-template name="GetLinkId" >
++					<xsl:with-param name="type" select="../.." />
++					<xsl:with-param name="member" select="." />
++				</xsl:call-template>
++			</xsl:variable>
+ 
+ 			<tr valign="top">
+ 
+@@ -999,8 +1201,11 @@
+ 					<td>
+ 					<div>
+ 					<b>
+-					<a href="#member_{$linkname}">
+-							<xsl:value-of select="$TypeName"/>
++					<a href="#{$linkid}">
++						<xsl:call-template name="GetConstructorName">
++							<xsl:with-param name="type" select="../.." />
++							<xsl:with-param name="ctor" select="." />
++						</xsl:call-template>
+ 					</a>
+ 					</b>
+ 
+@@ -1030,7 +1235,7 @@
+ 
+ 					<!-- link to member page -->
+ 					<b>
+-					<a href="#member_{$linkname}">
++					<a href="#{$linkid}">
+ 						<xsl:value-of select="@MemberName"/>
+ 					</a>
+ 					</b>
+@@ -1101,7 +1306,7 @@
+ 
+ 					<!-- link to method page -->
+ 					<b>
+-					<a href="#member_{$linkname}">
++					<a href="#{$linkid}">
+ 						<xsl:value-of select="@MemberName"/>
+ 					</a>
+ 					</b>
+@@ -1123,7 +1328,7 @@
+ 					<!-- return type -->
+ 					<xsl:if test="not(ReturnValue/ReturnType='System.Void')">
+ 						<nobr>
+-						:
++						<xsl:text>:</xsl:text>
+ 						<xsl:apply-templates select="ReturnValue/ReturnType" mode="typelink"><xsl:with-param name="wrt" select="$TypeNamespace"/></xsl:apply-templates>
+ 						</nobr>
+ 					</xsl:if>
+@@ -1142,14 +1347,16 @@
+ 					<xsl:choose>
+ 					<xsl:when test="@MemberName='op_Implicit' or @MemberName='op_Explicit'">
+ 						<b>
+-						<a href="#member_{$linkname}">
+-							Conversion
++						<a href="#{$linkid}">
++							<xsl:text>Conversion</xsl:text>
+ 							<xsl:choose>
+ 							<xsl:when test="ReturnValue/ReturnType = //Type/@FullName">
+-								From <xsl:value-of select="Parameters/Parameter/@Type"/>
++								<xsl:text> From </xsl:text>
++								<xsl:value-of select="Parameters/Parameter/@Type"/>
+ 							</xsl:when>
+ 							<xsl:otherwise>
+-								to <xsl:value-of select="ReturnValue/ReturnType"/>
++								<xsl:text> to </xsl:text>
++								<xsl:value-of select="ReturnValue/ReturnType"/>
+ 							</xsl:otherwise>
+ 							</xsl:choose>
+ 						</a>
+@@ -1157,23 +1364,23 @@
+ 
+ 						<xsl:choose>
+ 						<xsl:when test="@MemberName='op_Implicit'">
+-							(Implicit)
++							<xsl:text>(Implicit)</xsl:text>
+ 						</xsl:when>
+ 						<xsl:otherwise>
+-							(Explicit)
++							<xsl:text>(Explicit)</xsl:text>
+ 						</xsl:otherwise>
+ 						</xsl:choose>
+ 					</xsl:when>
+ 					<xsl:when test="count(Parameters/Parameter)=1">
+ 						<b>
+-						<a href="#member_{$linkname}">
++						<a href="#{$linkid}">
+ 							<xsl:value-of select="substring-after(@MemberName, 'op_')"/>
+ 						</a>
+ 						</b>
+ 					</xsl:when>
+ 					<xsl:otherwise>
+ 						<b>
+-						<a href="#member_{$linkname}">
++						<a href="#{$linkid}">
+ 							<xsl:value-of select="substring-after(@MemberName, 'op_')"/>
+ 						</a>
+ 						</b>
+@@ -1202,7 +1409,7 @@
+ 				
+ 				<xsl:otherwise>
+ 					<!-- Other types: just provide a link -->
+-					<a href="#member_{$linkname}">
++					<a href="#{$linkid}">
+ 						<xsl:value-of select="@MemberName"/>
+ 					</a>
+ 				</xsl:otherwise>
+@@ -1219,7 +1426,352 @@
+ 		</xsl:if>
+ 	</xsl:template>
+ 
++	<xsl:template name="GetLinkName">
++		<xsl:param name="type"/>
++		<xsl:param name="member"/>
++		<xsl:call-template name="memberlinkprefix">
++			<xsl:with-param name="member" select="$member"/>
++		</xsl:call-template>
++		<xsl:text>:</xsl:text>
++		<xsl:call-template name="GetEscapedTypeName">
++			<xsl:with-param name="typename" select="$type/@FullName" />
++		</xsl:call-template>
++		<xsl:if test="$member/MemberType != 'Constructor'">
++			<xsl:text>.</xsl:text>
++			<xsl:call-template name="GetGenericName">
++				<xsl:with-param name="membername" select="$member/@MemberName" />
++				<xsl:with-param name="member" select="$member" />
++			</xsl:call-template>
++		</xsl:if>
++	</xsl:template>
+ 
++	<xsl:template name="GetGenericName">
++		<xsl:param name="membername" />
++		<xsl:param name="member" />
++		<xsl:variable name="numgenargs" select="count($member/Docs/typeparam)" />
++		<xsl:choose>
++			<xsl:when test="$numgenargs = 0">
++				<xsl:value-of select="$membername" />
++			</xsl:when>
++			<xsl:otherwise>
++				<xsl:if test="contains($membername, '&lt;')">
++					<xsl:value-of select="substring-before ($membername, '&lt;')" />
++				</xsl:if>
++				<xsl:text>`</xsl:text>
++				<xsl:value-of select="$numgenargs" />
++			</xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++
++	<xsl:template name="GetEscapedTypeName">
++		<xsl:param name="typename" />
++		<xsl:variable name="base" select="substring-before ($typename, '&lt;')" />
++
++		<xsl:choose>
++			<xsl:when test="$base != ''">
++				<xsl:value-of select="translate ($base, '+', '.')" />
++				<xsl:text>`</xsl:text>
++				<xsl:call-template name="GetGenericArgumentCount">
++					<xsl:with-param name="arglist" select="substring-after ($typename, '&lt;')" />
++					<xsl:with-param name="count">1</xsl:with-param>
++				</xsl:call-template>
++			</xsl:when>
++			<xsl:otherwise><xsl:value-of select="translate ($typename, '+', '.')" /></xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++
++	<xsl:template name="GetGenericArgumentCount">
++		<xsl:param name="arglist" />
++		<xsl:param name="count" />
++
++		<xsl:variable name="rest">
++			<xsl:call-template name="SkipTypeArgument">
++				<xsl:with-param name="s" select="$arglist" />
++			</xsl:call-template>
++		</xsl:variable>
++
++		<xsl:choose>
++			<xsl:when test="$arglist = '' or $rest = ''">
++				<xsl:message terminate="yes">
++!WTF? arglist=<xsl:value-of select="$arglist" />; rest=<xsl:value-of select="$rest" />
++				</xsl:message>
++			</xsl:when>
++			<xsl:when test="starts-with ($rest, '>')">
++				<xsl:value-of select="$count" />
++				<xsl:call-template name="GetEscapedTypeName">
++					<xsl:with-param name="typename" select="substring-after ($rest, '>')" />
++				</xsl:call-template>
++			</xsl:when>
++			<xsl:when test="starts-with ($rest, ',')">
++				<xsl:call-template name="GetGenericArgumentCount">
++					<xsl:with-param name="arglist" select="substring-after ($rest, ',')" />
++					<xsl:with-param name="count" select="$count+1" />
++				</xsl:call-template>
++			</xsl:when>
++			<xsl:otherwise>
++				<xsl:message terminate="yes">
++!WTF 2? arglist=<xsl:value-of select="$arglist" />; rest=<xsl:value-of select="$rest" />
++				</xsl:message>
++			</xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++
++	<xsl:template name="SkipTypeArgument">
++		<xsl:param name="s" />
++
++		<xsl:variable name="c"  select="substring-before ($s, ',')" />
++		<xsl:variable name="lt" select="substring-before ($s, '&lt;')" />
++		<xsl:variable name="gt" select="substring-before ($s, '&gt;')" />
++
++		<xsl:choose>
++			<!--
++			Have to select between two `s' patterns:
++			A,B>: need to return ",B>"
++			Foo<A,B>>: Need to forward to SkipGenericArgument to eventually return ">"
++			-->
++			<xsl:when test="($c != '' and $lt != '' and string-length ($c) &lt; string-length ($lt)) or
++				($c != '' and $lt = '')">
++				<xsl:text>,</xsl:text>
++				<xsl:value-of select="substring-after ($s, ',')" />
++			</xsl:when>
++			<xsl:when test="$lt != '' and ($gt != '' and string-length ($lt) &lt; string-length ($gt))">
++				<xsl:call-template name="SkipGenericArgument">
++					<xsl:with-param name="s" select="$s" />
++				</xsl:call-template>
++			</xsl:when>
++			<xsl:when test="$gt != ''">
++				<xsl:text>&gt;</xsl:text>
++				<xsl:value-of select="substring-after ($s, '&gt;')" />
++			</xsl:when>
++			<xsl:otherwise><xsl:value-of select="$s" /></xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++
++	<!--
++	when given 'Foo<A,Bar<Baz<C,D,E>>>>', returns '>'
++	when given 'Foo<A,Bar<Baz<C,D,E>>>,', returns ','
++	(basically, it matches '<' to '>' and "skips" the intermediate contents.
++	  -->
++	<xsl:template name="SkipGenericArgument">
++		<xsl:param name="s" />
++
++		<xsl:variable name="c"  select="substring-before ($s, ',')" />
++		<xsl:variable name="lt" select="substring-before ($s, '&lt;')" />
++		<xsl:variable name="gt" select="substring-before ($s, '&gt;')" />
++
++		<xsl:choose>
++			<xsl:when test="$c != '' and string-length ($c) &lt; string-length ($lt)">
++				<!-- within 'C,D,E>', so consume rest of template -->
++				<xsl:call-template name="SkipGenericArgument">
++					<xsl:with-param name="s" select="substring-after ($s, ',')" />
++				</xsl:call-template>
++			</xsl:when>
++			<xsl:when test="$lt != '' and string-length ($lt) &lt; string-length ($gt)">
++				<!-- within 'Foo<A...'; look for matching '>' -->
++				<xsl:call-template name="SkipGenericArgument">
++					<xsl:with-param name="s" select="substring-after ($s, '&lt;')" />
++				</xsl:call-template>
++			</xsl:when>
++			<xsl:when test="$gt != ''">
++				<xsl:value-of select="substring-after ($s, '&gt;')" />
++			</xsl:when>
++			<xsl:otherwise>
++				<xsl:value-of select="$s" />
++			</xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++
++	<xsl:template name="GetEscapedParameter">
++		<xsl:param name="orig-parameter-type" />
++		<xsl:param name="parameter-type" />
++		<xsl:param name="parameter-types" />
++		<xsl:param name="escape" />
++		<xsl:param name="index" />
++
++		<xsl:choose>
++			<xsl:when test="$index &gt; count($parameter-types)">
++				<xsl:if test="$parameter-type != $orig-parameter-type">
++					<xsl:value-of select="$parameter-type" />
++				</xsl:if>
++				<!-- ignore -->
++			</xsl:when>
++			<xsl:otherwise>
++				<xsl:variable name="typeparam" select="$parameter-types[position() = $index]/@name" />
++				<xsl:call-template name="GetEscapedParameter">
++					<xsl:with-param name="orig-parameter-type" select="$orig-parameter-type" />
++					<xsl:with-param name="parameter-type">
++						<xsl:call-template name="Replace">
++							<xsl:with-param name="s">
++								<xsl:call-template name="Replace">
++									<xsl:with-param name="s">
++										<xsl:call-template name="Replace">
++											<xsl:with-param name="s">
++												<xsl:call-template name="Replace">
++													<xsl:with-param name="s" select="$parameter-type"/>
++													<xsl:with-param name="from" select="concat('&lt;', $typeparam, '&gt;')" />
++													<xsl:with-param name="to" select="concat('&lt;', $escape, $index, '&gt;')" />
++												</xsl:call-template>
++											</xsl:with-param>
++											<xsl:with-param name="from" select="concat('&lt;', $typeparam, ',')" />
++											<xsl:with-param name="to" select="concat('&lt;', $escape, $index, ',')" />
++										</xsl:call-template>
++									</xsl:with-param>
++									<xsl:with-param name="from" select="concat (',', $typeparam, '&gt;')" />
++									<xsl:with-param name="to" select="concat(',', $escape, $index, '&gt;')" />
++								</xsl:call-template>
++							</xsl:with-param>
++							<xsl:with-param name="from" select="concat (',', $typeparam, ',')" />
++							<xsl:with-param name="to" select="concat(',', $escape, $index, ',')" />
++						</xsl:call-template>
++					</xsl:with-param>
++					<xsl:with-param name="parameter-types" select="$parameter-types" />
++					<xsl:with-param name="typeparam" select="$typeparam" />
++					<xsl:with-param name="escape" select="$escape" />
++					<xsl:with-param name="index" select="$index + 1" />
++				</xsl:call-template>
++			</xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++
++	<xsl:template name="GetLinkId">
++		<xsl:param name="type"/>
++		<xsl:param name="member"/>
++		<xsl:call-template name="GetLinkName">
++			<xsl:with-param name="type" select="$type" />
++			<xsl:with-param name="member" select="$member" />
++		</xsl:call-template>
++		<xsl:if test="count($member/Parameters/Parameter) &gt; 0">
++			<xsl:text>(</xsl:text>
++			<xsl:for-each select="Parameters/Parameter">
++				<xsl:if test="not(position()=1)">,</xsl:if>
++				<xsl:call-template name="GetParameterType">
++					<xsl:with-param name="type" select="$type" />
++					<xsl:with-param name="member" select="$member" />
++					<xsl:with-param name="parameter" select="." />
++				</xsl:call-template>
++			</xsl:for-each>
++			<xsl:text>)</xsl:text>
++		</xsl:if>
++		<xsl:if test="$member/@MemberName='op_Implicit' or $member/@MemberName='op_Explicit'">
++			<xsl:text>~</xsl:text>
++			<xsl:value-of select="$member/ReturnValue/ReturnType" />
++		</xsl:if>
++	</xsl:template>
++
++	<!-- 
++	  - what should be <xsl:value-of select="@Type" /> becomes a nightmare once
++		- generics enter the picture, since a parameter type could come from the
++		- type itelf (becoming `N) or from the method (becoming ``N).
++	  -->
++	<xsl:template name="GetParameterType">
++		<xsl:param name="type" />
++		<xsl:param name="member" />
++		<xsl:param name="parameter" />
++
++		<!-- the actual parameter type -->
++		<xsl:variable name="ptype">
++			<xsl:choose>
++				<xsl:when test="contains($parameter/@Type, '[')">
++					<xsl:value-of select="substring-before ($parameter/@Type, '[')" />
++				</xsl:when>
++				<xsl:when test="contains($parameter/@Type, '&amp;')">
++					<xsl:value-of select="substring-before ($parameter/@Type, '&amp;')" />
++				</xsl:when>
++				<xsl:when test="contains($parameter/@Type, '*')">
++					<xsl:value-of select="substring-before ($parameter/@Type, '*')" />
++				</xsl:when>
++				<xsl:otherwise>
++					<xsl:value-of select="$parameter/@Type" />
++				</xsl:otherwise>
++			</xsl:choose>
++		</xsl:variable>
++
++		<!-- parameter modifiers -->
++		<xsl:variable name="pmodifier">
++			<xsl:call-template name="Replace">
++				<xsl:with-param name="s" select="substring-after ($parameter/@Type, $ptype)" />
++				<xsl:with-param name="from">&amp;</xsl:with-param>
++				<xsl:with-param name="to">@</xsl:with-param>
++			</xsl:call-template>
++		</xsl:variable>
++
++		<xsl:variable name="gen-type">
++			<xsl:call-template name="GetEscapedParameter">
++				<xsl:with-param name="orig-parameter-type" select="$ptype" />
++				<xsl:with-param name="parameter-type">
++					<xsl:variable name="nested">
++						<xsl:call-template name="GetEscapedParameter">
++							<xsl:with-param name="orig-parameter-type" select="$ptype" />
++							<xsl:with-param name="parameter-type" select="$ptype" />
++							<xsl:with-param name="parameter-types" select="$type/Docs/typeparam" />
++							<xsl:with-param name="escape" select="'`'" />
++							<xsl:with-param name="index" select="1" />
++						</xsl:call-template>
++					</xsl:variable>
++					<xsl:choose>
++						<xsl:when test="$nested != ''">
++							<xsl:value-of select="$nested" />
++						</xsl:when>
++						<xsl:otherwise>
++							<xsl:value-of select="$ptype" />
++						</xsl:otherwise>
++					</xsl:choose>
++				</xsl:with-param>
++				<xsl:with-param name="parameter-types" select="$member/Docs/typeparam" />
++				<xsl:with-param name="escape" select="'``'" />
++				<xsl:with-param name="index" select="1" />
++			</xsl:call-template>
++		</xsl:variable>
++
++		<!-- the actual parameter type -->
++		<xsl:variable name="parameter-type">
++			<xsl:choose>
++				<xsl:when test="$gen-type != ''">
++					<xsl:value-of select="$gen-type" />
++					<xsl:value-of select="$pmodifier" />
++				</xsl:when>
++				<xsl:otherwise>
++					<xsl:value-of select="concat($ptype, $pmodifier)" />
++				</xsl:otherwise>
++			</xsl:choose>
++		</xsl:variable>
++
++		<!-- s/</{/g; s/>/}/g; so that less escaping is needed. -->
++		<xsl:call-template name="Replace">
++			<xsl:with-param name="s">
++				<xsl:call-template name="Replace">
++					<xsl:with-param name="s" select="translate ($parameter-type, '+', '.')" />
++					<xsl:with-param name="from">&gt;</xsl:with-param>
++					<xsl:with-param name="to">}</xsl:with-param>
++				</xsl:call-template>
++			</xsl:with-param>
++			<xsl:with-param name="from">&lt;</xsl:with-param>
++			<xsl:with-param name="to">{</xsl:with-param>
++		</xsl:call-template>
++	</xsl:template>
++
++	<xsl:template name="Replace">
++		<xsl:param name="s" />
++		<xsl:param name="from" />
++		<xsl:param name="to" />
++		<xsl:choose>
++			<xsl:when test="not(contains($s, $from))">
++				<xsl:value-of select="$s" />
++			</xsl:when>
++			<xsl:otherwise>
++				<xsl:variable name="prefix" select="substring-before($s, $from)"/>
++				<xsl:variable name="suffix" select="substring-after($s, $from)" />
++				<xsl:value-of select="$prefix" />
++				<xsl:value-of select="$to" />
++				<xsl:call-template name="Replace">
++					<xsl:with-param name="s" select="$suffix" />
++					<xsl:with-param name="from" select="$from" />
++					<xsl:with-param name="to" select="$to" />
++				</xsl:call-template>
++			</xsl:otherwise>
++		</xsl:choose>
++	</xsl:template>
++
+ 	<xsl:template name="getmodifiers">
+ 		<xsl:param name="sig"/>
+ 		<xsl:param name="protection" select="true()"/>
+@@ -1268,6 +1820,17 @@
+ 			<xsl:if test="contains($Sig, ' enum ')">enum </xsl:if>
+ 		</xsl:if>
+ 	</xsl:template>
++
++	<xsl:template name="GetTypeDescription">
++		<xsl:variable name="sig" select="TypeSignature[@Language='C#']/@Value"/>
++		<xsl:choose>
++			<xsl:when test="contains($sig, ' class ')">Class</xsl:when>
++			<xsl:when test="contains($sig, ' interface ')">Interface</xsl:when>
++			<xsl:when test="contains($sig, ' struct ')">Struct</xsl:when>
++			<xsl:when test="contains($sig, ' delegate ')">Delegate</xsl:when>
++			<xsl:when test="contains($sig, ' enum ')">Enum</xsl:when>
++		</xsl:choose>
++	</xsl:template>
+ 	
+ 
+ </xsl:stylesheet>

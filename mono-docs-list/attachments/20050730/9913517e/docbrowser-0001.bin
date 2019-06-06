@@ -1,0 +1,757 @@
+Index: configure.in
+===================================================================
+--- configure.in	(revision 47406)
++++ configure.in	(working copy)
+@@ -42,8 +42,9 @@
+ #fi
+ AC_SUBST(GTK_SHARP_LIBS)
+ 
+-PKG_CHECK_MODULES(GECKO_SHARP, gecko-sharp = 0.6)
++PKG_CHECK_MODULES(GECKO_SHARP, gecko-sharp = 0.6, enable_gecko=yes, enable_gecko=no)
+ AC_SUBST(GECKO_SHARP_LIBS)
++AM_CONDITIONAL(ENABLE_GECKO, test "x$enable_gecko" = "xyes")
+ 
+ dnl Intl
+ GETTEXT_PACKAGE=mono-tools
+@@ -55,6 +56,7 @@
+ GNUNIT_VERSION=0.5
+ AC_SUBST(GNUNIT_VERSION)
+ 
++
+ AC_OUTPUT([
+ Makefile
+ gnunit/Makefile
+@@ -76,4 +78,9 @@
+ echo "Configuration summary"
+ echo ""
+ echo "   * Installation prefix = $prefix"
++echo "   * gecko-sharp.dll = $enable_gecko"
+ echo ""
++echo "      NOTE: if any of the above say 'no' you may install the"
++echo "            corresponding development packages for them, rerun"
++echo "            autogen.sh to include them in the build."
++echo ""
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 47406)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,6 @@
++2005-08-30 Mario Sopena Novales <mario.sopena@gmail.com>
++	* configure.in: make gecko-sharp dependency conditional
++
+ 2005-06-09 Gonzalo Paniagua Javier <gonzalo@ximian.com>
+ 
+ 	* configure.in: added GNUNIT_VERSION.
+Index: docbrowser/IHtmlRender.cs
+===================================================================
+--- docbrowser/IHtmlRender.cs	(revision 0)
++++ docbrowser/IHtmlRender.cs	(revision 0)
+@@ -0,0 +1,38 @@
++//
++// IHtmlRender.cs: Interface that abstracts the html render widget
++//
++// Author: Mario Sopena
++//
++using System;
++using Gtk;
++
++namespace Monodoc {
++public interface IHtmlRender {
++	// Jump to an anchor of the form <a name="tttt">
++	void JumpToAnchor (string anchor_name);
++
++	//Copy to the clipboard the selcted text
++	void Copy ();
++
++	//Select all the text
++	void SelectAll ();
++
++	//Render the HTML code given
++	void Render (string html_code);
++
++	//Event fired when the use is over an Url
++	event EventHandler OnUrl;
++
++	//Event fired when the user clicks on a Link
++	event EventHandler UrlClicked;
++
++	// Variable that handles the info encessary for the events
++	// As every implementation of HtmlRender will have differents events
++	// we try to homogenize them with the variabel
++	string Url { get; }
++
++	Widget HtmlPanel { get; }
++}
++
++
++}
+Index: docbrowser/GeckoHtmlRender.cs
+===================================================================
+--- docbrowser/GeckoHtmlRender.cs	(revision 0)
++++ docbrowser/GeckoHtmlRender.cs	(revision 0)
+@@ -0,0 +1,156 @@
++//
++// GeckoHtmlRender.cs: Implementation of IHtmlRender that uses Gecko
++//
++// Author: Mario Sopena
++//
++using System;
++using System.Text;
++using System.IO;
++using System.Collections;
++using Gecko;
++using Gtk;
++
++namespace Monodoc {
++public class GeckoHtmlRender : IHtmlRender {
++	
++	//Images are cached in a temporal directory
++	Hashtable cache_imgs;
++	string tmpPath;
++
++	WebControl html_panel;
++	Viewport panel;
++	public Widget HtmlPanel {
++		get { return (Widget) panel; }
++	}
++
++	string url;
++	public string Url {
++		get { return url; }
++	}
++	RootTree help_tree;
++
++	public event EventHandler OnUrl;
++	public event EventHandler UrlClicked;
++
++	public GeckoHtmlRender (RootTree help_tree) 
++	{
++		this.help_tree = help_tree;
++		html_panel = new WebControl("/tmp/monodoc", "MonodocGecko"); //FIXME
++		html_panel.Show(); //due to Gecko bug
++		html_panel.OpenUri += OnOpenUri;
++		html_panel.LinkMsg += OnLinkMsg;
++		panel = new Viewport();
++		panel.Add (html_panel);
++		cache_imgs = new Hashtable();
++		tmpPath = Path.Combine (Path.GetTempPath(), "monodoc");
++	}
++
++	protected void OnOpenUri (object o, OpenUriArgs args)
++	{
++		url = CheckUrl (args.AURI);
++		if (UrlClicked != null)
++			UrlClicked (this, new EventArgs());
++		args.RetVal = true; //this prevents Gecko to continue processing
++	}
++
++	protected void OnLinkMsg (object o, EventArgs args)
++	{
++		url = CheckUrl (html_panel.LinkMessage);
++		if (OnUrl != null)
++			OnUrl (this, args);
++	}
++	
++	// URL like T:System.Activator are lower cased by gecko to t.;System.Activator
++	// so we revert that
++	string CheckUrl (string u)
++	{
++		if (u.IndexOf (':') == 1)
++			return Char.ToUpper (u[0]) + u.Substring (1);
++		return u;
++	}
++		
++	/* NOT ALREADY IMPLEMENTED */
++	public void JumpToAnchor (string anchor_name) 
++	{
++	}
++
++	/* NOT ALREADY IMPLEMENTED */
++	public void Copy() {}
++
++	/* NOT ALREADY IMPLEMENTED */
++	public void SelectAll() {}
++
++	public void Render (string html_code) 
++	{
++		string r = ProcessImages (html_code);
++		html_panel.OpenStream ("file:///", "text/html");
++		html_panel.AppendData (r);
++		html_panel.CloseStream ();
++	}
++
++	// Substitute the src of the images with the appropriate path
++	string ProcessImages (string html_code)
++	{
++		//If there are no Images return fast
++		int pos = html_code.IndexOf ("<img", 0, html_code.Length);
++		if (pos == -1)
++			return html_code;
++
++		StringBuilder html = new StringBuilder ();
++		html.Append (html_code.Substring (0, pos)); 
++		int srcIni, srcEnd;
++		string Img;
++		Stream s;
++		string path, img_name;
++
++		while (pos != -1) {
++
++			//look for the src of the img
++		 	srcIni = html_code.IndexOf ("src=\"", pos);
++		 	srcEnd = html_code.IndexOf ("\"", srcIni+6);
++			Img = html_code.Substring (srcIni+5, srcEnd-srcIni-5);
++
++			path = "NO_IMG";
++			//is the img cached?
++			if (cache_imgs.Contains(Img)) {
++				path = (string) cache_imgs[Img];
++			} else {
++				//obtain the stream from the compressed sources
++				s = help_tree.GetImage (Img);
++				if (s != null) {
++					//write the file to a tmp directory
++					img_name = Img.Substring (Img.LastIndexOf (":")+1);
++					path = Path.Combine (tmpPath, img_name);
++					Directory.CreateDirectory (Path.GetDirectoryName (path));
++					FileStream file = new FileStream (path, FileMode.Create);
++					byte[] buffer = new byte [8192];
++					int n;
++	
++					while ((n = s.Read (buffer, 0, 8192)) != 0) 
++						file.Write (buffer, 0, n);
++					file.Flush();
++					file.Close();
++					System.Console.WriteLine("Cache: {0}", path);
++					//Add the image to the cache
++					cache_imgs[Img] = path;
++				}
++			}
++			//Add the html code from <img until src=" 
++			html.Append (html_code.Substring (pos, srcIni + 5 - pos));
++			//Add the Image path
++			html.Append (path);		
++			//Look for the next image
++			pos = html_code.IndexOf ("<img", srcIni);
++
++			if (pos == -1)  
++				//Add the rest of the file
++				html.Append (html_code.Substring (srcEnd));
++			else 
++				//Add from " to the next <img
++				html.Append (html_code.Substring (srcEnd, pos - srcEnd)); //check this
++		}
++		return html.ToString();
++	}
++
++}
++}
+Index: docbrowser/ChangeLog
+===================================================================
+--- docbrowser/ChangeLog	(revision 47406)
++++ docbrowser/ChangeLog	(working copy)
+@@ -1,3 +1,11 @@
++2005-08-30 Mario Sopena Novales <mario.sopena@gmail.com>
++	* Makefile.am: build gecko support in a separate dll: GeckoHtmlRender.dll
++	* monodoc.in: Change "--gecko" parameter to "--no-gecko"
++	* HtmlRender.cs: splitted in 3 files (deleted):
++		* IHtmlRender.cs: interface
++		* GtkHtmlHtmlRender.cs: GtkHtml based renderer
++		* GeckoHtmlRender.cs: Gecko-sharp based renderer
++
+ 2005-07-07 Mario Sopena Novales <mario.sopena@gmail.com>
+ 
+ 	Move the rendering logic to an interface IHtmlRender and write 
+Index: docbrowser/browser.cs
+===================================================================
+--- docbrowser/browser.cs	(revision 47406)
++++ docbrowser/browser.cs	(working copy)
+@@ -24,7 +24,7 @@
+ 	static int Main (string [] args)
+ 	{
+ 		string topic = null;
+-		bool useGecko = false;
++		bool useGecko = true;
+ 		
+ 		for (int i = 0; i < args.Length; i++){
+ 			switch (args [i]){
+@@ -81,8 +81,8 @@
+ 				i++;
+ 				break;
+ 				
+-			case "--gecko":
+-				useGecko = true;
++			case "--no-gecko":
++				useGecko = false;
+ 				break;
+ 			default:
+ 				topic = args [i];
+@@ -1847,12 +1847,28 @@
+ 		html_container.Show();
+ 		
+ 		//
+-		// Setup the HTML rendering area
++		// Setup the HTML rendering and preview area
+ 		//
+-		if (browser.UseGecko) 
+-			html = new GeckoHtmlRender (browser);
+-		else 
++		if (browser.UseGecko) {
++			try {
++				string exeAssembly = Assembly.GetExecutingAssembly ().Location;
++				string myPath = System.IO.Path.GetDirectoryName (exeAssembly);
++				Assembly gecko_dll = Assembly.LoadFrom (System.IO.Path.Combine (myPath, "GeckoHtmlRender.dll"));
++				Type gecko_render_type = gecko_dll.GetType ("Monodoc.GeckoHtmlRender", true);
++
++				object[] args = new object [1];
++				args [0] = browser.help_tree;
++				html = (IHtmlRender) Activator.CreateInstance (gecko_render_type, args);
++				html_preview = (IHtmlRender) Activator.CreateInstance (gecko_render_type, args);
++			} catch (Exception exc) {
++				html = new GtkHtmlHtmlRender (browser);
++				html_preview = new GtkHtmlHtmlRender (browser);
++			}
++		// if the user explicitally state that doesnt want gecko
++		} else {
+ 			html = new GtkHtmlHtmlRender (browser);
++			html_preview = new GtkHtmlHtmlRender (browser);
++		}
+ 		html_container.Add (html.HtmlPanel);
+ 		html.UrlClicked += new EventHandler (browser.LinkClicked);
+ 		html.OnUrl += new EventHandler (browser.OnUrlMouseOver);
+@@ -1905,10 +1921,6 @@
+ 		//
+ 		// code preview panel
+ 		//
+-		if (browser.UseGecko) 
+-			html_preview = new GeckoHtmlRender (browser);
+-		else 
+-			html_preview = new GtkHtmlHtmlRender (browser);
+ 		html_preview_container.Add (html_preview.HtmlPanel);
+ 		html_preview_frame.Add(html_preview_container);
+ 		
+Index: docbrowser/GtkHtmlHtmlRender.cs
+===================================================================
+--- docbrowser/GtkHtmlHtmlRender.cs	(revision 0)
++++ docbrowser/GtkHtmlHtmlRender.cs	(revision 0)
+@@ -0,0 +1,92 @@
++//
++//
++// GtkHtmlHtmlRender.cs: Implementation of IHtmlRender that uses Gtk.HTML
++//
++// Author: Mario Sopena
++//
++using System;
++using Gtk;
++using System.IO;
++
++namespace Monodoc {
++class GtkHtmlHtmlRender : IHtmlRender {
++	
++	HTML html_panel;
++	public Widget HtmlPanel {
++		get { return (Widget) html_panel; }
++	}
++
++	string url;
++	public string Url {
++		get { return url; }
++	}
++
++	Browser browser;
++	public event EventHandler OnUrl;
++	public event EventHandler UrlClicked;
++
++	
++	public GtkHtmlHtmlRender (Browser browser) 
++	{
++		html_panel = new HTML();
++		html_panel.Show(); 
++		html_panel.LinkClicked += new LinkClickedHandler (LinkClicked);
++		html_panel.OnUrl += new OnUrlHandler (OnUrlMouseOver);
++		html_panel.UrlRequested += new UrlRequestedHandler (UrlRequested);
++		this.browser = browser;
++	}
++	
++	protected void LinkClicked (object o, LinkClickedArgs args)
++	{
++		url = args.Url;
++		if (UrlClicked != null)
++			UrlClicked (this, new EventArgs());
++	}
++	
++	protected void OnUrlMouseOver (object o, OnUrlArgs args)
++	{
++		url = args.Url;
++		if (OnUrl != null)
++			OnUrl (this, args);
++	}
++
++	public void JumpToAnchor (string anchor)
++	{
++		html_panel.JumpToAnchor(anchor);
++	}
++
++	public void Copy () 
++	{
++		html_panel.Copy();	
++	}
++
++	public void SelectAll () 
++	{
++		html_panel.SelectAll();	
++	}
++
++	public void Render (string html_code) 
++	{
++		Gtk.HTMLStream stream = html_panel.Begin ("text/html");
++		stream.Write(html_code);
++		html_panel.End (stream, HTMLStreamStatus.Ok);
++	}
++
++	protected void UrlRequested (object sender, UrlRequestedArgs args)
++	{
++		Stream s = browser.help_tree.GetImage (args.Url);
++		
++		if (s == null)
++			s = browser.GetResourceImage ("monodoc.png");
++		byte [] buffer = new byte [8192];
++		int n, m;
++		m=0;
++		while ((n = s.Read (buffer, 0, 8192)) != 0) {
++			args.Handle.Write (buffer, n);
++			m += n;
++		}
++		args.Handle.Close (HTMLStreamStatus.Ok);
++	}
++	
++}
++}
+Index: docbrowser/monodoc.in
+===================================================================
+--- docbrowser/monodoc.in	(revision 47406)
++++ docbrowser/monodoc.in	(working copy)
+@@ -46,7 +46,7 @@
+ 	echo "  --help             Print this message"
+ 	echo "  --html TOPIC       Print the HTML contents of TOPIC"
+ 	echo "  --make-index       Create the documentation index"
+-	echo "  --gecko            Use Mozilla to render the contents"
++	echo "  --no-gecko         Don't use Mozilla to render the contents"
+ 	echo
+ 	echo "The following options are available for authoring documentation:"
+ 	echo "  --edit path        Edit (unassembled) documentation at path"
+Index: docbrowser/HtmlRender.cs
+===================================================================
+--- docbrowser/HtmlRender.cs	(revision 47406)
++++ docbrowser/HtmlRender.cs	(working copy)
+@@ -1,248 +0,0 @@
+-using System;
+-using Gecko;
+-using Gtk;
+-using System.Text;
+-using System.IO;
+-using System.Collections;
+-
+-namespace Monodoc {
+-interface IHtmlRender {
+-	// Jump to an anchor of the form <a name="tttt">
+-	void JumpToAnchor (string anchor_name);
+-
+-	//Copy to the clipboard the selcted text
+-	void Copy ();
+-
+-	//Select all the text
+-	void SelectAll ();
+-
+-	//Render the HTML code given
+-	void Render (string HtmlCode);
+-
+-	//Event fired when the use is over an Url
+-	event EventHandler OnUrl;
+-
+-	//Event fired when the user clicks on a Link
+-	event EventHandler UrlClicked;
+-
+-	// Variable that handles the info encessary for the events
+-	// As every implementation of HtmlRender will have differents events
+-	// we try to homogenize them with the variabel
+-	string Url { get; }
+-
+-	Widget HtmlPanel { get; }
+-}
+-
+-
+-class GeckoHtmlRender : IHtmlRender {
+-	
+-	Hashtable cache_imgs;
+-	string tmpPath;
+-	WebControl _HtmlPanel;
+-	Viewport panel;
+-	public Widget HtmlPanel {
+-		get { return (Widget) panel; }
+-	}
+-
+-	string _url;
+-	public string Url {
+-		get { return _url; }
+-	}
+-	Browser browser;
+-
+-	public event EventHandler OnUrl;
+-	public event EventHandler UrlClicked;
+-
+-	public GeckoHtmlRender (Browser browser) 
+-	{
+-		this.browser = browser;
+-		_HtmlPanel = new WebControl("/tmp/monodoc", "MonodocGecko"); //FIXME
+-		_HtmlPanel.Show(); //due to Gecko bug
+-		_HtmlPanel.OpenUri += OnOpenUri;
+-		_HtmlPanel.LinkMsg += OnLinkMsg;
+-		panel = new Viewport();
+-		panel.Add (_HtmlPanel);
+-		cache_imgs = new Hashtable();
+-		tmpPath = Path.Combine (Path.GetTempPath(), "monodoc");
+-	}
+-	protected void OnOpenUri (object o, OpenUriArgs args)
+-	{
+-		_url = args.AURI;
+-		if (UrlClicked != null)
+-			UrlClicked (this, new EventArgs());
+-		args.RetVal = true; //this prevents Gecko to continue processing
+-	}
+-	protected void OnLinkMsg (object o, EventArgs args)
+-	{
+-		_url = _HtmlPanel.LinkMessage;
+-		if (OnUrl != null)
+-			OnUrl (this, args);
+-	}
+-		
+-	/* NOT ALREADY IMPLEMENTED */
+-	public void JumpToAnchor (string anchor_name) 
+-	{
+-	}
+-
+-	/* NOT ALREADY IMPLEMENTED */
+-	public void Copy() {}
+-
+-	/* NOT ALREADY IMPLEMENTED */
+-	public void SelectAll() {}
+-
+-	public void Render (string HtmlCode) 
+-	{
+-		string r = ProcessImages(HtmlCode);
+-		_HtmlPanel.OpenStream("file:///", "text/html");
+-		_HtmlPanel.AppendData(r);
+-		_HtmlPanel.CloseStream();
+-	}
+-
+-	// Substitute the src of the images with the appropriate path
+-	string ProcessImages(string HtmlCode)
+-	{
+-		//If there are no Images return fast
+-		int pos = HtmlCode.IndexOf ("<img", 0, HtmlCode.Length);
+-		if (pos == -1)
+-			return HtmlCode;
+-
+-		StringBuilder html = new StringBuilder ();
+-		html.Append (HtmlCode.Substring (0, pos)); 
+-		int srcIni, srcEnd;
+-		string Img;
+-		Stream s;
+-		string path, img_name;
+-
+-		while (pos != -1) {
+-
+-			//look for the src of the img
+-		 	srcIni = HtmlCode.IndexOf ("src=\"", pos);
+-		 	srcEnd = HtmlCode.IndexOf ("\"", srcIni+6);
+-			Img = HtmlCode.Substring (srcIni+5, srcEnd-srcIni-5);
+-
+-			path = "NO_IMG";
+-			//is the img cached?
+-			if (cache_imgs.Contains(Img)) {
+-				path = (string) cache_imgs[Img];
+-			} else {
+-				//obtain the stream from the compressed sources
+-				s = browser.help_tree.GetImage (Img);
+-				if (s != null) {
+-					//write the file to a tmp directory
+-					img_name = Img.Substring (Img.LastIndexOf (":")+1);
+-					path = Path.Combine (tmpPath, img_name);
+-					Directory.CreateDirectory (Path.GetDirectoryName (path));
+-					FileStream file = new FileStream (path, FileMode.Create);
+-					byte[] buffer = new byte [8192];
+-					int n;
+-	
+-					while ((n = s.Read (buffer, 0, 8192)) != 0) 
+-						file.Write (buffer, 0, n);
+-					file.Flush();
+-					file.Close();
+-					System.Console.WriteLine("Cache: {0}", path);
+-					//Add the image to the cache
+-					cache_imgs[Img] = path;
+-				}
+-			}
+-			//Add the html code from <img until src=" 
+-			html.Append (HtmlCode.Substring (pos, srcIni + 5 - pos));
+-			//Add the Image path
+-			html.Append (path);		
+-			//Look for the next image
+-			pos = HtmlCode.IndexOf ("<img", srcIni);
+-
+-			if (pos == -1)  
+-				//Add the rest of the file
+-				html.Append (HtmlCode.Substring (srcEnd));
+-			else 
+-				//Add from " to the next <img
+-				html.Append (HtmlCode.Substring (srcEnd, pos - srcEnd)); //check this
+-		}
+-		return html.ToString();
+-	}
+-
+-}
+-
+-
+-
+-class GtkHtmlHtmlRender : IHtmlRender {
+-	
+-	HTML _HtmlPanel;
+-	public Widget HtmlPanel {
+-		get { 
+-			return (Widget) _HtmlPanel; }
+-	}
+-
+-	string _url;
+-	public string Url {
+-		get { return _url; }
+-	}
+-	Browser browser;
+-	
+-	public event EventHandler OnUrl;
+-	public event EventHandler UrlClicked;
+-
+-	
+-	public GtkHtmlHtmlRender (Browser browser) 
+-	{
+-		_HtmlPanel = new HTML();
+-		_HtmlPanel.Show(); 
+-		_HtmlPanel.LinkClicked += new LinkClickedHandler (LinkClicked);
+-		_HtmlPanel.OnUrl += new OnUrlHandler (OnUrlMouseOver);
+-		_HtmlPanel.UrlRequested += new UrlRequestedHandler (UrlRequested);
+-		this.browser = browser;
+-	}
+-	protected void LinkClicked (object o, LinkClickedArgs args)
+-	{
+-		_url = args.Url;
+-		if (UrlClicked != null)
+-			UrlClicked (this, new EventArgs());
+-	}
+-	protected void OnUrlMouseOver (object o, OnUrlArgs args)
+-	{
+-		_url = args.Url;
+-		if (OnUrl != null)
+-			OnUrl (this, args);
+-	}
+-	public void JumpToAnchor (string anchor)
+-	{
+-		_HtmlPanel.JumpToAnchor(anchor);
+-	}
+-
+-	public void Copy () 
+-	{
+-		_HtmlPanel.Copy();	
+-	}
+-
+-	public void SelectAll () 
+-	{
+-		_HtmlPanel.SelectAll();	
+-	}
+-
+-	public void Render (string HtmlCode) 
+-	{
+-
+-		Gtk.HTMLStream stream = _HtmlPanel.Begin ("text/html");
+-		stream.Write(HtmlCode);
+-		_HtmlPanel.End (stream, HTMLStreamStatus.Ok);
+-	}
+-
+-	protected void UrlRequested (object sender, UrlRequestedArgs args)
+-	{
+-		Stream s = browser.help_tree.GetImage (args.Url);
+-		
+-		if (s == null)
+-			s = browser.GetResourceImage ("monodoc.png");
+-		byte [] buffer = new byte [8192];
+-		int n, m;
+-		m=0;
+-		while ((n = s.Read (buffer, 0, 8192)) != 0) {
+-			args.Handle.Write (buffer, n);
+-			m += n;
+-		}
+-		args.Handle.Close (HTMLStreamStatus.Ok);
+-	}
+-	
+-}
+-}
+Index: docbrowser/Makefile.am
+===================================================================
+--- docbrowser/Makefile.am	(revision 47406)
++++ docbrowser/Makefile.am	(working copy)
+@@ -1,8 +1,16 @@
+ monodocdir=$(prefix)/lib/monodoc
+-monodoc_DATA = browser.exe 
+ noinst_DATA = admin.exe
+ 
+-CLEANFILES = browser.exe browser.exe.mdb admin.exe admin.exe.mdb
++
++if ENABLE_GECKO
++CLEANFILES = browser.exe browser.exe.mdb admin.exe admin.exe.mdb GeckoHtmlRender.dll 
++monodoc_DATA = browser.exe GeckoHtmlRender.dll 
++else
++CLEANFILES = browser.exe browser.exe.mdb admin.exe admin.exe.mdb 
++monodoc_DATA = browser.exe 
++endif
++
++
+ DISTCLEANFILES = AssemblyInfo.cs monodoc.desktop monodoc.in
+ 
+ bin_SCRIPTS = monodoc
+@@ -14,13 +22,19 @@
+ 	$(srcdir)/history.cs 		\
+ 	$(srcdir)/Contributions.cs	\
+ 	$(srcdir)/XmlNodeWriter.cs	\
+-	$(srcdir)/HtmlRender.cs	
++	$(srcdir)/GtkHtmlHtmlRender.cs	\
++	$(srcdir)/IHtmlRender.cs	
+ 
++
++geckorender_sources = \
++	$(srcdir)/GeckoHtmlRender.cs
++
+ admin_sources = \
+ 	$(srcdir)/admin.cs		\
+ 	$(srcdir)/Contributions.cs
+ 
+-browser_assemblies = $(GTK_SHARP_LIBS) $(GECKO_SHARP_LIBS) -pkg:monodoc -r:System.Web.Services 
++browser_assemblies = $(GTK_SHARP_LIBS) -pkg:monodoc -r:System.Web.Services 
++geckorender_assemblies = $(GTK_SHARP_LIBS) $(GECKO_SHARP_LIBS) -pkg:monodoc -r:browser.exe
+ 
+ EXTRA_DIST = \
+ 	$(browser_sources) 	\
+@@ -32,9 +46,14 @@
+ admin.exe: $(admin_sources) $(srcdir)/admin.glade
+ 	$(MCS) -debug -out:admin.exe $(admin_sources) -resource:$(srcdir)/admin.glade,admin.glade $(browser_assemblies) -r:System.Drawing
+ 
+-browser.exe: $(browser_sources) $(srcdir)/browser.glade $(srcdir)/monodoc.png
+-	$(MCS) -debug -out:browser.exe $(browser_sources) -resource:$(srcdir)/monodoc.png,monodoc.png -resource:$(srcdir)/browser.glade,browser.glade  $(browser_assemblies)
++browser.exe: $(browser_sources) $(srcdir)/browser.glade $(srcdir)/monodoc.png 
++	$(MCS) -debug -out:browser.exe $(browser_sources) -resource:$(srcdir)/monodoc.png,monodoc.png -resource:$(srcdir)/browser.glade,browser.glade  $(browser_assemblies) 
+ 
++GeckoHtmlRender.dll : $(geckorender_sources) browser.exe
++	$(MCS) -debug -target:library -out:GeckoHtmlRender.dll $(geckorender_sources) $(geckorender_assemblies)
++
++
++
+ b: browser.exe
+ 	MONO_PATH=. $(RUNTIME) --debug browser.exe
+ 

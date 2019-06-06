@@ -1,0 +1,203 @@
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 66218)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,16 @@
++2006-10-04  Jonathan Pryor  <jonpryor@vt.edu>
++
++	* ecma-provider.cs: Add support for generic types.  
++	  Use RootTree.GetNamespaceAndType() to do the namespace/type splitting.  
++	  Add support to "escape" generic types, converting e.g. F<T,U> into 
++	  F`2 (which is the on-disk filename).  
++	  Use index.xml/Overview/Types/Namespace/Type/@File to load files on-disk.
++	* provider.cs: Make GetNamespaceAndType() static; adapt
++	  GetNamespaceAndType() to properly handle generic types, so that when given
++	  Namespace.Foo<System.Int32>, it properly returns "Namespace" as the
++	  namespace, not "Namespace.Foo<System".
++	* mono-ecma.xsl: Display Type Parameters.
++
+ 2006-07-23 Pablo Orduña <pablo@ordunya.com>
+ 
+ 	* server.cs: Fix various uses of sql injection in the server code,
+Index: ecma-provider.cs
+===================================================================
+--- ecma-provider.cs	(revision 66218)
++++ ecma-provider.cs	(working copy)
+@@ -706,7 +706,7 @@
+ 			
+ 		// If a nested type, compare only inner type name to node list.
+ 		// This should be removed when the node list doesn't lose the containing type name.
+-		type = type.Replace("+", ".");
++		type = ToEscapedTypeName (type.Replace("+", "."));
+ 
+ 		string nsp = prefix + ns;
+ 
+@@ -722,6 +722,9 @@
+ 				string cname;
+ 				if (element.StartsWith("T:")) {
+ 					cname = element.Substring(2);
++					string _ns;
++					RootTree.GetNamespaceAndType (cname, out _ns, out cname);
++					cname = ToEscapedTypeName (cname);
+ 					int pidx = cname.LastIndexOf (".");
+ 					cname = cname.Substring(pidx+1);
+ 					pidx = cname.LastIndexOf ("/");
+@@ -773,6 +776,40 @@
+ 		return null;
+ 	}
+ 	
++	public static string ToEscapedTypeName (string typename)
++	{
++		StringBuilder filename = new StringBuilder (typename.Length);
++		int numArgs = 0;
++		int numLt = 0;
++		bool copy = true;
++		for (int i = 0; i < typename.Length; ++i) {
++			char c = typename [i];
++			switch (c) {
++				case '<':
++					copy = false;
++					++numLt;
++					break;
++				case '>':
++					--numLt;
++					if (numLt == 0) {
++						filename.Append ('`').Append ((numArgs+1).ToString());
++						numArgs = 0;
++						copy = true;
++					}
++					break;
++				case ',':
++					if (numLt == 1)
++						++numArgs;
++					break;
++				default:
++					if (copy)
++						filename.Append (c);
++					break;
++			}
++		}
++		return filename.ToString ();
++	}
++	
+ 	public override string GetNodeXPath (XPathNavigator n)
+ 	{
+ 		if (n.Matches ("/Type/Docs/param")) {
+@@ -1753,7 +1790,7 @@
+ 				
+ 				// Must load in each document to get the list of members...
+ 				XmlDocument typedoc = new XmlDocument();
+-				typedoc.Load(Path.Combine(Path.Combine(basedir.FullName, ns.GetAttribute("Name")), t.GetAttribute("Name") + ".xml"));
++				typedoc.Load(GetTypeDocFile (ns.GetAttribute ("Name"), t));
+ 				string kind = EcmaDoc.GetTypeKind (typedoc);
+ 				
+ 				string url = ns.GetAttribute("Name") + "." + t.GetAttribute("Name");
+@@ -1808,6 +1845,17 @@
+ 		if (has_content)
+ 			Tree.Sort();
+ 	}
++
++	private string GetTypeDocFile (string ns, XmlElement type)
++	{
++		string typefile = Path.Combine(Path.Combine(basedir.FullName, ns), 
++					type.GetAttribute("Name") + ".xml");
++		if (!File.Exists (typefile)) {
++			typefile = Path.Combine(Path.Combine(basedir.FullName, ns),
++						type.GetAttribute("File") + ".xml");
++		}
++		return typefile;
++	}
+ 	
+ 	public override string GetIdFromUrl (string prefix, string ns, string type)
+ 	{
+@@ -1828,11 +1876,15 @@
+ 			url = url.Substring(0, sidx);
+ 		}
+ 		
+-		int pidx = url.LastIndexOf(".");
+-		string ns = url.Substring(0, pidx);
+-		string type = url.Substring(pidx+1).Replace(".", "+");
++		string ns, type;
++		if (!RootTree.GetNamespaceAndType (url, out ns, out type)) {
++			Console.Error.WriteLine ("Could not determine namespace/type for {0}",
++					url);
++			return null;
++		}
+ 		
+-		string file = Path.Combine(Path.Combine(basedir.FullName, ns), type + ".xml");
++		string file = Path.Combine(Path.Combine(basedir.FullName, ns), 
++				ToEscapedTypeName (type).Replace ('.', '+') + ".xml");
+ 		if (!new FileInfo(file).Exists) return null;
+ 		
+ 		XmlDocument typedoc = new XmlDocument();
+@@ -1886,7 +1938,7 @@
+ 				
+ 		foreach (XmlElement t in basedoc.SelectNodes("Overview/Types/Namespace[@Name='" + ns + "']/Type")) {
+ 			XmlDocument typedoc = new XmlDocument();
+-			typedoc.Load(Path.Combine(Path.Combine(basedir.FullName, ns), t.GetAttribute("Name") + ".xml"));
++			typedoc.Load(GetTypeDocFile (ns, t));
+ 			
+ 			string typekind;
+ 			switch (EcmaDoc.GetTypeKind(typedoc)) {
+Index: provider.cs
+===================================================================
+--- provider.cs	(revision 66218)
++++ provider.cs	(working copy)
+@@ -959,10 +959,29 @@
+ 		}
+ 	}
+ 	
+-	public bool GetNamespaceAndType (string url, out string ns, out string type)
++	public static bool GetNamespaceAndType (string url, out string ns, out string type)
+ 	{
+-		int nsidx = url.LastIndexOf (".");
+-		if (nsidx == -1){
++		int nsidx = -1;
++		int numLt = 0;
++		for (int i = 0; i < url.Length; ++i) {
++			char c = url [i];
++			switch (c) {
++			case '<':
++			case '{':
++				++numLt;
++				break;
++			case '>':
++			case '}':
++				--numLt;
++				break;
++			case '.':
++				if (numLt == 0)
++					nsidx = i;
++				break;
++			}
++		}
++
++		if (nsidx == -1) {
+ 			Console.Error.WriteLine ("Did not find dot in: " + url);
+ 			ns = null;
+ 			type = null;
+Index: mono-ecma.xsl
+===================================================================
+--- mono-ecma.xsl	(revision 66218)
++++ mono-ecma.xsl	(working copy)
+@@ -843,6 +843,20 @@
+ 
+ 		<!-- parameters & return & value -->
+ 
++		<xsl:if test="count(Docs/typeparam)">
++			<h4>Type Parameters</h4>
++			<blockquote>
++			<dl>
++			<xsl:for-each select="Docs/typeparam">
++				<dt><i><xsl:value-of select="@name"/></i></dt>
++				<dd>
++					<xsl:apply-templates select="." mode="notoppara"/>
++					<xsl:apply-templates select="." mode="editlink"/>
++				</dd>
++			</xsl:for-each>
++			</dl>
++			</blockquote>
++		</xsl:if>
+ 		<xsl:if test="count(Docs/param)">
+ 			<h4>Parameters</h4>
+ 			<blockquote>

@@ -1,0 +1,1532 @@
+// Updater program for syncing Mono's ECMA-style documentation files
+// with an assembly.
+// By Joshua Tauberer <tauberer@for.net>
+
+using System;
+using System.Collections;
+using System.Text;
+using System.Reflection;
+using System.Xml;
+using System.ComponentModel;
+
+using Mono.GetOptions;
+
+[assembly: AssemblyTitle("Monodocer - The Mono Documentation Tool")]
+[assembly: AssemblyCopyright("Copyright (c) 2004 Joshua Tauberer <tauberer@for.net>\nreleased under the GPL.")]
+[assembly: AssemblyDescription("A tool for creating and updating Mono XML documentation files for assemblies.")]
+
+[assembly: Mono.UsageComplement("")]
+
+public class Stub {
+	
+	static string srcPath;
+	static Assembly[] assemblies;
+	
+	static bool nooverrides = true, delete = false, ignoremembers = false, usedescriptions;
+	
+	static int additions = 0, deletions = 0;
+
+	static string name;
+	static XmlDocument slashdocs;
+	
+	private class Opts : Options {
+		[Option("The root {directory} of an assembly's documentation files.")]
+		public string path = null;
+
+		[Option("When updating documentation, write the updated files to this {path}.")]
+		public string updateto = null;
+
+		[Option(-1, "The assembly to document.  Specify a {file} path or the name of a GAC'd assembly.")]
+		public string[] assembly = null;
+
+		[Option("Document only the {type name}d by this argument.")]
+		public string type = null;
+
+		[Option("Update only the types in this {namespace}.")]
+		public string @namespace = null;
+
+		[Option("Allow monodocer to delete members from files.")]
+		public bool delete = false;
+
+		[Option("Include overridden methods in documentation.")]
+		public bool overrides = false;
+
+		[Option("Don't update members.")]
+		public bool ignoremembers = false;
+
+		[Option("The {name} of the project this documentation is for.")]
+		public string name;
+
+		[Option("An XML documemntation {file} made by the /doc option of mcs/csc the contents of which will be imported.")]
+		public string importslashdoc;
+
+		[Option("Use member descriptions provided via System.ComponentModel.DescriptionAttribute attributes")]
+		public bool usedescriptions = false;
+
+	}
+	
+	private static int n(object o) {
+		return o == null ? 0 : 1;
+	}
+	
+	public static void Main(string[] args) {
+		Opts opts = new Opts();
+		opts.ProcessArgs(args);
+
+		if (args.Length == 0) {
+			opts.DoHelp();
+			return;
+		}
+		
+		nooverrides = !opts.overrides;
+		delete = opts.delete;
+		ignoremembers = opts.ignoremembers;
+		usedescriptions = opts.usedescriptions;
+		name = opts.name;
+
+		try {
+			// PARSE BASIC OPTIONS AND LOAD THE ASSEMBLY TO DOCUMENT
+			
+			if (opts.path == null)
+				throw new InvalidOperationException("The path option is required.");
+			
+			srcPath = opts.path;
+
+			if (n(opts.type) + n(opts.@namespace) > 1)
+				throw new InvalidOperationException("You cannot specify both 'type' and 'namespace'.");
+			
+			if (opts.assembly == null)
+				throw new InvalidOperationException("The assembly option is required.");
+				
+			assemblies = new Assembly [opts.assembly.Length];
+			for (int i = 0; i < opts.assembly.Length; i++)
+				assemblies [i] = LoadAssembly (opts.assembly [i]);
+				
+			// IMPORT FROM /DOC?
+			
+			if (opts.importslashdoc != null) {
+				try {
+					slashdocs = new XmlDocument();
+					slashdocs.Load(opts.importslashdoc);
+				} catch (Exception e) {
+					Console.Error.WriteLine("Could not load /doc file: " + e.Message);
+					Environment.ExitCode = 1;
+					return;
+				}
+			}
+			
+			// PERFORM THE UPDATES
+			
+			if (opts.type != null)
+				DoUpdateType(opts.path, opts.type, opts.updateto);
+			else if (opts.@namespace != null)
+				DoUpdateNS(opts.@namespace, opts.path + "/" + opts.@namespace, opts.updateto == null ? opts.path + "/" + opts.@namespace : opts.updateto + "/" + opts.@namespace);
+			else
+				DoUpdateAssemblies(opts.path, opts.updateto == null ? opts.path : opts.updateto);
+		
+		} catch (InvalidOperationException error) {
+			Console.Error.WriteLine(error.Message);
+			Environment.ExitCode = 1;
+			return;
+			
+		} catch (System.IO.IOException error) {
+			Console.Error.WriteLine(error.Message);
+			Environment.ExitCode = 1;
+			return;
+
+		} catch (Exception error) {
+			Console.Error.WriteLine(error);
+			Environment.ExitCode = 1;
+		}
+
+		Console.Error.WriteLine("Members Added: {0}, Members Deleted: {1}", additions, deletions);
+	}
+	
+	private static Assembly LoadAssembly (string name)
+	{
+		Assembly assembly = null;
+		try {
+			assembly = Assembly.LoadFile (name);
+		} catch (System.IO.FileNotFoundException e) { }
+
+		if (assembly == null) {
+			try {
+				assembly = Assembly.LoadWithPartialName (name);
+			} catch (Exception e) { }
+		}
+			
+		if (assembly == null)
+			throw new InvalidOperationException("Assembly " + name + " not found.");
+
+		return assembly;
+	}
+
+	private static void WriteXml(XmlElement element, System.IO.TextWriter output) {
+		XmlTextWriter writer = new XmlTextWriter(output);
+		writer.Formatting = Formatting.Indented;
+		writer.Indentation = 2;
+		writer.IndentChar = ' ';
+		element.WriteTo(writer);
+		output.WriteLine();	
+	}
+	
+	private static XmlDocument CreateIndexStub() {
+		XmlDocument index = new XmlDocument();
+
+		XmlElement index_root = index.CreateElement("Overview");
+		index.AppendChild(index_root);
+
+		if (assemblies.Length == 0)
+			throw new Exception ("No assembly");
+
+		XmlElement index_assemblies = index.CreateElement("Assemblies");
+		index_root.AppendChild(index_assemblies);
+
+		XmlElement index_remarks = index.CreateElement("Remarks");
+		index_remarks.InnerText = "To be added.";
+		index_root.AppendChild(index_remarks);
+
+		XmlElement index_copyright = index.CreateElement("Copyright");
+		index_copyright.InnerText = "To be added.";
+		index_root.AppendChild(index_copyright);
+
+		XmlElement index_types = index.CreateElement("Types");
+		index_root.AppendChild(index_types);
+		
+		return index;
+	}
+	
+	private static void WriteNamespaceStub(string ns, string outdir) {
+		XmlDocument index = new XmlDocument();
+
+		XmlElement index_root = index.CreateElement("Namespace");
+		index.AppendChild(index_root);
+		
+		index_root.SetAttribute("Name", ns);
+
+		XmlElement index_docs = index.CreateElement("Docs");
+		index_root.AppendChild(index_docs);
+
+		XmlElement index_summary = index.CreateElement("summary");
+		index_summary.InnerText = "To be added.";
+		index_docs.AppendChild(index_summary);
+
+		XmlElement index_remarks = index.CreateElement("remarks");
+		index_remarks.InnerText = "To be added.";
+		index_docs.AppendChild(index_remarks);
+
+		using (System.IO.TextWriter writer
+		= new System.IO.StreamWriter(new System.IO.FileStream(outdir + "/" + ns + ".xml", System.IO.FileMode.CreateNew))) {
+			WriteXml(index.DocumentElement, writer);
+		}
+	}
+	
+	public static void DoUpdateType(string basepath, string typename, string dest) {
+		Type type = null;
+		foreach (Assembly assembly in assemblies) {
+			type = assembly.GetType(typename, false);
+			if (type != null)
+				break;
+		}
+		if (type == null) throw new InvalidOperationException("Type not found: " + typename);
+		if (type.Namespace == null) throw new InvalidOperationException("Types in the root namespace cannot be documented: " + typename);
+		string typename2 = type.FullName.Substring(type.Namespace == "" ? 0 : type.Namespace.Length+1);
+
+		XmlDocument basefile = new XmlDocument();
+		string typefile = basepath + "/" + type.Namespace + "/" + typename2 + ".xml";
+		try {
+			basefile.Load(typefile);
+		} catch (Exception e) {
+			throw new InvalidOperationException("Error loading " + typefile + ": " + e.Message, e);
+		}
+		
+		if (dest == null) {
+			DoUpdateType2(basefile, type, typefile);
+		} else if (dest == "-") {
+			DoUpdateType2(basefile, type, null);
+		} else {
+			DoUpdateType2(basefile, type, dest + "/" + type.Namespace + "/" + typename2 + ".xml");
+		}	
+	}
+
+	
+	public static void DoUpdateNS(string ns, string nspath, string outpath) {
+		Hashtable seenTypes = new Hashtable();
+		Assembly assembly = assemblies [0];
+		
+		foreach (System.IO.FileInfo file in new System.IO.DirectoryInfo(nspath).GetFiles("*.xml")) {
+			XmlDocument basefile = new XmlDocument();
+			string typefile = nspath + "/" + file.Name;
+			try {
+				basefile.Load(typefile);
+			} catch (Exception e) {
+				throw new InvalidOperationException("Error loading " + typefile + ": " + e.Message, e);
+			}
+
+			string typename = basefile.SelectSingleNode("Type/@FullName").InnerText;
+			Type type = assembly.GetType(typename, false);
+			if (type == null) {
+				Console.Error.WriteLine(typename + " is no longer in the assembly.");
+				continue;
+			}			
+
+			seenTypes[type] = seenTypes;
+			DoUpdateType2(basefile, type, outpath + "/" + file.Name);
+		}
+		
+		// Stub types not in the directory
+		foreach (Type type in assembly.GetTypes()) {
+			if (type.Namespace == null) continue;
+			if (type.Namespace != ns || seenTypes.ContainsKey(type))
+				continue;
+
+			XmlElement td = StubType(type);
+			if (td == null) continue;
+			
+			Console.Error.WriteLine("New Type: " + type.FullName);
+
+			using (System.IO.TextWriter writer
+			= new System.IO.StreamWriter(new System.IO.FileStream(outpath + "/" + GetTypeFileName(type) + ".xml", System.IO.FileMode.CreateNew))) {
+				WriteXml(td, writer);
+			}
+			
+		}
+	}
+	
+	private static string GetTypeFileName(Type type) {
+		int start = 0;
+		if (type.Namespace != null && type.Namespace != "")
+			start = type.Namespace.Length + 1;
+		return type.FullName.Substring(start);
+	}
+	
+	private static void AddIndexAssembly (Assembly assembly, XmlElement parent)
+	{
+		XmlElement index_assembly = parent.OwnerDocument.CreateElement("Assembly");
+		index_assembly.SetAttribute("Name", assembly.GetName().Name);
+		index_assembly.SetAttribute("Version", assembly.GetName().Version.ToString());
+		MakeAttributes(index_assembly, assembly, true);
+		parent.AppendChild(index_assembly);
+	}
+
+	private static void DoUpdateAssemblies (string source, string dest) 
+	{
+		string indexfile = dest + "/index.xml";
+		XmlDocument index;
+		if (new System.IO.FileInfo(indexfile).Exists) {
+			index = new XmlDocument();
+			index.Load(indexfile);
+
+			// Format change
+			ClearElement(index.DocumentElement, "Assembly");
+			ClearElement(index.DocumentElement, "Attributes");
+		} else {
+			index = CreateIndexStub();
+		}
+		
+		if (name == null) {
+			string defaultTitle = "Untitled";
+			if (assemblies.Length == 1)
+				defaultTitle = assemblies[0].GetName().Name;
+			WriteElementInitialText(index.DocumentElement, "Title", defaultTitle);
+		} else {
+			WriteElementText(index.DocumentElement, "Title", name);
+		}
+		
+		XmlElement index_types = WriteElement(index.DocumentElement, "Types");
+		XmlElement index_assemblies = WriteElement(index.DocumentElement, "Assemblies");
+		index_assemblies.RemoveAll ();
+		
+		Hashtable goodfiles = new Hashtable();
+
+		foreach (Assembly assm in assemblies) {
+			AddIndexAssembly (assm, index_assemblies);
+			DoUpdateAssembly (assm, index_types, source, dest, goodfiles);
+		}
+		
+		CleanupFiles (dest, goodfiles);
+		CleanupIndexTypes (index_types, goodfiles);
+
+		using (System.IO.TextWriter writer
+			= new System.IO.StreamWriter(new System.IO.FileStream(indexfile, System.IO.FileMode.Create)))
+			WriteXml(index.DocumentElement, writer);
+	
+	}
+		
+	private static void DoUpdateAssembly (Assembly assembly, XmlElement index_types, string source, string dest, Hashtable goodfiles) 
+	{
+		foreach (Type type in assembly.GetTypes()) {
+			if (type.Namespace == null) continue;
+			
+			// Must get the A+B form of the type name.
+			string typename = GetTypeFileName(type);
+			
+			string typefile = source + "/" + type.Namespace + "/" + typename + ".xml";
+			System.IO.FileInfo file = new System.IO.FileInfo(typefile);
+			if (file.Exists) {
+				// Update
+				XmlDocument basefile = new XmlDocument();
+				try {
+					basefile.Load(typefile);
+				} catch (Exception e) {
+					throw new InvalidOperationException("Error loading " + typefile + ": " + e.Message, e);
+				}
+				
+				DoUpdateType2(basefile, type, dest + "/" + type.Namespace + "/" + typename + ".xml");
+			} else {
+				// Stub
+				XmlElement td = StubType(type);
+				if (td == null) continue;
+				
+				System.IO.DirectoryInfo dir = new System.IO.DirectoryInfo(dest + "/" + type.Namespace);
+				if (!dir.Exists) {
+					dir.Create();
+					Console.Error.WriteLine("Namespace Directory Created: " + type.Namespace);
+				}
+
+				Console.Error.WriteLine("New Type: " + type.FullName);
+
+				using (System.IO.TextWriter writer
+				= new System.IO.StreamWriter(new System.IO.FileStream(dest + "/" + type.Namespace + "/" + typename + ".xml", System.IO.FileMode.CreateNew))) {
+					WriteXml(td, writer);
+				}
+			}
+			
+			// Add namespace and type nodes into the index file as needed
+			XmlElement nsnode = (XmlElement)index_types.SelectSingleNode("Namespace[@Name='" + type.Namespace + "']");
+			if (nsnode == null) {
+				nsnode = index_types.OwnerDocument.CreateElement("Namespace");
+				nsnode.SetAttribute("Name", type.Namespace);
+				index_types.AppendChild(nsnode);
+			}
+			XmlElement typenode = (XmlElement)nsnode.SelectSingleNode("Type[@Name='" + typename + "']");
+			if (typenode == null) {
+				typenode = index_types.OwnerDocument.CreateElement("Type");
+				typenode.SetAttribute("Name", typename);
+				nsnode.AppendChild(typenode);
+			}
+				
+			// Ensure the namespace index file exists
+			if (!new System.IO.FileInfo(dest + "/" + type.Namespace + ".xml").Exists) {
+				Console.Error.WriteLine("New Namespace File: " + type.Namespace);
+				WriteNamespaceStub(type.Namespace, dest);
+			}
+
+			// mark the file as corresponding to a type
+			goodfiles[type.Namespace + "/" + typename + ".xml"] = goodfiles;
+		}
+	}
+
+	private static void CleanupFiles (string dest, Hashtable goodfiles)
+	{
+		// Look for files that no longer correspond to types
+		foreach (System.IO.DirectoryInfo nsdir in new System.IO.DirectoryInfo(dest).GetDirectories("*")) {
+			foreach (System.IO.FileInfo typefile in nsdir.GetFiles("*.xml")) {
+				if (!goodfiles.ContainsKey(nsdir.Name + "/" + typefile.Name)) {
+					string newname = typefile.FullName + ".remove";
+					try { System.IO.File.Delete(newname); } catch (Exception e) { }
+					try { typefile.MoveTo(newname); } catch (Exception e) { }					
+					Console.Error.WriteLine("Class no longer present; file renamed: " + nsdir.Name + "/" + typefile.Name);
+				}
+			}
+		}
+	}
+		
+	private static void CleanupIndexTypes (XmlElement index_types, Hashtable goodfiles)
+	{
+		// Look for type nodes that no longer correspond to types
+		foreach (XmlElement typenode in index_types.SelectNodes("Namespace/Type")) {
+			string fulltypename = ((XmlElement)typenode.ParentNode).GetAttribute("Name") + "/" + typenode.GetAttribute("Name") + ".xml";
+			if (!goodfiles.ContainsKey(fulltypename))
+				typenode.ParentNode.RemoveChild(typenode);
+		}
+	}
+		
+	public static void DoUpdateType2(XmlDocument basefile, Type type, string output) {
+		Console.Error.WriteLine("Updating: " + type.FullName);
+		
+		Hashtable seenmembers = new Hashtable();
+
+		// Update type metadata
+		UpdateType(basefile.DocumentElement, type, false);
+
+		// Update existing members.  Delete member nodes that no longer should be there,
+		// and remember what members are already documented so we don't add them again.
+		if (!ignoremembers)
+		foreach (XmlElement oldmember in basefile.SelectNodes("Type/Members/Member")) {
+			MemberInfo oldmember2 = GetMember(type, oldmember);
+			
+			// Interface implementations and overrides are deleted from the docs
+			// unless the overrides option is given.
+			if (oldmember2 != null && !IsNew(oldmember2))
+				oldmember2 = null;
+			
+			// Deleted (or signature changed)
+			if (oldmember2 == null) {
+				Console.Error.WriteLine("Member Deleted: " + oldmember.SelectSingleNode("MemberSignature[@Language='C#']/@Value").InnerText);
+				if (!delete && MemberDocsHaveUserContent(oldmember)) {
+					Console.Error.WriteLine("Member deletions must be enabled with the --delete option.");
+				} else {
+					oldmember.ParentNode.RemoveChild(oldmember);
+					deletions++;
+				}
+				continue;
+			}
+			
+			// Duplicated
+			if (seenmembers.ContainsKey(oldmember2)) {
+				Console.Error.WriteLine("Duplicate member: " + oldmember.SelectSingleNode("MemberSignature[@Language='C#']/@Value").InnerText);
+				oldmember.ParentNode.RemoveChild(oldmember);
+				deletions++;
+				continue;
+			}
+			
+			// Update signature information
+			UpdateMember(oldmember, oldmember2);
+			
+			seenmembers[oldmember2] = 1;
+		}
+		
+		if (!IsDelegate(type) && !ignoremembers) {
+			XmlNode members = basefile.SelectSingleNode("Type/Members");
+			foreach (MemberInfo m in type.GetMembers(BindingFlags.Public|BindingFlags.NonPublic|BindingFlags.Static|BindingFlags.Instance|BindingFlags.DeclaredOnly)) {
+				if (m is Type) continue;
+				if (seenmembers.ContainsKey(m)) continue;
+				
+				// To be nice on diffs, members/properties/events that are overrides or are interface implementations
+				// are not added in.
+				if (!IsNew(m)) continue;
+				
+				XmlElement mm = MakeMember(basefile, m);
+				if (mm == null) continue;
+				members.AppendChild( mm );
+	
+				Console.Error.WriteLine("Member Added: " + mm.SelectSingleNode("MemberSignature/@Value").InnerText);
+				additions++;
+			}
+		}
+		
+		// Import code snippets from files
+		foreach (XmlNode code in basefile.GetElementsByTagName("code")) {
+			if (!(code is XmlElement)) continue;
+			string file = ((XmlElement)code).GetAttribute("src");
+			if (file != "") {
+				try {
+					using (System.IO.StreamReader reader = new System.IO.StreamReader(srcPath + "/" + file)) {
+						code.InnerText = reader.ReadToEnd();
+					}
+				} catch (Exception e) {
+					Console.Error.WriteLine("Could not load code file '" + srcPath + "/" + file + "': " + e.Message);
+				}
+			}
+		}
+
+		System.IO.TextWriter writer;
+		if (output == null)
+			writer = Console.Out;
+		else
+			writer = new System.IO.StreamWriter(new System.IO.FileStream(output, System.IO.FileMode.Create));
+		WriteXml(basefile.DocumentElement, writer);
+		writer.Close();
+	}
+	
+	private static bool MemberDocsHaveUserContent(XmlElement e) {
+		e = (XmlElement)e.SelectSingleNode("Docs");
+		if (e == null) return false;
+		foreach (XmlElement d in e.SelectNodes("*"))
+			if (d.InnerText != "" && !d.InnerText.StartsWith("To be added"))
+				return true;
+		return false;
+	}
+	
+	private static bool IsNew(MemberInfo m) {
+		if (!nooverrides) return true;
+		if (m is MethodInfo && !IsNew((MethodInfo)m)) return false;
+		if (m is PropertyInfo && !IsNew(((PropertyInfo)m).GetGetMethod())) return false;
+		if (m is PropertyInfo && !IsNew(((PropertyInfo)m).GetSetMethod())) return false;
+		if (m is EventInfo && !IsNew(((EventInfo)m).GetAddMethod())) return false;
+		if (m is EventInfo && !IsNew(((EventInfo)m).GetRaiseMethod())) return false;
+		if (m is EventInfo && !IsNew(((EventInfo)m).GetRemoveMethod())) return false;
+		return true;
+	}
+	
+	private static bool IsNew(MethodInfo m) {
+		if (m == null) return true;
+		MethodInfo b = m.GetBaseDefinition();
+		if (b == null || b == m) return true;
+		return false;
+	}
+	
+	// UPDATE HELPER FUNCTIONS	
+	
+	private static XmlElement FindMatchingMember(Type type, XmlElement newfile, XmlElement oldmember) {
+		MemberInfo oldmember2 = GetMember(type, oldmember);
+		if (oldmember2 == null) return null;
+		
+		string membername = oldmember.GetAttribute("MemberName");
+		foreach (XmlElement newmember in newfile.SelectNodes("Members/Member[@MemberName='" + membername + "']")) {
+			if (GetMember(type, newmember) == oldmember2) return newmember;
+		}
+		
+		return null;
+	}
+	
+	private static MemberInfo GetMember(Type type, XmlElement member) {
+		string membertype = member.SelectSingleNode("MemberType").InnerText;
+		
+		string returntype = null;
+		XmlNode returntypenode = member.SelectSingleNode("ReturnValue/ReturnType");
+		if (returntypenode != null) returntype = returntypenode.InnerText;
+		
+		// Get list of parameter types for member
+		ArrayList memberparams = new ArrayList();
+		foreach (XmlElement param in member.SelectNodes("Parameters/Parameter"))
+			memberparams.Add(param.GetAttribute("Type"));
+		
+		// Loop through all members in this type with the same name
+		MemberInfo[] mis = type.GetMember(member.GetAttribute("MemberName"), BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+		foreach (MemberInfo mi in mis) {
+			if (mi is Type) continue;
+			if (GetMemberType(mi) != membertype) continue;
+
+			string sig = MakeMemberSignature(mi);
+			if (sig == null) continue; // not publicly visible
+
+			if (mi is MethodInfo) {
+				// Casting operators can overload based on return type.
+				if (returntype != ((MethodInfo)mi).ReturnType.FullName) continue;
+			}
+
+			ParameterInfo[] pis = null;
+			if (mi is MethodInfo || mi is ConstructorInfo)
+				pis = ((MethodBase)mi).GetParameters();
+			else if (mi is PropertyInfo)
+				pis = ((PropertyInfo)mi).GetIndexParameters();
+			
+			if (pis == null)
+				pis = new ParameterInfo[0];
+				
+			if (pis.Length != memberparams.Count) continue;			
+			
+			bool good = true;
+			for (int i = 0; i < pis.Length; i++)
+				if (pis[i].ParameterType.FullName != (string)memberparams[i]) { good = false; break; }
+			if (!good) continue;
+
+			return mi;
+		}
+		
+		return null;
+	}
+	
+	// CREATE A STUB DOCUMENTATION FILE	
+
+	public static XmlElement StubType(Type type) {
+		string typesig = MakeTypeSignature(type);
+		if (typesig == null) return null; // not publicly visible
+		
+		string typename = type.FullName.Substring(type.Namespace == "" ? 0 : type.Namespace.Length+1);
+
+		XmlDocument doc = new XmlDocument();
+		XmlElement root = doc.CreateElement("Type");
+		root.SetAttribute("Name", typename);
+		root.SetAttribute("FullName", type.FullName);
+		
+		UpdateType(root, type, true);
+		
+		return root;
+	}
+	
+	// STUBBING/UPDATING FUNCTIONS
+	
+	public static void UpdateType(XmlElement root, Type type, bool addmembers) {
+		WriteElementAttribute(root, "TypeSignature[@Language='C#']", "Language", "C#");
+		WriteElementAttribute(root, "TypeSignature[@Language='C#']", "Value", MakeTypeSignature(type));
+		
+		XmlElement ass = WriteElement(root, "AssemblyInfo");
+		WriteElementText(ass, "AssemblyName", type.Assembly.GetName().Name);
+		WriteElementText(ass, "AssemblyVersion", type.Assembly.GetName().Version.ToString());
+		if (type.Assembly.GetName().CultureInfo.Name != "")
+			WriteElementText(ass, "AssemblyCulture", type.Assembly.GetName().CultureInfo.Name);
+		else
+			ClearElement(ass, "AssemblyCulture");
+		
+		// Why-oh-why do we put assembly attributes in each type file?
+		// Neither monodoc nor monodocs2html use them, so I'm deleting them
+		// since they're outdated in current docs, and a waste of space.
+		//MakeAttributes(ass, type.Assembly, true);
+		XmlNode assattrs = ass.SelectSingleNode("Attributes");
+		if (assattrs != null)
+			ass.RemoveChild(assattrs);
+		
+		NormalizeWhitespace(ass);
+		
+		if (type.BaseType != null) {
+			string basetypename = type.BaseType.FullName;
+			if (basetypename == "System.MulticastDelegate") basetypename = "System.Delegate";
+			WriteElementText(root, "Base/BaseTypeName", basetypename);
+		} else {
+			ClearElement(root, "Base");
+		}
+
+		if (!IsDelegate(type) && !type.IsEnum) {
+			// Get a sorted list of interface implementations.  Don't include
+			// interfaces that are implemented by a base type or another interface
+			// because they go on the base type or base interface's signature.
+			ArrayList interface_names = new ArrayList();
+			foreach (Type i in type.GetInterfaces())
+				if ((type.BaseType == null || Array.IndexOf(type.BaseType.GetInterfaces(), i) == -1) && InterfaceNotFromAnother(i, type.GetInterfaces()))
+					interface_names.Add(i.FullName);
+			interface_names.Sort();
+
+			XmlElement interfaces = WriteElement(root, "Interfaces");
+			interfaces.RemoveAll();
+			foreach (string iname in interface_names) {
+				XmlElement iface = root.OwnerDocument.CreateElement("Interface");
+				interfaces.AppendChild(iface);
+				WriteElementText(iface, "InterfaceName", iname);
+			}
+		} else {
+			ClearElement(root, "Interfaces");
+		}
+
+		MakeAttributes(root, type, false);
+		
+		if (IsDelegate(type)) {
+			MakeParameters(root, type.GetMethod("Invoke").GetParameters());
+			MakeReturnValue(root, type.GetMethod("Invoke"));
+		}
+		
+		if (!IsDelegate(type) && addmembers) {
+			XmlElement members = WriteElement(root, "Members");
+			
+			foreach (MemberInfo m in type.GetMembers(BindingFlags.Public|BindingFlags.NonPublic|BindingFlags.Static|BindingFlags.Instance|BindingFlags.DeclaredOnly)) {
+				if (m is Type) continue;
+				if (!IsNew(m)) continue;
+				
+				XmlElement mm = MakeMember(root.OwnerDocument, m);
+				if (mm == null) continue;
+				members.AppendChild( mm );
+			}
+		}
+			
+		XmlElement docs = WriteElement(root, "Docs");
+		MakeDocNode(type, docs, true);
+		
+		NormalizeWhitespace(root);
+	}
+	
+	private static void UpdateMember(XmlElement me, MemberInfo mi) {	
+		WriteElementAttribute(me, "MemberSignature[@Language='C#']", "Language", "C#");
+		WriteElementAttribute(me, "MemberSignature[@Language='C#']", "Value", MakeMemberSignature(mi));
+
+		WriteElementText(me, "MemberType", GetMemberType(mi));
+		
+		MakeAttributes(me, mi, false);
+		MakeReturnValue(me, mi);
+		MakeParameters(me, mi);
+		
+		string fieldValue;
+		if (mi is FieldInfo && GetFieldConstValue((FieldInfo)mi, out fieldValue))
+			WriteElementText(me, "MemberValue", fieldValue);
+		
+		ParameterInfo[] paraminfo = null;
+		Type returntype = null;
+		bool returnisreturn = true; // the name of the node is 'return', vs 'value'
+		bool addremarks = true;
+		
+		if (mi is MethodInfo || mi is ConstructorInfo)
+			paraminfo = ((MethodBase)mi).GetParameters();
+		else if (mi is PropertyInfo)
+			paraminfo = ((PropertyInfo)mi).GetIndexParameters();
+			
+		if (mi is MethodInfo) {
+			returntype = ((MethodInfo)mi).ReturnType;
+		} else if (mi is PropertyInfo) {
+			returntype = ((PropertyInfo)mi).PropertyType;
+			returnisreturn = false;
+		}
+
+		// no remarks section for enum members
+		if (mi.DeclaringType.IsEnum)
+			addremarks = false;
+
+		string slashdocsig = MakeSlashDocMemberSig(mi);
+
+		MakeDocNode(me, paraminfo, returntype, returnisreturn, addremarks, slashdocsig);
+
+		// set the summary according to any DescriptionAttribute attrs,
+		// if the user asked us to
+		if (usedescriptions) {
+			object[] memberAttrs = mi.GetCustomAttributes(false);
+			XmlElement summary = (XmlElement)me.SelectSingleNode("Docs/summary");;
+			if (summary != null) {
+				foreach (object at in memberAttrs) {
+					if (at is DescriptionAttribute)  {
+						string desc = ((DescriptionAttribute)at).Description;
+						summary.InnerText = desc;
+					}
+				}
+			}
+		}
+		
+	}
+	
+	private static bool GetFieldConstValue(FieldInfo field, out string value) {
+		value = null;
+		if (field.DeclaringType.IsEnum) return false;
+		if (field.IsLiteral || (field.IsStatic && field.IsInitOnly)) {
+			object val = field.GetValue(null);
+			if (val == null) value = "null";
+			else if (val is Enum) value = val.ToString();
+			else if (val is IFormattable) {
+				value = ((IFormattable)val).ToString();
+				if (val is string)
+					value = "\"" + value + "\"";
+			}
+			if (value != null && value != "")
+				return true;
+		}
+		return false;
+	}
+	
+	// XML HELPER FUNCTIONS
+	
+	private static XmlElement WriteElement(XmlElement parent, string element) {
+		XmlElement ret = (XmlElement)parent.SelectSingleNode(element);
+		if (ret == null) {
+			string[] path = element.Split('/');
+			foreach (string p in path) {
+				ret = (XmlElement)parent.SelectSingleNode(p);
+				if (ret == null) {
+					string ename = p;
+					if (ename.IndexOf('[') >= 0) // strip off XPath predicate
+						ename = ename.Substring(0, ename.IndexOf('['));
+					ret = parent.OwnerDocument.CreateElement(ename);
+					parent.AppendChild(ret);
+					parent = ret;
+				}
+			}
+		}
+		return ret;
+	}
+	private static void WriteElementText(XmlElement parent, string element, string value) {
+		XmlElement node = WriteElement(parent, element);
+		node.InnerText = value;
+	}
+	private static void WriteElementInitialText(XmlElement parent, string element, string value) {
+		XmlElement node = (XmlElement)parent.SelectSingleNode(element);
+		if (node != null)
+			return;
+		node = WriteElement(parent, element);
+		node.InnerText = value;
+	}
+	private static void WriteElementAttribute(XmlElement parent, string element, string attribute, string value) {
+		XmlElement node = WriteElement(parent, element);
+		if (node.GetAttribute(attribute) == value) return;
+		node.SetAttribute(attribute, value);
+	}
+	private static void ClearElement(XmlElement parent, string name) {
+		XmlElement node = (XmlElement)parent.SelectSingleNode(name);
+		if (node != null)
+			parent.RemoveChild(node);
+	}
+	
+	// DOCUMENTATION HELPER FUNCTIONS
+	
+	private static void MakeDocNode(Type type, XmlElement e, bool addremarks) {
+		ParameterInfo[] parameters = null;
+		Type returntype = null;
+		if (IsDelegate(type)) {
+			parameters = type.GetMethod("Invoke").GetParameters();
+			returntype = type.GetMethod("Invoke").ReturnType;
+		}
+		MakeDocNode(parameters, returntype, true, e, addremarks, "T:" + type.FullName);
+	}
+	
+	private static void MakeDocNode(XmlElement root, ParameterInfo[] parameters, Type returntype, bool returnisreturn, bool addremarks, string slashdocsig) {
+		XmlElement e = WriteElement(root, "Docs");
+		MakeDocNode(parameters, returntype, returnisreturn, e, addremarks, slashdocsig);
+	}
+	
+	private static void MakeDocNode(ParameterInfo[] parameters, Type returntype, bool returnisreturn, XmlElement e, bool addremarks, string slashdocname) {
+
+
+		// THIS IS THE LINE
+		WriteElementInitialText(e, "summary", "To be added.");
+
+
+		
+		if (parameters != null) {
+			XmlNode[] paramnodes = new XmlNode[parameters.Length];
+			
+			// Some documentation had param nodes with leading spaces.
+			foreach (XmlElement paramnode in e.SelectNodes("param")){
+				paramnode.SetAttribute("name", paramnode.GetAttribute("name").Trim());
+			}
+			
+			// If a member has only one parameter, we can track changes to
+			// the name of the parameter easily.
+			if (parameters.Length == 1) {
+				int c = e.SelectNodes("param").Count;
+				if (c == 1) {
+					UpdateParameterName (e, (XmlElement) e.SelectSingleNode("param"), parameters[0].Name);
+				} else if (c > 1) {
+					foreach (XmlElement paramnode in e.SelectNodes("param")) {
+						if (paramnode.InnerText.StartsWith("To be added"))
+							paramnode.ParentNode.RemoveChild(paramnode);
+						else
+							UpdateParameterName (e, paramnode, parameters[0].Name);
+					}
+				}
+			}
+
+			bool reinsert = false;
+
+			// Pick out existing and still-valid param nodes, and
+			// create nodes for parameters not in the file.
+			Hashtable seenParams = new Hashtable();
+			for (int pi = 0; pi < parameters.Length; pi++) {
+				ParameterInfo p = parameters[pi];
+				seenParams[p.Name] = pi;
+				
+				paramnodes[pi] = e.SelectSingleNode("param[@name='" + p.Name + "']");
+				if (paramnodes[pi] != null) continue;
+				
+				XmlElement pe = e.OwnerDocument.CreateElement("param");
+				pe.SetAttribute("name", p.Name);
+				pe.InnerText = "To be added.";
+				paramnodes[pi] = pe;
+				reinsert = true;
+			}
+
+			// Remove parameters that no longer exist and check all params are in the right order.
+			int idx = 0;
+			foreach (XmlElement paramnode in e.SelectNodes("param")) {
+				string name = paramnode.GetAttribute("name");
+				if (!seenParams.ContainsKey(name)) {
+					if (!delete && !paramnode.InnerText.StartsWith("To be added")) {
+						Console.Error.Write("The following param node can only be deleted if the --delete option is given: ");
+						Console.Error.WriteLine(paramnode.OuterXml);
+					} else {
+						paramnode.ParentNode.RemoveChild(paramnode);
+					}
+					continue;
+				}
+
+				if ((int)seenParams[name] != idx)
+					reinsert = true;
+				
+				idx++;
+			}
+			
+			// Re-insert the parameter nodes at the top of the doc section.
+			if (reinsert)
+				for (int pi = parameters.Length-1; pi >= 0; pi--)
+					e.PrependChild(paramnodes[pi]);
+		} else {
+			// Clear all existing param nodes
+			foreach (XmlNode paramnode in e.SelectNodes("param")) {
+				if (!delete && !paramnode.InnerText.StartsWith("To be added")) {
+					Console.Error.WriteLine("The following param node can only be deleted if the --delete option is given:");
+					Console.Error.WriteLine(paramnode.OuterXml);
+				} else {
+					paramnode.ParentNode.RemoveChild(paramnode);
+				}
+			}
+		}
+		
+		string retnodename = null;
+		if (returntype != null && returntype != typeof(void)) {
+			retnodename = returnisreturn ? "returns" : "value";
+			string retnodename_other = !returnisreturn ? "returns" : "value";
+			
+			// If it has a returns node instead of a value node, change its name.
+			XmlElement retother = (XmlElement)e.SelectSingleNode(retnodename_other);
+			if (retother != null) {
+				XmlElement retnode = e.OwnerDocument.CreateElement(retnodename);
+				foreach (XmlNode node in retother)
+					retnode.AppendChild(node.CloneNode(true));
+				e.ReplaceChild(retnode, retother);
+			} else {
+				WriteElementInitialText(e, retnodename, "To be added.");
+			}
+		} else {
+			ClearElement(e, "returns");
+			ClearElement(e, "value");
+		}
+
+		if (addremarks)
+			WriteElementInitialText(e, "remarks", "To be added.");
+		
+		if (slashdocs != null && slashdocname != null) {
+			XmlElement elem = (XmlElement)slashdocs.SelectSingleNode("doc/members/member[@name='" + slashdocname + "']");
+			if (elem != null) {
+				XmlElement xsummary = (XmlElement)elem.SelectSingleNode("summary");
+				if (xsummary != null)
+					WriteElementText(e, "summary", xsummary.InnerText);
+
+				XmlElement xremarks = (XmlElement)elem.SelectSingleNode("remarks");
+				if (xremarks != null)
+					WriteElementText(e, "remarks", xremarks.InnerText);
+				else if (xsummary != null)
+					ClearElement(e, "remarks");
+
+				if (retnodename != null) {
+					XmlElement xreturns = (XmlElement)elem.SelectSingleNode(retnodename);
+					if (xreturns != null)
+						WriteElementText(e, retnodename, xreturns.InnerText);
+				}
+				
+				foreach (XmlElement p in elem.SelectNodes("param")) {
+					XmlElement p2 = (XmlElement)e.SelectSingleNode("param[@name='" + p.GetAttribute("name") + "']");
+					if (p2 != null)
+						p2.InnerText = p.InnerText;
+				}
+			}
+		}
+		
+		NormalizeWhitespace(e);
+	}
+
+	private static void UpdateParameterName (XmlElement docs, XmlElement pe, string newName)
+	{
+		string existingName = pe.GetAttribute ("name");
+		pe.SetAttribute ("name", newName);
+		if (existingName == newName)
+			return;
+		foreach (XmlElement paramref in docs.SelectNodes (".//paramref"))
+			if (paramref.GetAttribute ("name").Trim () == existingName)
+				paramref.SetAttribute ("name", newName);
+	}
+
+	private static void NormalizeWhitespace(XmlElement e) {
+		// Remove all text and whitespace nodes from the element so it
+		// is outputted with nice indentation and no blank lines.
+		ArrayList deleteNodes = new ArrayList();
+		foreach (XmlNode n in e)
+			if (n is XmlText || n is XmlWhitespace || n is XmlSignificantWhitespace)
+				deleteNodes.Add(n);
+		foreach (XmlNode n in deleteNodes)
+				n.ParentNode.RemoveChild(n);
+	}
+	
+	private static void MakeAttributes(XmlElement root, ICustomAttributeProvider attributes, bool assemblyAttributes) {
+		object[] at = attributes.GetCustomAttributes(false);
+		if (at.Length == 0) {
+			ClearElement(root, "Attributes");
+			return;
+		}
+
+		bool b = false;
+		XmlElement e = (XmlElement)root.SelectSingleNode("Attributes");
+		if (e != null)
+			e.RemoveAll();
+		else
+			e = root.OwnerDocument.CreateElement("Attributes");
+		
+		foreach (Attribute a in at) {
+			if (GetTypeVisibility(a.GetType().Attributes) == null) continue; // hide non-visible attributes
+			
+			//if (assemblyAttributes && a.GetType().FullName.StartsWith("System.Reflection.")) continue;
+			if (a.GetType().FullName == "System.Reflection.AssemblyKeyFileAttribute" || a.GetType().FullName == "System.Reflection.AssemblyDelaySignAttribute") continue; // hide security-related attributes
+			
+			b = true;
+			
+			// There's no way to reconstruct how the attribute's constructor was called,
+			// so as a substitute, just list the value of all of the attribute's public fields.
+			
+			ArrayList fields = new ArrayList();
+			foreach (PropertyInfo f in a.GetType().GetProperties(BindingFlags.Public|BindingFlags.Instance)) {
+				if (f.Name == "TypeId") continue;
+				
+				object v = f.GetValue(a, null);
+				if (v == null) v = "null";
+				else if (v is string) v = "\"" + v + "\"";
+				else if (v is Type) v = "typeof(" + ((Type)v).FullName + ")";
+				else if (v is Enum) v = v.GetType().FullName + "." + v.ToString().Replace(", ", "|");
+					
+				fields.Add(f.Name + "=" + v);
+			}
+			string a2 = String.Join(", ", (string[])fields.ToArray(typeof(string)));
+			if (a2 != "") a2 = "(" + a2 + ")";
+			
+			XmlElement ae = root.OwnerDocument.CreateElement("Attribute");
+			e.AppendChild(ae);
+			
+			string name = a.GetType().FullName;
+			if (name.EndsWith("Attribute")) name = name.Substring(0, name.Length-"Attribute".Length);
+			WriteElementText(ae, "AttributeName", name + a2);
+		}
+		
+		if (b && e.ParentNode == null)
+			root.AppendChild(e);
+		else if (!b)
+			ClearElement(root, "Attributes");
+		
+		NormalizeWhitespace(e);
+	}
+	
+	private static void MakeParameters(XmlElement root, ParameterInfo[] parameters) {
+		XmlElement e = WriteElement(root, "Parameters");
+		e.RemoveAll();
+		foreach (ParameterInfo p in parameters) {
+			XmlElement pe = root.OwnerDocument.CreateElement("Parameter");
+			e.AppendChild(pe);
+			pe.SetAttribute("Name", p.Name);
+			pe.SetAttribute("Type", p.ParameterType.FullName);
+			if (p.ParameterType.IsByRef) {
+				if (p.IsOut) pe.SetAttribute("RefType", "out");
+				else pe.SetAttribute("RefType", "ref");
+			}
+			MakeAttributes(pe, p, false);
+		}
+	}
+
+	private static void MakeParameters(XmlElement root, MemberInfo mi) {
+		if (mi is ConstructorInfo) MakeParameters(root, ((ConstructorInfo)mi).GetParameters());
+		else if (mi is MethodInfo) MakeParameters(root, ((MethodInfo)mi).GetParameters());
+		else if (mi is PropertyInfo) {
+			ParameterInfo[] parameters = ((PropertyInfo)mi).GetIndexParameters();
+			if (parameters.Length > 0)
+				MakeParameters(root, parameters);
+			else
+				return;
+		}
+		else if (mi is FieldInfo) return;
+		else if (mi is EventInfo) return;
+		else throw new ArgumentException();
+	}
+
+	private static void MakeReturnValue(XmlElement root, Type type, ICustomAttributeProvider attributes) {
+		XmlElement e = WriteElement(root, "ReturnValue");
+		e.RemoveAll();
+		WriteElementText(e, "ReturnType", type.FullName);
+		if (attributes != null)
+			MakeAttributes(root, attributes, false);
+	}
+	
+	private static void MakeReturnValue(XmlElement root, MemberInfo mi) {
+		if (mi is ConstructorInfo) return;
+		else if (mi is MethodInfo) MakeReturnValue(root, ((MethodInfo)mi).ReturnType, ((MethodInfo)mi).ReturnTypeCustomAttributes);
+		else if (mi is PropertyInfo) MakeReturnValue(root, ((PropertyInfo)mi).PropertyType, null);
+		else if (mi is FieldInfo) MakeReturnValue(root, ((FieldInfo)mi).FieldType, null);
+		else if (mi is EventInfo) MakeReturnValue(root, ((EventInfo)mi).EventHandlerType, null);
+		else throw new ArgumentException(mi + " is a " + mi.GetType().FullName);
+	}
+	
+	private static MemberInfo GetInterfaceDefinition(MethodInfo mi) {
+		if (mi.DeclaringType.IsInterface) return null;
+
+		foreach (Type i in mi.DeclaringType.GetInterfaces()) {
+			System.Reflection.InterfaceMapping map = mi.DeclaringType.GetInterfaceMap(i);
+			for (int idx = 0; idx < map.InterfaceMethods.Length; idx++) {
+				if (map.TargetMethods[idx] == mi)
+					return map.InterfaceMethods[idx];
+			}
+		}
+		
+		return null;
+	}
+
+	private static XmlElement MakeMember(XmlDocument doc, MemberInfo mi) {
+		if (mi is Type) return null;
+		
+		string sigs = MakeMemberSignature(mi);
+		if (sigs == null) return null; // not publicly visible
+		
+		// no documentation for property/event accessors.  Is there a better way of doing this?
+		if (mi.Name.StartsWith("get_")) return null;
+		if (mi.Name.StartsWith("set_")) return null;
+		if (mi.Name.StartsWith("add_")) return null;
+		if (mi.Name.StartsWith("remove_")) return null;
+		if (mi.Name.StartsWith("raise_")) return null;
+		
+		XmlElement me = doc.CreateElement("Member");
+		me.SetAttribute("MemberName", mi.Name);
+		
+		UpdateMember(me, mi);
+		
+		return me;
+	}
+	
+	static bool IsDelegate(Type type) {
+		return typeof(System.Delegate).IsAssignableFrom (type) && !type.IsAbstract;
+	}
+	
+	/// SIGNATURE GENERATION FUNCTIONS
+	
+	private static bool InterfaceNotFromAnother(Type i, Type[] i2) {
+		foreach (Type t in i2)
+			if (i != t && Array.IndexOf(t.GetInterfaces(), i) != -1)
+				return false;
+		return true;
+	}
+	
+	static string GetTypeKind (Type t) {
+		if (t.IsEnum) return "enum";
+		if (t.IsClass || t == typeof(System.Enum)) return "class";
+		if (t.IsInterface) return "interface";
+		if (t.IsValueType) return "struct";
+		throw new ArgumentException(t.FullName);
+	}
+
+	static string GetTypeVisibility (TypeAttributes ta) {
+		switch (ta & TypeAttributes.VisibilityMask) {
+		case TypeAttributes.Public:
+		case TypeAttributes.NestedPublic:
+				return "public";
+
+		case TypeAttributes.NestedFamily:
+		case TypeAttributes.NestedFamORAssem:
+				return "protected";
+
+		default:
+				return null;
+		}
+	}
+
+	static string MakeTypeSignature (Type type) {
+		StringBuilder sig = new StringBuilder();
+		
+		string visibility = GetTypeVisibility(type.Attributes);
+		if (visibility == null) return null;
+		sig.Append(visibility);
+		sig.Append(" ");
+
+		if (type.IsAbstract && !type.IsInterface) sig.Append("abstract ");
+		if (type.IsSealed && !IsDelegate(type) && !type.IsValueType) sig.Append("sealed ");
+
+		if (IsDelegate(type)) {
+			sig.Append("delegate ");
+			MethodInfo invoke = type.GetMethod ("Invoke");
+			string arguments = GetMethodParameters(invoke.GetParameters());
+			string return_value = ConvertCTSName(invoke.ReturnType.FullName);
+			sig.Append(return_value);
+			sig.Append(" ");
+			sig.Append(type.Name);
+			sig.Append("(");
+			sig.Append(arguments);
+			sig.Append(");");
+			return sig.ToString();
+		}
+		
+		sig.Append(GetTypeKind(type));
+		sig.Append(" ");
+		sig.Append(type.Name);
+
+		if (!type.IsValueType && !type.IsEnum) {
+			Type basetype = type.BaseType;
+			if (basetype == typeof(object)) // don't show this in signatures
+				basetype = null;
+			
+			ArrayList interface_names = new ArrayList();
+			foreach (Type i in type.GetInterfaces())
+				if ((type.BaseType == null || Array.IndexOf(type.BaseType.GetInterfaces(), i) == -1) && InterfaceNotFromAnother(i, type.GetInterfaces()))
+					interface_names.Add(i.FullName);
+			interface_names.Sort();
+			
+			if (basetype != null || interface_names.Count > 0)
+				sig.Append(" : ");
+			
+			if (basetype != null) {
+				sig.Append(basetype.FullName);
+				if (interface_names.Count > 0)
+					sig.Append(", ");
+			}
+			
+			for (int i = 0; i < interface_names.Count; i++){
+					if (i != 0) sig.Append(", ");
+					sig.Append(interface_names[i]);
+			}
+		}
+
+		return sig.ToString();
+	}
+
+
+	static string GetFieldVisibility (FieldInfo field) {
+		if (field.IsPublic) return "public";
+		if (field.IsFamily) return "protected";
+		return null;
+	}
+
+	static string MakeFieldSignature (FieldInfo field) {
+		if (field.DeclaringType.IsEnum && field.Name == "value__")
+			return null; // This member of enums aren't documented.
+		
+		string visibility = GetFieldVisibility (field);
+		if (visibility == null) return null;
+		if (field.DeclaringType.IsEnum) return field.Name;
+		
+		string type = ConvertCTSName (field.FieldType.FullName);
+		
+		string modifiers = String.Empty;
+		if (field.IsStatic && !field.IsLiteral) modifiers += " static";
+		if (field.IsInitOnly) modifiers += " readonly";
+		if (field.IsLiteral) modifiers += " const";
+		
+		string fieldValue;
+		if (GetFieldConstValue(field, out fieldValue))
+			fieldValue = " = " + fieldValue;
+		else
+			fieldValue = "";
+
+		return String.Format ("{0}{1} {2} {3}{4};",
+						visibility, modifiers, type, field.Name, fieldValue);
+	}
+
+	static string GetMethodVisibility (MethodBase method) {
+		if (method.IsPublic) return "public";
+		if (method.IsFamily) return "protected";
+		return null;
+	}
+
+	static string GetMethodParameters (ParameterInfo[] pi) {
+		if (pi.Length == 0) return "";
+		
+		StringBuilder sb = new StringBuilder ();
+
+		int i = 0;
+		foreach (ParameterInfo parameter in pi) {
+			if (i != 0) sb.Append (", ");
+			if (parameter.ParameterType.IsByRef) {
+				if (parameter.IsOut) sb.Append("out ");
+				else sb.Append("ref ");
+			}
+			string param = parameter.ParameterType.FullName;
+			if (parameter.ParameterType.IsByRef)
+				param = param.Substring (0, param.Length - 1);
+			param = ConvertCTSName(param);			
+			sb.Append (param);
+			sb.Append (" ");
+			sb.Append (parameter.Name);
+			i++;
+		}
+
+		return sb.ToString();
+	}
+
+	static string MakeMethodSignature (MethodInfo method) {
+		string visibility = GetMethodVisibility (method);
+		if (visibility == null)
+				return null;
+		
+		string modifiers = String.Empty;
+		if (method.IsStatic) modifiers += " static";
+		if (method.IsVirtual && !method.IsAbstract) {
+			if ((method.Attributes & MethodAttributes.NewSlot) != 0) modifiers += " virtual";
+			else modifiers += " override";
+		}
+		if (method.IsAbstract && !method.DeclaringType.IsInterface) modifiers += " abstract";
+		if (method.IsFinal) modifiers += " sealed";
+		if (modifiers == " virtual sealed") modifiers = "";
+
+		// Special signature for destructors.
+		if (method.Name == "Finalize" && method.GetParameters().Length == 0)
+			return "~" + method.DeclaringType.Name + " ();";	
+
+		string return_type = ConvertCTSName (method.ReturnType.FullName);
+		string parameters = GetMethodParameters (method.GetParameters());
+
+		string method_name = method.Name;
+		
+		// operators, default accessors need name rewriting
+
+		return String.Format ("{0}{1} {2} {3} ({4});",
+						visibility, modifiers, return_type, method_name, parameters);
+	}
+
+	static string MakeConstructorSignature (ConstructorInfo constructor) {
+		string visibility = GetMethodVisibility (constructor);
+		if (visibility == null)
+			return null;
+
+		string name = constructor.DeclaringType.Name;
+		string parameters = GetMethodParameters (constructor.GetParameters());
+
+		return String.Format ("{0} {1} ({2});",
+						visibility, name, parameters);
+	}
+
+
+	static string MakePropertySignature (PropertyInfo property) {
+		// Check accessibility of get and set, since they can be different these days.
+		string get_visible = null, set_visible = null;
+		MethodBase get_method = property.GetGetMethod (true);
+		MethodBase set_method = property.GetSetMethod (true);
+		if (get_method != null) get_visible = GetMethodVisibility(get_method);
+		if (set_method != null) set_visible = GetMethodVisibility(set_method);
+		if (get_visible == null && set_visible == null) return null; // neither are visible
+		
+		// Pick an accessor to use for static/virtual/override/etc. checks.
+		MethodBase method = property.GetSetMethod (true);
+		if (method == null)
+			method = property.GetGetMethod (true);
+	
+		string modifiers = String.Empty;
+		if (method.IsStatic) modifiers += " static";
+		if (method.IsVirtual && !method.IsAbstract) {
+				if ((method.Attributes & MethodAttributes.NewSlot) != 0) modifiers += " virtual";
+				else modifiers += " override";
+		}
+		if (method.IsAbstract && !method.DeclaringType.IsInterface) modifiers += " abstract";
+		if (method.IsFinal) modifiers += " sealed";
+		if (modifiers == " virtual sealed") modifiers = "";
+	
+		string name = property.Name;
+	
+		string type_name = property.PropertyType.FullName;
+		type_name = ConvertCTSName (type_name);
+		
+		string parameters = GetMethodParameters (property.GetIndexParameters());
+		if (parameters != "") parameters = "[" + parameters + "]";		
+		
+		string visibility;
+		if (get_visible != null && (set_visible == null || (set_visible != null && get_visible == set_visible)))
+			visibility = get_visible;
+		else if (set_visible != null && get_visible == null)
+			visibility = set_visible;
+		else
+			visibility = "public"; // if they are different, but both externally accessible, the greater access must be public, I think
+		
+		string accessors = "{";
+		if (set_visible != null) {
+			if (set_visible != visibility)
+				accessors += " " + set_visible;
+			accessors += " set;";
+		}
+		if (get_visible != null) {
+			if (get_visible != visibility)
+				accessors += " " + get_visible;
+			accessors += " get;";
+		}
+		accessors += " }";
+	
+		return String.Format ("{0}{1} {2} {3}{4} {5};",
+						visibility, modifiers, type_name, name, parameters, accessors);
+	}
+		
+	static string MakeEventSignature (EventInfo ev) {
+		MethodInfo add = ev.GetAddMethod ();
+
+		string visibility = GetMethodVisibility(add);
+		if (visibility == null)
+			return null;
+
+		string modifiers = String.Empty;
+		if (add.IsStatic) modifiers += " static";
+		if (add.IsVirtual && !add.IsAbstract) {
+			if ((add.Attributes & MethodAttributes.NewSlot) != 0) modifiers += " virtual";
+			else modifiers += " override";
+		}
+		if (add.IsAbstract && !ev.DeclaringType.IsInterface) modifiers += " abstract";
+		if (add.IsFinal) modifiers += " sealed";
+		if (modifiers == " virtual sealed") modifiers = "";
+		
+		string name = ev.Name;
+		string type = ConvertCTSName(ev.EventHandlerType.FullName);
+
+		return String.Format ("{0}{1} event {2} {3};",
+						visibility, modifiers, type, name);
+	}
+	
+	static string MakeMemberSignature(MemberInfo mi) {
+		if (mi is ConstructorInfo) return MakeConstructorSignature((ConstructorInfo)mi);
+		if (mi is MethodInfo) return MakeMethodSignature((MethodInfo)mi);
+		if (mi is PropertyInfo) return MakePropertySignature((PropertyInfo)mi);
+		if (mi is FieldInfo) return MakeFieldSignature((FieldInfo)mi);
+		if (mi is EventInfo) return MakeEventSignature((EventInfo)mi);
+		throw new ArgumentException(mi.ToString());
+	}
+
+	static string GetMemberType(MemberInfo mi) {
+		if (mi is ConstructorInfo) return "Constructor";
+		if (mi is MethodInfo) return "Method";
+		if (mi is PropertyInfo) return "Property";
+		if (mi is FieldInfo) return "Field";
+		if (mi is EventInfo) return "Event";
+		throw new ArgumentException();
+	}
+
+	// Converts a fully .NET qualified type name into a C#-looking one
+	static string ConvertCTSName (string type) {
+		if (type.EndsWith ("[]"))
+			return ConvertCTSName(type.Substring(0, type.Length - 2).TrimEnd()) + "[]";
+
+		if (type.EndsWith ("&"))
+			return ConvertCTSName(type.Substring(0, type.Length - 1).TrimEnd()) + "&";
+
+		if (type.EndsWith ("*"))
+			return ConvertCTSName(type.Substring(0, type.Length - 1).TrimEnd()) + "*";
+
+		if (!type.StartsWith ("System."))
+				return type;
+		
+		switch (type) {
+		case "System.Byte": return "byte";
+		case "System.SByte": return "sbyte";
+		case "System.Int16": return "short";
+		case "System.Int32": return "int";
+		case "System.Int64": return "long";
+
+		case "System.UInt16": return "ushort";
+		case "System.UInt32": return "uint";
+		case "System.UInt64": return "ulong";
+
+		case "System.Single":  return "float";
+		case "System.Double":  return "double";
+		case "System.Decimal": return "decimal";
+		case "System.Boolean": return "bool";
+		case "System.Char":    return "char";
+		case "System.Void":    return "void";
+		case "System.String":  return "string";
+		case "System.Object":  return "object";
+		}
+		
+		// Types in the system namespace just get their type name returned.
+		if (type.StartsWith("System.")) {
+			string sysname = type.Substring(7);
+			if (sysname.IndexOf(".") == -1)
+				return sysname;
+		}
+
+		return type;
+	}
+	
+	private static string MakeSlashDocMemberSig(MemberInfo m) {
+		string typename = m.DeclaringType.FullName;
+		string memname = m.Name;
+		
+		if (m is ConstructorInfo)
+			return "C:" + typename + ".#ctor(" + MakeSlashDocMemberSigArgs(((ConstructorInfo)m).GetParameters()) + ")";
+		if (m is MethodInfo)
+			return "M:" + typename + "." + memname + MakeSlashDocMemberSigArgs(((MethodInfo)m).GetParameters()) + MakeSlashDocMemberSigReturn((MethodInfo)m);
+		if (m is PropertyInfo && ((PropertyInfo)m).GetIndexParameters().Length == 0)
+			return "P:" + typename + "." + memname;
+		if (m is PropertyInfo && ((PropertyInfo)m).GetIndexParameters().Length > 0)
+			return "P:" + typename + "." + memname + MakeSlashDocMemberSigArgs(((PropertyInfo)m).GetIndexParameters());
+		if (m is FieldInfo)
+			return "F:" + typename + "." + memname;
+		if (m is EventInfo)
+			return "F:" + typename + "." + memname;
+		throw new ArgumentException();
+	}
+	
+	private static string MakeSlashDocMemberSigReturn(MethodInfo m) {
+		if (m.Name != "op_Implicit" && m.Name != "op_Explicit") return "";
+		return "~" + m.ReturnType.FullName;
+	}
+	
+	private static string MakeSlashDocMemberSigArgs(ParameterInfo[] ps) {
+		string ret = "";
+		foreach (ParameterInfo p in ps) {
+			if (ret != "") ret += ",";
+			ret += p.ParameterType.FullName.Replace("&", "@");
+		}
+		if (ret != "")
+			ret = "(" + ret + ")";
+		return ret;
+	}
+
+}
