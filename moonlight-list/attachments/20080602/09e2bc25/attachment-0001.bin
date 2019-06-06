@@ -1,0 +1,796 @@
+Index: font.h
+===================================================================
+--- font.h	(revision 104345)
++++ font.h	(working copy)
+@@ -118,8 +118,9 @@
+ class TextFont {
+ 	int ref_count;
+ 	
++	cairo_font_face_t *face;
+ 	FcPattern *pattern;
+-	FT_Face face;
++	FT_Face ftface;
+ 	
+ 	double underline_thickness;
+ 	double underline_position;
+@@ -163,6 +164,9 @@
+ 	void Path (cairo_t *cr, GlyphInfo *glyph, double x, double y);
+ 	void Path (cairo_t *cr, gunichar unichar, double x, double y);
+ 	
++	void Render (cairo_t *cr, const cairo_glyph_t *glyphs, int n_glyphs);
++	void Extents (cairo_t *cr, const cairo_glyph_t *glyphs, int n_glyphs, cairo_text_extents_t *extents);
++	
+ 	void Render (cairo_t *cr, GlyphInfo *glyph, double x, double y);
+ 	void Render (cairo_t *cr, gunichar unichar, double x, double y);
+ 	
+Index: text.h
+===================================================================
+--- text.h	(revision 104345)
++++ text.h	(working copy)
+@@ -276,8 +276,8 @@
+ 	TextFontDescription *desc;
+ 	Downloader *downloader;
+ 	
+-	moon_path *path;
+ 	gunichar *text;
++	GArray *glyphs;
+ 	List *attrs;
+ 	Brush *fill;
+ 	int index;
+@@ -289,12 +289,12 @@
+ 	double left;
+ 	double top;
+ 	
++	int origin_y_specified:1;
++	int simulation_none:1;
+ 	int invalid:1;
+ 	int dirty:1;
+-	int origin_y_specified:1;
+-	int simulation_none:1;
+ 	
+-	void Layout ();
++	void Layout (cairo_t *cr);
+ 	void SetIndicesInternal (const char *in);
+ 	
+ 	void DownloaderComplete ();
+Index: font.cpp
+===================================================================
+--- font.cpp	(revision 104345)
++++ font.cpp	(working copy)
+@@ -15,6 +15,7 @@
+ 
+ #include <glib.h>
+ #include <glib/gstdio.h>
++#include <cairo/cairo-ft.h>
+ 
+ #include <string.h>
+ #include <sys/types.h>
+@@ -856,7 +857,7 @@
+ 		delete (FontFamilyInfo *) array->pdata[i];
+ 	g_ptr_array_free (array, true);
+ 	
+-	return FT_New_Face (libft2, file->path, fface->index, &face) == 0;
++	return FT_New_Face (libft2, file->path, fface->index, &ftface) == 0;
+ }
+ 
+ TextFont::TextFont (FcPattern *pattern, const char *family_name, const char *debug_name)
+@@ -918,15 +919,15 @@
+ 			goto fail;
+ 		
+ 		d(fprintf (stderr, "\t* loading font from `%s' (index=%d)... ", filename, id));
+-		if ((err = FT_New_Face (libft2, (const char *) filename, id, &face)) == 0) {
+-			if (!family_name || !face->family_name) {
++		if ((err = FT_New_Face (libft2, (const char *) filename, id, &ftface)) == 0) {
++			if (!family_name || !ftface->family_name) {
+ 				d(fprintf (stderr, "success!\n"));
+ 				break;
+ 			}
+ 			
+ 			// make sure the font family name matches what was requested...
+ 			for (i = 0; families[i]; i++) {
+-				if (!g_ascii_strcasecmp (face->family_name, families[i]))
++				if (!g_ascii_strcasecmp (ftface->family_name, families[i]))
+ 					break;
+ 			}
+ 			
+@@ -936,10 +937,10 @@
+ 			}
+ 			
+ 			d(fprintf (stderr, "no; incorrect family: '%s' does not match '%s'\n",
+-				   face->family_name, family_name));
++				   ftface->family_name, family_name));
+ 			
+-			FT_Done_Face (face);
+-			face = NULL;
++			FT_Done_Face (ftface);
++			ftface = NULL;
+ 		} else {
+ 			d(fprintf (stderr, "failed :(\n"));
+ 		}
+@@ -968,7 +969,7 @@
+ 		}
+ 		
+ 		if (fallback != NULL) {
+-			face = NULL;
++			ftface = NULL;
+ 			break;
+ 		}
+ 		
+@@ -987,7 +988,7 @@
+ 		FcPatternDestroy (fallback);
+ 		family_name = NULL;
+ 		filename = NULL;
+-		face = NULL;
++		ftface = NULL;
+ 	} while (true);
+ 	
+ 	FcPatternDestroy (matched);
+@@ -997,15 +998,17 @@
+ 	if (families)
+ 		g_strfreev (families);
+ 	
+-	if (face != NULL) {
+-		FT_Set_Pixel_Sizes (face, 0, (int) size);
++	if (ftface != NULL) {
++		FT_Set_Pixel_Sizes (ftface, 0, (int) size);
+ 		
++		face = cairo_ft_font_face_create_for_ft_face (ftface, LOAD_FLAGS);
++		
+ 		// calculate underline thickness
+-		thickness = FT_MulFix (face->underline_thickness, face->size->metrics.y_scale);
++		thickness = FT_MulFix (ftface->underline_thickness, ftface->size->metrics.y_scale);
+ 		underline_thickness = ((double) thickness) / (scale * 64);
+ 		
+ 		// calculate underline position
+-		position = FT_MulFix (-face->underline_position, face->size->metrics.y_scale);
++		position = FT_MulFix (-ftface->underline_position, ftface->size->metrics.y_scale);
+ 		underline_position = ((double) position) / (scale * 64) + ((underline_thickness + 1) / 2.0);
+ 		
+ 		if (underline_thickness < 1.0)
+@@ -1039,9 +1042,14 @@
+ 		}
+ 	}
+ 	
+-	if (face)
+-		FT_Done_Face (face);
++	if (face) {
++		cairo_font_face_destroy (face);
++		ftface = NULL;
++	}
+ 	
++	if (ftface)
++		FT_Done_Face (ftface);
++	
+ 	g_hash_table_remove (font_cache, pattern);
+ 	FcPatternDestroy (pattern);
+ }
+@@ -1077,10 +1085,10 @@
+ bool
+ TextFont::IsScalable ()
+ {
+-	if (!face)
++	if (!ftface)
+ 		return false;
+ 	
+-	return FT_IS_SCALABLE (face);
++	return FT_IS_SCALABLE (ftface);
+ }
+ 
+ double
+@@ -1088,10 +1096,10 @@
+ {
+ 	FT_Vector kerning;
+ 	
+-	if (!face || !FT_HAS_KERNING (face) || left == 0 || right == 0)
++	if (!ftface || !FT_HAS_KERNING (ftface) || left == 0 || right == 0)
+ 		return 0.0;
+ 	
+-	FT_Get_Kerning (face, left, right, FT_KERNING_DEFAULT, &kerning);
++	FT_Get_Kerning (ftface, left, right, FT_KERNING_DEFAULT, &kerning);
+ 	
+ 	return (double) kerning.x / (scale * 64);
+ }
+@@ -1099,28 +1107,28 @@
+ double
+ TextFont::Descender ()
+ {
+-	if (!face)
++	if (!ftface)
+ 		return 0.0;
+ 	
+-	return (double) face->size->metrics.descender / (scale * 64);
++	return (double) ftface->size->metrics.descender / (scale * 64);
+ }
+ 
+ double
+ TextFont::Ascender ()
+ {
+-	if (!face)
++	if (!ftface)
+ 		return 0.0;
+ 	
+-	return (double) face->size->metrics.ascender / (scale * 64);
++	return (double) ftface->size->metrics.ascender / (scale * 64);
+ }
+ 
+ double
+ TextFont::Height ()
+ {
+-	if (!face)
++	if (!ftface)
+ 		return 0.0;
+ 	
+-	return (double) face->size->metrics.height / (scale * 64);
++	return (double) ftface->size->metrics.height / (scale * 64);
+ }
+ 
+ static int
+@@ -1279,7 +1287,7 @@
+ 	GlyphInfo *glyph;
+ 	int i;
+ 	
+-	if (!face)
++	if (!ftface)
+ 		return NULL;
+ 	
+ 	for (i = 0; i < nglyphs; i++) {
+@@ -1290,10 +1298,10 @@
+ 		}
+ 	}
+ 	
+-	if (FT_Load_Glyph (face, index, LOAD_FLAGS) != 0)
++	if (FT_Load_Glyph (ftface, index, LOAD_FLAGS) != 0)
+ 		return NULL;
+ 	
+-	if (FT_Render_Glyph (face->glyph, FT_RENDER_MODE_NORMAL) != 0)
++	if (FT_Render_Glyph (ftface->glyph, FT_RENDER_MODE_NORMAL) != 0)
+ 		return NULL;
+ 	
+ 	if (nglyphs == 256) {
+@@ -1323,7 +1331,7 @@
+ 	glyph->requested = 1;
+ 	glyph->path = NULL;
+ 	
+-	if (FT_IS_SCALABLE (face)) {
++	if (FT_IS_SCALABLE (ftface)) {
+ 		FT_Matrix matrix;
+ 		
+ 		// FIXME: can the scale ever overflow the 16.16 Fixed type?
+@@ -1333,23 +1341,23 @@
+ 		matrix.yx = 0;
+ 		
+ 		glyph->path = moon_path_new (8);
+-		FT_Outline_Transform (&face->glyph->outline, &matrix);
+-		FT_Outline_Decompose (&face->glyph->outline, &outline_funcs, glyph->path);
++		FT_Outline_Transform (&ftface->glyph->outline, &matrix);
++		FT_Outline_Decompose (&ftface->glyph->outline, &outline_funcs, glyph->path);
+ 	} else {
+ 		if (glyph->bitmap == NULL)
+ 			glyph->bitmap = g_new (GlyphBitmap, 1);
+ 		
+-		glyph->bitmap->left = face->glyph->bitmap_left;
+-		glyph->bitmap->top = face->glyph->bitmap_top;
+-		prepare_bitmap (glyph, &face->glyph->bitmap);
++		glyph->bitmap->left = ftface->glyph->bitmap_left;
++		glyph->bitmap->top = ftface->glyph->bitmap_top;
++		prepare_bitmap (glyph, &ftface->glyph->bitmap);
+ 	}
+ 	
+-	metrics = &face->glyph->metrics;
++	metrics = &ftface->glyph->metrics;
+ 	
+ 	glyph->metrics.horiBearingX = DOUBLE_FROM_26_6 (metrics->horiBearingX) * scale;
+ 	glyph->metrics.horiBearingY = DOUBLE_FROM_26_6 (metrics->horiBearingY) * scale;
+-	if (face->glyph->format == FT_GLYPH_FORMAT_OUTLINE)
+-		glyph->metrics.horiAdvance = DOUBLE_FROM_16_16 (face->glyph->linearHoriAdvance) * scale;
++	if (ftface->glyph->format == FT_GLYPH_FORMAT_OUTLINE)
++		glyph->metrics.horiAdvance = DOUBLE_FROM_16_16 (ftface->glyph->linearHoriAdvance) * scale;
+ 	else
+ 		glyph->metrics.horiAdvance = DOUBLE_FROM_26_6 (metrics->horiAdvance) * scale;
+ 	glyph->metrics.height = DOUBLE_FROM_26_6 (metrics->height) * scale;
+@@ -1363,10 +1371,10 @@
+ {
+ 	uint32_t index;
+ 	
+-	if (!face)
++	if (!ftface)
+ 		return NULL;
+ 	
+-	index = FT_Get_Char_Index (face, unichar);
++	index = FT_Get_Char_Index (ftface, unichar);
+ 	
+ 	return GetGlyphInfo (unichar, index);
+ }
+@@ -1377,13 +1385,13 @@
+ 	gunichar unichar;
+ 	uint32_t idx;
+ 	
+-	if (!face)
++	if (!ftface)
+ 		return NULL;
+ 	
+ 	if (index != 0) {
+-		unichar = FT_Get_First_Char (face, &idx);
++		unichar = FT_Get_First_Char (ftface, &idx);
+ 		while (idx != index && idx != 0)
+-			unichar = FT_Get_Next_Char (face, unichar, &idx);
++			unichar = FT_Get_Next_Char (ftface, unichar, &idx);
+ 		
+ 		if (idx == 0)
+ 			unichar = 0;
+@@ -1397,10 +1405,10 @@
+ bool
+ TextFont::HasGlyph (gunichar unichar)
+ {
+-	if (!face)
++	if (!ftface)
+ 		return false;
+ 	
+-	return FcFreeTypeCharIndex (face, unichar) != 0;
++	return FcFreeTypeCharIndex (ftface, unichar) != 0;
+ }
+ 
+ double
+@@ -1467,6 +1475,20 @@
+ }
+ 
+ void
++TextFont::Render (cairo_t *cr, const cairo_glyph_t *glyphs, int n_glyphs)
++{
++	cairo_set_font_face (cr, face);
++	cairo_show_glyphs (cr, glyphs, n_glyphs);
++}
++
++void
++TextFont::Extents (cairo_t *cr, const cairo_glyph_t *glyphs, int n_glyphs, cairo_text_extents_t *extents)
++{
++	cairo_set_font_face (cr, face);
++	cairo_glyph_extents (cr, glyphs, n_glyphs, extents);
++}
++
++void
+ TextFont::Path (cairo_t *cr, GlyphInfo *glyph, double x, double y)
+ {
+ 	if (!glyph->path || !(&glyph->path->cairo)->data)
+@@ -1536,7 +1558,6 @@
+ 	AppendPath (path, glyph, x, y);
+ }
+ 
+-
+ TextFontDescription::TextFontDescription ()
+ {
+ 	font = NULL;
+Index: text.cpp
+===================================================================
+--- text.cpp	(revision 104345)
++++ text.cpp	(working copy)
+@@ -1339,8 +1339,8 @@
+ 	downloader = NULL;
+ 	
+ 	fill = NULL;
+-	path = NULL;
+ 	
++	glyphs = g_array_new (false, false, sizeof (cairo_glyph_t));
+ 	attrs = new List ();
+ 	text = NULL;
+ 	index = 0;
+@@ -1354,21 +1354,19 @@
+ 	left = 0.0;
+ 	top = 0.0;
+ 	
++	simulation_none	= true;
+ 	invalid = false;
+ 	dirty = false;
+-	simulation_none	= true;
+ }
+ 
+ Glyphs::~Glyphs ()
+ {
+-	if (path)
+-		moon_path_destroy (path);
+-	
+ 	if (downloader) {
+ 		downloader_abort (downloader);
+ 		downloader->unref ();
+ 	}
+ 	
++	g_array_free (glyphs, TRUE);
+ 	attrs->Clear (true);
+ 	delete attrs;
+ 	
+@@ -1378,14 +1376,19 @@
+ }
+ 
+ void
+-Glyphs::Layout ()
++Glyphs::Layout (cairo_t *cr)
+ {
+ 	uint32_t code_units, glyph_count, i;
+-	bool plot = false, first_char = true;
+-	double right, bottom, x, y, v;
++	cairo_text_extents_t extents;
++	bool first_char = true;
++	double bottom, right;
++	double bottom0, top0;
++	cairo_glyph_t cg;
+ 	GlyphInfo *glyph;
++	double x, y0, y1;
+ 	GlyphAttr *attr;
+ 	TextFont *font;
++	double offset;
+ 	bool cluster;
+ 	double scale;
+ 	int n = 0;
+@@ -1398,11 +1401,8 @@
+ 	left = 0.0;
+ 	top = 0.0;
+ 	
+-	if (path) {
+-		moon_path_destroy (path);
+-		path = NULL;
+-	}
+-
++	g_array_set_size (glyphs, 0);
++	
+ 	// Silverlight only renders for None (other, invalid, values do not render anything)
+ 	if (!simulation_none) {
+ 		invalid = true;
+@@ -1433,17 +1433,20 @@
+ 	left = origin_x;
+ 	x = origin_x;
+ 	
+-	// OriginY is the baseline if specified; set 'y' to the topline
++	// OriginY is the baseline if specified
+ 	if (origin_y_specified) {
+-		y = origin_y - font->Ascender ();
+-		bottom = y + font->Height ();
+-		top = y;
++		top0 = origin_y - font->Ascender ();
++		y0 = origin_y;
+ 	} else {
+-		bottom = font->Height ();
+-		top = 0.0;
+-		y = 0.0;
++		y0 = font->Ascender ();
++		top0 = 0.0;
+ 	}
+ 	
++	bottom0 = top0 + font->Height ();
++	
++	bottom = bottom0;
++	top = top0;
++	
+ 	attr = (GlyphAttr *) attrs->First ();
+ 	
+ 	if (text && text[0]) {
+@@ -1465,7 +1468,6 @@
+ 				cluster = true;
+ 			
+ 			// render the glyph cluster
+-			plot = true;
+ 			i = 0;
+ 			do {
+ 				if (attr && (attr->set & Index)) {
+@@ -1479,30 +1481,33 @@
+ 					glyph = font->GetGlyphInfo (*c);
+ 				}
+ 				
++				y1 = y0;
+ 				if (attr && (attr->set & vOffset)) {
+-					v = (attr->voffset * scale);
+-					bottom = MAX (bottom, y + v + font->Height ());
+-					top = MIN (top, y + v);
+-				}
++					offset = (attr->voffset * scale);
++					bottom = MAX (bottom, bottom0 + offset);
++					top = MIN (top, top0 + offset);
++					y1 += offset;
++				} 
+ 				
+ 				if (attr && (attr->set & uOffset)) {
+-					v = x + (attr->uoffset * scale);
+-					right = MAX (right, x);
+-					left = MIN (left, x);
+-				} else {
+-					if (first_char) {
+-						if (glyph->metrics.horiBearingX < 0)
+-							x -= glyph->metrics.horiBearingX;
+-						
+-						first_char = false;
+-					}
++					offset = (attr->uoffset * scale);
++					left = MIN (left, x + offset);
++					x += offset;
++				} else if (first_char) {
++					if (glyph->metrics.horiBearingX < 0)
++						x -= glyph->metrics.horiBearingX;
+ 					
+-					v = x;
++					first_char = false;
+ 				}
+ 				
+-				v += glyph->metrics.horiAdvance;
+-				right = MAX (right, v);
++				right = MAX (right, x + glyph->metrics.horiAdvance);
+ 				
++				cg.index = glyph->index;
++				cg.y = y1;
++				cg.x = x;
++				
++				g_array_append_val (glyphs, cg);
++				
+ 				if (attr && (attr->set & Advance))
+ 					x += attr->advance * scale;
+ 				else
+@@ -1553,32 +1558,33 @@
+ 		if (!(glyph = font->GetGlyphInfoByIndex (attr->index)))
+ 			goto next;
+ 		
+-		plot = true;
+-		
++		y1 = y0;
+ 		if ((attr->set & vOffset)) {
+-			v = (attr->voffset * scale);
+-			bottom = MAX (bottom, y + v + font->Height ());
+-			top = MIN (top, y + v);
++			offset = (attr->voffset * scale);
++			bottom = MAX (bottom, bottom0 + offset);
++			top = MIN (top, top0 + offset);
++			y1 += offset;
+ 		}
+ 		
+ 		if ((attr->set & uOffset)) {
+-			v = x + (attr->uoffset * scale);
+-			right = MAX (right, x);
+-			left = MIN (left, x);
+-		} else {
+-			if (first_char) {
+-				if (glyph->metrics.horiBearingX < 0)
+-					x -= glyph->metrics.horiBearingX;
+-				
+-				first_char = false;
+-			}
++			offset = (attr->uoffset * scale);
++			left = MIN (left, x + offset);
++			x += offset;
++		} else if (first_char) {
++			if (glyph->metrics.horiBearingX < 0)
++				x -= glyph->metrics.horiBearingX;
+ 			
+-			v = x;
++			first_char = false;
+ 		}
+ 		
+-		v += glyph->metrics.horiAdvance;
+-		right = MAX (right, v);
++		right = MAX (right, x + glyph->metrics.horiAdvance);
+ 		
++		cg.index = glyph->index;
++		cg.y = y1;
++		cg.x = x;
++		
++		g_array_append_val (glyphs, cg);
++		
+ 		if ((attr->set & Advance))
+ 			x += attr->advance * scale;
+ 		else
+@@ -1590,9 +1596,25 @@
+ 		n++;
+ 	}
+ 	
+-	if (plot) {
+-		height = bottom - top;
+-		width = right - left;
++	if (glyphs->len > 0) {
++		// Note: My hand-calculated extents are a little more
++		// conservative than cairo's - we should check which
++		// ones are closer to the Silverlight extents.
++		
++		//height = bottom - top;
++		//width = right - left;
++		//
++		//printf ("my extents = { left=%.2f, top=%.2f, width=%.2f, height=%.2f }\n",
++		//	left, top, width, height);
++		
++		font->Extents (cr, (const cairo_glyph_t *) glyphs->data, glyphs->len, &extents);
++		left = origin_x + extents.x_bearing;
++		top = y0 + extents.y_bearing;
++		height = extents.height;
++		width = extents.width;
++		
++		//printf ("cairo extents = { left=%.2f, top=%.2f, width=%.2f, height=%.2f }\n\n",
++		//	left, top, width, height);
+ 	}
+ 	
+ done:
+@@ -1604,7 +1626,7 @@
+ Glyphs::GetSizeForBrush (cairo_t *cr, double *width, double *height)
+ {
+ 	if (dirty)
+-		Layout ();
++		Layout (cr);
+ 	
+ 	*height = this->height;
+ 	*width = this->width;
+@@ -1630,14 +1652,7 @@
+ void
+ Glyphs::Render (cairo_t *cr, int x, int y, int width, int height)
+ {
+-	uint32_t code_units, glyph_count, i;
+-	bool first_char = true;
+-	GlyphInfo *glyph;
+-	GlyphAttr *attr;
+ 	TextFont *font;
+-	double x0, y0;
+-	double x1, y1;
+-	double scale;
+ 	
+ 	if (this->width == 0.0 && this->height == 0.0)
+ 		return;
+@@ -1652,147 +1667,10 @@
+ 	cairo_set_matrix (cr, &absolute_xform);
+ 	
+ 	fill->SetupBrush (cr, this);
+-	
+-	if (path) {
+-		if (path->cairo.num_data) {
+-			cairo_append_path (cr, &path->cairo);
+-			cairo_fill (cr);
+-		}
+-		
+-		cairo_restore (cr);
+-		return;
+-	}
+-	
+ 	font = desc->GetFont ();
+ 	
+-	// scale Advance, uOffset and vOffset units to pixels
+-	scale = desc->GetSize () * 20.0 / 2048.0;
++	font->Render (cr, (const cairo_glyph_t *) glyphs->data, glyphs->len);
+ 	
+-	x0 = origin_x;
+-	
+-	// OriginY is the baseline if specified
+-	if (!origin_y_specified)
+-		y0 = font->Height () + font->Descender ();
+-	else
+-		y0 = origin_y;
+-	
+-	attr = (GlyphAttr *) attrs->First ();
+-	
+-	if (font->IsScalable ()) {
+-		path = moon_path_new (16);
+-		cairo_new_path (cr);
+-	}
+-	
+-	if (text && text[0]) {
+-		gunichar *c = text;
+-		
+-		while (*c != 0) {
+-			if (attr && (attr->set & Cluster)) {
+-				// get the cluster's GlyphCount and CodeUnitCount
+-				glyph_count = attr->glyph_count;
+-				code_units = attr->code_units;
+-			} else {
+-				glyph_count = 1;
+-				code_units = 1;
+-			}
+-			
+-			// render the glyph cluster
+-			for (i = 0; i < glyph_count; i++) {
+-				if (attr && (attr->set & Index)) {
+-					if (!(glyph = font->GetGlyphInfoByIndex (attr->index)))
+-						goto next1;
+-				} else {
+-					glyph = font->GetGlyphInfo (*c);
+-				}
+-				
+-				if (attr && (attr->set & vOffset))
+-					y1 = y0 - (attr->voffset * scale);
+-				else
+-					y1 = y0;
+-				
+-				if (attr && (attr->set & uOffset)) {
+-					x1 = x0 + (attr->uoffset * scale);
+-				} else {
+-					if (first_char) {
+-						if (glyph->metrics.horiBearingX < 0)
+-							x0 -= glyph->metrics.horiBearingX;
+-						
+-						first_char = false;
+-					}
+-					
+-					x1 = x0;
+-				}
+-				
+-				if (font->IsScalable ()) {
+-					font->AppendPath (path, glyph, x1, y1);
+-					font->Path (cr, glyph, x1, y1);
+-				} else {
+-					font->Render (cr, glyph, x1, y1);
+-				}
+-				
+-				if (attr && (attr->set & Advance))
+-					x0 += attr->advance * scale;
+-				else
+-					x0 += glyph->metrics.horiAdvance;
+-				
+-			next1:
+-				
+-				attr = attr ? (GlyphAttr *) attr->next : NULL;
+-			}
+-			
+-			// consume the code units
+-			for (i = 0; i < code_units && *c != 0; i++)
+-				c++;
+-		}
+-	}
+-	
+-	while (attr) {
+-		if (!(glyph = font->GetGlyphInfoByIndex (attr->index)))
+-			goto next;
+-		
+-		if ((attr->set & vOffset))
+-			y1 = y0 - (attr->voffset * scale);
+-		else
+-			y1 = y0;
+-		
+-		if ((attr->set & uOffset)) {
+-			x1 = x0 + (attr->uoffset * scale);
+-		} else {
+-			if (first_char) {
+-				if (glyph->metrics.horiBearingX < 0)
+-					x0 -= glyph->metrics.horiBearingX;
+-				
+-				first_char = false;
+-			}
+-			
+-			x1 = x0;
+-		}
+-		
+-		if (font->IsScalable ()) {
+-			font->AppendPath (path, glyph, x1, y1);
+-			font->Path (cr, glyph, x1, y1);
+-		} else {
+-			font->Render (cr, glyph, x1, y1);
+-		}
+-		
+-		if ((attr->set & Advance))
+-			x0 += attr->advance * scale;
+-		else
+-			x0 += glyph->metrics.horiAdvance;
+-		
+-	next:
+-		
+-		attr = (GlyphAttr *) attr->next;
+-	}
+-	
+-	if (font->IsScalable ()) {
+-		moon_close_path (path);
+-		cairo_close_path (cr);
+-		
+-		if (path->cairo.num_data)
+-			cairo_fill (cr);
+-	}
+-	
+ 	font->unref ();
+ 	
+ 	cairo_restore (cr);
+@@ -1801,9 +1679,15 @@
+ void 
+ Glyphs::ComputeBounds ()
+ {
+-	if (dirty)
+-		Layout ();
++	cairo_t *cr;
+ 	
++	if (dirty) {
++		cr = measuring_context_create ();
++		cairo_identity_matrix (cr);
++		Layout (cr);
++		measuring_context_destroy (cr);
++	}
++	
+ 	bounds = IntersectBoundsWithClipPath (Rect (left, top, width, height), false).Transform (&absolute_xform);
+ }
+ 

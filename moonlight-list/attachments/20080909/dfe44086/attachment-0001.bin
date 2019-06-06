@@ -1,0 +1,232 @@
+Index: plugin.cpp
+===================================================================
+--- plugin.cpp	(revision 112555)
++++ plugin.cpp	(working copy)
+@@ -340,6 +340,7 @@
+ 	this->instance = instance;
+ 	this->mode = mode;
+ 	this->silverlight2 = strcmp (pluginType, MIME_SILVERLIGHT_2) == 0;
++	mediaplayer = strncmp (pluginType, MIME_SILVERLIGHT_1, sizeof (MIME_SILVERLIGHT_1) - 1) != 0;
+ 	window = NULL;
+ 	
+ 	properties_fps_label = NULL;
+@@ -1227,11 +1228,10 @@
+ 	
+ 	if (object == NULL)
+ 		return NULL;
+-		
+ 	
+ 	string.utf8characters = code;
+ 	string.utf8length = strlen (code);
+-		
++	
+ 	result = NPN_Evaluate (instance, object, &string, &output);
+ 	
+ 	// TODO: Return result to caller.
+@@ -1256,6 +1256,37 @@
+ 		"</TextBlock>" \
+ "</Canvas>"
+ 
++#define MOONLIGHT_MEDIA_PLAYER_XAML \
++	"<Canvas xmlns=\"http://schemas.microsoft.com/client/2007\"\n" \
++	"        xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"\n" \
++	"        x:Name=\"Canvas\" Width=\"400\" Height=\"300\"\n" \
++	"        Loaded=\"OnMoonlightPlayerLoaded\">\n" \
++	"  <MediaElement x:Name=\"Media\" Source=\"%s\" AutoPlay=\"true\" Opacity=\"0.0\" IsHitTestVisible=\"false\"/>\n" \
++	"  <Rectangle x:Name=\"Screen\" Width=\"400\" Height=\"300\">\n" \
++	"    <Rectangle.Fill>\n" \
++	"      <VideoBrush x:Name=\"Brush\" SourceName=\"Media\" Stretch=\"None\"/>\n" \
++	"    </Rectangle.Fill>\n" \
++	"  </Rectangle>\n" \
++	"</Canvas>\n"
++
++#define MOONLIGHT_MEDIA_PLAYER_JS \
++	"function OnMediaPlayerLoaded (sender, args) { " \
++	"    var screen = sender.findName (\"Screen\"); " \
++	"    var media = sender.findName (\"Media\"); " \
++	"    var brush = sender.findName (\"Brush\"); " \
++	"    sender.height = screen.height = media.naturalVideoHeight * 2; " \
++	"    sender.width = screen.width = media.naturalVideoWidth * 2; " \
++	"    brush.stretch = \"Uniform\"; media.play (); " \
++	"}"
++
++static char *
++media_player_xaml (const char *filename)
++{
++	printf ("MediaPlayer Plugin: %s\n", filename);
++	
++	return g_strdup_printf (MOONLIGHT_MEDIA_PLAYER_XAML, filename);
++}
++
+ void
+ PluginInstance::StreamAsFile (NPStream *stream, const char *fname)
+ {
+@@ -1267,32 +1298,43 @@
+ 	if (IS_NOTIFY_SOURCE (stream->notifyData)) {
+ 		if (xaml_loader != NULL)
+ 			delete xaml_loader;
+-	
++		
++		if (IsMediaPlayer ()) {
++			char *xaml = media_player_xaml (source_location);
++			
++			Evaluate (MOONLIGHT_MEDIA_PLAYER_JS);
++			
++			xaml_loader = PluginXamlLoader::FromStr (xaml, this, surface);
++			g_free (xaml);
++			LoadXAML ();
++		} else {
+ #if PLUGIN_SL_2_0
+-		// FIXME horrible hack to test sl2 sites that use the sl1
+-		// mimetype.
+-		if (IsSilverlight2 ()) {
+-			LoadXAP (fname);		
+-		} else if (strstr (stream->url, ".xap")) {
+-			g_warning ("HACK to use sl2 on uris containing .xap engaged");
+-			this->silverlight2 = TRUE;
+-			LoadXAP (fname);		
+-		} else {
++			// FIXME horrible hack to test sl2 sites that use the sl1
++			// mimetype.
++			if (IsSilverlight2 ()) {
++				LoadXAP (fname);
++			} else if (strstr (stream->url, ".xap")) {
++				g_warning ("HACK to use sl2 on uris containing .xap engaged");
++				this->silverlight2 = true;
++				LoadXAP (fname);
++			} else {
++				xaml_loader = PluginXamlLoader::FromFilename (fname, this, surface);
++				LoadXAML ();
++			}
+ #else
+ 			unzFile zf = unzOpen (fname);
+ 			if (zf) {
++				// zipped input source suggests Silverlight 2.0
+ 				unzClose (zf);
+ 				xaml_loader = PluginXamlLoader::FromStr (MOONLIGHT_1_0_LOADING_2_0_ERROR_XAML,
+ 									 this, surface);
++			} else {
++				xaml_loader = PluginXamlLoader::FromFilename (fname, this, surface);
+ 			}
+-			else
++			
++			LoadXAML ();
+ #endif
+-				xaml_loader = PluginXamlLoader::FromFilename (fname, this, surface);
+-	
+-			LoadXAML ();
+-#if PLUGIN_SL_2_0
+ 		}
+-#endif
+ 	} else if (IS_NOTIFY_DOWNLOADER (stream->notifyData)){
+ 		Downloader *dl = (Downloader *) ((StreamNotify *)stream->notifyData)->pdata;
+ 		
+Index: plugin.h
+===================================================================
+--- plugin.h	(revision 112555)
++++ plugin.h	(working copy)
+@@ -101,6 +101,7 @@
+ 				    char **platform, char **userAgent,
+ 				    bool *cookieEnabled);
+ 	bool IsSilverlight2 () { return silverlight2; } 
++	bool IsMediaPlayer () { return mediaplayer; }
+ 	
+ 	static gboolean plugin_button_press_callback (GtkWidget *widget, GdkEventButton *event, gpointer user_data);
+ 	
+@@ -156,6 +157,7 @@
+ 
+ 	bool windowless;
+ 	bool silverlight2;
++	bool mediaplayer;
+ 	int maxFrameRate;
+ 
+ 	BrowserBridge *bridge;
+Index: moonlight.h
+===================================================================
+--- moonlight.h	(revision 112555)
++++ moonlight.h	(working copy)
+@@ -37,6 +37,7 @@
+ 
+ #include "libmoon.h"
+ 
++
+ // Plugin information
+ #define MIME_SILVERLIGHT_1  "application/x-silverlight"
+ #define MIME_SILVERLIGHT_2  "application/x-silverlight-2-b2"
+@@ -46,10 +47,8 @@
+ #define PLUGIN_SUFFIX       "Novell <a href=\"http://www.mono-project.com/Moonlight\">Moonlight</a> " VERSION " is Mono's Free/Open Source implementation of Silverlight."
+ #if PLUGIN_SL_2_0
+ #    define PLUGIN_DESCRIPTION  "2.0.30523.8"
+-#    define MIME_TYPES_HANDLED  MIME_SILVERLIGHT_1 ":scr:Novell Moonlight;" MIME_SILVERLIGHT_2 "::Novell Moonlight"
+ #else
+ #    define PLUGIN_DESCRIPTION  "1.0.30401.0"
+-#    define MIME_TYPES_HANDLED  MIME_SILVERLIGHT_1 ":scr:Novell Moonlight" 
+ #endif
+ 
+ #define MAX_STREAM_SIZE 65536
+Index: plugin-glue.cpp
+===================================================================
+--- plugin-glue.cpp	(revision 112555)
++++ plugin-glue.cpp	(working copy)
+@@ -196,10 +196,60 @@
+ 	return plugin->SetValue (variable, value);
+ }
+ 
++static struct {
++	const char *mime_type;
++	const char *extensions;
++	const char *description;
++} mime_types[] = {
++	{ "application/x-silverlight",      "scr",           "Novell Moonlight"       },
++#if PLUGIN_SL_2_0
++	{ "application/x-silverlight-2-b2", NULL,            "Novell Moonlight"       },
++#endif
++#if 1 //PLUGIN_MEDIA_PLAYER
++	{ "application/x-mplayer2",         "avi, wma, wmv", "AVI Video"              },
++	{ "video/x-ms-asf-plugin",          "asf, wmv",      "ASF Video"              },
++	{ "video/x-msvideo",                "asf, wmv",      "AVI Video"              },
++	{ "video/x-ms-asf",                 "asf",           "ASF Video"              },
++	{ "video/x-ms-wmv",                 "wmv",           "Windows Media Video"    },
++	{ "video/x-wmv",                    "wmv",           "Windows Media Video"    },
++	{ "video/x-ms-wvx",                 "wmv",           "Windows Media Video"    },
++	{ "video/x-ms-wm",                  "wmv",           "Windows Media Video"    },
++	{ "video/x-ms-wmp",                 "wmv",           "Windows Media Video"    },
++	{ "application/x-ms-wms",           "wms",           "Windows Media Video"    },
++	{ "application/x-ms-wmp",           "wmp",           "Windows Media Video"    },
++	{ "application/asx",                "asx",           "Microsoft ASX Playlist" },
++	{ "audio/x-ms-wma",                 "wma",           "Windows Media Audio"    },
++	{ "audio/mpeg",                     "mp3",           "MPEG Audio"             },
++#endif
++};
++
++
+ char *
+ NPP_GetMIMEDescription (void)
+ {
+-	return (char *) (MIME_TYPES_HANDLED);
++	static char *mime = NULL;
++	GString *str;
++	guint i;
++	
++	if (!mime) {
++		str = g_string_new ("");
++		for (i = 0; i < G_N_ELEMENTS (mime_types); i++) {
++			if (i > 0)
++				g_string_append_c (str, ';');
++			
++			g_string_append (str, mime_types[i].mime_type);
++			g_string_append_c (str, ':');
++			if (mime_types[i].extensions)
++				g_string_append (str, mime_types[i].extensions);
++			g_string_append_c (str, ':');
++			g_string_append (str, mime_types[i].description);
++		}
++		
++		mime = str->str;
++		g_string_free (str, false);
++	}
++	
++	return mime;
+ }
+ 
+ static bool gtk_initialized = false;

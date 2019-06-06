@@ -1,0 +1,201 @@
+Index: src/bitmapcache.h
+===================================================================
+--- src/bitmapcache.h	(revision 146380)
++++ src/bitmapcache.h	(working copy)
+@@ -38,9 +38,14 @@
+ 
+ 	double GetRenderAtScale ();
+ 	void SetRenderAtScale (double scale);
++	void SetRenderPattern (cairo_pattern_t *pattern);
++	cairo_pattern_t *GetRenderPattern ();
+ 
+ protected:
+ 	virtual ~BitmapCache ();
++
++private:
++	cairo_pattern_t *bitmapPattern;
+ };
+ 
+ #endif /* __MOONLIGHT_BITMAPCACHE_H__ */
+Index: src/uielement.cpp
+===================================================================
+--- src/uielement.cpp	(revision 146380)
++++ src/uielement.cpp	(working copy)
+@@ -29,6 +29,7 @@
+ #include "resources.h"
+ #include "popup.h"
+ #include "provider.h"
++#include "bitmapcache.h"
+ 
+ //#define DEBUG_INVALIDATE 0
+ #define MIN_FRONT_TO_BACK_COUNT 25
+@@ -1100,6 +1101,7 @@
+ bool
+ UIElement::UseBackToFront ()
+ {
++	if (GetCacheMode ()) return false;
+ 	return VisualTreeWalker (this).GetCount () < MIN_FRONT_TO_BACK_COUNT;
+ }
+ 
+@@ -1116,9 +1118,16 @@
+ 		return;
+ 
+ 	if (!UseBackToFront ()) {
+-		Region *self_region = new Region (surface_region);
+-		self_region->Intersect (GetSubtreeBounds().RoundOut());
++		Region *self_region;
++		BitmapCache *cache_mode = (BitmapCache *) GetCacheMode ();
+ 
++		if (cache_mode && !cache_mode->GetRenderPattern ()) {
++			self_region = new Region (GetSubtreeBounds().RoundOut());
++		} else {
++			self_region = new Region (surface_region);
++			self_region->Intersect (GetSubtreeBounds().RoundOut());
++		}
++
+ 		// we need to include our children in this one, since
+ 		// we'll be rendering them in the PostRender method.
+ 		if (!self_region->IsEmpty())
+@@ -1196,13 +1205,22 @@
+ UIElement::PreRender (cairo_t *cr, Region *region, bool skip_children)
+ {
+ 	double local_opacity = GetOpacity ();
++	CacheMode *cacheMode = GetCacheMode ();
++	bool saveBitmapCache = FALSE;
+ 
++	if (cacheMode && cacheMode->Is (Type::BITMAPCACHE)) {
++		BitmapCache *bitmapCache = (BitmapCache *) cacheMode;
++
++		if (!bitmapCache->GetRenderPattern ())
++			saveBitmapCache = TRUE;
++	}
++
+ 	cairo_save (cr);
+ 
+ 	cairo_set_matrix (cr, &absolute_xform);
+ 	RenderClipPath (cr);
+ 
+-	if (opacityMask || IS_TRANSLUCENT (local_opacity)) {
++	if (opacityMask || IS_TRANSLUCENT (local_opacity) || saveBitmapCache) {
+ 		Rect r = GetSubtreeBounds ().RoundOut();
+ 		cairo_identity_matrix (cr);
+ 
+@@ -1241,18 +1259,55 @@
+ 
+ 	if (opacityMask != NULL)
+ 		cairo_push_group (cr);
++
++	if (saveBitmapCache)
++		cairo_push_group (cr);
+ }
+ 
+ void
+ UIElement::PostRender (cairo_t *cr, Region *region, bool front_to_back)
+ {
++	CacheMode *cacheMode = GetCacheMode ();
++	BitmapCache *bitmapCache = NULL;
++	bool renderChildren = !front_to_back;
++
++	if (cacheMode != NULL && cacheMode->Is (Type::BITMAPCACHE))
++		bitmapCache = (BitmapCache *) cacheMode;
++
++	if (bitmapCache != NULL && bitmapCache->GetRenderPattern () != NULL)
++		renderChildren = FALSE;
++
+ 	// if we didn't render front to back, then render the children here
+-	if (!front_to_back) {
++	if (front_to_back)
++		renderChildren = FALSE;
++
++	if (renderChildren) {
+ 		VisualTreeWalker walker (this, ZForward);
+ 		while (UIElement *child = walker.Step ())
+ 			child->DoRender (cr, region);
+ 	}
+ 
++	if (bitmapCache != NULL && renderChildren)
++		bitmapCache->SetRenderPattern (cairo_pop_group (cr));
++
++	if (bitmapCache != NULL && bitmapCache->GetRenderPattern () != NULL) {
++		Geometry *geometry = LayoutInformation::GetClip ((FrameworkElement *) this);
++		if (geometry) {
++			cairo_matrix_t xform;
++
++			cairo_get_matrix (cr, &xform);
++			cairo_set_matrix (cr, &absolute_xform);
++			cairo_new_path (cr);
++			geometry->Draw (cr);
++			cairo_clip (cr);
++			cairo_set_matrix (cr, &xform);
++		}
++		double scale = bitmapCache->GetRenderAtScale ();
++		cairo_scale (cr, scale, scale);
++		cairo_set_source (cr, bitmapCache->GetRenderPattern ());
++		cairo_paint (cr);
++	}
++
+ 	double local_opacity = GetOpacity ();
+ 
+ 	if (opacityMask != NULL) {
+Index: src/bitmapcache.cpp
+===================================================================
+--- src/bitmapcache.cpp	(revision 146380)
++++ src/bitmapcache.cpp	(working copy)
+@@ -29,8 +29,29 @@
+ BitmapCache::BitmapCache ()
+ {
+ 	SetObjectType (Type::BITMAPCACHE);
++	bitmapPattern = NULL;
+ }
+ 
+ BitmapCache::~BitmapCache ()
+ {
++	if (bitmapPattern)
++		cairo_pattern_destroy (bitmapPattern);
+ }
++
++void
++BitmapCache::SetRenderPattern (cairo_pattern_t *pattern)
++{
++	if (pattern)
++		cairo_pattern_reference (pattern);
++
++	if (bitmapPattern)
++		cairo_pattern_destroy (bitmapPattern);
++
++	bitmapPattern = pattern;
++}
++
++cairo_pattern_t *
++BitmapCache::GetRenderPattern ()
++{
++	return bitmapPattern;
++}
+Index: src/frameworkelement.cpp
+===================================================================
+--- src/frameworkelement.cpp	(revision 146380)
++++ src/frameworkelement.cpp	(working copy)
+@@ -24,6 +24,7 @@
+ #include "collection.h"
+ #include "style.h"
+ #include "validators.h"
++#include "bitmapcache.h"
+ 
+ #define MAX_LAYOUT_PASSES 250
+ 
+@@ -103,7 +104,15 @@
+ 
+ 	while (element) {
+ 		Geometry *geom = LayoutInformation::GetLayoutClip (element);
++		CacheMode *cacheMode = ((UIElement *) element)->GetCacheMode ();
+ 
++		if (cacheMode != NULL && cacheMode->Is (Type::BITMAPCACHE)) {
++			BitmapCache *bitmapCache = (BitmapCache *) cacheMode;
++
++			if (!bitmapCache->GetRenderPattern ())
++				break;
++		}
++
+ 		if (geom) {
+ 			geom->Draw (cr);
+ 			cairo_clip (cr);

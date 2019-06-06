@@ -1,0 +1,244 @@
+Index: downloader.cpp
+===================================================================
+--- downloader.cpp	(revision 123019)
++++ downloader.cpp	(working copy)
+@@ -366,6 +366,9 @@
+ void
+ Downloader::SendInternal ()
+ {
++	const char *cached_filename;
++	const char *uri;
++	
+ 	LOG_DOWNLOADER ("Downloader::SendInternal ()\n");
+ 	
+ 	if (!GetSurface ()) {
+@@ -379,6 +382,23 @@
+ 	
+ 	send_queued = false;
+ 	
++	uri = GetUri ();
++	cached_filename = GetSurface ()->GetDownloaderCache ()->Query (uri);
++
++	LOG_DOWNLOADER ("Downloader::SendInternal (): Cache lookup for '%s' returned: '%s'.\n", uri, cached_filename);
++
++	if (cached_filename != NULL) {
++		if (write == NULL) {
++			LOG_DOWNLOADER ("Downloader::SendInternal (): Cache lookup succeeded, loading cached file '%s'.\n", cached_filename);
++			completed = true;
++			SetFilename (cached_filename);
++			NotifyFinished (NULL);
++			return;
++		} else {
++			LOG_DOWNLOADER ("Downloader::SendInternal (): Cache lookup succeeded, but won't load cache file since a write listener is registered.\n");
++		}
++	}
++
+ 	if (completed) {
+ 		// Consumer is re-sending a request which finished successfully.
+ 		NotifyFinished (NULL);
+@@ -490,7 +510,7 @@
+ void
+ Downloader::SetFilename (const char *fname)
+ {
+-	LOG_DOWNLOADER ("Downloader::SetFilename (%s)\n", fname);
++	LOG_DOWNLOADER ("Downloader::SetFilename (%s) (URI: %s)\n", fname, GetUri ());
+ 	
+ 	if (buffer) {
+ 		g_free (buffer);
+@@ -502,6 +522,10 @@
+ 
+ 	filename = g_strdup (fname);
+ 	((FileDownloader *)internal_dl)->setFilename (filename);
++
++	Surface *surface = GetSurface ();
++	if (surface != NULL)
++		surface->GetDownloaderCache ()->Add (fname, GetUri ());
+ }
+ 
+ void
+@@ -819,7 +843,77 @@
+ 		response->SetDownloaderRequest (NULL);
+ }
+ 
++/*
++ * DownloaderCache
++ */
++
++DownloaderCache::DownloaderCache ()
++{
++	cache = NULL;
++}
++
++DownloaderCache::~DownloaderCache ()
++{
++	if (cache != NULL) {
++		g_hash_table_destroy (cache);
++		cache = NULL;
++	}
++}
++
+ void
++DownloaderCache::Add (const char *filename, const char *uri)
++{
++	Uri u;
++	const char *current;
++	
++	LOG_DOWNLOADER ("DownloaderCache::Add ('%s', '%s').\n", filename, uri);
++
++	if (filename == NULL || uri == NULL)
++		return;
++
++	if (!u.Parse (uri)) {
++		LOG_DOWNLOADER ("DownloaderCache::Add ('%s', '%s'): Failed to parse uri.\n", filename, uri);
++		return;
++	}
++
++	if (u.user != NULL || u.auth != NULL || u.passwd != NULL || u.params != NULL || u.query != NULL || u.fragment != NULL) {
++		LOG_DOWNLOADER ("DownloaderCache::Add ('%s', '%s'): URI not simple enough (user: '%s', auth: '%s', passwd: '%s', params: '%p', query: '%s', fragments: '%s'.\n", 
++			filename, uri, u.user, u.auth, u.passwd, u.params, u.query, u.fragment);
++		return;
++	}
++
++	if (cache == NULL) {
++		cache = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free); 
++	} else {
++		current = (const char *) g_hash_table_lookup (cache, uri);
++		if (current != NULL) {
++			if (strcmp (current, filename) != 0)
++				LOG_DOWNLOADER ("DownloaderCache::Add ('%s', '%s'): There already is a cache entry for this uri ('%s')\n", filename, uri, current);
++			return;
++		}
++	}
++
++	g_hash_table_insert (cache, g_strdup (uri), g_strdup (filename));
++}
++
++const char *
++DownloaderCache::Query (const char *uri)
++{
++	const char *result;
++
++	if (cache == NULL) {
++		// LOG_DOWNLOADER ("DownloaderCache::Query ('%s'): NULL (no cache).\n", uri);
++		return NULL;
++	}
++
++	result = (const char *) g_hash_table_lookup (cache, uri);
++
++	LOG_DOWNLOADER ("DownloaderCache::Query ('%s'): '%s'\n", uri, result);
++
++	return result;
++}
++
++void
+ *downloader_create_webrequest (Downloader *dl, const char *method, const char *uri)
+ {
+ 	return dl->GetRequestFunc() (method, uri, dl->GetContext());
+Index: downloader.h
+===================================================================
+--- downloader.h	(revision 123019)
++++ downloader.h	(working copy)
+@@ -240,6 +240,23 @@
+ 	void SetDownloaderResponse (DownloaderResponse *value) { response = value; }
+ };
+ 
++class DownloaderCache {
++ private:
++	GHashTable *cache;
++
++ public:
++ 	DownloaderCache ();
++ 	~DownloaderCache ();
++
++	// Adds a uri to the cache.
++	// We only cache:
++	// - params=null,query=null,fragment=null,auth=null,passwd=null,user=null
++	// - protocol=http,host=any,port=any,path=any
++	void Add (const char *filename, const char *uri);
++	// Returns null if the uri doesn't exist in the cache
++	const char *Query (const char *uri);
++};
++
+ double downloader_get_download_progress (Downloader *dl);
+ 
+ const char *downloader_get_status_text (Downloader *dl);
+Index: runtime.cpp
+===================================================================
+--- runtime.cpp	(revision 123019)
++++ runtime.cpp	(working copy)
+@@ -269,6 +269,7 @@
+ 	zombie = false;
+ 	downloader_context = NULL;
+ 	downloaders = NULL;
++	downloader_cache = NULL;
+ 	background_color = NULL;
+ 	cursor = MouseCursorDefault;
+ 	mouse_event = NULL;
+@@ -369,6 +370,7 @@
+ 	delete down_dirty;
+ 	
+ 	delete downloaders;
++	delete downloader_cache;
+ 	
+ 	surface_list = g_list_remove (surface_list, this);
+ }
+@@ -1439,6 +1441,14 @@
+ 	downloaders->Clear (true);
+ }
+ 
++DownloaderCache *
++Surface::GetDownloaderCache ()
++{
++	if (downloader_cache == NULL)
++		downloader_cache = new DownloaderCache ();
++	return downloader_cache;
++}
++
+ void
+ Surface::OnDownloaderDestroyed (EventObject *sender, EventArgs *args, gpointer closure)
+ {
+Index: runtime.h
+===================================================================
+--- runtime.h	(revision 123019)
++++ runtime.h	(working copy)
+@@ -209,6 +209,7 @@
+ 	void Zombify ();
+ 	
+ 	void DetachDownloaders ();
++	DownloaderCache *GetDownloaderCache ();
+ 	
+ #if FRONT_TO_BACK_STATS
+ 	int uielements_rendered_front_to_back;
+@@ -268,6 +269,8 @@
+ 	
+ 	gpointer downloader_context;
+ 	List *downloaders;
++	DownloaderCache *downloader_cache;
++	
+ 	static void OnDownloaderDestroyed (EventObject *sender, EventArgs *args, gpointer closure);
+ 	
+ 	Color *background_color;
+Index: value.h
+===================================================================
+--- value.h	(revision 123019)
++++ value.h	(working copy)
+@@ -45,6 +45,7 @@
+ class DependencyProperty;
+ class Surface;
+ class AnimationStorage;
++class DownloaderCache;
+ 
+ class Animation;
+ class AnimationClock;
+Index: value.h.in
+===================================================================
+--- value.h.in	(revision 123019)
++++ value.h.in	(working copy)
+@@ -41,6 +41,7 @@
+ class DependencyProperty;
+ class Surface;
+ class AnimationStorage;
++class DownloaderCache;
+ 
+ /*DO_FWD_DECLS*/
+ 

@@ -1,0 +1,1283 @@
+Index: deepzoomimagetilesource.cpp
+===================================================================
+--- deepzoomimagetilesource.cpp	(revision 131264)
++++ deepzoomimagetilesource.cpp	(working copy)
+@@ -145,7 +145,7 @@
+ DeepZoomImageTileSource::~DeepZoomImageTileSource ()
+ {
+ 	if (downloader) {
+-		downloader_abort (downloader);
++		downloader->Abort ();
+ 		downloader->unref ();
+ 	}		
+ }
+@@ -209,12 +209,14 @@
+ void
+ DeepZoomImageTileSource::DownloaderComplete ()
+ {
+-	const char *filename;
+-
+-	if (!(filename = downloader->getFileDownloader ()->GetDownloadedFile ()))
++	char *filename;
++	
++	if (!(filename = downloader->GetDownloadedFilename (NULL)))
+ 		return;
+-
++	
+ 	Parse (filename);
++	
++	g_free (filename);
+ }
+ 
+ void
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 131264)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2009-04-07  Jeffrey Stedfast  <fejj@novell.com>
++
++	* downloader.cpp (GetDownloadedFilename): Work around the Mozilla
++	64k bug here too.
++
+ 2009-04-07  Geoff Norton  <gnorton@novell.com>
+ 
+ 	* pipeline.cpp|h: Ensure that we can post ReportSeekCompleted back to the
+Index: bitmapimage.cpp
+===================================================================
+--- bitmapimage.cpp	(revision 131264)
++++ bitmapimage.cpp	(working copy)
+@@ -254,7 +254,7 @@
+ 				downloader->Open ("GET", str, MediaPolicy);
+ 				g_free (str);
+ 			}
+-			downloader->SetWriteFunc (pixbuf_write, NULL, this);
++			downloader->SetStreamFunctions (pixbuf_write, NULL, this);
+ 			downloader->Send ();
+ 		}
+ 	}
+Index: pipeline-ui.cpp
+===================================================================
+--- pipeline-ui.cpp	(revision 131264)
++++ pipeline-ui.cpp	(working copy)
+@@ -166,12 +166,11 @@
+ void
+ CodecDownloader::DownloadCompleted (EventObject *sender, EventArgs *args)
+ {
+-	guint64 size;
+-
+ 	gchar *downloaded_file = NULL;
+ 	gchar *codec_path = NULL;
+ 	gchar *codec_dir = NULL;
+ 	int codec_fd = 0;
++	gint64 size;
+ 	
+ 	LOG_UI ("CodecDownloader::DownloadCompleted ()\n");
+ 	
+Index: downloader.cpp
+===================================================================
+--- downloader.cpp	(revision 131264)
++++ downloader.cpp	(working copy)
+@@ -57,14 +57,14 @@
+ // Downloader
+ //
+ 
+-downloader_create_state_func Downloader::create_state = NULL;
+-downloader_destroy_state_func Downloader::destroy_state = NULL;
+-downloader_open_func Downloader::open_func = NULL;
+-downloader_send_func Downloader::send_func = NULL;
+-downloader_abort_func Downloader::abort_func = NULL;
+-downloader_header_func Downloader::header_func = NULL;
+-downloader_body_func Downloader::body_func = NULL;
+-downloader_create_webrequest_func Downloader::request_func = NULL;
++DownloaderCreateStateFunc Downloader::create_state = NULL;
++DownloaderDestroyStateFunc Downloader::destroy_state = NULL;
++DownloaderOpenFunc Downloader::open_func = NULL;
++DownloaderSendFunc Downloader::send_func = NULL;
++DownloaderAbortFunc Downloader::abort_func = NULL;
++DownloaderHeaderFunc Downloader::header_func = NULL;
++DownloaderBodyFunc Downloader::body_func = NULL;
++DownloaderCreateWebRequestFunc Downloader::request_func = NULL;
+ 
+ Downloader::Downloader ()
+ {
+@@ -73,11 +73,11 @@
+ 	SetObjectType (Type::DOWNLOADER);
+ 
+ 	downloader_state = Downloader::create_state (this);
+-	consumer_closure = NULL;
++	user_data = NULL;
+ 	context = NULL;
+ 	streaming_features = HttpStreamingFeaturesNone;
+ 	notify_size = NULL;
+-	this->write = NULL;
++	writer = NULL;
+ 	internal_dl = NULL;
+ 	
+ 	send_queued = false;
+@@ -137,11 +137,42 @@
+ {
+ 	LOG_DOWNLOADER ("Downloader::GetDownloadedFilename (%s)\n", filename);
+ 	
++	// This is a horrible hack to work around mozilla bug #444160
++	// Basically if a very small file is downloaded (<64KB in mozilla as of Jan5/09
++	// it can be inserted into a shared cache map, and served up to us without ever
++	// giving us the filename for a NP_ASFILE request.
++	if (buffer != NULL) {
++		FileDownloader *fdl = (FileDownloader *) internal_dl;
++		char *tmpfile;
++		int fd;
++		
++		tmpfile = g_build_filename (g_get_tmp_dir (), "mozilla-workaround-XXXXXX", NULL);
++		if ((fd = g_mkstemp (tmpfile)) == -1) {
++			g_free (tmpfile);
++			return NULL;
++		}
++		
++		if (write_all (fd, buffer, (size_t) total) == -1) {
++			unlink (tmpfile);
++			g_free (tmpfile);
++			close (fd);
++			return NULL;
++		}
++		
++		close (fd);
++		
++		fdl->SetFilename (tmpfile);
++		fdl->SetUnlink (true);
++		g_free (tmpfile);
++		g_free (buffer);
++		buffer = NULL;
++	}
++	
+ 	return internal_dl->GetDownloadedFilename (partname);
+ }
+ 
+ char *
+-Downloader::GetResponseText (const char *PartName, guint64 *size)
++Downloader::GetResponseText (const char *PartName, gint64 *size)
+ {
+ 	LOG_DOWNLOADER ("Downloader::GetResponseText (%s, %p)\n", PartName, size);
+ 
+@@ -484,14 +515,14 @@
+ 	
+ 	Emit (DownloadProgressChangedEvent);
+ 
+-	if (write)
+-		write (buf, offset, n, consumer_closure);
+-
++	if (writer)
++		writer (buf, offset, n, user_data);
++	
+ 	// This is a horrible hack to work around mozilla bug #444160
+ 	// See Downloader::GetResponseText for an explanation
+-	if (n == total && total < 65536) {
+-		buffer = (char *) g_malloc (total);
+-		memcpy (buffer, buf, total);
++	if (internal_dl->GetType () == InternalDownloader::FileDownloader && n == total && total < 65536) {
++		buffer = (char *) g_malloc ((size_t) total);
++		memcpy (buffer, buf, (size_t) total);
+ 	} 
+ }
+ 
+@@ -500,16 +531,13 @@
+ {
+ 	LOG_DOWNLOADER ("Downloader::SetFilename (%s)\n", fname);
+ 	
+-	if (buffer) {
+-		g_free (buffer);
+-		buffer = NULL;
+-	}
+-
+-	if (filename)
+-		g_free (filename);
+-
++	g_free (filename);
++	g_free (buffer);
++	buffer = NULL;
++	
+ 	filename = g_strdup (fname);
+-	((FileDownloader *)internal_dl)->setFilename (filename);
++	
++	((FileDownloader *)internal_dl)->SetFilename (filename);
+ }
+ 
+ void
+@@ -583,7 +611,7 @@
+ 		return;
+ 	
+ 	if (notify_size)
+-		notify_size (size, consumer_closure);
++		notify_size (size, user_data);
+ }
+ 
+ bool
+@@ -603,26 +631,26 @@
+ }
+ 
+ void
+-Downloader::SetWriteFunc (downloader_write_func write,
+-			  downloader_notify_size_func notify_size,
+-			  gpointer data)
++Downloader::SetStreamFunctions (DownloaderWriteFunc writer,
++				DownloaderNotifySizeFunc downloader_notify_size,
++				gpointer user_data)
+ {
+-	LOG_DOWNLOADER ("Downloader::SetWriteFunc\n");
++	LOG_DOWNLOADER ("Downloader::SetStreamFunctions\n");
+ 	
+-	this->write = write;
+ 	this->notify_size = notify_size;
+-	this->consumer_closure = data;
++	this->writer = writer;
++	this->user_data = user_data;
+ }
+ 
+ void
+-Downloader::SetFunctions (downloader_create_state_func create_state,
+-			  downloader_destroy_state_func destroy_state,
+-			  downloader_open_func open,
+-			  downloader_send_func send,
+-			  downloader_abort_func abort,
+-			  downloader_header_func header,
+-			  downloader_body_func body,
+-			  downloader_create_webrequest_func request,
++Downloader::SetFunctions (DownloaderCreateStateFunc create_state,
++			  DownloaderDestroyStateFunc destroy_state,
++			  DownloaderOpenFunc open,
++			  DownloaderSendFunc send,
++			  DownloaderAbortFunc abort,
++			  DownloaderHeaderFunc header,
++			  DownloaderBodyFunc body,
++			  DownloaderCreateWebRequestFunc request,
+ 			  bool only_if_not_set)
+ {
+ 	LOG_DOWNLOADER ("Downloader::SetFunctions\n");
+@@ -717,77 +745,7 @@
+ 	return value ? value->AsString () : NULL;
+ }
+ 
+-double
+-downloader_get_download_progress (Downloader *dl)
+-{
+-	return dl->GetDownloadProgress ();
+-}
+ 
+-const char *
+-downloader_get_status_text (Downloader *dl)
+-{
+-	return dl->GetStatusText ();
+-}
+-
+-int
+-downloader_get_status (Downloader *dl)
+-{
+-	return dl->GetStatus ();
+-}
+-
+-void
+-downloader_set_uri (Downloader *dl, const char *uri)
+-{
+-	dl->SetUri (uri);
+-}
+-
+-const char *
+-downloader_get_uri (Downloader *dl)
+-{
+-	return dl->GetUri ();
+-}
+-
+-void
+-downloader_abort (Downloader *dl)
+-{
+-	dl->Abort ();
+-}
+-
+-char *
+-downloader_get_response_text (Downloader *dl, const char *PartName, guint64 *size)
+-{
+-	return dl->GetResponseText (PartName, size);
+-}
+-
+-//void
+-//downloader_open (Downloader *dl, const char *verb, const char *uri)
+-//{
+-//	dl->Open (verb, uri);
+-//}
+-
+-void
+-downloader_send (Downloader *dl)
+-{
+-	if (!dl->Completed () && dl->Started ())
+-		downloader_abort (dl);
+-	
+-	dl->Send ();
+-}
+-
+-void
+-downloader_set_functions (downloader_create_state_func create_state,
+-			  downloader_destroy_state_func destroy_state,
+-			  downloader_open_func open,
+-			  downloader_send_func send,
+-			  downloader_abort_func abort, 
+-			  downloader_header_func header,
+-			  downloader_body_func body,
+-			  downloader_create_webrequest_func request)
+-{
+-	Downloader::SetFunctions (create_state, destroy_state,
+-				  open, send, abort, header, body, request, false);
+-}
+-
+ /*
+  * DownloaderRequest / DownloaderResponse
+  */
+@@ -841,8 +799,8 @@
+ 	GetDeployment ()->UnregisterDownloader (this);
+ }
+ 
+-void
+-*downloader_create_webrequest (Downloader *dl, const char *method, const char *uri)
++void *
++downloader_create_webrequest (Downloader *dl, const char *method, const char *uri)
+ {
+ 	return dl->GetRequestFunc() (method, uri, dl->GetContext());
+ }
+@@ -967,6 +925,7 @@
+ }
+ 
+ 
++#if 0
+ const char *
+ downloader_deobfuscate_font (Downloader *downloader, const char *path)
+ {
+@@ -1018,3 +977,4 @@
+ 	
+ 	return downloader->getFileDownloader ()->GetDownloadedFile ();
+ }
++#endif
+Index: glyphs.cpp
+===================================================================
+--- glyphs.cpp	(revision 131264)
++++ glyphs.cpp	(working copy)
+@@ -476,15 +476,18 @@
+ void
+ Glyphs::DownloaderComplete ()
+ {
+-	const char *filename, *path;
++	char guid[16], *filename;
++	const char *path;
+ 	struct stat st;
+ 	
+ 	/* the download was aborted */
+-	if (!(filename = downloader->getFileDownloader ()->GetDownloadedFile ()))
++	if (!(filename = downloader->GetDownloadedFilename (NULL)))
+ 		return;
+ 	
+-	if (stat (filename, &st) == -1 || !S_ISREG (st.st_mode))
++	if (stat (filename, &st) == -1 || !S_ISREG (st.st_mode)) {
++		g_free (filename);
+ 		return;
++	}
+ 	
+ 	if (!downloader->getFileDownloader ()->IsDeobfuscated ()) {
+ 		if ((path = downloader_deobfuscate_font (downloader, filename)))
+Index: internal-downloader.h
+===================================================================
+--- internal-downloader.h	(revision 131264)
++++ internal-downloader.h	(working copy)
+@@ -14,8 +14,6 @@
+ #ifndef __INTERNAL_DOWNLOADER_H__
+ #define __INTERNAL_DOWNLOADER_H__
+ 
+-#include <stdint.h>
+-
+ class Downloader;
+ 
+ class InternalDownloader {
+@@ -39,9 +37,9 @@
+ 
+ 	virtual void Open (const char *verb, const char *uri) = 0;
+ 	virtual void Write (void *buf, gint32 offset, gint32 n) = 0;
+-	virtual char *GetResponseText (const char *partname, guint64 *size) = 0; 
++	virtual char *GetResponseText (const char *partname, gint64 *size) = 0; 
+ 	virtual char *GetDownloadedFilename (const char *partname) = 0;
+ 	virtual DownloaderType GetType () = 0;
+ };
+ 
+-#endif
++#endif /* __INTERNAL_DOWNLOADER_H__ */
+Index: mms-downloader.h
+===================================================================
+--- mms-downloader.h	(revision 131264)
++++ mms-downloader.h	(working copy)
+@@ -113,10 +113,10 @@
+ 	MmsDownloader (Downloader *dl);
+ 	virtual ~MmsDownloader ();
+ 
+-	void Open (const char *verb, const char *uri);
+-	void Write (void *buf, gint32 offset, gint32 n);
+-	char *GetDownloadedFilename (const char *partname);
+-	char *GetResponseText (const char *partname, guint64 *size);
++	virtual void Open (const char *verb, const char *uri);
++	virtual void Write (void *buf, gint32 offset, gint32 n);
++	virtual char *GetDownloadedFilename (const char *partname);
++	virtual char *GetResponseText (const char *partname, gint64 *size);
+ 	virtual InternalDownloader::DownloaderType GetType () { return InternalDownloader::MmsDownloader; }
+ 
+ 	ASFParser *GetASFParser () { return parser; }
+@@ -126,4 +126,4 @@
+ 	guint64 GetRequestedPts ();
+ };
+ 
+-#endif
++#endif /* __MMS_DOWNLOADER_H__ */
+Index: downloader.h
+===================================================================
+--- downloader.h	(revision 131264)
++++ downloader.h	(working copy)
+@@ -26,17 +26,17 @@
+ class FileDownloader;
+ class Downloader;
+ 
+-typedef void     (*downloader_write_func) (void *buf, gint32 offset, gint32 n, gpointer cb_data);
+-typedef void     (*downloader_notify_size_func) (gint64 size, gpointer cb_data);
++typedef void     (* DownloaderWriteFunc) (void *buf, gint32 offset, gint32 n, gpointer cb_data);
++typedef void     (* DownloaderNotifySizeFunc) (gint64 size, gpointer cb_data);
+ 
+-typedef gpointer (*downloader_create_state_func) (Downloader *dl);
+-typedef void     (*downloader_destroy_state_func) (gpointer state);
+-typedef void     (*downloader_open_func) (const char *verb, const char *uri, bool streaming, gpointer state);
+-typedef void     (*downloader_send_func) (gpointer state);
+-typedef void     (*downloader_abort_func) (gpointer state);
+-typedef void     (*downloader_header_func) (gpointer state, const char *header, const char *value);
+-typedef void     (*downloader_body_func) (gpointer state, void *body, guint32 length);
+-typedef gpointer (*downloader_create_webrequest_func) (const char *method, const char *uri, gpointer context);
++typedef gpointer (* DownloaderCreateStateFunc) (Downloader *dl);
++typedef void     (* DownloaderDestroyStateFunc) (gpointer state);
++typedef void     (* DownloaderOpenFunc) (const char *verb, const char *uri, bool streaming, gpointer state);
++typedef void     (* DownloaderSendFunc) (gpointer state);
++typedef void     (* DownloaderAbortFunc) (gpointer state);
++typedef void     (* DownloaderHeaderFunc) (gpointer state, const char *header, const char *value);
++typedef void     (* DownloaderBodyFunc) (gpointer state, void *body, guint32 length);
++typedef gpointer (* DownloaderCreateWebRequestFunc) (const char *method, const char *uri, gpointer context);
+ 
+ enum DownloaderAccessPolicy {
+ 	DownloaderPolicy,
+@@ -49,19 +49,19 @@
+ /* @Namespace=None */
+ /* @ManagedDependencyProperties=None */
+ class Downloader : public DependencyObject {
+-	static downloader_create_state_func create_state;
+-	static downloader_destroy_state_func destroy_state;
+-	static downloader_open_func open_func;
+-	static downloader_send_func send_func;
+-	static downloader_abort_func abort_func;
+-	static downloader_header_func header_func;
+-	static downloader_body_func body_func;
+-	static downloader_create_webrequest_func request_func;
++	static DownloaderCreateStateFunc create_state;
++	static DownloaderDestroyStateFunc destroy_state;
++	static DownloaderOpenFunc open_func;
++	static DownloaderSendFunc send_func;
++	static DownloaderAbortFunc abort_func;
++	static DownloaderHeaderFunc header_func;
++	static DownloaderBodyFunc body_func;
++	static DownloaderCreateWebRequestFunc request_func;
+ 
+ 	// Set by the consumer
+-	downloader_notify_size_func notify_size;
+-	downloader_write_func write;
+-	gpointer consumer_closure;
++	DownloaderNotifySizeFunc notify_size;
++	DownloaderWriteFunc writer;
++	gpointer user_data;
+ 	
+ 	// Set by the supplier.
+ 	gpointer downloader_state;
+@@ -76,10 +76,12 @@
+ 	char *buffer;
+ 	
+ 	char *failed_msg;
+-	bool send_queued;
+-	bool started;
+-	bool aborted;
+-	bool completed;
++	
++	int send_queued:1;
++	int completed:1;
++	int started:1;
++	int aborted:1;
++	
+ 	InternalDownloader *internal_dl;
+ 
+ 	DownloaderAccessPolicy access_policy;
+@@ -112,7 +114,8 @@
+ 	Downloader ();
+ 	
+ 	void Abort ();
+-	char *GetResponseText (const char *Partname, guint64 *size);
++	char *GetResponseText (const char *Partname, gint64 *size);
++	char *GetDownloadedFilename (const char *partname);
+ 	void Open (const char *verb, const char *uri, DownloaderAccessPolicy policy);
+ 	void SendInternal ();
+ 	void Send ();
+@@ -132,7 +135,6 @@
+ 	void NotifyFinished (const char *final_uri);
+ 	void NotifyFailed (const char *msg);
+ 	void NotifySize (gint64 size);
+-	char *GetDownloadedFilename (const char *partname);
+ 	void SetFilename (const char *fname);
+ 	char *GetBuffer () { return buffer; }
+ 	gint64 GetSize () { return total; }
+@@ -141,20 +143,21 @@
+ 	
+ 	// This is called by the consumer of the downloaded data (the
+ 	// Image class for instance)
+-	void SetWriteFunc (downloader_write_func write,
+-			   downloader_notify_size_func notify_size,
+-			   gpointer closure);
++	void SetStreamFunctions (DownloaderWriteFunc writer,
++				 DownloaderNotifySizeFunc notify_size,
++				 gpointer user_data);
+ 	
+ 	// This is called by the supplier of the downloaded data (the
+ 	// managed framework, the browser plugin, the demo test)
+-	static void SetFunctions (downloader_create_state_func create_state,
+-				  downloader_destroy_state_func destroy_state,
+-				  downloader_open_func open,
+-				  downloader_send_func send,
+-				  downloader_abort_func abort,
+-				  downloader_header_func header,
+-				  downloader_body_func body,
+-			          downloader_create_webrequest_func request,
++	
++	static void SetFunctions (DownloaderCreateStateFunc create_state,
++				  DownloaderDestroyStateFunc destroy_state,
++				  DownloaderOpenFunc open,
++				  DownloaderSendFunc send,
++				  DownloaderAbortFunc abort,
++				  DownloaderHeaderFunc header,
++				  DownloaderBodyFunc body,
++			          DownloaderCreateWebRequestFunc request,
+ 				  bool only_if_not_set);
+ 		
+ 	bool Started ();
+@@ -167,7 +170,7 @@
+ 	gpointer GetDownloaderState () { return downloader_state; }
+ 	void     SetHttpStreamingFeatures (HttpStreamingFeatures features) { streaming_features = features; }
+ 	HttpStreamingFeatures GetHttpStreamingFeatures () { return streaming_features; }
+-	downloader_create_webrequest_func GetRequestFunc () {return request_func; }
++	DownloaderCreateWebRequestFunc GetRequestFunc () {return request_func; }
+ 
+ 	//
+ 	// Property Accessors
+@@ -180,18 +183,15 @@
+ 	
+ 	void SetUri (const char *uri);
+ 	const char *GetUri ();
+-
+-	// FIXME: This is exposed for text right now and should be cleaned up.
+-	FileDownloader *getFileDownloader () { return (FileDownloader *) internal_dl; }
+ };
+ 
+ class DownloaderResponse;
+ class DownloaderRequest;
+ 
+-typedef uint32_t (* DownloaderResponseStartedHandler) (DownloaderResponse *response, gpointer context);
+-typedef uint32_t (* DownloaderResponseDataAvailableHandler) (DownloaderResponse *response, gpointer context, char *buffer, uint32_t length);
+-typedef uint32_t (* DownloaderResponseFinishedHandler) (DownloaderResponse *response, gpointer context, bool success, gpointer data, const char *uri);
+-typedef void (*DownloaderResponseHeaderVisitorCallback) (const char *header, const char *value);
++typedef guint32 (* DownloaderResponseStartedHandler) (DownloaderResponse *response, gpointer context);
++typedef guint32 (* DownloaderResponseDataAvailableHandler) (DownloaderResponse *response, gpointer context, char *buffer, guint32 length);
++typedef guint32 (* DownloaderResponseFinishedHandler) (DownloaderResponse *response, gpointer context, bool success, gpointer data, const char *uri);
++typedef void (* DownloaderResponseHeaderVisitorCallback) (const char *header, const char *value);
+ 
+ class IDownloader {
+  private:
+@@ -259,52 +259,12 @@
+ 
+ G_BEGIN_DECLS
+ 
+-double downloader_get_download_progress (Downloader *dl);
++void downloader_init (void);
+ 
+-const char *downloader_get_status_text (Downloader *dl);
+-int downloader_get_status (Downloader *dl);
+-
+-void downloader_set_uri (Downloader *dl, const char *uri);
+-const char *downloader_get_uri (Downloader *dl);
+-
+-Surface *downloader_get_surface    (Downloader *dl);
+-
+-
+-void  downloader_abort	       (Downloader *dl);
+-char *downloader_get_downloaded_file (Downloader *dl);
+-char *downloader_get_response_text   (Downloader *dl, const char *PartName, guint64 *size);
+-char *downloader_get_response_file   (Downloader *dl, const char *PartName);
+-//void  downloader_open		(Downloader *dl, const char *verb, const char *uri);
+-void  downloader_send		(Downloader *dl);
+-
+ //
+ // Used to push data to the consumer
+ //
+ 
+-/* @GeneratePInvoke */
+-void downloader_write		(Downloader *dl, void *buf, gint32 offset, gint32 n);
+-void downloader_completed       (Downloader *dl, const char *filename);
+-
+-/* @GeneratePInvoke */
+-void downloader_notify_size     (Downloader *dl, gint64 size);
+-/* @GeneratePInvoke */
+-void downloader_notify_finished (Downloader *dl, const char *filename);
+-/* @GeneratePInvoke */
+-void downloader_notify_error    (Downloader *dl, const char *msg);
+-
+-
+-/* @GeneratePInvoke */
+-void downloader_set_functions (downloader_create_state_func create_state,
+-			       downloader_destroy_state_func destroy_state,
+-			       downloader_open_func open,
+-			       downloader_send_func send,
+-			       downloader_abort_func abort,
+-			       downloader_header_func header,
+-			       downloader_body_func body,
+-			       downloader_create_webrequest_func request);
+-
+-void downloader_init (void);
+-
+ void *downloader_create_webrequest (Downloader *dl, const char *method, const char *uri);
+ 
+ bool downloader_request_get_response (DownloaderRequest *dr, DownloaderResponseStartedHandler started, DownloaderResponseDataAvailableHandler available, DownloaderResponseFinishedHandler finished, gpointer context);
+@@ -314,6 +274,8 @@
+ 
+ void downloader_response_set_header_visitor (DownloaderResponse *dr, DownloaderResponseHeaderVisitorCallback visitor);
+ 
++
++// FIXME: get rid of this
+ const char *downloader_deobfuscate_font (Downloader *downloader, const char *path);
+ 
+ G_END_DECLS
+Index: font.cpp
+===================================================================
+--- font.cpp	(revision 131264)
++++ font.cpp	(working copy)
+@@ -17,6 +17,7 @@
+ #include <glib.h>
+ #include <glib/gstdio.h>
+ 
++#include <stdio.h>
+ #include <string.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+@@ -36,6 +37,15 @@
+ #include FT_OUTLINE_H
+ 
+ 
++
++// TODO:
++//
++// 1. Figure out how to register a new key/value pair on an FcPattern (for GUID key)
++//
++// 2. Add API for TextFontDescription for setting a GUID
++//
++// 3. Set the GUID key on the FcPattern(s)
++
+ #define FONT_FACE_SIZE 41.0
+ 
+ #define DOUBLE_TO_26_6(d) ((FT_F26Dot6)((d) * 64.0))
+@@ -67,11 +77,119 @@
+ 	int slant;
+ };
+ 
++
++struct FontStream {
++	bool obfuscated;
++	char guid[16];
++	FILE *fp;
++};
++
++static void
++font_stream_set_guid (FT_Stream stream, const char *guid)
++{
++	FontStream *fs = (FontStream *) stream->descriptor.pointer;
++	
++	if (guid) {
++		memcpy (fs->guid, guid, 16);
++		fs->obfuscated = true;
++	} else {
++		fs->obfuscated = false;
++	}
++}
++
++static const char *
++font_stream_get_uid (FT_Stream stream)
++{
++	FontStream *fs = (FontStream *) stream->descriptor.pointer;
++	
++	if (fs->obfuscated)
++		return fs->guid;
++	
++	return NULL;
++}
++
++static unsigned long
++font_stream_read (FT_Stream stream, unsigned long offset, unsigned char *buffer, unsigned long count)
++{
++	FontStream *fs = (FontStream *) stream->descriptor.pointer;
++	size_t nread;
++	
++	if (fseek (fs->fp, (long) offset, SEEK_SET) == -1)
++		return 0;
++	
++	if (count == 0 || count == (unsigned long) ~0)
++		return 0;
++	
++	nread = fread (buffer, 1, count, fs->fp);
++	
++	if (offset < 32 && nread > 0 && fs->obfuscated) {
++		/* obfuscated font... need to deobfuscate */
++		unsigned long i = offset;
++		unsigned long j = 0;
++		
++		for ( ; i < 32 && j < nread; i++, j++)
++			buffer[j] = buffer[j] ^ fs->guid[i % 16];
++	}
++	
++	return nread;
++}
++
++static void
++font_stream_close (FT_Stream stream)
++{
++	FontStream *fs = (FontStream *) stream->descriptor.pointer;
++	
++	if (fs->fp != NULL) {
++		fclose (fs->fp);
++		fs->fp = NULL;
++	}
++}
++
++static FT_Stream
++font_stream_new (const char *filename, const char *guid)
++{
++	FT_Stream stream;
++	FontStream *fs;
++	FILE *fp;
++	
++	if (!(fp = fopen (filename, "r")))
++		return NULL;
++	
++	fs = (FileStream *) g_malloc (sizeof (FontStream));
++	fs->obfuscated = guid != NULL;
++	if (fs->obfuscated)
++		memcpy (fs->guid, guid, 16);
++	fs->fp = fp;
++	
++	stream = (FT_Stream *) g_malloc0 (sizeof (FT_Stream));
++	stream->close = font_stream_close;
++	stream->read = font_stream_read;
++	stream->descriptor.pointer = fs;
++	
++	fseek (fp, 0, SEEK_END);
++	stream->size = ftell (fp);
++	fseek (fp, 0, SEEK_SET);
++	
++	return stream;
++}
++
++static void
++font_stream_destroy (FT_Stream stream)
++{
++	FontStream *fs = (FontStream *) stream->descriptor.pointer;
++	
++	FT_Stream_Close (stream);
++	g_free (stream);
++	g_free (fs);
++}
++
++
+ struct FontFile : public List::Node {
+ 	GPtrArray *faces;
+ 	char *path;
++	char *guid;
+ 	
+-	FontFile (const char *path);
++	FontFile (const char *path, const char *guid);
+ 	~FontFile ();
+ };
+ 
+@@ -108,7 +226,7 @@
+ 		g_free (key);
+ 	}
+ 	
+-	void CacheFileInfo (const char *filename, FT_Face face);
++	void CacheFileInfo (const char *filename, FT_Open_Args *args, FT_Face face);
+ };
+ 
+ GHashTable *FontFace::cache = NULL;
+@@ -506,8 +624,15 @@
+ 	this->file = file;
+ }
+ 
+-FontFile::FontFile (const char *path)
++FontFile::FontFile (const char *path, const char *guid)
+ {
++	if (guid) {
++		this->guid = (char *) g_malloc (16);
++		memcpy (this->guid, guid, 16);
++	} else {
++		this->guid = NULL;
++	}
++	
+ 	this->path = g_strdup (path);
+ 	faces = NULL;
+ }
+@@ -524,20 +649,22 @@
+ 		
+ 		g_ptr_array_free (faces, true);
+ 	}
++	
++	g_free (guid);
+ }
+ 
+ void
+-FontDir::CacheFileInfo (const char *filename, FT_Face face)
++FontDir::CacheFileInfo (const char *filename, FT_Open_Args *args, FT_Face face)
+ {
+ 	int i = 0, nfaces = face->num_faces;
+ 	FontFileFace *fface;
+ 	FontFile *file;
+ 	
+-	file = new FontFile (filename);
++	file = new FontFile (filename, font_stream_get_guid (args->stream));
+ 	file->faces = g_ptr_array_new ();
+ 	
+ 	do {
+-		if (i > 0 && FT_New_Face (libft2, filename, i, &face) != 0)
++		if (i > 0 && FT_Open_Face (libft2, args, i, &face) != 0)
+ 			break;
+ 		
+ 		LOG_FONT (stderr, "\t\t* caching font info for `%s'...\n", filename);
+@@ -545,6 +672,9 @@
+ 		g_ptr_array_add (file->faces, fface);
+ 		
+ 		FT_Done_Face (face);
++		
++		FT_Stream_Seek (args->stream, 0);
++		
+ 		i++;
+ 	} while (i < nfaces);
+ 	
+@@ -552,7 +682,7 @@
+ }
+ 
+ bool
+-DecodeObfuscatedFontGUID (const char *in, char *key)
++DecodeObfuscatedFontGUID (const char *in, char *guid)
+ {
+ 	const char *inptr = in;
+ 	int i = 16;
+@@ -564,22 +694,22 @@
+ 		i--;
+ 		
+ 		if (*inptr >= '0' && *inptr <= '9')
+-			key[i] = (*inptr - '0') * 16;
++			guid[i] = (*inptr - '0') * 16;
+ 		else if (*inptr >= 'a' && *inptr <= 'f')
+-			key[i] = ((*inptr - 'a') + 10) * 16;
++			guid[i] = ((*inptr - 'a') + 10) * 16;
+ 		else if (*inptr >= 'A' && *inptr <= 'F')
+-			key[i] = ((*inptr - 'A') + 10) * 16;
++			guid[i] = ((*inptr - 'A') + 10) * 16;
+ 		else
+ 			return false;
+ 		
+ 		inptr++;
+ 		
+ 		if (*inptr >= '0' && *inptr <= '9')
+-			key[i] += (*inptr - '0');
++			guid[i] += (*inptr - '0');
+ 		else if (*inptr >= 'a' && *inptr <= 'f')
+-			key[i] += ((*inptr - 'a') + 10);
++			guid[i] += ((*inptr - 'a') + 10);
+ 		else if (*inptr >= 'A' && *inptr <= 'F')
+-			key[i] += ((*inptr - 'A') + 10);
++			guid[i] += ((*inptr - 'A') + 10);
+ 		else
+ 			return false;
+ 		
+@@ -592,6 +722,7 @@
+ 	return true;
+ }
+ 
++#if 0
+ bool
+ DeobfuscateFontFileWithGUID (const char *filename, const char *guid, FT_Face *pFace)
+ {
+@@ -645,12 +776,14 @@
+ 	
+ 	return false;
+ }
++#endif
+ 
+ static bool
+ IndexFontSubdirectory (const char *toplevel, GString *path, FontDir **out)
+ {
+ 	FontDir *fontdir = *out;
+ 	struct dirent *dent;
++	FT_Open_Args args;
+ 	struct stat st;
+ 	FT_Face face;
+ 	size_t len;
+@@ -662,6 +795,9 @@
+ 	g_string_append_c (path, G_DIR_SEPARATOR);
+ 	len = path->len;
+ 	
++	memset (&args, 0, sizeof (FT_Open_Args));
++	args.flags = FT_OPEN_STREAM;
++	
+ 	while ((dent = readdir (dir))) {
+ 		if (!strcmp (dent->d_name, "..") ||
+ 		    !strcmp (dent->d_name, "."))
+@@ -677,23 +813,34 @@
+ 			goto next;
+ 		}
+ 		
+-		if (FT_New_Face (libft2, path->str, 0, &face) != 0) {
++		args.stream = font_stream_new (path->str, NULL);
++		
++		if (FT_Open_Face (libft2, &args, 0, &face) != 0) {
+ 			// not a valid font file... is it maybe an obfuscated font?
+ 			char guid[16];
+ 			
+ 			if (!DecodeObfuscatedFontGUID (dent->d_name, guid))
+ 				goto next;
+ 			
+-			if (!DeobfuscateFontFileWithGUID (path->str, guid, &face))
++			font_stream_set_guid (args.stream, guid);
++			FT_Stream_Seek (args.stream, 0);
++			
++			if (FT_Open_Face (libft2, &args, 0, &face) != 0) {
++				FT_Stream_Close (args.stream);
++				g_free (args.stream);
+ 				goto next;
++			}
+ 		}
+ 		
+ 		if (fontdir == NULL)
+ 			fontdir = new FontDir (toplevel);
+ 		
+ 		// cache font info
+-		fontdir->CacheFileInfo (path->str, face);
++		fontdir->CacheFileInfo (path->str, &args, face);
+ 		
++		FT_Stream_Close (args.stream);
++		g_free (args.stream);
++		
+ 	 next:
+ 		g_string_truncate (path, len);
+ 	}
+@@ -868,6 +1015,7 @@
+ 	FontFamilyInfo *family;
+ 	FontStyleInfo style;
+ 	FontFileFace *fface;
++	FT_Open_Args args;
+ 	GPtrArray *array;
+ 	FontFile *file;
+ 	FontDir *dir;
+@@ -985,16 +1133,27 @@
+ 		delete (FontFamilyInfo *) array->pdata[i];
+ 	g_ptr_array_free (array, true);
+ 	
+-	return FT_New_Face (libft2, file->path, fface->index, face) == 0;
++	memset (&args, 0, sizeof (FT_Open_Args));
++	args.stream = font_stream_new (file->path, file->guid);
++	args.flags = FT_OPEN_STREAM;
++	
++	if (FT_Open_Face (libft2, &args, fface->index, face) == 0)
++		return true;
++	
++	FT_Stream_Close (args.stream);
++	g_free (args.stream);
++	
++	return false;
+ }
+ 
+ bool
+ FontFace::LoadFontFace (FT_Face *face, FcPattern *pattern, const char **families)
+ {
+ 	FcPattern *matched = NULL, *fallback = NULL;
+-	FcChar8 *filename = NULL;
++	FcChar8 *filename = NULL, *guid = NULL;
+ 	bool try_nofile = false;
+ 	FT_Face ftface = NULL;
++	FT_Open_Args args;
+ 	FcResult result;
+ 	FT_Error err;
+ 	int index, i;
+@@ -1025,6 +1184,9 @@
+ 		matched = pattern;
+ 	}
+ 	
++	memset (&args, 0, sizeof (FT_Open_Args));
++	args.flags = FT_OPEN_STREAM;
++	
+ 	do {
+ 		if (FcPatternGetString (matched, FC_FILE, 0, &filename) != FcResultMatch)
+ 			goto fail;
+@@ -1032,8 +1194,13 @@
+ 		if (FcPatternGetInteger (matched, FC_INDEX, 0, &index) != FcResultMatch)
+ 			goto fail;
+ 		
++		if (FcPatternGetString (matched, GUID, 0, &guid) != FcResultMatch)
++			guid = NULL;
++		
++		args.stream = font_stream_new ((const char *) filename, (const char *) guid);
++		
+ 		LOG_FONT (stderr, "\t* loading font from `%s' (index=%d)... ", filename, index);
+-		if ((err = FT_New_Face (libft2, (const char *) filename, index, &ftface)) == 0) {
++		if ((err = FT_Open_Face (libft2, &args, index, &ftface)) == 0) {
+ 			if (FT_IS_SCALABLE (ftface)) {
+ 				if (!families || !ftface->family_name) {
+ 					LOG_FONT (stderr, "success!\n");
+@@ -1138,11 +1305,18 @@
+ 
+ FontFace::~FontFace ()
+ {
++	FT_Stream stream;
++	
+ 	g_hash_table_remove (FontFace::cache, pattern);
+ 	FcPatternDestroy (pattern);
+ 	
+-	if (face && own_face)
++	if (face && own_face) {
++		stream = face->stream;
+ 		FT_Done_Face (face);
++		
++		FT_Stream_Close (stream);
++		g_free (stream);
++	}
+ }
+ 
+ static FT_Face default_face;
+Index: utils.h
+===================================================================
+--- utils.h	(revision 131264)
++++ utils.h	(working copy)
+@@ -71,6 +71,8 @@
+ 
+ int CopyFileTo (const char *filename, int fd);
+ 
++ssize_t write_all (int fd, char *buf, size_t len);
++
+ cairo_t *measuring_context_create (void);
+ void     measuring_context_destroy (cairo_t *cr);
+ 
+Index: font.h
+===================================================================
+--- font.h	(revision 131264)
++++ font.h	(working copy)
+@@ -46,8 +46,8 @@
+ void font_init (void);
+ void font_shutdown (void);
+ 
+-bool DecodeObfuscatedFontGUID (const char *in, char *key);
+-bool DeobfuscateFontFileWithGUID (const char *filename, const char *guid, FT_Face *pFace);
++bool DecodeObfuscatedFontGUID (const char *in, char *guid);
++//bool DeobfuscateFontFileWithGUID (const char *filename, const char *guid, FT_Face *pFace);
+ G_END_DECLS
+ 
+ struct GlyphBitmap;
+Index: file-downloader.h
+===================================================================
+--- file-downloader.h	(revision 131264)
++++ file-downloader.h	(working copy)
+@@ -21,15 +21,13 @@
+ 
+ class FileDownloader : public InternalDownloader {
+  private:
+-	char *uri;
+ 	char *filename;
+ 	char *unzipdir;
++	char *uri;
+ 	
+ 	bool deobfuscated;
+ 	bool unlinkit;
+ 	bool unzipped;
+-
+-	InternalDownloader *internal_dl;
+ 	
+ 	bool DownloadedFileIsZipped ();
+ 	void CleanupUnzipDir ();
+@@ -37,11 +35,11 @@
+  public:
+ 	FileDownloader (Downloader *dl);
+ 	virtual ~FileDownloader ();
+-
+-	void Open (const char *verb, const char *uri);
+-	void Write (void *buf, gint32 offset, gint32 n);
+-	char *GetDownloadedFilename (const char *partname);
+-	char *GetResponseText (const char *partname, guint64 *size);
++	
++	virtual void Open (const char *verb, const char *uri);
++	virtual void Write (void *buf, gint32 offset, gint32 n);
++	virtual char *GetDownloadedFilename (const char *partname);
++	virtual char *GetResponseText (const char *partname, gint64 *size);
+ 	virtual InternalDownloader::DownloaderType GetType () { return InternalDownloader::FileDownloader; }
+ 	
+ 	const char *GetDownloadedFile ();
+@@ -52,7 +50,8 @@
+ 
+ 	const char *GetUnzippedPath ();
+ 
+-	void setFilename (char *fname) { if (filename) g_free (filename); filename = g_strdup (fname); }
++	void SetFilename (char *fname) { g_free (filename); filename = g_strdup (fname); }
++	void SetUnlink (bool value) { unlinkit = value; }
+ };
+ 
+-#endif
++#endif /* __FILE_DOWNLOADER_H__ */
+Index: mms-downloader.cpp
+===================================================================
+--- mms-downloader.cpp	(revision 131264)
++++ mms-downloader.cpp	(working copy)
+@@ -200,7 +200,7 @@
+ }
+ 
+ char *
+-MmsDownloader::GetResponseText (const char *partname, guint64 *size)
++MmsDownloader::GetResponseText (const char *partname, gint64 *size)
+ {
+ 	LOG_MMS ("MmsDownloader::GetResponseText ('%s', %p)\n", partname, size);
+ 	return NULL;
+Index: textblock.cpp
+===================================================================
+--- textblock.cpp	(revision 131264)
++++ textblock.cpp	(working copy)
+@@ -318,11 +318,15 @@
+ Size
+ TextBlock::MeasureOverride (Size availableSize)
+ {
++	const char *text = layout->GetText ();
+ 	Thickness padding = *GetPadding ();
+ 	Size constraint;
+ 	Size desired;
+ 	
+-	//printf ("TextBlock::MeasureOverride(availableSize = { %f, %f })\n", availableSize.width, availableSize.height);
++	if (text && (!strcmp (text, "751 items") || !strncmp (text, "Use your mouse wheel to", 23))) {
++		printf ("\nTextBlock::MeasureOverride(availableSize = { %f, %f })\n", availableSize.width, availableSize.height);
++		printf ("\tText = \"%s\";\n", text);
++	}
+ 	
+ 	constraint = availableSize.GrowBy (-padding);
+ 	Layout (constraint);
+@@ -331,25 +335,37 @@
+ 	SetActualWidth (actual_width);
+ 	
+ 	desired = Size (actual_width, actual_height).GrowBy (padding);
++	desired = desired.Min (availableSize);
+ 	
+-	return desired.Min (availableSize);
++	if (text && (!strcmp (text, "751 items") || !strncmp (text, "Use your mouse wheel", 20)))
++		printf ("\treturn { %f, %f };\n", desired.width, desired.height);
++	
++	return desired;
+ }
+ 
+ Size
+ TextBlock::ArrangeOverride (Size finalSize)
+ {
++	const char *text = layout->GetText ();
+ 	Thickness padding = *GetPadding ();
+ 	Size constraint;
+ 	Size arranged;
+ 	
+-	//printf ("TextBlock::ArrangeOverride(finalSize = { %f, %f })\n", finalSize.width, finalSize.height);
++	if (text && (!strcmp (text, "751 items") || !strncmp (text, "Use your mouse wheel to", 23))) {
++		printf ("\nTextBlock::ArrangeOverride(finalSize = { %f, %f })\n", finalSize.width, finalSize.height);
++		printf ("\tText = \"%s\";\n", text);
++	}
+ 	
+ 	constraint = finalSize.GrowBy (-padding);
+ 	Layout (constraint);
+ 	
+ 	arranged = Size (actual_width, actual_height).GrowBy (padding);
++	arranged = arranged.Max (finalSize);
+ 	
+-	return arranged.Max (finalSize);
++	if (text && (!strcmp (text, "751 items") || !strncmp (text, "Use your mouse wheel", 20)))
++		printf ("\treturn { %f, %f };\n", arranged.width, arranged.height);
++	
++	return arranged;
+ }
+ 
+ void
+@@ -417,6 +433,8 @@
+ void
+ TextBlock::Layout (Size constraint)
+ {
++	const char *text = layout->GetText ();
++	
+ 	if (was_set && !GetValueNoDefault (TextBlock::TextProperty)) {
+ 		// FIXME: Does this only apply if the Text is set to
+ 		// String.Empty?  If so, then TextLayout::Layout()
+@@ -443,7 +461,8 @@
+ 		layout->GetActualExtents (&actual_width, &actual_height);
+ 	}
+ 	
+-	//printf ("TextBlock::Layout(constraint = { %f, %f }) => %f, %f\n", constraint.width, constraint.height, actual_width, actual_height);
++	if (text && (!strcmp (text, "751 items") || !strncmp (text, "Use your mouse wheel to", 23)))
++		printf ("\tTextBlock::Layout(constraint = { %f, %f }) => %f, %f\n", constraint.width, constraint.height, actual_width, actual_height);
+ 	
+ 	dirty = false;
+ }
+Index: frameworkelement.cpp
+===================================================================
+--- frameworkelement.cpp	(revision 131264)
++++ frameworkelement.cpp	(working copy)
+@@ -119,6 +119,7 @@
+ 			ClearValue (FrameworkElement::ActualHeightProperty);
+ 			ClearValue (FrameworkElement::ActualWidthProperty);
+ 		} else {
++			// FIXME: this breaks TextBlock's ActualWidth/Height in the TextBlockTest.cs:ComputeActualWidth() test
+ 			Size actual (GetMinWidth (), GetMinHeight ());
+ 			actual = actual.Max (GetWidth (), GetHeight ());
+ 			actual = actual.Min (GetMaxWidth (), GetMaxHeight ());
+Index: file-downloader.cpp
+===================================================================
+--- file-downloader.cpp	(revision 131264)
++++ file-downloader.cpp	(working copy)
+@@ -32,7 +32,11 @@
+ {
+ 	filename = NULL;
+ 	unzipdir = NULL;
++	uri = NULL;
++	
++	deobfuscated = false;
+ 	unzipped = false;
++	unlinkit = false;
+ }
+ 
+ FileDownloader::~FileDownloader ()
+@@ -75,7 +79,7 @@
+ }
+ 
+ char *
+-FileDownloader::GetResponseText (const char *partname, guint64 *size)
++FileDownloader::GetResponseText (const char *partname, gint64 *size)
+ {
+ 	TextStream *stream;
+ 	char buffer[4096];
+Index: utils.cpp
+===================================================================
+--- utils.cpp	(revision 131264)
++++ utils.cpp	(working copy)
+@@ -230,7 +230,7 @@
+ 	array->pdata[index] = item;
+ }
+ 
+-static ssize_t
++ssize_t
+ write_all (int fd, char *buf, size_t len)
+ {
+ 	size_t nwritten = 0;

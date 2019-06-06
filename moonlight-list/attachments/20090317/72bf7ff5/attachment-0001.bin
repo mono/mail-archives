@@ -1,0 +1,318 @@
+Index: src/deployment.h
+===================================================================
+--- src/deployment.h	(revision 129149)
++++ src/deployment.h	(working copy)
+@@ -91,8 +91,10 @@
+ 	/* @GenerateCBinding,GeneratePInvoke */
+ 	static void SetCurrent (Deployment* value);
+ 	static void SetCurrent (Deployment* value, bool domain);
+-
+-	static bool Initialize ();
++	
++	static bool InitializeDesktop ();
++	static bool InitializeBrowser ();
++	
+ 	static void RegisterThread (Deployment *deployment);
+ 
+ 	void UnrefDelayed (EventObject *obj);
+@@ -100,7 +102,10 @@
+ 	void TrackObjectCreated (EventObject *obj);
+ 	void TrackObjectDestroyed (EventObject *obj);
+ 
+-private:	
++private:
++	Deployment (MonoDomain *domain);
++	static bool Initialize (MonoDomain *root);
++	
+ 	void AbortAllDownloaders ();
+ 	void DrainUnrefs ();
+ 	static gboolean DrainUnrefs (gpointer ptr);
+@@ -124,7 +129,8 @@
+ 	pthread_mutex_t objects_alive_mutex;
+ 	void ReportLeaks ();
+ #endif
+-
++	
++	static Deployment *desktop_deployment;
+ 	static GHashTable *current_hash;
+ 	static gboolean initialized;
+ 	static pthread_key_t tls_key;
+Index: src/runtime.h
+===================================================================
+--- src/runtime.h	(revision 129149)
++++ src/runtime.h	(working copy)
+@@ -405,10 +405,10 @@
+ 
+ G_BEGIN_DECLS
+ 
+-void     runtime_init (guint64 flags);
++void     runtime_init (guint64 flags, gboolean browser);
+ 
+-void     runtime_init_browser ();
+-void     runtime_init_desktop ();
++void     runtime_init_browser (void);
++void     runtime_init_desktop (void);
+ 
+ GList   *runtime_get_surface_list (void);
+ 
+Index: src/deployment.cpp
+===================================================================
+--- src/deployment.cpp	(revision 129149)
++++ src/deployment.cpp	(working copy)
+@@ -39,18 +39,54 @@
+ pthread_mutex_t Deployment::hash_mutex;
+ GHashTable* Deployment::current_hash = NULL;
+ MonoDomain* Deployment::root_domain = NULL;
++Deployment *Deployment::desktop_deployment = NULL;
+ 
+ class IDownloaderNode : public List::Node {
+ public:
+ 	IDownloader *dl;
+ 	IDownloaderNode (IDownloader *dl) { this->dl = dl; }
+ };
+- 
++
+ bool
+-Deployment::Initialize()
++Deployment::Initialize (MonoDomain *root)
+ {
++	initialized = true;
++	
++	current_hash = g_hash_table_new (g_direct_hash, g_direct_equal);
++	pthread_key_create (&tls_key, NULL);
++	pthread_mutex_init (&hash_mutex, NULL);
++	root_domain = root;
++	
++	enable_vm_stack_trace ();
++	
++	LOG_DEPLOYMENT ("Deployment::Initialize (): Using root domain: %p\n", root_domain);
++	
++	return true;
++}
++
++bool
++Deployment::InitializeDesktop ()
++{
++	MonoDomain *cur_domain = mono_domain_get ();
++	
++	if (initialized)
++		return true;
++	
++	if (!Initialize (cur_domain))
++		return false;
++	
++	Deployment::desktop_deployment = new Deployment (cur_domain);
++	Deployment::SetCurrent (Deployment::desktop_deployment);
++	
++	return true;
++}
++
++bool
++Deployment::InitializeBrowser ()
++{
+ 	const gchar *trace_options;
+ 	const gchar *moon_path;
++	MonoDomain *root;
+ 	
+ 	if (initialized)
+ 		return true;
+@@ -60,10 +96,10 @@
+ #endif
+ 
+ 	mono_config_parse (NULL);
+-
++	
+ 	if (g_getenv ("MOON_SECURITY") != NULL)
+ 		mono_security_enable_core_clr ();
+-
++	
+ 	trace_options = g_getenv ("MOON_TRACE");
+ 	if (trace_options != NULL){
+ 		printf ("Setting trace options to: %s\n", trace_options);
+@@ -78,18 +114,10 @@
+ 	
+ 	mono_set_signal_chaining (true);
+ 	mono_debug_init (MONO_DEBUG_FORMAT_MONO);
+-	root_domain = mono_jit_init_version ("Moonlight Root Domain", "moonlight");
+-
+-	initialized = true;
+-	current_hash = g_hash_table_new (g_direct_hash, g_direct_equal);
+-	pthread_key_create (&tls_key, NULL);
+-	pthread_mutex_init (&hash_mutex, NULL);
+-
+-	enable_vm_stack_trace ();
+-
+-	LOG_DEPLOYMENT ("Deployment::Initialize (): Created root domain: %p\n", root_domain);
+ 	
+-	return true;
++	root = mono_jit_init_version ("Moonlight Root Domain", "moonlight");
++	
++	return Initialize (root);
+ }
+ 
+ void
+@@ -169,6 +197,33 @@
+ 	pthread_setspecific (tls_key, deployment);
+ }
+ 
++Deployment::Deployment (MonoDomain *domain)
++	: DependencyObject (this, Type::DEPLOYMENT)
++{
++	this->domain = domain;
++	current_app = NULL;
++	types = NULL;
++	downloaders = NULL;
++	pending_unrefs = NULL;
++	objects_created = 0;
++	objects_destroyed = 0;
++	
++#if OBJECT_TRACKING
++	objects_alive = NULL;
++	pthread_mutex_init (&objects_alive_mutex, NULL);
++#endif
++	
++	pthread_setspecific (tls_key, this);
++	
++	pthread_mutex_lock (&hash_mutex);
++	g_hash_table_insert (current_hash, domain, this);
++	pthread_mutex_unlock (&hash_mutex);
++
++	types = new Types ();
++	types->Initialize ();
++	downloaders = new List ();
++}
++
+ Deployment::Deployment()
+ 	: DependencyObject (this, Type::DEPLOYMENT)
+ {
+@@ -240,8 +295,10 @@
+ 	pthread_mutex_unlock (&hash_mutex);
+ 
+ 	mono_domain_set (root_domain, FALSE);
+-	mono_domain_unload (domain);
+-
++	
++	if (domain != root_domain)
++		mono_domain_unload (domain);
++	
+ 	LOG_DEPLOYMENT ("Deployment::~Deployment (): %p\n", this);
+ 
+ #if SANITY
+Index: src/runtime.cpp
+===================================================================
+--- src/runtime.cpp	(revision 129149)
++++ src/runtime.cpp	(working copy)
+@@ -69,6 +69,7 @@
+ static bool inited = false;
+ static bool g_type_inited = false;
+ static GList* surface_list = NULL;
++static Application *desktop_app = NULL;
+ guint64 moonlight_flags = 0;
+ #if DEBUG
+ guint64 debug_flags = 0;
+@@ -1896,15 +1897,15 @@
+ }
+ 
+ void
+-runtime_init_browser ()
++runtime_init_browser (void)
+ {
+-	runtime_init (RUNTIME_INIT_BROWSER);
++	runtime_init (RUNTIME_INIT_BROWSER, true);
+ }
+ 
+ void
+-runtime_init_desktop ()
++runtime_init_desktop (void)
+ {
+-	runtime_init (RUNTIME_INIT_DESKTOP);
++	runtime_init (RUNTIME_INIT_DESKTOP, false);
+ }
+ 
+ static gint64
+@@ -1960,15 +1961,15 @@
+ }
+ 
+ void
+-runtime_init (guint64 flags)
++runtime_init (guint64 flags, gboolean browser)
+ {
+ 
+ 	if (inited)
+ 		return;
+ 
+-	if (cairo_version () < CAIRO_VERSION_ENCODE(1,4,0)) {
++	if (cairo_version () < CAIRO_VERSION_ENCODE(1,8,0)) {
+ 		printf ("*** WARNING ***\n");
+-		printf ("*** Cairo versions < 1.4.0 should not be used for Moon.\n");
++		printf ("*** Cairo versions < 1.8.0 should not be used for Moon.\n");
+ 		printf ("*** Moon is being run against version %s.\n", cairo_version_string ());
+ 		printf ("*** Proceed at your own risk\n");
+ 	}
+@@ -1993,7 +1994,14 @@
+ 	
+ 	moonlight_flags = flags;
+ 	
+-	Deployment::Initialize ();
++	if (!browser) {
++		Deployment::InitializeDesktop ();
++		desktop_app = new Application ();
++		Application::SetCurrent (desktop_app);
++	} else {
++		Deployment::InitializeBrowser ();
++	}
++	
+ 	xaml_init ();
+ 	font_init ();
+ 	downloader_init ();
+@@ -2005,7 +2013,10 @@
+ {
+ 	if (!inited)
+ 		return;
+-
++	
++	if (desktop_app)
++		desktop_app->unref ();
++	
+ 	Media::Shutdown ();
+ 	
+ 	font_shutdown ();
+Index: src/type-generated.cpp
+===================================================================
+--- src/type-generated.cpp	(revision 129149)
++++ src/type-generated.cpp	(working copy)
+@@ -304,7 +304,7 @@
+ 	types [(int) Type::MARKERSTREAM] = new Type (Type::MARKERSTREAM, Type::IMEDIASTREAM, false, "MarkerStream", "MARKERSTREAM", 0, 2, NULL, NULL, NULL);
+ 	types [(int) Type::MATRIX] = new Type (Type::MATRIX, Type::DEPENDENCY_OBJECT, false, "Matrix", "MATRIX", 0, 1, NULL, (create_inst_func *) matrix_new, NULL);
+ 	types [(int) Type::MATRIXTRANSFORM] = new Type (Type::MATRIXTRANSFORM, Type::TRANSFORM, false, "MatrixTransform", "MATRIXTRANSFORM", 0, 1, NULL, (create_inst_func *) matrix_transform_new, NULL);
+-	types [(int) Type::MEDIA] = new Type (Type::MEDIA, Type::EVENTOBJECT, false, "Media", "MEDIA", 8, 9, Media_Events, NULL, NULL);
++	types [(int) Type::MEDIA] = new Type (Type::MEDIA, Type::IMEDIAOBJECT, false, "Media", "MEDIA", 8, 9, Media_Events, NULL, NULL);
+ 	types [(int) Type::MEDIAATTRIBUTE] = new Type (Type::MEDIAATTRIBUTE, Type::DEPENDENCY_OBJECT, false, "MediaAttribute", "MEDIAATTRIBUTE", 0, 1, NULL, (create_inst_func *) media_attribute_new, NULL);
+ 	types [(int) Type::MEDIAATTRIBUTE_COLLECTION] = new Type (Type::MEDIAATTRIBUTE_COLLECTION, Type::DEPENDENCY_OBJECT_COLLECTION, false, "MediaAttributeCollection", "MEDIAATTRIBUTE_COLLECTION", 0, 3, NULL, (create_inst_func *) media_attribute_collection_new, NULL);
+ 	types [(int) Type::MEDIABASE] = new Type (Type::MEDIABASE, Type::FRAMEWORKELEMENT, false, "MediaBase", "MEDIABASE", 1, 17, MediaBase_Events, (create_inst_func *) media_base_new, NULL);
+Index: test/2.0/TextBoxExample/Page.xaml
+===================================================================
+--- test/2.0/TextBoxExample/Page.xaml	(revision 129149)
++++ test/2.0/TextBoxExample/Page.xaml	(working copy)
+@@ -3,7 +3,7 @@
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="800" Height="600">
+ 
+-  <TextBox Canvas.Left="5" Canvas.Top="5" x:Name="txtTextBox" Width="640" Height="480" MaxLength="255"
++  <TextBox Canvas.Left="5" Canvas.Top="5" x:Name="txtTextBox" Width="640" Height="480" MaxLength="0" TextAlignment="Left" TextWrapping="Wrap"
+    AcceptsReturn="true" HorizontalScrollBarVisibility="Visible" VerticalScrollBarVisibility="Visible"/>
+   <TextBlock Canvas.Left="650" Canvas.Top="5" x:Name="txtTextBlock" Width="640" Height="480" 
+    TextWrapping="NoWrap" Text="This is a TextBlock mirror of the TextBox content"/>
+Index: class/System.Windows/Mono/NativeMethods.cs
+===================================================================
+--- class/System.Windows/Mono/NativeMethods.cs	(revision 129149)
++++ class/System.Windows/Mono/NativeMethods.cs	(working copy)
+@@ -61,7 +61,7 @@
+ 
+ 	
+ 		[DllImport("moon")]
+-		public extern static void runtime_init (int flags);
++		public extern static void runtime_init (int flags, bool browser);
+ 
+ 		[DllImport("moon")]
+ 		public extern static void runtime_init_browser ();

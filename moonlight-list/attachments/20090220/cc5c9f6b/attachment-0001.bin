@@ -1,0 +1,449 @@
+Index: src/pipeline-ffmpeg.cpp
+===================================================================
+--- src/pipeline-ffmpeg.cpp	(revision 127068)
++++ src/pipeline-ffmpeg.cpp	(working copy)
+@@ -42,7 +42,8 @@
+ 	
+ 	avcodec_init ();
+ 	avcodec_register_all ();
+-		
++	av_register_all ();
++	
+ 	ffmpeg_initialized = true;
+ }
+ 
+@@ -50,9 +51,9 @@
+ register_ffmpeg ()
+ {
+ 	initialize_ffmpeg ();
+-		
++
+ 	Media::RegisterDecoder (new FfmpegDecoderInfo ());
+-	//Media::RegisterDemuxer (new FfmpegDemuxerInfo ());
++	Media::RegisterDemuxer (new FfmpegDemuxerInfo ());
+ }
+ 
+ /*
+@@ -451,3 +452,345 @@
+ {
+ 	return new FfmpegDecoder (media, stream);
+ }
++
++
++AVInputFormat * 
++FfmpegDemuxer::GetInputFormat (IMediaSource *source)
++{
++	AVProbeData data;
++	int amount = 16 * 1024;
++	data.filename = NULL;
++	data.buf = (unsigned char*)g_malloc (amount); 
++	data.buf_size = amount;                                     
++	source->Peek (data.buf, amount);
++		
++	AVInputFormat *format = av_probe_input_format (&data,true);
++		
++	g_free (data.buf);
++
++	return format;
++}
++
++
++
++FfmpegDemuxer::FfmpegDemuxer (Media *media, IMediaSource *source) : IMediaDemuxer (media, source) 
++{
++	ffmpeg_to_moon_index = NULL;
++	format_context = NULL;
++	frame_queue = NULL;
++	
++}
++
++FfmpegDemuxer::~FfmpegDemuxer ()
++{
++	
++	for (int i = 0; i < GetStreamCount (); i++) {
++		g_free (frame_queue[i]);	
++	}
++	g_free (frame_queue);
++	
++	g_free (ffmpeg_to_moon_index);
++	
++	
++	//av_free (input_byte_io);	
++	//av_free (input_buffer);
++	
++	for (guint32 i = 0; i < format_context->nb_streams; i++) {
++		av_freep (&format_context->streams[i]->codec);
++		av_freep (&format_context->streams[i]);
++		}
++	
++	av_free (format_context);
++		
++}
++
++MediaResult 
++FfmpegDemuxer::SeekInternal (guint64 pts)
++{
++	return NULL;	
++}
++
++MediaResult 
++FfmpegDemuxer::ReadHeader ()
++{
++	MediaResult result = MEDIA_SUCCESS;
++	IMediaStream ** streams;
++	IMediaStream* stream = NULL;
++
++	//number of audio and video streams to be outputted
++	int number_of_streams = 0;
++	
++	//incase there are streams that are ignored
++	int current_stream_index = 0;
++	
++	//int input_buffer_size;
++	//unsigned char *input_buffer;
++	//ByteIOContext *input_byte_io;
++		
++	
++	//get the input format
++	//this should never return null since we checked for support earlier	
++	AVInputFormat *input_format = GetInputFormat (source);
++	if(input_format == NULL){
++		Media::Warning (MEDIA_INVALID_MEDIA, "FfmpegDemuxer::ReadHeader () failed:  Input Format could not be found");
++		result = MEDIA_UNKNOWN_MEDIA_TYPE;
++		goto failure;
++		}
++	
++	if (source->GetType () == MediaSourceTypeFile) {
++		
++		FileSource* file_source = (FileSource*) source;
++		
++		if(av_open_input_file (&format_context, file_source->GetFileName (), input_format, 0, NULL) != 0) {
++			Media::Warning (MEDIA_INVALID_MEDIA, "FfmpegDemuxer::ReadHeader () failed:  Input File could not be opened");
++			result = MEDIA_DEMUXER_ERROR;	
++			goto failure;
++		}
++	/*	Read source data from a non file
++	
++		} else if (source->GetType () ==) { //not sure what this should check for
++		input_buffer_size =  source->GetSize ();
++		input_buffer = (unsigned char *) g_malloc (input_buffer_size);
++		source->ReadAll (input_buffer,input_buffer_size);
++		
++		input_byte_io = (ByteIOContext*) av_mallocz (sizeof (ByteIOContext));
++		if (init_put_byte (input_byte_io, input_buffer, input_buffer_size, 0, NULL, NULL, NULL, NULL) != 0) {
++			result = MEDIA_DEMUXER_ERROR;
++			goto failure;
++		}
++		
++		if (av_open_input_stream (&format_context, input_byte_io, "", input_format, NULL)) {
++			result = MEDIA_DEMUXER_ERROR;
++			goto failure;
++		}
++	*/	
++	} else {
++		result = MEDIA_INVALID_DATA;
++		goto failure;
++		}
++
++
++	av_find_stream_info (format_context);
++	
++	//find the number of streams that we will actually use.
++	//might be a good idea to filter out audio that has more than two channels? 
++	for (int i=0; i < format_context->nb_streams; i++) {
++		if (format_context->streams[i]->codec->codec_type == CODEC_TYPE_VIDEO ||
++			(format_context->streams[i]->codec->codec_type == CODEC_TYPE_AUDIO))
++			number_of_streams++;
++		}
++	
++		
++	//allocate memory	
++	streams = (IMediaStream **) g_malloc0 (sizeof (IMediaStream *) * (number_of_streams + 1));
++	frame_queue = (Queue**) g_malloc0 (sizeof (Queue*) * number_of_streams);
++	ffmpeg_to_moon_index = (gint32*) g_malloc0 (sizeof (gint32) * format_context->nb_streams);
++		
++	memset (ffmpeg_to_moon_index, -1, format_context->nb_streams);
++	
++	//iterate through all the streams and find the audio and video 
++	//set stream-specific data
++	for (guint32 i=0; i<format_context->nb_streams; i++) {
++					
++		AVCodecContext *codec_context = format_context->streams[i]->codec;
++		
++		if (codec_context->codec_type == CODEC_TYPE_VIDEO) {
++			VideoStream* video = new VideoStream (GetMedia ());
++			
++			video->width = codec_context->width;
++			video->height = codec_context->height;
++			
++			// note: both height and width are unsigned
++			if ((video->height > MAX_VIDEO_HEIGHT) || (video->width > MAX_VIDEO_WIDTH)) {
++				result = MEDIA_INVALID_STREAM;
++				Media::Warning (result, 
++					"Video stream size (width: %d, height: %d) outside limits (%d, %d)", 
++					video->height, video->width, MAX_VIDEO_HEIGHT, MAX_VIDEO_WIDTH);
++				goto failure;
++			}
++						
++			video->bit_rate = codec_context->bit_rate;
++			video->codec_id = codec_context->codec_id;
++			video->bits_per_sample = codec_context->bits_per_coded_sample;
++			video->initial_pts = format_context->start_time;
++			
++			//not quite sure what this should be set at
++			video->pts_per_frame = MilliSeconds_ToPts (1000 * format_context->streams[i]->time_base.num / 
++														format_context->streams[i]->time_base.den);
++					
++			stream = video;
++			
++		} else if (codec_context->codec_type == CODEC_TYPE_AUDIO) {
++			AudioStream* audio = new AudioStream (GetMedia ());
++			
++			audio->channels = codec_context->channels;
++			audio->block_align = codec_context->block_align;
++			audio->sample_rate = codec_context->sample_rate;
++			audio->bit_rate = codec_context->bit_rate;
++			audio->bits_per_sample = codec_context->bits_per_coded_sample;
++			
++			stream = audio;
++		} else {
++			//ignore other type of streams (SUBTITLE, CODEC_TYPE_DATA, et al.) 
++			continue;
++			}
++				
++			
++		/* fill in common data */	
++		
++		//need to open codec to retrieve codec name and to access frames later
++		AVCodec *codecInfo = avcodec_find_decoder (codec_context->codec_id);	
++		if(avcodec_open (codec_context, codecInfo) != 0){
++			Media::Warning (MEDIA_INVALID_MEDIA, "FfmpegDemuxer::ReadHeader () failed:  Open Codec failed; codec id [%i]",codec_context->codec_id);
++			result = MEDIA_FAIL;
++			goto failure;
++			}
++			
++		stream->codec = g_strdup (codecInfo->name);
++		stream->codec_id = codec_context->codec_id;
++		stream->index = current_stream_index;
++		stream->duration = format_context->streams[i]->duration;
++		stream->extra_data_size = codec_context->extradata_size;
++		stream->extra_data = NULL;
++		
++		if (stream->extra_data_size > 0) {
++			stream->extra_data = g_malloc0 (stream->extra_data_size);
++			memcpy (stream->extra_data, codec_context->extradata, stream->extra_data_size);
++		}
++		
++		streams [current_stream_index] = stream;
++		frame_queue[current_stream_index] = new Queue ();
++		ffmpeg_to_moon_index[i] = current_stream_index;
++		
++		current_stream_index++;
++	}
++		
++	SetStreams (streams, number_of_streams);
++	return result;
++
++failure:
++	
++	return result;
++	
++}
++
++
++MediaResult 
++FfmpegDemuxer::TryReadFrame (IMediaStream *stream, MediaFrame **f)
++{
++	/* av_read_frame returns both audio and video frames, so keep iterating through 
++	all frames and if they aren't for the stream we are looking for
++	add them to the proper queue to be returned later	
++	
++	NOTE:  An alternative method would be to use the av_seek_frame method, but not all 
++	formats support seeking.  Even for those that do support seeking there appears to be 
++	no support for seeking to specific frames, just the nearest keyframe to a pts.	*/ 
++	
++	int moon_stream_index;
++	
++	MediaFrame *frame;
++	MediaResult result = MEDIA_SUCCESS;
++	AVPacket packet;
++	
++	Queue *current_queue = frame_queue[stream->index];
++		
++	if(current_queue->IsEmpty ()){
++		while(av_read_frame (format_context, &packet) >= 0) {
++			moon_stream_index = ffmpeg_to_moon_index[packet.stream_index];
++								
++			if(moon_stream_index == -1){
++				//we don't care about this packet
++				av_free_packet (&packet);
++				continue;
++				}
++			
++			MediaFrame *temp_frame = new MediaFrame (GetStream (moon_stream_index));
++				
++			//convert from ffmpeg timebase to moon timebase
++			temp_frame->pts = MilliSeconds_ToPts (1000 * packet.pts * 
++													format_context->streams[packet.stream_index]->time_base.num / 
++													format_context->streams[packet.stream_index]->time_base.den);
++			
++			temp_frame->duration = packet.duration;
++			temp_frame->buflen = packet.size;
++			temp_frame->buffer = (guint8 *) g_try_malloc (temp_frame->buflen);	
++			
++			if (temp_frame->buffer == NULL) {
++				Media::Warning (MEDIA_OUT_OF_MEMORY, "Could not allocate memory for next frame.");
++				result = MEDIA_OUT_OF_MEMORY;
++				goto failure;
++			}
++			
++			memcpy (temp_frame->buffer, packet.data, temp_frame->buflen);
++					
++			if (packet.flags & PKT_FLAG_KEY)
++				temp_frame->AddState (FRAME_KEYFRAME);
++											
++			if(moon_stream_index != stream->index){
++				frame_queue[moon_stream_index]->Lock ();
++				frame_queue[moon_stream_index]->LinkedList ()->Append (new FrameNode (temp_frame));
++				frame_queue[moon_stream_index]->Unlock ();
++				av_free_packet (&packet);
++			} else {
++				frame = temp_frame;
++				av_free_packet (&packet);
++				break;
++			}
++		} 
++	} else {
++		current_queue->Lock ();
++		FrameNode *node = (FrameNode *) current_queue->LinkedList ()->First ();
++		
++		if (node != NULL) {
++			frame = node->frame; 
++			current_queue->LinkedList ()->Remove (node);
++		} 	
++		current_queue->Unlock ();
++	}
++	
++	if(frame == NULL)
++		return MEDIA_NO_MORE_DATA;
++	
++	*f = frame;
++    
++	frame->AddState (FRAME_DEMUXED);
++	
++	return MEDIA_SUCCESS;
++	
++	
++failure:
++	return result;
++
++}
++
++void 
++FfmpegDemuxer::UpdateSelected (IMediaStream *stream)
++{
++//what is this for?	
++}
++
++/*
++ * FfmpegDemuxerInfo
++ */
++MediaResult
++FfmpegDemuxerInfo::Supports (IMediaSource *source)
++{
++	LOG_FFMPEG ("FfmpegDemuxerInfo::Supports (%p) pos: %lld, avail pos: %lld\n", source, source->GetPosition (), source->GetLastAvailablePosition ());
++	
++	
++	if (!source->GetPosition () == 0)
++		fprintf (stderr, "FfmpegDemuxerInfo::Supports (%p): Trying to check if a media is supported, but the media isn't at position 0 (it's at position %lld)\n", source, source->GetPosition ());
++	
++	if(FfmpegDemuxer::GetInputFormat (source) == NULL){
++		Media::Warning (MEDIA_INVALID_MEDIA, "FfmpegDemuxerInfo::Supports () failed:  Input Format could not be found");
++		return MEDIA_UNKNOWN_MEDIA_TYPE;
++		}
++	
++	return MEDIA_SUCCESS;
++}
++ 
++IMediaDemuxer*
++FfmpegDemuxerInfo::Create (Media* media, IMediaSource* source)
++{
++	return new FfmpegDemuxer (media, source);
++}
+Index: src/pipeline-ffmpeg.h
+===================================================================
+--- src/pipeline-ffmpeg.h	(revision 127068)
++++ src/pipeline-ffmpeg.h	(working copy)
+@@ -23,8 +23,10 @@
+ #include <limits.h>
+ #if HAVE_LIBAVCODEC_AVCODEC_H
+ #include <libavcodec/avcodec.h>
++#include <libavformat/avformat.h>
+ #else
+ #include <avcodec.h>
++#include <avformat.h>
+ #endif
+ G_END_DECLS
+ 
+@@ -34,11 +36,7 @@
+  
+ void register_ffmpeg ();
+ 
+-class FfmpegDemuxer : public IMediaDemuxer {
+-public:
+-	FfmpegDemuxer (Media *media, IMediaSource *source) : IMediaDemuxer (media, source) {}
+-};
+- 
++
+ class FfmpegDecoder : public IMediaDecoder {
+ public:
+ 	FfmpegDecoder (Media* media, IMediaStream* stream);
+@@ -68,5 +66,48 @@
+ 	virtual const char* GetName () { return "FfmpegDecoder"; }
+ };
+ 
++
++/*
++ * FfmpegDemuxer
++ */
++class FfmpegDemuxer : public IMediaDemuxer {
++
++protected:
++	virtual ~FfmpegDemuxer ();
++	virtual MediaResult SeekInternal (guint64 pts);
++	
++public:
++	
++	class FrameNode : public List::Node {
++		 public:
++			MediaFrame *frame;
++			FrameNode (MediaFrame *frame) { this->frame = frame; }
++			virtual ~FrameNode () {/* I assume the frame is being cleaned up elsewhere */}
++		};
++	
++	
++	FfmpegDemuxer (Media *media, IMediaSource *source);
++	
++	virtual MediaResult ReadHeader ();
++	virtual MediaResult TryReadFrame (IMediaStream *stream, MediaFrame **frame);
++	virtual void UpdateSelected (IMediaStream *stream);
++
++	virtual const char *GetName () { return "FfmpegDemuxer"; }
++	
++	static AVInputFormat *GetInputFormat (IMediaSource *source);
++private:
++	gint32 *ffmpeg_to_moon_index;
++	AVFormatContext *format_context;
++	Queue **frame_queue;
++};
++
++
++class FfmpegDemuxerInfo : public DemuxerInfo {
++public:
++	virtual MediaResult Supports (IMediaSource *source);
++	virtual IMediaDemuxer *Create (Media *media, IMediaSource *source); 
++	virtual const char *GetName () { return "FFMpegDemuxer"; }
++};
++
+ #endif // __MOON_PIPELINE_FFMPEG__
+ #endif // INCLUDE_FFMPEG

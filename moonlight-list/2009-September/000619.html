@@ -1,0 +1,223 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Moonlight-list] Moonlight shutdown
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:moonlight-list%40lists.ximian.com?Subject=%5BMoonlight-list%5D%20Moonlight%20shutdown&In-Reply-To=8cca42d80909181033w3cfa1987p8f06fd06b623f362%40mail.gmail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="000616.html">
+   <LINK REL="Next"  HREF="000620.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Moonlight-list] Moonlight shutdown</H1>
+    <B>Rolf Bjarne Kvinge</B> 
+    <A HREF="mailto:moonlight-list%40lists.ximian.com?Subject=%5BMoonlight-list%5D%20Moonlight%20shutdown&In-Reply-To=8cca42d80909181033w3cfa1987p8f06fd06b623f362%40mail.gmail.com"
+       TITLE="[Moonlight-list] Moonlight shutdown">rolflists at ya.com
+       </A><BR>
+    <I>Mon Sep 21 09:45:50 EDT 2009</I>
+    <P><UL>
+        <LI>Previous message: <A HREF="000616.html">[Moonlight-list] Moonlight shutdown
+</A></li>
+        <LI>Next message: <A HREF="000620.html">[Moonlight-list] Moonlight shutdown
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#619">[ date ]</a>
+              <a href="thread.html#619">[ thread ]</a>
+              <a href="subject.html#619">[ subject ]</a>
+              <a href="author.html#619">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi,
+&gt;<i>
+</I>&gt;&gt;<i>Hi,
+</I>&gt;&gt;<i>Unfortunately I've found a major issue with our shutdown design, which
+</I>&gt;&gt;<i>loosely goes like this
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>1) firefox notifies us that the plugin has been removed from the page
+</I>&gt;&gt;<i>2) we do managed cleanup: (Deployment::Dispose () is called) which calls
+</I>&gt;&gt;<i>mono_domain_finalize (which will finalize every single object in that
+</I>&gt;&gt;<i>appdomain)
+</I>&gt;&gt;<i>3) we do native cleanup: we wait until the managed objects have freed
+</I>their
+&gt;&gt;<i>native refs, which will cause a cascading effect of native objects
+</I>unreffing
+&gt;&gt;<i>other native objects.
+</I>&gt;&gt;<i>4) the last object alive is the Deployment instance, and in
+</I>&gt;&gt;<i>Deployment::~Deployment &#160;we call mono_domain_unload (which will abort all
+</I>&gt;&gt;<i>managed threads)
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>The problem is in 2): mono_domain_finalize assumes all threads running in
+</I>&gt;&gt;<i>the domain have already been aborted. Since that's not done until 4), a
+</I>lot
+&gt;&gt;<i>of weird things happen in those threads (mostly crashes of course, but
+</I>also
+&gt;&gt;<i>weirds NREs).
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>The reason we can't call mono_domain_unload in 2) (and skip 4)
+</I>completely),
+&gt;&gt;<i>is that we might end up invoking managed delegates in 3), which would
+</I>crash
+&gt;&gt;<i>too.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>I'm able to reproduce these issues with <A HREF="http://hdbeta.ctv.ca/">http://hdbeta.ctv.ca/</A> 99% of the
+</I>&gt;&gt;<i>time.
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>I can think of 2 solutions:
+</I>&gt;&gt;<i>
+</I>&gt;&gt;<i>a) Somehow guarantee that we won't call into managed code in 3), and call
+</I>&gt;&gt;<i>mono_domain_unload in 2) instead of mono_domain_finalize. Possibly by
+</I>having
+&gt;&gt;<i>a 'shutting_down' flag on the Deployment instance that can be checked
+</I>before
+&gt;&gt;<i>calling function pointers (event emitting being the biggest I think, but
+</I>&gt;&gt;<i>there are quite a few others too). Or maybe add managed finalizers to
+</I>clear
+&gt;&gt;<i>out the native function pointer (this may have threading issues though
+</I>since
+&gt;&gt;<i>finalizers aren't run on the main thread).
+</I>&gt;&gt;<i>Hi,
+</I>
+I've just had a better (though more complicated) idea, splitting the
+shutdown into several well-defined parts:
+
+0) during execution we maintain a list of managed objects which has function
+pointers in native code that can get called during native shutdown [0]
+
+1) firefox notifies us that the plugin has been removed from the page
+(Deployment::Dispose () is called on the plugins Deployment instance)
+
+2) We ensure that our media thread pool does not execute anything for this
+deployment anymore (if necessary waiting/polling while currently executing
+work is finishing up)
+ 
+3) We call mono_domain_unload, registering a callback to call when all the
+mono threads have been aborted [1]
+
+4) Our callback is called, and we iterate the managed objects from the list
+in 0) asking them to nullify the managed function pointer native code has.
+[2] [3]
+
+5) At this point we can guarantee that no more managed code will be
+executed, and we can return from the callback
+
+6) We call mono_domain_free [4] and proceed with the native shutdown.
+
+Pros:
+* it solves any threading issues since we make sure that we don't do much
+until we're only executing on the main thread.
+* there is no polling required to check if it's safe to call a function
+pointer or not
+
+Cons:
+* requires mono runtime changes
+* not sure if I'm over-complicating things given that I've only found 1 case
+I'm sure this is an issue [0]. 
+
+
+[0] I've isolated these cases of managed callbacks in native code:
+* ExternalDemuxer: definitively might call back into managed code during
+native cleanup.
+* EventObject has a DestroyedEvent that managed code could attach to: not
+sure about this one (I quick grep didn't find anything in managed code).
+* Downloaders (and related managed BrowserHttp* classes): Pretty sure this
+is safe, since we abort all downloaders in Deployment::Dispose.
+* DispatcherTimer: the clock should have stopped, so it should be safe.
+* UI events (mouse, rendering events): the Surface should be zombified, so
+nothing should happen here. The clock should be stopped too.
+* Other events from EventObject (and derived classes): the clock should have
+stopped, so I can't see how it could happen.
+* Xaml parsing/loading: I don't think this can happen during shutdown in the
+first place.
+* Others?
+
+[1] The idea is to ensure that no more user code is executed anymore, so it
+would be called after the domain jobs have been cleared, but before
+mono_domain_finalize is called in appdomain.c:unload_thread_main. It also
+requires making mono_domain_unload async. One possible way would be to have
+the equivalent of this API:
+
+MonoUnloadData *mono_domain_unload_begin (MonoDomain *domain, callback
+*callback); // does everything in mono_domain_unload up to where it waits
+for the unload thread
+void mono_domain_unload_end (MonoUnloadData *data); // does the rest of
+mono_domain_unload, including waiting for the unload thread.
+
+
+[2] I'm assuming that it's still legal to execute managed code at this point
+(though we'd obviously have to make sure that we only execute code we can
+control, not user code).
+
+[3] This callback can be called from a different thread, it's trivial to
+marshal the logic in 4) to the main thread and wait until that code has
+executed.
+
+[4] We're not calling mono_domain_free right now, not sure why since I'd
+assume we'd leak otherwise.
+ 
+
+&gt;&gt;<i>2) we do managed cleanup: (Deployment::Dispose () is called) which calls
+</I>&gt;&gt;<i>mono_domain_finalize (which will finalize every single object in that
+</I>&gt;&gt;<i>appdomain)
+</I>&gt;&gt;<i>3) we do native cleanup: we wait until the managed objects have freed
+</I>their
+&gt;&gt;<i>native refs, which will cause a cascading effect of native objects
+</I>unreffing
+&gt;&gt;<i>other native objects.
+</I>&gt;&gt;<i>4) the last object alive is the Deployment instance, and in
+</I>&gt;&gt;<i>Deployment::~Deployment  we call mono_domain_unload (which will abort all
+</I>&gt;&gt;<i>managed threads)
+</I>
+
+&gt;&gt;<i>b) Expose a method in the mono runtime that aborts all the managed
+</I>threads,
+&gt;&gt;<i>and do that just before calling mono_domain_finalize. However I have a
+</I>&gt;&gt;<i>feeling that the runtime folks won't think this is a good idea ;-) To me
+</I>it
+&gt;&gt;<i>feels like a dirty hack, especially since we'd basically duplicate
+</I>&gt;&gt;<i>mono_domain_unload.
+</I>&gt;<i>
+</I>&gt;<i>Yes, domain unload is a very very tricky subject, so I think option (a) is
+</I>the way to go.
+&gt;<i>
+</I>&gt;<i>I think it would be a matter of pushing all unmanaged cleanup to happen
+</I>during domain
+&gt;<i>unload. I suppose the whole problem is that mono_domain_unload is
+</I>asynchronous. 
+&gt;<i>
+</I>&gt;<i>We could extend the runtime interface to enable it to be done synchronous
+</I>or give back a
+&gt;<i>native event object that will be pulsed when done - so batch parallel
+</I>unload is possible. If
+&gt;<i>that's not enough and there is a clear point during unload that ML needs a
+</I>hook for, we
+&gt;<i>could add one too.
+</I>
+Rolf
+
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message: <A HREF="000616.html">[Moonlight-list] Moonlight shutdown
+</A></li>
+	<LI>Next message: <A HREF="000620.html">[Moonlight-list] Moonlight shutdown
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#619">[ date ]</a>
+              <a href="thread.html#619">[ thread ]</a>
+              <a href="subject.html#619">[ subject ]</a>
+              <a href="author.html#619">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.ximian.com/mailman/listinfo/moonlight-list">More information about the Moonlight-list
+mailing list</a><br>
+</body></html>

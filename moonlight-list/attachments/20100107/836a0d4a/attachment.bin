@@ -1,0 +1,291 @@
+commit e16653132e41668f80599d65367ea7062e6301a7
+Author: David Reveman <davidr@novell.com>
+Date:   Thu Jan 7 18:26:09 2010 -0500
+
+    Adjust bounds and dirty region calculations to effects framework.
+
+diff --git a/src/dirty.cpp b/src/dirty.cpp
+index 00571dc..350f53d 100644
+--- a/src/dirty.cpp
++++ b/src/dirty.cpp
+@@ -395,25 +395,30 @@ Surface::ProcessUpDirtyElements ()
+ 
+ 			Region *dirty = el->dirty_region;
+ 
+-			GdkRectangle *rects;
+-			int count;
+-			dirty->GetRectangles (&rects, &count);
+-			Surface *surface = el->GetDeployment ()->GetSurface ();
+-			if (el->IsAttached ()) {
+-				while (count--) {
+-					Rect r = Rect ((double)rects [count].x,
+-						       (double)rects [count].y,
+-						       (double)rects [count].width,
+-						       (double)rects [count].height);
+-					//printf (" + + invalidating parent (%f,%f,%f,%f)\n",
+-					//	r.x,
+-					//	r.y,
+-					//	r.w,
+-					//	r.h);
+-
+-					surface->Invalidate (r);					
++			if (el->GetVisualParent ()) {
++				el->GetVisualParent ()->Invalidate (dirty);
++			}
++			else {
++				GdkRectangle *rects;
++				int count;
++				dirty->GetRectangles (&rects, &count);
++				Surface *surface = el->GetDeployment ()->GetSurface ();
++				if (el->IsAttached ()) {
++					while (count--) {
++						Rect r = Rect ((double)rects [count].x,
++							       (double)rects [count].y,
++							       (double)rects [count].width,
++							       (double)rects [count].height);
++						//printf (" + + invalidating parent (%f,%f,%f,%f)\n",
++						//	r.x,
++						//	r.y,
++						//	r.w,
++						//	r.h);
++
++						surface->Invalidate (r);					
++					}
++					g_free (rects);
+ 				}
+-				g_free (rects);
+ 			}
+ 
+ 			delete el->dirty_region;
+diff --git a/src/effect.cpp b/src/effect.cpp
+index 5f74f34..4617d36 100644
+--- a/src/effect.cpp
++++ b/src/effect.cpp
+@@ -919,6 +919,12 @@ BlurEffect::GetPaddingRight ()
+ 	return GetRadius ();
+ }
+ 
++Rect
++BlurEffect::GrowDirtyRectangle (Rect bounds, Rect rect)
++{
++	return rect.GrowBy (GetRadius ());
++}
++
+ void
+ BlurEffect::UpdateShader ()
+ {
+diff --git a/src/effect.h b/src/effect.h
+index f422047..8f24ee3 100644
+--- a/src/effect.h
++++ b/src/effect.h
+@@ -17,6 +17,7 @@
+ #include <cairo.h>
+ #include "enums.h"
+ #include "dependencyobject.h"
++#include "rect.h"
+ 
+ struct st_context;
+ struct pipe_buffer;
+@@ -36,6 +37,7 @@ public:
+ 	virtual double GetPaddingBottom ();
+ 	virtual double GetPaddingLeft ();
+ 	virtual double GetPaddingRight ();
++	virtual Rect GrowDirtyRectangle (Rect bounds, Rect rect) { return rect; }
+ 
+ 	//
+ 	// Composite
+@@ -90,6 +92,7 @@ public:
+ 	double GetPaddingBottom ();
+ 	double GetPaddingLeft ();
+ 	double GetPaddingRight ();
++	Rect GrowDirtyRectangle (Rect bounds, Rect rect);
+ 
+ 	//
+ 	// Shader
+diff --git a/src/frameworkelement.cpp b/src/frameworkelement.cpp
+index eeb3187..1e5594d 100644
+--- a/src/frameworkelement.cpp
++++ b/src/frameworkelement.cpp
+@@ -24,6 +24,7 @@
+ #include "collection.h"
+ #include "style.h"
+ #include "validators.h"
++#include "effect.h"
+ 
+ #define MAX_LAYOUT_PASSES 250
+ 
+@@ -244,6 +245,7 @@ FrameworkElement::ComputeBounds ()
+ 	extents = Rect (0, 0, size.width, size.height);
+ 
+ 	bounds = IntersectBoundsWithClipPath (extents, false).Transform (&absolute_xform);
++	bounds = GrowBoundsByEffectPadding (bounds);
+ 	bounds_with_children = bounds;
+ 
+ 	VisualTreeWalker walker = VisualTreeWalker (this);
+diff --git a/src/glyphs.cpp b/src/glyphs.cpp
+index 4272d2a..666092b 100644
+--- a/src/glyphs.cpp
++++ b/src/glyphs.cpp
+@@ -453,6 +453,7 @@ Glyphs::ComputeBounds ()
+ 		Layout ();
+ 	
+ 	bounds = IntersectBoundsWithClipPath (Rect (left, top, width, height), false).Transform (&absolute_xform);
++	bounds = GrowBoundsByEffectPadding (bounds);
+ }
+ 
+ Point
+diff --git a/src/grid.cpp b/src/grid.cpp
+index d649819..84eec22 100644
+--- a/src/grid.cpp
++++ b/src/grid.cpp
+@@ -510,6 +510,7 @@ Grid::ComputeBounds ()
+ 	if (GetShowGridLines ()) {
+ 		extents = Rect (0,0,GetActualWidth (),GetActualHeight ());
+ 		bounds = IntersectBoundsWithClipPath (extents, false).Transform (&absolute_xform);
++		bounds = GrowBoundsByEffectPadding (bounds);
+ 		bounds_with_children = bounds_with_children.Union (bounds);
+ 	}
+ }
+diff --git a/src/panel.cpp b/src/panel.cpp
+index d4956c3..a302268 100644
+--- a/src/panel.cpp
++++ b/src/panel.cpp
+@@ -80,6 +80,8 @@ Panel::ComputeBounds ()
+ 		bounds_with_children = bounds_with_children.Union (bounds);
+ 	}
+ 
++	bounds_with_children = GrowBoundsByEffectPadding (bounds_with_children);
++
+ #if DEBUG_BOUNDS
+ 	space (levelb);
+ 	printf ("Panel: Leave ComputeBounds (%g %g %g %g)\n",
+diff --git a/src/shape.cpp b/src/shape.cpp
+index 0dcb382..bfc7ac4 100644
+--- a/src/shape.cpp
++++ b/src/shape.cpp
+@@ -709,13 +709,17 @@ void
+ Shape::TransformBounds (cairo_matrix_t *old, cairo_matrix_t *current)
+ {
+ 	InvalidateSurfaceCache ();
+-	bounds_with_children = bounds = IntersectBoundsWithClipPath (GetStretchExtents (), false).Transform (current);
++	bounds = IntersectBoundsWithClipPath (GetStretchExtents (), false).Transform (current);
++        bounds = GrowBoundsByEffectPadding (bounds);
++        bounds_with_children = bounds;
+ }
+ 
+ void
+ Shape::ComputeBounds ()
+ {
+-	bounds_with_children = bounds = IntersectBoundsWithClipPath (GetStretchExtents (), false).Transform (&absolute_xform);
++        bounds = IntersectBoundsWithClipPath (GetStretchExtents (), false).Transform (&absolute_xform);
++        bounds = GrowBoundsByEffectPadding (bounds);
++        bounds_with_children = bounds;
+ 	//printf ("%f,%f,%f,%f\n", bounds.x, bounds.y, bounds.width, bounds.height);
+ }
+ 
+diff --git a/src/textblock.cpp b/src/textblock.cpp
+index ea54d19..8ecff22 100644
+--- a/src/textblock.cpp
++++ b/src/textblock.cpp
+@@ -465,7 +465,9 @@ TextBlock::ComputeBounds ()
+ 	extents.x += padding.left;
+ 	extents.y += padding.top;
+ 	
+-        bounds = bounds_with_children = IntersectBoundsWithClipPath (extents, false).Transform (&absolute_xform);
++        bounds = IntersectBoundsWithClipPath (extents, false).Transform (&absolute_xform);
++	bounds = GrowBoundsByEffectPadding (bounds);
++        bounds_with_children = bounds;
+ }
+ 
+ Point
+diff --git a/src/uielement.cpp b/src/uielement.cpp
+index eb93738..89a52d4 100644
+--- a/src/uielement.cpp
++++ b/src/uielement.cpp
+@@ -164,6 +164,19 @@ UIElement::RenderClipPath (cairo_t *cr, bool path_only)
+ 		cairo_clip (cr);
+ }
+ 
++Rect
++UIElement::GrowBoundsByEffectPadding (Rect bounds)
++{
++	Effect *effect = GetEffect ();
++	if (!effect)
++		return bounds;
++
++	return bounds.GrowBy (effect->GetPaddingLeft (),
++			      effect->GetPaddingTop (),
++			      effect->GetPaddingRight (),
++			      effect->GetPaddingBottom ());
++}
++
+ void
+ UIElement::OnPropertyChanged (PropertyChangedEventArgs *args, MoonError *error)
+ {
+@@ -220,6 +233,8 @@ UIElement::OnPropertyChanged (PropertyChangedEventArgs *args, MoonError *error)
+ 	} else if (args->GetId () == UIElement::UseLayoutRoundingProperty) {
+ 		InvalidateMeasure ();
+ 		InvalidateArrange ();
++	} else if (args->GetId () == UIElement::EffectProperty) {
++		UpdateBounds (true);
+ 	}
+ 
+ 	NotifyListenersOfPropertyChange (args, error);
+@@ -882,9 +897,14 @@ UIElement::Invalidate (Rect r)
+ 
+ 
+ 	if (IsAttached ()) {
++		Effect *effect = GetEffect ();
++
+ 		GetDeployment ()->GetSurface ()->AddDirtyElement (this, DirtyInvalidate);
+ 
+-		dirty_region->Union (r);
++		if (effect)
++			dirty_region->Union (effect->GrowDirtyRectangle (bounds, r));
++		else
++			dirty_region->Union (r);
+ 
+ 		GetTimeManager()->NeedRedraw ();
+ 
+@@ -899,9 +919,28 @@ UIElement::Invalidate (Region *region)
+ 		return;
+ 
+ 	if (IsAttached ()) {
++		Effect *effect = GetEffect ();
++
+ 		GetDeployment ()->GetSurface ()->AddDirtyElement (this, DirtyInvalidate);
+ 
+-		dirty_region->Union (region);
++		if (effect) {
++			GdkRectangle *rects;
++			int count;
++
++			region->GetRectangles (&rects, &count);
++			while (count--) {
++				Rect r = Rect ((double) rects[count].x,
++					       (double) rects[count].y,
++					       (double) rects[count].width,
++					       (double) rects[count].height);
++
++				dirty_region->Union (effect->GrowDirtyRectangle (bounds, r));
++			}
++			g_free (rects);
++		}
++		else {
++			dirty_region->Union (region);
++		}
+ 
+ 		GetTimeManager()->NeedRedraw ();
+ 
+diff --git a/src/uielement.h b/src/uielement.h
+index 26a0fa0..43b1d43 100644
+--- a/src/uielement.h
++++ b/src/uielement.h
+@@ -564,6 +564,7 @@ protected:
+ 	virtual ~UIElement ();
+ 	Rect IntersectBoundsWithClipPath (Rect bounds, bool transform);
+ 	void RenderClipPath (cairo_t *cr, bool path_only = false);
++	Rect GrowBoundsByEffectPadding (Rect bounds);
+ 
+ 	void SetDesiredSize (Size s) { desired_size = s; }
+ 	void SetRenderSize (Size s) { render_size = s; }

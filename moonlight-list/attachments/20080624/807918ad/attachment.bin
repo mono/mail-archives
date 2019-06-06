@@ -1,0 +1,703 @@
+Index: src/downloader.cpp
+===================================================================
+--- src/downloader.cpp	(revision 106454)
++++ src/downloader.cpp	(working copy)
+@@ -62,6 +62,7 @@
+ downloader_abort_func Downloader::abort_func = NULL;
+ downloader_header_func Downloader::header_func = NULL;
+ downloader_body_func Downloader::body_func = NULL;
++downloader_create_webrequest_func Downloader::request_func = NULL;
+ 
+ DependencyProperty *Downloader::DownloadProgressProperty;
+ DependencyProperty *Downloader::ResponseTextProperty;
+@@ -385,6 +386,7 @@
+ 			  downloader_abort_func abort,
+ 			  downloader_header_func header,
+ 			  downloader_body_func body,
++			  downloader_create_webrequest_func request,
+ 			  bool only_if_not_set)
+ {
+ 	if (only_if_not_set &&
+@@ -394,7 +396,8 @@
+ 	     Downloader::send_func != NULL ||
+ 	     Downloader::abort_func != NULL ||
+ 	     Downloader::header_func != NULL ||
+-	     Downloader::body_func != NULL))
++	     Downloader::body_func != NULL ||
++	     Downloader::request_func != NULL))
+ 	  return;
+ 
+ 	Downloader::create_state = create_state;
+@@ -404,6 +407,7 @@
+ 	Downloader::abort_func = abort;
+ 	Downloader::header_func = header;
+ 	Downloader::body_func = body;
++	Downloader::request_func = request;
+ }
+ 
+ void
+@@ -535,12 +539,17 @@
+ 			  downloader_send_func send,
+ 			  downloader_abort_func abort, 
+ 			  downloader_header_func header,
+-			  downloader_body_func body)
++			  downloader_body_func body,
++			  downloader_create_webrequest_func request)
+ {
+ 	Downloader::SetFunctions (create_state, destroy_state,
+-				  open, send, abort, header, body, false);
++				  open, send, abort, header, body, request, false);
+ }
+ 
++void *downloader_create_webrequest (Downloader *dl, const char *method, const char *uri)
++{
++	return dl->GetRequestFunc() (method, uri, dl->GetContext());
++}
+ void
+ downloader_request_position (Downloader *dl, gint64 *pos)
+ {
+@@ -615,7 +624,13 @@
+ 	g_warning ("downloader_set_function has never been called.\n");
+ }
+ 
++static void
++*dummy_downloader_create_web_request (const char *method, const char *uri, gpointer context)
++{
++	g_warning ("downloader_set_function has never been called.\n");
++}
+ 
++
+ void
+ downloader_init (void)
+ {
+@@ -631,5 +646,6 @@
+ 				  dummy_downloader_send,
+ 				  dummy_downloader_abort,
+ 				  dummy_downloader_header,
+-				  dummy_downloader_body, true);
++				  dummy_downloader_body,
++				  dummy_downloader_create_web_request, true);
+ }
+Index: src/downloader.h
+===================================================================
+--- src/downloader.h	(revision 106454)
++++ src/downloader.h	(working copy)
+@@ -39,6 +39,7 @@
+ typedef void     (*downloader_abort_func) (gpointer state);
+ typedef void     (*downloader_header_func) (gpointer state, const char *header, const char *value);
+ typedef void     (*downloader_body_func) (gpointer state, void *body, guint32 length);
++typedef void	 *(*downloader_create_webrequest_func) (const char *method, const char *uri, gpointer context);
+ 
+ class Downloader : public DependencyObject {
+ 	static downloader_create_state_func create_state;
+@@ -48,7 +49,8 @@
+ 	static downloader_abort_func abort_func;
+ 	static downloader_header_func header_func;
+ 	static downloader_body_func body_func;
+-	
++	static downloader_create_webrequest_func request_func;
++
+ 	// Set by the consumer
+ 	downloader_notify_size_func notify_size;
+ 	downloader_write_func write;
+@@ -133,6 +135,7 @@
+ 				  downloader_abort_func abort,
+ 				  downloader_header_func header,
+ 				  downloader_body_func body,
++			          downloader_create_webrequest_func request,
+ 				  bool only_if_not_set);
+ 	
+ 	void RequestPosition (gint64 *pos);
+@@ -146,7 +149,8 @@
+ 	gpointer GetDownloaderState () { return downloader_state; }
+ 	void     SetHttpStreamingFeatures (HttpStreamingFeatures features) { streaming_features = features; }
+ 	HttpStreamingFeatures GetHttpStreamingFeatures () { return streaming_features; }
+-	
++	downloader_create_webrequest_func GetRequestFunc () {return request_func; }	
++
+ 	//
+ 	// Property Accessors
+ 	//
+@@ -163,7 +167,73 @@
+ 	FileDownloader *getFileDownloader () { return (FileDownloader *) internal_dl; }
+ };
+ 
++class DownloaderResponse;
+ 
++typedef uint32_t (* DownloaderResponseStartedHandler) (DownloaderResponse *response, gpointer context);
++typedef uint32_t (* DownloaderResponseDataAvailableHandler) (DownloaderResponse *response, gpointer context, char *buffer, uint32_t length);
++typedef uint32_t (* DownloaderResponseFinishedHandler) (DownloaderResponse *response, gpointer context, gpointer data);
++
++
++class DownloaderResponse {
++ protected:
++	DownloaderResponseStartedHandler started;
++	DownloaderResponseDataAvailableHandler available;
++	DownloaderResponseFinishedHandler finished;
++	gpointer context;
++
++	bool aborted;
++
++ public:
++	DownloaderResponse ()
++	{
++		aborted = false;
++	}
++
++	DownloaderResponse (DownloaderResponseStartedHandler started, DownloaderResponseDataAvailableHandler available, DownloaderResponseFinishedHandler finished, gpointer context)
++	{
++		this->aborted = false;
++		this->started = started;
++		this->available = available;
++		this->finished = finished;
++		this->context = context;
++	}
++
++	virtual ~DownloaderResponse ()
++	{
++	}
++
++	virtual void Abort () = 0;
++	virtual const bool IsAborted () { return this->aborted; }
++};
++
++class DownloaderRequest {
++ protected:
++	char *uri;
++	char *method;
++	
++	bool aborted;
++
++ public:
++	DownloaderRequest (const char *method, const char *uri)
++	{
++		this->method = g_strdup (method);
++		this->uri = g_strdup (uri);
++	}
++
++	virtual ~DownloaderRequest ()
++	{
++		g_free (method);
++		g_free (uri);
++	}
++
++	virtual void Abort () = 0;
++	virtual bool GetResponse (DownloaderResponseStartedHandler started, DownloaderResponseDataAvailableHandler available, DownloaderResponseFinishedHandler finished, gpointer context) = 0;
++	virtual const bool IsAborted () { return this->aborted; }
++	virtual void SetHttpHeader (const char *name, const char *value) = 0;
++	virtual void SetBody (void *body, int size) = 0;
++};
++
++
+ Downloader *downloader_new (void);
+ 
+ double downloader_get_download_progress (Downloader *dl);
+@@ -202,10 +272,13 @@
+ 			       downloader_send_func send,
+ 			       downloader_abort_func abort,
+ 			       downloader_header_func header,
+-			       downloader_body_func body);
++			       downloader_body_func body,
++			       downloader_create_webrequest_func request);
+ 
+ void downloader_init (void);
+ 
++void *downloader_create_webrequest (Downloader *dl, const char *method, const char *uri);
++
+ G_END_DECLS
+ 
+ #endif
+Index: plugin/plugin-downloader.h
+===================================================================
+--- plugin/plugin-downloader.h	(revision 106454)
++++ plugin/plugin-downloader.h	(working copy)
+@@ -21,21 +21,19 @@
+ #include "plugin.h"
+ #include "plugin-class.h"
+ 
+-class BrowserResponse;
+-class BrowserRequest;
+ 
+ G_BEGIN_DECLS
+ 
+-uint32_t plugin_downloader_started (BrowserResponse *response, gpointer state);
+-uint32_t plugin_downloader_available (BrowserResponse *response, gpointer state, char *buffer, uint32_t length);
+-uint32_t plugin_downloader_finished (BrowserResponse *response, gpointer state, gpointer data);
++uint32_t plugin_downloader_started (DownloaderResponse *response, gpointer state);
++uint32_t plugin_downloader_available (DownloaderResponse *response, gpointer state, char *buffer, uint32_t length);
++uint32_t plugin_downloader_finished (DownloaderResponse *response, gpointer state, gpointer data);
+ 
+ G_END_DECLS
+ 
+ class PluginDownloader {
+  private:
+-	BrowserResponse *response;
+-	BrowserRequest *request;
++	DownloaderResponse *response;
++	DownloaderRequest *request;
+ 	uint64_t offset;
+ 	bool finished;
+ 	
+@@ -60,8 +58,8 @@
+ 	
+ 	PluginInstance *GetPlugin ();
+ 
+-	void setResponse (BrowserResponse *response) { this->response = response; }
+-	BrowserRequest *getRequest () { return this->request; }
++	void setResponse (DownloaderResponse *response) { this->response = response; }
++	DownloaderRequest *getRequest () { return this->request; }
+ 	
+ 	Downloader *dl;
+ };
+Index: plugin/npstream-request.cpp
+===================================================================
+--- plugin/npstream-request.cpp	(revision 106454)
++++ plugin/npstream-request.cpp	(working copy)
+@@ -40,7 +40,7 @@
+ }
+ 
+ bool
+-NPStreamRequest::GetResponse (BrowserResponseStartedHandler started, BrowserResponseDataAvailableHandler available, BrowserResponseFinishedHandler finished, gpointer context)
++NPStreamRequest::GetResponse (DownloaderResponseStartedHandler started, DownloaderResponseDataAvailableHandler available, DownloaderResponseFinishedHandler finished, gpointer context)
+ {
+ 	PluginDownloader *pd = (PluginDownloader *) context;
+ 
+Index: plugin/firefox/browser-http.inc
+===================================================================
+--- plugin/firefox/browser-http.inc	(revision 106454)
++++ plugin/firefox/browser-http.inc	(working copy)
+@@ -27,7 +27,7 @@
+ #include <xpcom/nsIStorageStream.h>
+ #endif
+ 
+-class GECKO_SYM(BrowserResponse) : public BrowserResponse, public nsIStreamListener {
++class GECKO_SYM(DownloaderResponse) : public DownloaderResponse, public nsIStreamListener {
+  private:
+ 	nsCOMPtr<nsIChannel> channel;
+ 	bool aborted;
+@@ -39,51 +39,51 @@
+  public:
+ 	NS_DECL_ISUPPORTS
+ 
+-	GECKO_SYM(BrowserResponse) (nsCOMPtr<nsIChannel> channel, BrowserResponseStartedHandler started, BrowserResponseDataAvailableHandler available, BrowserResponseFinishedHandler finished, gpointer context)
+-		: BrowserResponse (started, available, finished, context)
++	GECKO_SYM(DownloaderResponse) (nsCOMPtr<nsIChannel> channel, DownloaderResponseStartedHandler started, DownloaderResponseDataAvailableHandler available, DownloaderResponseFinishedHandler finished, gpointer context)
++		: DownloaderResponse (started, available, finished, context)
+ 	{
+ 		this->channel = channel;
+ 		this->aborted = false;
+ 	}
+ 
+-	virtual ~GECKO_SYM(BrowserResponse) ()
++	virtual ~GECKO_SYM(DownloaderResponse) ()
+ 	{
+ 	}
+ 
+ 	void Abort ();
+ };
+ 
+-class GECKO_SYM(BrowserRequest) : public BrowserRequest {
++class GECKO_SYM(DownloaderRequest) : public DownloaderRequest {
+  private:
+ 	nsCOMPtr<nsIChannel> channel;
+ 
+ 	void CreateChannel ();
+ 
+  public:
+-	GECKO_SYM(BrowserRequest) (const char *method, const char *uri)
+-	    : BrowserRequest (method, uri)
++	GECKO_SYM(DownloaderRequest) (const char *method, const char *uri)
++	    : DownloaderRequest (method, uri)
+ 	{
+ 		CreateChannel ();
+ 	}
+ 
+-	~GECKO_SYM(BrowserRequest) ()
++	~GECKO_SYM(DownloaderRequest) ()
+ 	{
+ 	}
+ 
+-	BrowserResponse *GetResponse ();
+-	bool GetResponse (BrowserResponseStartedHandler started, BrowserResponseDataAvailableHandler available, BrowserResponseFinishedHandler finished, gpointer context);
++	DownloaderResponse *GetResponse ();
++	bool GetResponse (DownloaderResponseStartedHandler started, DownloaderResponseDataAvailableHandler available, DownloaderResponseFinishedHandler finished, gpointer context);
+ 	void SetHttpHeader (const char *name, const char *value);
+ 	void SetBody (void *body, int size);
+ 	
+ 	void Abort ();
+ };
+ 
+-// BrowserResponse
++// DownloaderResponse
+ 
+-NS_IMPL_ISUPPORTS1 (GECKO_SYM(BrowserResponse), nsIStreamListener)
++NS_IMPL_ISUPPORTS1 (GECKO_SYM(DownloaderResponse), nsIStreamListener)
+ 
+ void
+-GECKO_SYM(BrowserResponse)::Abort ()
++GECKO_SYM(DownloaderResponse)::Abort ()
+ {
+ 	if (!aborted) {
+ 		this->channel->Cancel (NS_BINDING_ABORTED);
+@@ -92,7 +92,7 @@
+ }
+ 
+ NS_IMETHODIMP
+-GECKO_SYM(BrowserResponse)::OnStartRequest (nsIRequest *request, nsISupports *context)
++GECKO_SYM(DownloaderResponse)::OnStartRequest (nsIRequest *request, nsISupports *context)
+ {
+ 	if (!aborted)
+ 		return started (this, this->context);
+@@ -100,7 +100,7 @@
+ }
+ 
+ NS_IMETHODIMP
+-GECKO_SYM(BrowserResponse)::OnStopRequest (nsIRequest *request, nsISupports *ctx, nsresult status)
++GECKO_SYM(DownloaderResponse)::OnStopRequest (nsIRequest *request, nsISupports *ctx, nsresult status)
+ {
+ 	if (!aborted)
+ 		return finished (this, this->context, NULL);
+@@ -108,7 +108,7 @@
+ }
+ 
+ NS_IMETHODIMP
+-GECKO_SYM(BrowserResponse)::OnDataAvailable (nsIRequest *request, nsISupports *context, nsIInputStream *input, PRUint32 offset, PRUint32 count)
++GECKO_SYM(DownloaderResponse)::OnDataAvailable (nsIRequest *request, nsISupports *context, nsIInputStream *input, PRUint32 offset, PRUint32 count)
+ {
+ 	PRUint32 length = 0;
+ 	nsresult res;
+@@ -124,10 +124,10 @@
+ 	return res;
+ }
+ 
+-// BrowserRequest
++// DownloaderRequest
+ 
+ void
+-GECKO_SYM(BrowserRequest)::CreateChannel ()
++GECKO_SYM(DownloaderRequest)::CreateChannel ()
+ {
+ 	nsresult rv = NS_OK;
+ 	nsCOMPtr<nsIServiceManager> mgr;
+@@ -149,7 +149,7 @@
+ 	nsEmbedCString url;
+ 	url = this->uri;
+ 
+-	printf ("BrowserRequest: %s\n", uri);
++	printf ("DownloaderRequest: %s\n", uri);
+ 
+ 	nsCOMPtr<nsIURI> uri;
+ 	rv = ioservice->NewURI (url, nsnull, nsnull, getter_AddRefs (uri));
+@@ -166,24 +166,24 @@
+ }
+ 
+ void
+-GECKO_SYM(BrowserRequest)::Abort ()
++GECKO_SYM(DownloaderRequest)::Abort ()
+ {
+ 	channel->Cancel (NS_BINDING_ABORTED);
+ }
+ 
+ bool
+-GECKO_SYM(BrowserRequest)::GetResponse (BrowserResponseStartedHandler started, BrowserResponseDataAvailableHandler available, BrowserResponseFinishedHandler finished, gpointer context)
++GECKO_SYM(DownloaderRequest)::GetResponse (DownloaderResponseStartedHandler started, DownloaderResponseDataAvailableHandler available, DownloaderResponseFinishedHandler finished, gpointer context)
+ {
+ 	nsresult rs = NS_OK;
+-	GECKO_SYM(BrowserResponse) *response;
++	GECKO_SYM(DownloaderResponse) *response;
+ 
+-	response = new GECKO_SYM(BrowserResponse) (channel, started, available, finished, context);
+-	rs = channel->AsyncOpen (response, (GECKO_SYM(BrowserResponse)*)response);
++	response = new GECKO_SYM(DownloaderResponse) (channel, started, available, finished, context);
++	rs = channel->AsyncOpen (response, (GECKO_SYM(DownloaderResponse)*)response);
+ 	return !NS_FAILED (rs);
+ }
+ 
+ void
+-GECKO_SYM(BrowserRequest)::SetHttpHeader (const char *name, const char *value)
++GECKO_SYM(DownloaderRequest)::SetHttpHeader (const char *name, const char *value)
+ {
+ 	nsCOMPtr<nsIHttpChannel> httpchannel = do_QueryInterface (channel);
+ 	if (!httpchannel)
+@@ -197,7 +197,7 @@
+ }
+ 
+ void
+-GECKO_SYM(BrowserRequest)::SetBody (void *body, int size)
++GECKO_SYM(DownloaderRequest)::SetBody (void *body, int size)
+ {
+ 	nsCOMPtr<nsIHttpChannel> httpchannel = do_QueryInterface (channel);
+ 	if (!httpchannel)
+Index: plugin/firefox/ff2/ff2-http.cpp
+===================================================================
+--- plugin/firefox/ff2/ff2-http.cpp	(revision 106454)
++++ plugin/firefox/ff2/ff2-http.cpp	(working copy)
+@@ -10,8 +10,8 @@
+ #define GECKO_SYM(x) CONCAT(FF2,x)
+ #include "../browser-http.inc"
+ 
+-BrowserRequest*
+-FF2BrowserBridge::CreateBrowserRequest (const char *method, const char *uri)
++DownloaderRequest*
++FF2BrowserBridge::CreateDownloaderRequest (const char *method, const char *uri)
+ {
+-	return new FF2BrowserRequest (method, uri);
++	return new FF2DownloaderRequest (method, uri);
+ }
+Index: plugin/firefox/ff2/ff2-bridge.h
+===================================================================
+--- plugin/firefox/ff2/ff2-bridge.h	(revision 106454)
++++ plugin/firefox/ff2/ff2-bridge.h	(working copy)
+@@ -11,7 +11,7 @@
+ 	virtual gpointer HtmlObjectAttachEvent (NPP npp, NPObject *npobj, const char *name, callback_dom_event cb);
+ 	virtual void     HtmlObjectDetachEvent (NPP npp, const char *name, gpointer listener_ptr);
+ 
+-	virtual BrowserRequest* CreateBrowserRequest (const char *method, const char *uri);
++	virtual DownloaderRequest* CreateDownloaderRequest (const char *method, const char *uri);
+ };
+ 
+ #endif // FF2_BRIDGE
+Index: plugin/firefox/ff3/ff3-http.cpp
+===================================================================
+--- plugin/firefox/ff3/ff3-http.cpp	(revision 106454)
++++ plugin/firefox/ff3/ff3-http.cpp	(working copy)
+@@ -10,8 +10,8 @@
+ #define GECKO_SYM(x) CONCAT(FF3,x)
+ #include "../browser-http.inc"
+ 
+-BrowserRequest*
+-FF3BrowserBridge::CreateBrowserRequest (const char *method, const char *uri)
++DownloaderRequest*
++FF3BrowserBridge::CreateDownloaderRequest (const char *method, const char *uri)
+ {
+-	return new FF3BrowserRequest (method, uri);
++	return new FF3DownloaderRequest (method, uri);
+ }
+Index: plugin/firefox/ff3/ff3-bridge.h
+===================================================================
+--- plugin/firefox/ff3/ff3-bridge.h	(revision 106454)
++++ plugin/firefox/ff3/ff3-bridge.h	(working copy)
+@@ -11,7 +11,7 @@
+ 	virtual gpointer HtmlObjectAttachEvent (NPP npp, NPObject *npobj, const char *name, callback_dom_event cb);
+ 	virtual void     HtmlObjectDetachEvent (NPP npp, const char *name, gpointer listener_ptr);
+ 
+-	virtual BrowserRequest* CreateBrowserRequest (const char *method, const char *uri);
++	virtual DownloaderRequest* CreateDownloaderRequest (const char *method, const char *uri);
+ };
+ 
+ #endif // FF3_BRIDGE
+Index: plugin/plugin-downloader.cpp
+===================================================================
+--- plugin/plugin-downloader.cpp	(revision 106454)
++++ plugin/plugin-downloader.cpp	(working copy)
+@@ -19,7 +19,7 @@
+ bool downloader_shutdown = false;
+ 
+ uint32_t
+-plugin_downloader_started (BrowserResponse *response, gpointer state)
++plugin_downloader_started (DownloaderResponse *response, gpointer state)
+ {
+ 	d(printf ("plugin_downloader_started (%p, %p).\n", response, state));
+ 	PluginDownloader *pd = (PluginDownloader *)state;
+@@ -33,7 +33,7 @@
+ }
+ 
+ uint32_t
+-plugin_downloader_available (BrowserResponse *response, gpointer state, char *buffer, uint32_t length)
++plugin_downloader_available (DownloaderResponse *response, gpointer state, char *buffer, uint32_t length)
+ {
+ 	d(printf ("plugin_downloader_available (%p, %p, %p, %u).\n", response, state, buffer, length));
+ 	PluginDownloader *pd = (PluginDownloader *)state;
+@@ -46,7 +46,7 @@
+ }
+ 
+ uint32_t
+-plugin_downloader_finished (BrowserResponse *response, gpointer state, gpointer data)
++plugin_downloader_finished (DownloaderResponse *response, gpointer state, gpointer data)
+ {
+ 	d(printf ("plugin_downloader_finished (%p, %p).\n", response, state));
+ 	PluginDownloader *pd = (PluginDownloader *)state;
+@@ -129,6 +129,13 @@
+ 	pd->Abort ();
+ }
+ 
++static void
++*plugin_downloader_create_webrequest (const char *method, const char *uri, gpointer context)
++{
++	PluginInstance *instance = (PluginInstance *) context;
++	return instance->GetBridge ()->CreateDownloaderRequest (method, uri);
++}
++
+ PluginDownloader::PluginDownloader (Downloader *dl)
+ {
+ 	d (printf ("PluginDownloader::PluginDownloader (), dl: %p\n", dl));
+@@ -181,7 +188,7 @@
+ 	this->uri = g_strdup (uri);
+ 	
+ 	if (streaming) {
+-		this->request = GetPlugin ()->GetBridge ()->CreateBrowserRequest ("GET", this->uri);
++		this->request = GetPlugin ()->GetBridge ()->CreateDownloaderRequest ("GET", this->uri);
+ 	} else {
+ 		this->request = new NPStreamRequest ("GET", this->uri, GetPlugin ());
+ 	}
+@@ -267,7 +274,8 @@
+ 		plugin_downloader_send,
+ 		plugin_downloader_abort,
+ 		plugin_downloader_set_header,
+-		plugin_downloader_set_body);
++		plugin_downloader_set_body,
++		plugin_downloader_create_webrequest);
+ }
+ 
+ void
+Index: plugin/browser-bridge.h
+===================================================================
+--- plugin/browser-bridge.h	(revision 106454)
++++ plugin/browser-bridge.h	(working copy)
+@@ -4,80 +4,15 @@
+ #include "plugin-class.h"
+ #include "plugin-downloader.h"
+ 
+-class BrowserResponse;
+-
+ #define DOWNLOADER_OK 0
+ #define DOWNLOADER_ERR -1
+ 
+-typedef uint32_t (* BrowserResponseStartedHandler) (BrowserResponse *response, gpointer context);
+-typedef uint32_t (* BrowserResponseDataAvailableHandler) (BrowserResponse *response, gpointer context, char *buffer, uint32_t length);
+-typedef uint32_t (* BrowserResponseFinishedHandler) (BrowserResponse *response, gpointer context, gpointer data);
+-
+ G_BEGIN_DECLS
+ 
+ BrowserBridge *CreateBrowserBridge ();
+ 
+ G_END_DECLS
+ 
+-class BrowserResponse {
+- protected:
+-	BrowserResponseStartedHandler started;
+-	BrowserResponseDataAvailableHandler available;
+-	BrowserResponseFinishedHandler finished;
+-	gpointer context;
+-
+-	bool aborted;
+-
+- public:
+-	BrowserResponse ()
+-	{
+-		aborted = false;
+-	}
+-
+-	BrowserResponse (BrowserResponseStartedHandler started, BrowserResponseDataAvailableHandler available, BrowserResponseFinishedHandler finished, gpointer context)
+-	{
+-		this->aborted = false;
+-		this->started = started;
+-		this->available = available;
+-		this->finished = finished;
+-		this->context = context;
+-	}
+-
+-	virtual ~BrowserResponse ()
+-	{
+-	}
+-
+-	virtual void Abort () = 0;
+-	virtual const bool IsAborted () { return this->aborted; }
+-};
+-
+-class BrowserRequest {
+- protected:
+-	char *uri;
+-	char *method;
+-	
+-	bool aborted;
+-
+- public:
+-	BrowserRequest (const char *method, const char *uri)
+-	{
+-		this->method = g_strdup (method);
+-		this->uri = g_strdup (uri);
+-	}
+-
+-	virtual ~BrowserRequest ()
+-	{
+-		g_free (method);
+-		g_free (uri);
+-	}
+-
+-	virtual void Abort () = 0;
+-	virtual bool GetResponse (BrowserResponseStartedHandler started, BrowserResponseDataAvailableHandler available, BrowserResponseFinishedHandler finished, gpointer context) = 0;
+-	virtual const bool IsAborted () { return this->aborted; }
+-	virtual void SetHttpHeader (const char *name, const char *value) = 0;
+-	virtual void SetBody (void *body, int size) = 0;
+-};
+-
+ class BrowserBridge {
+  public:
+ 	// HtmlObject
+@@ -85,7 +20,7 @@
+ 	virtual gpointer HtmlObjectAttachEvent (NPP npp, NPObject *npobj, const char *name, callback_dom_event cb) = 0;
+ 	virtual void     HtmlObjectDetachEvent (NPP npp, const char *name, gpointer listener_ptr) = 0;
+ 
+-	virtual BrowserRequest* CreateBrowserRequest (const char *method, const char *uri) = 0;
++	virtual DownloaderRequest* CreateDownloaderRequest (const char *method, const char *uri) = 0;
+ };
+ 
+ #endif /* BROWSER_BRIDGE */
+Index: plugin/npstream-request.h
+===================================================================
+--- plugin/npstream-request.h	(revision 106454)
++++ plugin/npstream-request.h	(working copy)
+@@ -17,7 +17,7 @@
+ #include "browser-bridge.h"
+ #include "plugin-downloader.h"
+ 
+-class NPStreamRequest : public BrowserRequest {
++class NPStreamRequest : public DownloaderRequest {
+  private:
+ 	NPP npp;
+ 	NPStream *stream;
+@@ -27,7 +27,7 @@
+ 	uint32_t offset;
+ 
+  public:
+-	NPStreamRequest (const char *verb, const char *uri, PluginInstance *instance) : BrowserRequest (verb, uri)
++	NPStreamRequest (const char *verb, const char *uri, PluginInstance *instance) : DownloaderRequest (verb, uri)
+ 	{
+ 		this->npp = NULL;
+ 		this->stream = NULL;
+@@ -42,7 +42,7 @@
+ 	}
+ 
+ 	void Abort ();
+-	bool GetResponse (BrowserResponseStartedHandler started, BrowserResponseDataAvailableHandler available, BrowserResponseFinishedHandler finished, gpointer context);
++	bool GetResponse (DownloaderResponseStartedHandler started, DownloaderResponseDataAvailableHandler available, DownloaderResponseFinishedHandler finished, gpointer context);
+ 	const bool IsAborted () { return this->aborted; }
+ 	void SetHttpHeader (const char *name, const char *value);
+ 	void SetBody (void *body, int size);
+Index: tools/mopen/mopen1.cpp
+===================================================================
+--- tools/mopen/mopen1.cpp	(revision 106454)
++++ tools/mopen/mopen1.cpp	(working copy)
+@@ -131,6 +131,12 @@
+ 	g_assert_not_reached ();
+ }
+ 
++static void
++*downloader_request (const char *method, const char *uri, gpointer context)
++{
++	g_assert_not_reached ();
++}
++
+ static gboolean
+ delete_event (GtkWidget *widget, GdkEvent *e, gpointer data)
+ {
+@@ -151,7 +157,7 @@
+ 
+ 	file = g_basename (file);
+ 
+-	downloader_set_functions (downloader_create_state, downloader_destroy_state, downloader_open, downloader_send, downloader_abort, downloader_header, downloader_body);
++	downloader_set_functions (downloader_create_state, downloader_destroy_state, downloader_open, downloader_send, downloader_abort, downloader_header, downloader_body, downloader_request);
+ 
+ 	Type::Kind et;
+ 	Surface* surface = surface_new (300, 300);

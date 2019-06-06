@@ -1,0 +1,169 @@
+Index: security-core-clr.c
+===================================================================
+--- security-core-clr.c	(revision 130214)
++++ security-core-clr.c	(working copy)
+@@ -300,28 +300,63 @@
+ 	return level;
+ }
+ 
++/*
++ * mono_security_core_clr_is_platform_image:
++ *
++ *   Return the (cached) boolean value indicating if this image represent platform code
++ */
+ gboolean
+ mono_security_core_clr_is_platform_image (MonoImage *image)
+ {
+-	const char *prefix = mono_assembly_getrootdir ();
+-	int prefix_len = strlen (prefix);
+-	static const char subprefix[] = "/mono/2.1/";
+-	int subprefix_len = strlen (subprefix);
++	return image->core_clr_platform_code;
++}
+ 
+-	if (!image->name)
+-		return FALSE;
+-	if (strncmp (prefix, image->name, prefix_len) != 0)
+-		return FALSE;
+-	if (strncmp (subprefix, image->name + prefix_len, subprefix_len) != 0)
+-		return FALSE;
+-	if (strchr (image->name + prefix_len + subprefix_len, '/'))
+-		return FALSE;
+-	return TRUE;
++/*
++ * default_platform_check:
++ *
++ *	Default platform check. Always return FALSE.
++ */
++static gboolean
++default_platform_check (const char *image_name)
++{
++	return FALSE;
+ }
+ 
++static MonoCoreClrPlatformCB platform_callback = default_platform_check;
++
++/*
++ * mono_security_core_clr_determine_platform_image:
++ *
++ *	Call the supplied callback (from mono_security_set_core_clr_platform_callback) 
++ *	to determine if this image represents platform code.
++ */
++gboolean
++mono_security_core_clr_determine_platform_image (MonoImage *image)
++{
++	return platform_callback (image->name);
++}
++
++/*
++ * mono_security_enable_core_clr:
++ *
++ *   Enable the verifier and the CoreCLR security model
++ */
+ void
+ mono_security_enable_core_clr ()
+ {
+ 	mono_verifier_set_mode (MONO_VERIFIER_MODE_VERIFIABLE);
+ 	mono_security_set_mode (MONO_SECURITY_MODE_CORE_CLR);
+ }
++
++/*
++ * mono_security_set_core_clr_platform_callback:
++ *
++ *	Set the callback function that will be used to determine if an image
++ *	is part, or not, of the platform code.
++ */
++void
++mono_security_set_core_clr_platform_callback (MonoCoreClrPlatformCB callback)
++{
++	platform_callback = callback;
++}
++
+Index: security-core-clr.h
+===================================================================
+--- security-core-clr.h	(revision 130214)
++++ security-core-clr.h	(working copy)
+@@ -31,5 +31,6 @@
+ extern MonoSecurityCoreCLRLevel mono_security_core_clr_method_level (MonoMethod *method, gboolean with_class_level) MONO_INTERNAL;
+ 
+ extern gboolean mono_security_core_clr_is_platform_image (MonoImage *image) MONO_INTERNAL;
++extern gboolean mono_security_core_clr_determine_platform_image (MonoImage *image) MONO_INTERNAL;
+ 
+ #endif	/* _MONO_METADATA_SECURITY_CORE_CLR_H_ */
+Index: ChangeLog
+===================================================================
+--- ChangeLog	(revision 130214)
++++ ChangeLog	(working copy)
+@@ -1,3 +1,21 @@
++2009-03-25  Sebastien Pouliot  <sebastien@ximian.com> 
++
++	* appdomain.h: Export a new callback type and a new function to
++	set this callback. This allow a mono host to provide it's own
++	definition for "platform code".
++	* metadata-internals.h: Add a core_clr_platform_code flag on 
++	_MonoImage to (cache and) know if it is representing platform 
++	code.
++	* image.c (do_mono_image_open): Set core_clr_platform_code flag 
++	on platform code images.
++	* security-core-clr.c|h	
++	(mono_security_set_core_clr_platform_callback): Allow the host
++	to provide it's own platform check definition.
++	(mono_security_core_clr_determine_platform_image): Detect if an 
++	image is platform code (using the specified callback).
++	(mono_security_core_clr_is_platform_image): Return cached value 
++	for platform code.
++
+ 2009-03-25  Sebastien Pouliot  <sebastien@ximian.com>
+ 
+ 	* appdomain.c: Bump MONO_CORLIB_VERSION to 73
+Index: appdomain.h
+===================================================================
+--- appdomain.h	(revision 130212)
++++ appdomain.h	(working copy)
+@@ -205,6 +205,11 @@
+ void
+ mono_security_enable_core_clr (void);
+ 
++typedef gboolean (*MonoCoreClrPlatformCB) (const char *image_name);
++
++void
++mono_security_set_core_clr_platform_callback (MonoCoreClrPlatformCB callback);
++
+ G_END_DECLS
+ #endif /* _MONO_METADATA_APPDOMAIN_H_ */
+ 
+Index: image.c
+===================================================================
+--- image.c	(revision 130212)
++++ image.c	(working copy)
+@@ -34,6 +34,7 @@
+ #include <mono/metadata/class-internals.h>
+ #include <mono/metadata/assembly.h>
+ #include <mono/metadata/object-internals.h>
++#include <mono/metadata/security-core-clr.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #ifdef HAVE_UNISTD_H
+@@ -911,6 +912,8 @@
+ 	image->name = mono_path_resolve_symlinks (fname);
+ 	image->ref_only = refonly;
+ 	image->ref_count = 1;
++	/* if MONO_SECURITY_MODE_CORE_CLR is set then determine if this image is platform code */
++	image->core_clr_platform_code = mono_security_core_clr_determine_platform_image (image);
+ 
+ 	mono_file_map_close (filed);
+ 	return do_mono_image_load (image, status, care_about_cli);
+Index: metadata-internals.h
+===================================================================
+--- metadata-internals.h	(revision 130212)
++++ metadata-internals.h	(working copy)
+@@ -108,6 +108,9 @@
+ 	guint8 idx_string_wide : 1;
+ 	guint8 idx_guid_wide : 1;
+ 	guint8 idx_blob_wide : 1;
++
++	/* Whenever this image is considered as platform code for the CoreCLR security model */
++	guint8 core_clr_platform_code : 1;
+ 			    
+ 	char *name;
+ 	const char *assembly_name;

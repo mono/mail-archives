@@ -1,0 +1,468 @@
+Index: animation.h
+===================================================================
+--- animation.h	(revision 127411)
++++ animation.h	(working copy)
+@@ -210,7 +210,7 @@
+ 
+ 	Animation/*Timeline*/ () { };
+ 	
+-	virtual Clock *AllocateClock ();
++	virtual void AllocateClock ();
+ 
+ 	virtual Value *GetCurrentValue (Value *defaultOriginValue, Value *defaultDestinationValue,
+ 					AnimationClock* animationClock);
+@@ -786,10 +786,9 @@
+ 	void HookupAnimationsRecurse (Clock *clock);
+ 	void TeardownClockGroup ();
+ 	gboolean Tick ();
+-	Clock *clock;
+-	Clock *root_clock;
+ 	bool pending_begin;
+-	
++ 	bool had_parent;
++
+  protected:
+ 	virtual ~Storyboard ();
+ 
+@@ -832,8 +831,11 @@
+ 	/* @GenerateCBinding,GeneratePInvoke */
+ 	int GetCurrentState ();
+ 	
+-	virtual Clock *AllocateClock ();
++	bool GetHadParent () { return this->had_parent; }
++	void SetHadParent (bool had_parent) { this->had_parent = had_parent; }
+ 
++	virtual void OnCollectionChanged (Collection *col, CollectionChangedEventArgs *args);
++
+ 	static void SetTargetName (DependencyObject *o, const char *targetName);
+ 	static const char *GetTargetName (DependencyObject *o);
+ 	static void SetTargetProperty (DependencyObject *o, PropertyPath *targetProperty);
+Index: animation.cpp
+===================================================================
+--- animation.cpp	(revision 127411)
++++ animation.cpp	(working copy)
+@@ -341,17 +341,17 @@
+ 	}
+ }
+ 
+-Clock*
++void
+ Animation/*Timeline*/::AllocateClock()
+ {
+-	Clock *clock = new AnimationClock (this);
++	clock = new AnimationClock (this);
+ 	char *name = g_strdup_printf ("AnimationClock for %s, targetobj = %p/%s, targetprop = %s", GetTypeName(),
+ 				      Storyboard::GetTargetName(this) == NULL ? NULL : FindName (Storyboard::GetTargetName(this)),
+ 				      Storyboard::GetTargetName(this),
+ 				      Storyboard::GetTargetProperty (this) == NULL ? NULL : Storyboard::GetTargetProperty (this)->path);
+ 	clock->SetValue (DependencyObject::NameProperty, name);
+ 	g_free (name);
+-	return clock;
++	clock->AddHandler (Clock::CompletedEvent, Timeline::timeline_completed, this);
+ }
+ 
+ Value*
+@@ -384,14 +384,14 @@
+ 	SetObjectType (Type::STORYBOARD);
+ 
+ 	clock = NULL;
+-	root_clock = NULL;
++	had_parent = false;
+ 	pending_begin = false;
+ }
+ 
+ Storyboard::~Storyboard ()
+ {
+-	if (root_clock) {
+-		//printf ("Clock %p (ref=%d)\n", root_clock, root_clock->refcount);
++	if (!GetHadParent () && clock) {
++		//printf ("Clock %p (ref=%d)\n", clock, clock->refcount);
+ 		Stop ();
+ 		TeardownClockGroup ();
+ 	}
+@@ -476,31 +476,40 @@
+ }
+ 
+ void
++Storyboard::OnCollectionChanged (Collection *col, CollectionChangedEventArgs *args)
++{
++	if (col == GetChildren () && args->new_value && !args->new_value->GetIsNull ()) {
++		if (args->new_value->Is (Type::STORYBOARD)) {
++			args->new_value->AsStoryboard ()->SetHadParent (true);
++		}
++	}
++}
++
++void
+ Storyboard::TeardownClockGroup ()
+ {
+-	if (root_clock) {
+-		ClockGroup *group = root_clock->GetParent();
++	clock->RemoveHandler (clock->CompletedEvent, storyboard_completed, this);
++	if (!GetHadParent () && clock) {
++		ClockGroup *group = clock->GetParent();
+ 		if (group)
+-			group->RemoveChild (root_clock);
+-		root_clock->unref ();
+-		root_clock = NULL;
++			group->RemoveChild (clock);
++		DeallocateClock ();
+ 	}
+-
+-	clock = NULL;
+ }
+ 
+ void
+ Storyboard::storyboard_completed (EventObject *sender, EventArgs *calldata, gpointer closure)
+ {
+ 	Storyboard *sb = (Storyboard *) closure;
+-	
++
+ 	// Only teardown the clocks if the whole storyboard is stopped.
+ 	// Otherwise just remove from parent not be affected by it's 
+ 	// state changes
+-	if (sb->root_clock->GetClockState () == Clock::Stopped)
++	if (!sb->GetHadParent () && sb->clock && sb->clock->GetClockState () == Clock::Stopped)
+ 		sb->TeardownClockGroup ();
+-	
+-	sb->Emit (sb->CompletedEvent);
++			
++	// Chain up to the timeline_completed event first
++	sb->timeline_completed (sender, calldata, closure);
+ }
+ 
+ bool
+@@ -521,8 +530,7 @@
+ 	/* destroy the clock hierarchy and recreate it to restart.
+ 	   easier than making Begin work again with the existing clock
+ 	   hierarchy */
+-	if (root_clock) {
+-		root_clock->RemoveHandler (root_clock->CompletedEvent, storyboard_completed, this);
++	if (!GetHadParent () && clock) {
+ 		TeardownClockGroup ();
+     }
+ #endif
+@@ -546,24 +554,25 @@
+ 	// This creates the clock tree for the hierarchy.  if a
+ 	// Timeline A is a child of TimelineGroup B, then Clock cA
+ 	// will be a child of ClockGroup cB.
+-	root_clock = AllocateClock ();
++	AllocateClock ();
+ 	char *name = g_strdup_printf ("Storyboard, named '%s'", GetName());
+-	root_clock->SetValue (DependencyObject::NameProperty, name);
++	clock->SetValue (DependencyObject::NameProperty, name);
+ 	g_free (name);
+-	root_clock->AddHandler (root_clock->CompletedEvent, storyboard_completed, this);
++	clock->RemoveHandler (Clock::CompletedEvent, Timeline::timeline_completed, this);
++	clock->AddHandler (clock->CompletedEvent, storyboard_completed, this);
+ 
+ 	// walk the clock tree hooking up the correct properties and
+ 	// creating AnimationStorage's for AnimationClocks.
+-	HookupAnimationsRecurse (root_clock);
++	HookupAnimationsRecurse (clock);
+ 
+ 	group->ComputeBeginTime ();
+ 
+-	group->AddChild (root_clock);
++	group->AddChild (clock);
+ 
+ 	if (HasBeginTime ())
+-		root_clock->ComputeBeginTime ();
++		clock->ComputeBeginTime ();
+ 	else
+-		root_clock->BeginOnTick ();
++		clock->BeginOnTick ();
+ 
+ 	// we delay starting the surface's ClockGroup until the first
+ 	// child has been added.  otherwise we run into timing issues
+@@ -587,17 +596,11 @@
+ 	return Begin ();
+ }
+ 
+-Clock *
+-Storyboard::AllocateClock ()
+-{
+-	return (clock = ParallelTimeline::AllocateClock ());
+-}
+-
+ void
+ Storyboard::Pause ()
+ {
+-	if (root_clock)
+-		root_clock->Pause ();
++	if (clock && !GetHadParent ())
++		clock->Pause ();
+ }
+ 
+ void
+@@ -613,8 +616,8 @@
+ void
+ Storyboard::Resume ()
+ {
+-	if (root_clock)
+-		root_clock->Resume ();
++	if (clock && !GetHadParent ())
++		clock->Resume ();
+ }
+ 
+ void
+@@ -624,15 +627,15 @@
+ 		MoonError::FillIn (error, MoonError::INVALID_OPERATION, "Cannot Resume a Storyboard which is not the root Storyboard.");
+ 		return;
+ 	}
+-	if (root_clock)
+-		root_clock->Resume ();
++	if (clock && !GetHadParent ())
++		clock->Resume ();
+ }
+ 
+ void
+ Storyboard::Seek (TimeSpan timespan)
+ {
+-	if (root_clock)
+-		root_clock->Seek (timespan);
++	if (clock && !GetHadParent ())
++		clock->Seek (timespan);
+ }
+ 
+ void
+@@ -642,16 +645,16 @@
+ 		MoonError::FillIn (error, MoonError::INVALID_OPERATION, "Cannot Seek a Storyboard which is not the root Storyboard.");
+ 		return;
+ 	}
+-	if (root_clock)
+-		root_clock->Seek (timespan);
++	if (clock && !GetHadParent ())
++		clock->Seek (timespan);
+ }
+ 
+ void
+ Storyboard::Stop ()
+ {
+-	if (root_clock) {
+-		root_clock->RemoveHandler (root_clock->CompletedEvent, storyboard_completed, this);
+-		root_clock->Stop ();
++
++	if (clock && !GetHadParent ()) {
++		clock->Stop ();
+ 		TeardownClockGroup ();
+ 	}
+ }
+@@ -672,20 +675,20 @@
+ 	if (GetSurface() == surface)
+ 		return;
+ 
+-	if (GetSurface() && surface == NULL && root_clock && root_clock->GetClockState() == Clock::Active) {
++	if (GetSurface() && surface == NULL && !GetHadParent () && clock && clock->GetClockState() == Clock::Active) {
+ 		/* we're being detached from a surface, so pause clock */
+ 		Pause ();
+-		root_clock->OnSurfaceDetach ();
++		clock->OnSurfaceDetach ();
+ 	}
+  	else if (!GetSurface() && surface) {
+ 		/* we're being (re-)attached to a surface, so
+ 		   1. resume clock if we were paused.
+ 		   2. start clock if we had Begin called before being attached 
+ 		*/
+-		if (root_clock) {
+-			if (root_clock->GetIsPaused() && GetLogicalParent()) {
++		if (!GetHadParent () && clock) {
++			if (clock->GetIsPaused() && GetLogicalParent()) {
+ 				Resume ();
+-				root_clock->OnSurfaceReAttach ();
++				clock->OnSurfaceReAttach ();
+ 			}
+ 		}
+ 		else if (pending_begin && GetLogicalParent ()) {
+Index: clock.h
+===================================================================
+--- clock.h	(revision 127411)
++++ clock.h	(working copy)
+@@ -511,6 +511,7 @@
+ 	DependencyObject *manual_target;
+ 	
+  protected:
++ 	static void timeline_completed (EventObject *sender, EventArgs *calldata, gpointer data);
+ 	virtual ~Timeline ();
+ 
+  public:
+@@ -541,9 +542,6 @@
+ 	
+ 	FillBehavior GetFillBehavior ();
+ 	void SetFillBehavior (FillBehavior behavior);
+-	
+-	bool GetHadParent () { return this->had_parent; }
+-	void SetHadParent (bool had_parent) { this->had_parent = had_parent; }
+ 
+ 	void SetRepeatBehavior (RepeatBehavior behavior);
+ 	RepeatBehavior *GetRepeatBehavior ();
+@@ -554,7 +552,9 @@
+ 	Duration GetNaturalDuration (Clock *clock);
+ 	virtual Duration GetNaturalDurationCore (Clock *clock);
+ 	
+-	virtual Clock *AllocateClock () { return new Clock (this); }
++	virtual void AllocateClock ();
++	virtual void DeallocateClock ();
++	
+ 	virtual bool Validate ();
+ 
+ 	enum TimelineStatus {
+@@ -572,10 +572,9 @@
+ 
+ 	// events
+ 	const static int CompletedEvent;
++	Clock *clock;
+ 
+-
+  private:
+- 	bool had_parent;
+ 	TimelineStatus timeline_status;
+ };
+ 
+@@ -588,8 +587,7 @@
+  public:
+  	/* @GenerateCBinding,GeneratePInvoke */
+ 	TimelineCollection ();
+-	
+-	virtual bool AddedToCollection (Value *value, MoonError *error);
++
+ 	virtual Type::Kind GetElementType() { return Type::TIMELINE; }
+ };
+ 
+@@ -606,7 +604,8 @@
+  	/* @GenerateCBinding,GeneratePInvoke */
+ 	TimelineGroup ();
+ 	
+-	virtual Clock *AllocateClock ();
++	virtual void AllocateClock ();
++	virtual void DeallocateClock ();
+ 	virtual bool Validate ();
+ 	
+ 	void AddChild (Timeline *child);
+Index: clock.cpp
+===================================================================
+--- clock.cpp	(revision 127411)
++++ clock.cpp	(working copy)
+@@ -1449,7 +1449,7 @@
+ 	Clock::RaiseAccumulatedCompleted ();
+ 	
+ 	clock_list_foreach (child_clocks, CallRaiseAccumulatedCompleted);
+-	
++
+ 	if (emit_completed && (state == Clock::Stopped || state == Clock::Filling)) {
+ 		emit_completed = false;
+ 		Emit (CompletedEvent);
+@@ -1492,7 +1492,7 @@
+ {
+ 	SetObjectType (Type::TIMELINE);
+ 
+-	had_parent = false;
++	clock = NULL;
+ 	manual_target = NULL;
+ 	timeline_status = TIMELINE_STATUS_OK;
+ }
+@@ -1501,6 +1501,28 @@
+ {
+ }
+ 
++void
++Timeline::AllocateClock ()
++{
++	clock = new Clock (this);
++	clock->AddHandler (clock->CompletedEvent, timeline_completed, this);
++}
++
++void
++Timeline::DeallocateClock ()
++{
++	clock->RemoveHandler (clock->CompletedEvent, timeline_completed, this);
++	clock->unref ();
++	clock = NULL;
++}
++
++void
++Timeline::timeline_completed (EventObject *sender, EventArgs *calldata, gpointer closure)
++{
++	Timeline *t = (Timeline *) closure;
++	t->Emit (t->CompletedEvent);
++}
++
+ bool
+ Timeline::Validate ()
+ {
+@@ -1595,22 +1617,40 @@
+ {
+ }
+ 
+-Clock *
++void
+ TimelineGroup::AllocateClock ()
+ {
+ 	TimelineCollection *collection = GetChildren ();
+ 	ClockGroup *group = new ClockGroup (this);
+-	Clock *clock;
++	Timeline *timeline;
+ 	
+ 	for (int i = 0; i < collection->GetCount (); i++) {
+-		clock = collection->GetValueAt (i)->AsTimeline ()->AllocateClock ();
+-		group->AddChild (clock);
+-		clock->unref ();
++		timeline = collection->GetValueAt (i)->AsTimeline ();
++		timeline->AllocateClock ();
++		group->AddChild (timeline->clock);
++		//clock->unref ();
+ 	}
+ 	
+-	return group;
++	group->AddHandler (group->CompletedEvent, timeline_completed, this);
++	this->clock = group;
+ }
+ 
++void
++TimelineGroup::DeallocateClock ()
++{
++	Timeline *timeline;
++	ClockGroup *group = (ClockGroup *)clock;
++	TimelineCollection *collection = GetChildren ();
++
++	for (int i = 0; i < collection->GetCount (); i++) {
++		timeline = collection->GetValueAt (i)->AsTimeline ();
++		group->RemoveChild (timeline->clock);
++		timeline->DeallocateClock ();
++	}
++
++	Timeline::DeallocateClock ();
++}
++
+ // Validate this TimelineGroup by validating all of it's children
+ bool
+ TimelineGroup::Validate ()
+@@ -1647,18 +1687,6 @@
+ 	SetObjectType (Type::TIMELINE_COLLECTION);
+ }
+ 
+-bool
+-TimelineCollection::AddedToCollection (Value *value, MoonError *error)
+-{
+-	if (!DependencyObjectCollection::AddedToCollection (value, error))
+-		return false;
+-
+-	if (value && !value->GetIsNull())
+-		value->AsTimeline ()->SetHadParent (true);
+-	return true;
+-}
+-
+-
+ TimelineCollection::~TimelineCollection ()
+ {
+ }
+@@ -1753,7 +1781,8 @@
+ 	} else {
+ 	    Surface *surface = Deployment::GetCurrent ()->GetSurface ();
+ 
+-	    root_clock = TimelineGroup::AllocateClock ();
++	    AllocateClock ();
++	    root_clock = this->clock;
+ 	    char *name = g_strdup_printf ("DispatcherTimer (%p)", this);
+ 	    root_clock->SetValue (DependencyObject::NameProperty, name);
+ 	    g_free (name);

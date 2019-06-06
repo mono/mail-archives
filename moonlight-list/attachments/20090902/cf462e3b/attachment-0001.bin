@@ -1,0 +1,310 @@
+Index: linker/Mono.Linker.Steps/MarkStep.cs
+===================================================================
+--- linker/Mono.Linker.Steps/MarkStep.cs	(revision 140748)
++++ linker/Mono.Linker.Steps/MarkStep.cs	(working copy)
+@@ -58,7 +58,7 @@
+ 				InitializeAssembly (assembly);
+ 		}
+ 
+-		void InitializeAssembly (AssemblyDefinition assembly)
++		protected virtual void InitializeAssembly (AssemblyDefinition assembly)
+ 		{
+ 			MarkAssembly (assembly);
+ 			foreach (TypeDefinition type in assembly.MainModule.Types) {
+@@ -111,6 +111,11 @@
+ 			return _queue.Count == 0;
+ 		}
+ 
++		protected virtual void EnqueueMethod (MethodDefinition method)
++		{
++			_queue.Enqueue (method);
++		}
++
+ 		void MarkMethodBody (MethodBody body)
+ 		{
+ 			foreach (VariableDefinition var in body.Variables)
+@@ -213,7 +218,7 @@
+ 			MarkType (type);
+ 		}
+ 
+-		static bool CheckProcessed (IAnnotationProvider provider)
++		protected static bool CheckProcessed (IAnnotationProvider provider)
+ 		{
+ 			if (Annotations.IsProcessed (provider))
+ 				return true;
+@@ -254,7 +259,7 @@
+ 			Annotations.Mark (field);
+ 		}
+ 
+-		bool IgnoreScope (IMetadataScope scope)
++		protected bool IgnoreScope (IMetadataScope scope)
+ 		{
+ 			AssemblyDefinition assembly = ResolveAssembly (scope);
+ 			return Annotations.GetAction (assembly) != AssemblyAction.Link;
+@@ -269,7 +274,7 @@
+ 			return fd;
+ 		}
+ 
+-		void MarkType (TypeReference reference)
++		protected virtual void MarkType (TypeReference reference)
+ 		{
+ 			if (reference == null)
+ 				return;
+@@ -401,7 +406,7 @@
+ 			return td.BaseType != null && td.BaseType.FullName == "System.MulticastDelegate";
+ 		}
+ 
+-		TypeDefinition ResolveTypeDefinition (TypeReference type)
++		protected TypeDefinition ResolveTypeDefinition (TypeReference type)
+ 		{
+ 			TypeDefinition td = type as TypeDefinition;
+ 			if (td == null)
+@@ -410,7 +415,7 @@
+ 			return td;
+ 		}
+ 
+-		TypeReference GetOriginalType (TypeReference type)
++		protected TypeReference GetOriginalType (TypeReference type)
+ 		{
+ 			while (type is TypeSpecification) {
+ 				GenericInstanceType git = type as GenericInstanceType;
+@@ -497,7 +502,7 @@
+ 
+ 			Annotations.SetAction (method, MethodAction.Parse);
+ 
+-			_queue.Enqueue (method);
++			EnqueueMethod (method);
+ 		}
+ 
+ 		AssemblyDefinition ResolveAssembly (IMetadataScope scope)
+Index: tuner/Mono.Tuner.dll.sources
+===================================================================
+--- tuner/Mono.Tuner.dll.sources	(revision 140748)
++++ tuner/Mono.Tuner.dll.sources	(working copy)
+@@ -4,6 +4,7 @@
+ Mono.Tuner/AdjustVisibility.cs
+ Mono.Tuner/CheckVisibility.cs
+ Mono.Tuner/InjectSecurityAttributes.cs
++Mono.Tuner/MoonlightA11yApiMarker.cs
+ Mono.Tuner/MoonlightA11yAssemblyStep.cs
+ Mono.Tuner/MoonlightA11yDescriptorGenerator.cs
+ Mono.Tuner/MoonlightA11yProcessor.cs
+Index: tuner/Mono.Tuner.csproj
+===================================================================
+--- tuner/Mono.Tuner.csproj	(revision 140748)
++++ tuner/Mono.Tuner.csproj	(working copy)
+@@ -45,6 +45,7 @@
+     <Compile Include="Mono.Tuner\MoonlightA11yAssemblyStep.cs" />
+     <Compile Include="Mono.Tuner\MoonlightA11yUsageInspectionStep.cs" />
+     <Compile Include="Mono.Tuner\MoonlightA11yDescriptorGenerator.cs" />
++    <Compile Include="Mono.Tuner\MoonlightA11yApiMarker.cs" />
+   </ItemGroup>
+   <Import Project="$(MSBuildBinPath)\Microsoft.CSharp.targets" />
+   <!-- To modify your build process, add your task inside one of the targets below and uncomment it.
+Index: tuner/Mono.Tuner/MoonlightA11yDescriptorGenerator.cs
+===================================================================
+--- tuner/Mono.Tuner/MoonlightA11yDescriptorGenerator.cs	(revision 140748)
++++ tuner/Mono.Tuner/MoonlightA11yDescriptorGenerator.cs	(working copy)
+@@ -26,7 +26,7 @@
+ // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ //
+ 
+-
++using System;
+ using System.Collections;
+ using System.Xml;
+ 
+@@ -42,7 +42,7 @@
+ 		XmlTextWriter writer = null;
+ 		protected override void ProcessAssembly (AssemblyDefinition assembly)
+ 		{
+-			if (assembly.Name.Name == "MoonAtkBridge" || assembly.Name.Name == "System.Windows" ||
++			if (assembly.Name.Name == "MoonAtkBridge" ||
+ 			    assembly.Name.Name.Contains ("Dummy"))
+ 				return;
+ 			
+@@ -123,10 +123,11 @@
+ 
+ 			Hashtable members_used = new Hashtable ();
+ 			foreach (TypeDefinition type in assembly.MainModule.Types) {
+-				if (Annotations.IsMarked (type)) {
+-					members_used [type] = ScanType (type);
+-					continue;
+-				}
++				IList used_providers = FilterPublicMembers (ScanType (type));
++				if (used_providers.Count > 0) {
++					members_used [type] = used_providers;
++				} else if (IsInternal (type) && Annotations.IsMarked (type))
++					throw new NotSupportedException (String.Format ("The type {0} is used while its API is not", type.ToString ()));
+ 			}
+ 			return members_used;
+ 		}
+@@ -136,21 +137,54 @@
+ 			return ExtractUsedProviders (type.Methods, type.Constructors, type.Fields);
+ 		}
+ 
+-		static IList /*List<IAnnotationProvider>*/ ExtractUsedProviders (IList methods, IList ctors, IList fields)
++		static IList FilterPublicMembers (IList members)
+ 		{
+-			IList used = new ArrayList ();
+-			ExtractUsedProviders (methods, used);
+-			ExtractUsedProviders (ctors, used);
+-			ExtractUsedProviders (fields, used);
+-			return used;
++			IList new_list = new ArrayList ();
++			foreach (MemberReference item in members)
++				if (IsInternal (item))
++					new_list.Add (item);
++			
++			return new_list;
+ 		}
+ 
+-		static void ExtractUsedProviders (IList members, IList result)
++		static bool IsInternal (TypeDefinition type)
+ 		{
+-			foreach (IAnnotationProvider provider in members)
+-				if (Annotations.IsMarked (provider))
+-					result.Add (provider);
++			return (!type.IsNested && !type.IsPublic) ||
++				(type.IsNested && (!type.IsNestedPublic || IsInternal (type.DeclaringType)));
+ 		}
+ 
++		static bool IsInternal (MemberReference member)
++		{
++			TypeDefinition type = member.DeclaringType.Resolve ();
++
++			if (IsInternal (type))
++				return true;
++			
++			MethodDefinition method = member as MethodDefinition;
++			FieldDefinition field = member as FieldDefinition;
++	
++			if (field == null && method == null)
++				throw new System.NotSupportedException ("Members to scan should be methods or fields");
++
++			if (method != null)
++				return !method.IsPublic;
++
++			return !field.IsPublic;
++		}
++
++		static IList /*List<IAnnotationProvider>*/ ExtractUsedProviders (params IList[] members)
++		{
++			IList used = new ArrayList ();
++			if (members == null || members.Length == 0)
++				return used;
++
++			foreach (IList members_list in members)
++				foreach (IAnnotationProvider provider in members_list)
++					if (Annotations.IsMarked (provider))
++						used.Add (provider);
++
++			return used;
++		}
++
+ 	}
+ }
+Index: tuner/Mono.Tuner/MoonlightA11yApiMarker.cs
+===================================================================
+--- tuner/Mono.Tuner/MoonlightA11yApiMarker.cs	(revision 0)
++++ tuner/Mono.Tuner/MoonlightA11yApiMarker.cs	(revision 0)
+@@ -0,0 +1,87 @@
++//
++// MoonlightA11yDescriptorGenerator.cs
++//
++// Author:
++//   Andrés G. Aragoneses (aaragoneses@novell.com)
++//
++// (C) 2009 Novell, Inc.
++//
++// Permission is hereby granted, free of charge, to any person obtaining
++// a copy of this software and associated documentation files (the
++// "Software"), to deal in the Software without restriction, including
++// without limitation the rights to use, copy, modify, merge, publish,
++// distribute, sublicense, and/or sell copies of the Software, and to
++// permit persons to whom the Software is furnished to do so, subject to
++// the following conditions:
++//
++// The above copyright notice and this permission notice shall be
++// included in all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
++// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
++// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++//
++
++
++using System.Collections;
++using System.Xml;
++
++using Mono.Linker;
++using Mono.Linker.Steps;
++
++using Mono.Cecil;
++
++namespace Mono.Tuner {
++
++	public class MoonlightA11yApiMarker : MarkStep {
++
++		AssemblyDefinition _assembly;
++
++		protected override void InitializeAssembly (AssemblyDefinition assembly)
++		{
++			if (!assembly.ToString ().Contains ("Dummy") && 
++			    !assembly.ToString ().Contains ("MoonAtkBridge"))
++				return;
++
++			if (_assembly == null || assembly.ToString ().Contains ("MoonAtkBridge"))
++				_assembly = assembly;
++			base.InitializeAssembly (assembly);
++		}
++
++		protected override void EnqueueMethod (MethodDefinition method)
++		{
++			if (_assembly.MainModule.Types.Contains (method.DeclaringType))
++				base.EnqueueMethod (method);
++			else
++				Annotations.Mark (method);
++		}
++
++		protected override void MarkType (TypeReference reference)
++		{
++			if (reference == null)
++				return;
++
++			reference = GetOriginalType (reference);
++
++			if (reference is GenericParameter)
++				return;
++
++			if (IgnoreScope (reference.Scope))
++				return;
++
++			TypeDefinition type = ResolveTypeDefinition (reference);
++
++			if (type == null)
++				throw new ResolutionException (reference);
++
++			if (CheckProcessed (type))
++				return;
++
++			Annotations.Mark (type);
++		}
++	}
++}
+Index: tuner/Mono.Tuner/MoonlightA11yUsageInspectionStep.cs
+===================================================================
+--- tuner/Mono.Tuner/MoonlightA11yUsageInspectionStep.cs	(revision 140748)
++++ tuner/Mono.Tuner/MoonlightA11yUsageInspectionStep.cs	(working copy)
+@@ -41,6 +41,7 @@
+ 
+ 		protected override void CustomizePipeline (Pipeline pipeline)
+ 		{
++			pipeline.ReplaceStep (typeof (MarkStep), new MoonlightA11yApiMarker ());
+ 			pipeline.ReplaceStep (typeof (SweepStep), new MoonlightA11yDescriptorGenerator ());
+ 			pipeline.RemoveStep (typeof (LoadI18nAssemblies));
+ 			pipeline.RemoveStep (typeof (CleanStep));

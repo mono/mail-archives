@@ -1,0 +1,563 @@
+Index: src/security.c
+===================================================================
+--- src/security.c	(revision 0)
++++ src/security.c	(revision 0)
+@@ -0,0 +1,91 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
++/*
++ * security.c:
++ *
++ * Contact:
++ *   Moonlight List (moonlight-list@lists.ximian.com)
++ *
++ * Copyright 2009 Novell, Inc. (http://www.novell.com)
++ *
++ * See the LICENSE file included with the distribution for details.
++ */
++
++#include "security.h"
++
++static struct stat platform_stat;
++
++const static char* platform_code_assemblies [] = {
++	"mscorlib.dll",
++	"System.dll",
++	"System.Core.dll",
++	"System.Net.dll",
++	"System.Runtime.Serialization.dll",
++	"System.ServiceModel.dll",
++	"System.ServiceModel.Web.dll",
++	"System.Windows.dll",
++	"System.Windows.Browser.dll",
++	"System.Xml.dll",
++	"Microsoft.VisualBasic.dll",
++};
++
++static gboolean
++determine_platform_image (const char *image_name)
++{
++	struct stat info;
++	gchar *dir, *name;
++	int i;
++
++	if (!image_name)
++		return FALSE;
++
++	/* all platform code resides in the same directory */
++	dir = g_path_get_dirname (image_name);
++	if (!dir || stat (dir, &info) != 0) {
++		g_free (dir);
++		return FALSE;
++	}
++
++	/* we avoid comparing strings, e.g. /opt/mono/lib/moon versus /opt/mono//lib/moon */
++	if ((platform_stat.st_mode != info.st_mode) ||
++		(platform_stat.st_ino != info.st_ino) ||
++		(platform_stat.st_dev != info.st_dev)) {
++		g_free (dir);
++		return FALSE;
++	}
++	g_free (dir);
++
++	/* we know the names of every platform assembly, because we ship them */
++	name = g_path_get_basename (image_name);
++	if (!name)
++		return FALSE;
++
++	for (i = 0; i < G_N_ELEMENTS (platform_code_assemblies); i++) {
++		if (g_ascii_strcasecmp (name, platform_code_assemblies [i]) == 0) {
++			g_free (name);
++			return TRUE;
++		}
++	}
++	g_free (name);
++	return FALSE;
++}
++
++void
++security_enable_coreclr (const char *platform_dir)
++{
++	// XXX condition to be reversed before preview XXX
++	if (g_getenv ("MOON_SECURITY") == NULL) {
++		g_warning ("CORECLR was DISABLED using MOON_SECURITY override");
++		return;
++	}
++
++	memset (&platform_stat, 0, sizeof (platform_stat));
++	if (g_path_is_absolute (platform_dir)) {
++		if (stat (platform_dir, &platform_stat) == 0) {
++			mono_assembly_setrootdir (platform_dir);
++		}
++	}
++
++	mono_security_enable_core_clr ();
++	mono_security_set_core_clr_platform_callback (determine_platform_image);
++}
++
+Index: src/security.h
+===================================================================
+--- src/security.h	(revision 0)
++++ src/security.h	(revision 0)
+@@ -0,0 +1,28 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
++/*
++ * security.h: 
++ *
++ * Contact:
++ *   Moonlight List (moonlight-list@lists.ximian.com)
++ *
++ * Copyright 2009 Novell, Inc. (http://www.novell.com)
++ *
++ * See the LICENSE file included with the distribution for details.
++ */
++
++#ifndef __SECURITY_H__
++#define __SECURITY_H__
++
++#include <string.h>
++#include <glib.h>
++#include <sys/stat.h>
++#include <mono/metadata/appdomain.h>
++
++G_BEGIN_DECLS
++
++G_GNUC_INTERNAL void security_enable_coreclr (const char *platform_dir);
++
++G_END_DECLS
++
++#endif
++
+Index: src/deployment.h
+===================================================================
+--- src/deployment.h	(revision 130418)
++++ src/deployment.h	(working copy)
+@@ -92,7 +92,7 @@
+ 	static void SetCurrent (Deployment* value);
+ 	static void SetCurrent (Deployment* value, bool domain);
+ 
+-	static bool Initialize ();
++	static bool Initialize (const char *platform_dir);
+ 	static void RegisterThread (Deployment *deployment);
+ 
+ 	void UnrefDelayed (EventObject *obj);
+Index: src/ChangeLog
+===================================================================
+--- src/ChangeLog	(revision 130323)
++++ src/ChangeLog	(working copy)
+@@ -1,3 +1,13 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* deployment.cpp|h (Initialize): If a platform directory is
++	specified then we initialize the CoreCLR security model.
++	* runtime.cpp|h: Initialize the runtime using the plugin
++	directory (when applicable, i.e. browser mode).
++	* security.c|h: New. Handle the CoreCLR security model 
++	initialization and platform code detection.
++	* Makefile.am: Add security.[c|h] to the build
++
+ 2009-03-26  Jeffrey Stedfast  <fejj@novell.com>
+ 
+ 	* deepzoomimagetilesource.cpp (DeepZoomImageTileSource::GetTileLayer):
+Index: src/runtime.h
+===================================================================
+--- src/runtime.h	(revision 130418)
++++ src/runtime.h	(working copy)
+@@ -406,10 +406,10 @@
+ 
+ G_BEGIN_DECLS
+ 
+-void     runtime_init (guint64 flags);
++void     runtime_init (const char *plugin_dir, guint64 flags);
+ 
+-void     runtime_init_browser ();
+-void     runtime_init_desktop ();
++void     runtime_init_browser (const char *plugin_dir);
++void     runtime_init_desktop (void);
+ 
+ GList   *runtime_get_surface_list (void);
+ 
+Index: src/deployment.cpp
+===================================================================
+--- src/deployment.cpp	(revision 130418)
++++ src/deployment.cpp	(working copy)
+@@ -16,6 +16,7 @@
+ #include "deployment.h"
+ #include "debug.h"
+ #include "utils.h"
++#include "security.h"
+ 
+ #include <stdlib.h>
+ #include <mono/jit/jit.h>
+@@ -50,7 +51,7 @@
+ };
+  
+ bool
+-Deployment::Initialize()
++Deployment::Initialize (const char *platform_dir)
+ {
+ 	const gchar *trace_options;
+ 	const gchar *moon_path;
+@@ -74,21 +75,27 @@
+ 
+ 	mono_config_parse (NULL);
+ 
+-	if (g_getenv ("MOON_SECURITY") != NULL)
+-		mono_security_enable_core_clr ();
++	/* if a platform directory is provided then we're running inside the browser and CoreCLR should be enabled */
++	if (platform_dir) {
++		security_enable_coreclr (platform_dir);
+ 
++		/* XXX confine mono itself to the platform directory XXX incomplete */
++		g_setenv ("MONO_PATH", platform_dir, true);
++		g_unsetenv ("MONO_GAC_PREFIX");
++	} else {
++		moon_path = g_getenv ("MOON_PATH");
++		if (moon_path != NULL && moon_path [0] != 0) {
++			printf ("Setting moonlight root directory to: %s\n", moon_path);
++			mono_assembly_setrootdir (moon_path);
++		}
++	}
++
+ 	trace_options = g_getenv ("MOON_TRACE");
+ 	if (trace_options != NULL){
+ 		printf ("Setting trace options to: %s\n", trace_options);
+ 		mono_jit_set_trace_options (trace_options);
+ 	}
+ 	
+-	moon_path = g_getenv ("MOON_PATH");
+-	if (moon_path != NULL && moon_path [0] != 0) {
+-		printf ("Setting moonlight root directory to: %s\n", moon_path);
+-		mono_assembly_setrootdir (moon_path);
+-	}
+-
+ 	profiler = g_getenv ("MOON_PROFILER");
+ 	if (profiler != NULL) {
+ 		printf ("Setting profiler to: %s\n", profiler);
+Index: src/runtime.cpp
+===================================================================
+--- src/runtime.cpp	(revision 130418)
++++ src/runtime.cpp	(working copy)
+@@ -1932,15 +1932,15 @@
+ }
+ 
+ void
+-runtime_init_browser ()
++runtime_init_browser (const char *plugin_dir)
+ {
+-	runtime_init (RUNTIME_INIT_BROWSER);
++	runtime_init (plugin_dir, RUNTIME_INIT_BROWSER);
+ }
+ 
+ void
+ runtime_init_desktop ()
+ {
+-	runtime_init (RUNTIME_INIT_DESKTOP);
++	runtime_init (NULL, RUNTIME_INIT_DESKTOP);
+ }
+ 
+ static gint64
+@@ -1996,7 +1996,7 @@
+ }
+ 
+ void
+-runtime_init (guint64 flags)
++runtime_init (const char *plugin_dir, guint64 flags)
+ {
+ 
+ 	if (inited)
+@@ -2029,7 +2029,7 @@
+ 	
+ 	moonlight_flags = flags;
+ 	
+-	Deployment::Initialize ();
++	Deployment::Initialize (plugin_dir);
+ 	xaml_init ();
+ 	font_init ();
+ 	downloader_init ();
+Index: src/Makefile.am
+===================================================================
+--- src/Makefile.am	(revision 130418)
++++ src/Makefile.am	(working copy)
+@@ -76,6 +76,7 @@
+ 	region.h		\
+ 	resources.h		\
+ 	runtime.h		\
++	security.h		\
+ 	shape.h			\
+ 	size.h			\
+ 	style.h			\
+@@ -170,6 +171,7 @@
+ 	region.cpp		\
+ 	resources.cpp		\
+ 	runtime.cpp		\
++	security.c		\
+ 	shape.cpp		\
+ 	size.cpp		\
+ 	style.cpp		\
+Index: plugin/plugin.cpp
+===================================================================
+--- plugin/plugin.cpp	(revision 130418)
++++ plugin/plugin.cpp	(working copy)
+@@ -641,19 +641,29 @@
+ 
+ typedef BrowserBridge* (*create_bridge_func)();
+ 
++const char*
++get_plugin_dir (void)
++{
++	static char *plugin_dir = NULL;
++
++	if (!plugin_dir) {
++		Dl_info dlinfo;
++		if (dladdr((void *) &plugin_show_menu, &dlinfo) == 0) {
++			fprintf (stderr, "Unable to find the location of libmoonplugin.so: %s\n", dlerror ());
++			return NULL;
++		}
++		plugin_dir = g_path_get_dirname (dlinfo.dli_fname);
++	}
++	return plugin_dir;
++}
++
+ void
+ PluginInstance::TryLoadBridge (const char *prefix)
+ {
+-	Dl_info dlinfo;
+-	if (dladdr((void *) &plugin_show_menu, &dlinfo) == 0) {
+-		fprintf (stderr, "Unable to find the location of libmoonplugin.so: %s\n", dlerror ());
+-		return;
+-	}
+-
+ 	char *bridge_name = g_strdup_printf ("libmoonplugin-%sbridge.so", prefix);
+ 	char *bridge_path;
+ 
+-	bridge_path = g_build_filename (g_path_get_dirname(dlinfo.dli_fname), bridge_name, NULL);
++	bridge_path = g_build_filename (get_plugin_dir (), bridge_name, NULL);
+ 
+ 	void* bridge_handle = dlopen (bridge_path, RTLD_LAZY);
+ 
+Index: plugin/plugin.h
+===================================================================
+--- plugin/plugin.h	(revision 130418)
++++ plugin/plugin.h	(working copy)
+@@ -310,6 +310,8 @@
+ 
+ G_BEGIN_DECLS
+ 
++const char *get_plugin_dir (void);
++
+ int32_t plugin_instance_get_actual_width  (PluginInstance *instance);
+ int32_t plugin_instance_get_actual_height (PluginInstance *instance);
+ 
+Index: plugin/ChangeLog
+===================================================================
+--- plugin/ChangeLog	(revision 130418)
++++ plugin/ChangeLog	(working copy)
+@@ -1,3 +1,9 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* plugin.cpp|h: Export a new function (get_plugin_dir) that returns
++	the location of the plugin.
++	* plugin-glue.cpp: Initialize the runtime using the plugin location.
++
+ 2009-03-27  Andreia Gaita  <avidigal@novell.com>
+ 
+ 	* plugin.cpp: Don't release return from Eval if they're npobj,
+Index: plugin/plugin-glue.cpp
+===================================================================
+--- plugin/plugin-glue.cpp	(revision 130418)
++++ plugin/plugin-glue.cpp	(working copy)
+@@ -225,7 +225,7 @@
+ 
+ 	if (!runtime_initialized) {
+ 		runtime_initialized = true;
+-		runtime_init_browser ();
++		runtime_init_browser (get_plugin_dir ());
+ 	}
+ 
+ 	plugin_init_classes ();
+Index: class/System.Windows.Controls/ChangeLog
+===================================================================
+--- class/System.Windows.Controls/ChangeLog	(revision 130418)
++++ class/System.Windows.Controls/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* Makefile.am: Do not install 2.1 in the GAC but in the plugin dir
++
+ 2009-03-16  Rolf Bjarne Kvinge  <RKvinge@novell.com>
+ 
+ 	* Makefile.am: Add missing files and resources to build.
+Index: class/System.Windows.Controls/Makefile.am
+===================================================================
+--- class/System.Windows.Controls/Makefile.am	(revision 130418)
++++ class/System.Windows.Controls/Makefile.am	(working copy)
+@@ -93,7 +93,8 @@
+ 
+ if INCLUDE_BROWSER_MANAGED_CODE
+ install-sl:
+-	$(GACUTIL) /i $(assemblysl)      /f /package 2.1
++	$(INSTALL) -c -m 755  $(assemblysl) $(prefix)/lib/moon/plugin/$(assembly).dll
++	test ! -f $(assemblysl).mdb || $(INSTALL) -c -m 755 $(assemblysl).mdb $(prefix)/lib/moon/plugin/$(assembly).dll.mdb
+ else
+ install-sl:
+ endif
+Index: class/System.Windows.Controls.Data/ChangeLog
+===================================================================
+--- class/System.Windows.Controls.Data/ChangeLog	(revision 130418)
++++ class/System.Windows.Controls.Data/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* Makefile.am: Do not install 2.1 in the GAC but in the plugin dir
++
+ 2009-03-17  Rolf Bjarne Kvinge  <RKvinge@novell.com>
+ 
+ 	* Makefile.am: Include resources in
+Index: class/System.Windows.Controls.Data/Makefile.am
+===================================================================
+--- class/System.Windows.Controls.Data/Makefile.am	(revision 130418)
++++ class/System.Windows.Controls.Data/Makefile.am	(working copy)
+@@ -123,7 +123,8 @@
+ 
+ if INCLUDE_BROWSER_MANAGED_CODE
+ install-sl:
+-	$(GACUTIL) /i $(assemblysl)      /f /package 2.1
++	$(INSTALL) -c -m 755  $(assemblysl) $(prefix)/lib/moon/plugin/$(assembly).dll
++	test ! -f $(assemblysl).mdb || $(INSTALL) -c -m 755 $(assemblysl).mdb $(prefix)/lib/moon/plugin/$(assembly).dll.mdb
+ else
+ install-sl:
+ endif
+Index: class/System.Windows.Browser/ChangeLog
+===================================================================
+--- class/System.Windows.Browser/ChangeLog	(revision 130418)
++++ class/System.Windows.Browser/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* Makefile.am: Do not install 2.1 in the GAC but in the plugin dir
++
+ 2009-03-12  Sebastien Pouliot  <sebastien@ximian.com>
+ 
+ 	* Makefile.am: Add security attributes using the linker after the
+Index: class/System.Windows.Browser/Makefile.am
+===================================================================
+--- class/System.Windows.Browser/Makefile.am	(revision 130418)
++++ class/System.Windows.Browser/Makefile.am	(working copy)
+@@ -95,7 +95,8 @@
+ 
+ if INCLUDE_BROWSER_MANAGED_CODE
+ install-sl:
+-	$(GACUTIL) /i $(assemblysl)      /f /package 2.1
++	$(INSTALL) -c -m 755  $(assemblysl) $(prefix)/lib/moon/plugin/$(assembly).dll
++	test ! -f $(assemblysl).mdb || $(INSTALL) -c -m 755 $(assemblysl).mdb $(prefix)/lib/moon/plugin/$(assembly).dll.mdb
+ else
+ install-sl:
+ endif
+Index: class/tuning/ChangeLog
+===================================================================
+--- class/tuning/ChangeLog	(revision 130418)
++++ class/tuning/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* Makefile.am: Do not install 2.1 in the GAC but in the plugin dir
++
+ 2009-03-13  Jb Evain  <jbevain@novell.com>
+ 
+ 	* Makefile.am: copy back the tuned assemblies in the mcs tree.
+Index: class/tuning/Makefile.am
+===================================================================
+--- class/tuning/Makefile.am	(revision 130418)
++++ class/tuning/Makefile.am	(working copy)
+@@ -1,7 +1,7 @@
+ SUBDIRS=SecurityAttributes
+ 
+ LINKER = ../lib/tuner/monolinker.exe
+-GACUTIL = gacutil /gacdir $(DESTDIR)$(prefix)/lib /root $(DESTDIR)$(prefix)/lib /package 2.1
++#GACUTIL = gacutil /gacdir $(DESTDIR)$(prefix)/lib /root $(DESTDIR)$(prefix)/lib /package 2.1
+ 
+ TUNER_DESCS =	\
+ 	Descriptors/mscorlib.xml	\
+@@ -91,19 +91,17 @@
+ end-install:	\
+ 	inst-mscorlib.dll	\
+ 	inst-smcs.exe	\
+-	gac-System	\
+-	gac-System.Net	\
+-	gac-System.Xml	\
+-	gac-System.Xml.Linq	\
+-	gac-System.Core	\
+-	gac-System.Runtime.Serialization	\
+-	gac-System.ServiceModel	\
+-	gac-System.ServiceModel.Web	\
+-	gac-Mono.CompilerServices.SymbolWriter
++	inst-System.dll	\
++	inst-System.Net.dll	\
++	inst-System.Xml.dll	\
++	inst-System.Xml.Linq.dll	\
++	inst-System.Core.dll	\
++	inst-System.Runtime.Serialization.dll	\
++	inst-System.ServiceModel.dll	\
++	inst-System.ServiceModel.Web.dll	\
++	inst-Mono.CompilerServices.SymbolWriter.dll
+ 
+ inst-%: $(OUTPUT_DIR)/%
+-	$(INSTALL) -c -m 755  $(OUTPUT_DIR)/$* $(TUNER_INSTALL_DIR)/$*
+-	test ! -f $(OUTPUT_DIR)/$*.mdb || $(INSTALL) -c -m 755  $(OUTPUT_DIR)/$*.mdb $(TUNER_INSTALL_DIR)/$*.mdb
++	$(INSTALL) -c -m 755  $(OUTPUT_DIR)/$* $(prefix)/lib/moon/plugin/$*
++	test ! -f $(OUTPUT_DIR)/$*.mdb || $(INSTALL) -c -m 755  $(OUTPUT_DIR)/$*.mdb $(prefix)/lib/moon/plugin/$*.mdb
+ 
+-gac-%: $(OUTPUT_DIR)/%.dll
+-	$(GACUTIL) /f /i $(OUTPUT_DIR)/$*.dll
+Index: class/tuning/SecurityAttributes/ChangeLog
+===================================================================
+--- class/tuning/SecurityAttributes/ChangeLog	(revision 130418)
++++ class/tuning/SecurityAttributes/ChangeLog	(working copy)
+@@ -1,3 +1,8 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com> 
++
++	* Makefile.am: Use the plugin directory as the assembly source
++	to analyze.
++
+ 2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
+ 
+ 	* detect-sc.cs: Handle interfaces and method overrides since the
+Index: class/tuning/SecurityAttributes/Makefile.am
+===================================================================
+--- class/tuning/SecurityAttributes/Makefile.am	(revision 130418)
++++ class/tuning/SecurityAttributes/Makefile.am	(working copy)
+@@ -3,7 +3,7 @@
+ CECIL=-r:$(MCS_PATH)/class/lib/net_1_1/Mono.Cecil.dll
+ LIBS=$(CECIL) -r:Moonlight.SecurityModel.dll
+ MONO_PLATFORM_CODE=$(MCS_PATH)/class/lib/net_2_1/
+-MOONLIGHT_PLATFORM_CODE=${prefix}/lib/mono/2.1/
++MOONLIGHT_PLATFORM_CODE=${prefix}/lib/moon/plugin
+ SILVERLIGHT_PLATFORM_CODE="/cygdrive/c/Program\ Files/Microsoft\ Silverlight/2.0.31005.0/"
+ 
+ SECURITY_ATTRIBUTES_AUTOMATIC_INFO= \
+Index: class/System.Windows/ChangeLog
+===================================================================
+--- class/System.Windows/ChangeLog	(revision 130418)
++++ class/System.Windows/ChangeLog	(working copy)
+@@ -1,3 +1,7 @@
++2009-03-27  Sebastien Pouliot  <sebastien@ximian.com>
++
++	* Makefile.am: Do not install 2.1 in the GAC but in the plugin dir
++
+ 2009-03-18  Andrés G. Aragoneses  <aaragoneses@novell.com>
+ 
+ 	* System.Windows.mdp: Update.
+Index: class/System.Windows/Makefile.am
+===================================================================
+--- class/System.Windows/Makefile.am	(revision 130418)
++++ class/System.Windows/Makefile.am	(working copy)
+@@ -514,7 +514,8 @@
+ 
+ if INCLUDE_BROWSER_MANAGED_CODE
+ install-sl:
+-	$(GACUTIL) /i $(assemblysl)      /f /package 2.1
++	$(INSTALL) -c -m 755  $(assemblysl) $(prefix)/lib/moon/plugin/$(assembly).dll
++	test ! -f $(assemblysl).mdb || $(INSTALL) -c -m 755 $(assemblysl).mdb $(prefix)/lib/moon/plugin/$(assembly).dll.mdb
+ else
+ install-sl:
+ endif
