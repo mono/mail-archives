@@ -1,0 +1,361 @@
+#include <pthread.h>
+
+#include <mono/metadata/profiler.h>
+#include <mono/metadata/image.h>
+#include <mono/metadata/assembly.h>
+#include <mono/metadata/debug-helpers.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <time.h>
+
+typedef union {
+	unsigned long long value;
+	unsigned int ints[2];
+} TSC_value;
+
+#define rdtsc(v) \
+        __asm__ __volatile__("rdtsc" : "=a" (v.ints[0]), "=d" (v.ints[1]))
+
+struct method_descriptor {
+	MonoMethod *method;
+	unsigned int calls;
+	unsigned int flags;
+	unsigned int used_times;
+	unsigned long long cumulative_time;
+	unsigned long long real_cumulative;
+	unsigned long long children_time;
+};
+
+struct activation_record {
+	struct activation_record *next;
+	struct method_descriptor *method;
+	unsigned long long entry_time;
+	unsigned long long children_time;
+};
+
+struct class_descriptor {
+	MonoClass *klass;
+	unsigned cumulative_size;
+	unsigned instance_count;
+	GHashTable *methods;
+};
+
+struct class_method_descriptor {
+	MonoMethod *method;
+	unsigned count;
+};
+
+struct _MonoProfiler {
+	time_t last_writeout_time;
+	GHashTable *methods;
+	GHashTable *classes;
+	MonoMemPool *mempool;
+	unsigned long long total_time;
+	unsigned long long total_memory;
+	pthread_key_t thread_stacks;
+};
+
+struct thread_stack_descriptor {
+	struct activation_record *the_stack;
+	struct activation_record *free_records;
+};
+
+
+static void
+output_method (MonoMethod *meth, struct method_descriptor *desc, MonoProfiler *prof)
+{
+  //        assert (desc->used_times == 0);
+
+	printf("%10lld %10lld %10d %8lld %12lld   %s %s\n", 
+	       (desc->cumulative_time - desc->children_time) / (prof->total_time / 100000),
+	       desc->real_cumulative / (prof->total_time / 100000),
+	       desc->calls,
+	       (desc->cumulative_time - desc->children_time) / desc->calls,
+	       desc->real_cumulative / desc->calls,
+	       mono_method_full_name (meth, TRUE),
+	       desc->flags & 1 ? "(flawed)" : "");
+}
+
+struct get_hash_values_data {
+	gpointer *array;
+	int offset;
+};
+
+static void
+get_hash_values_helper (gpointer key, gpointer value, struct get_hash_values_data *user_data)
+{
+	user_data->array[user_data->offset++] = value;
+}
+
+static gpointer *
+get_sorted_hash_values (GHashTable *h, void *comparer)
+{
+	struct get_hash_values_data ghvd;
+	ghvd.array = (gpointer*)g_malloc(sizeof(gpointer) * g_hash_table_size (h));
+	ghvd.offset = 0;
+	g_hash_table_foreach (h, (GHFunc) get_hash_values_helper, &ghvd);
+
+	qsort(ghvd.array, g_hash_table_size (h), sizeof(gpointer), comparer);
+
+	return ghvd.array;
+}
+
+static int
+compare_alloc_size (const struct class_descriptor **a, const struct class_descriptor **b) {
+	if ((*a)->cumulative_size > (*b)->cumulative_size) return -1;
+	if ((*a)->cumulative_size < (*b)->cumulative_size) return 1;
+	return 0;
+}
+
+static int
+compare_call_count (const struct class_method_descriptor **a, const struct class_method_descriptor **b) {
+	if ((*a)->count > (*b)->count) return -1;
+	if ((*a)->count < (*b)->count) return 1;
+	return 0;
+}
+
+static void
+write_report(FILE *file, MonoProfiler *prof) {
+	unsigned int i, j;
+	time_t now;
+
+	now = time(NULL);
+	fprintf(file, "%s\n", ctime(&now));	
+
+	if (0) {
+		fprintf(file, "%10s %10s %10s %8s %12s   %s\n",
+			"Total [%]", "Self [%]", "Cnt called",
+			"Cyc/call", "TotCyc/Call", "Name");
+		g_hash_table_foreach (prof->methods, (GHFunc) output_method, prof);
+	}
+
+	if (1) {
+		struct class_descriptor **array = (struct class_descriptor**)
+			get_sorted_hash_values(prof->classes, compare_alloc_size);
+		fprintf(file, "Types that accounted for more than five percent of the memory allocated:\n");
+		fprintf(file, "%10s %10s %8s  %s\n", "Size (KB)", "Instances", "Bytes/Inst", "Type Name");
+		for (i = 0; i < g_hash_table_size (prof->classes); i++) {
+			if (array[i]->cumulative_size <= prof->total_memory/20) continue;
+			fprintf(file, "%10u %10u %8.2f  %s\n", array[i]->cumulative_size/1024, array[i]->instance_count,
+				(double)array[i]->cumulative_size / array[i]->instance_count,
+				mono_type_full_name (mono_class_get_type (array[i]->klass)));
+
+			struct class_method_descriptor **array2 = (struct class_method_descriptor**)
+				get_sorted_hash_values(array[i]->methods, compare_call_count);
+			for (j = 0; j < g_hash_table_size (array[i]->methods); j++) {
+				if (array2[j]->count <= array[i]->instance_count/20) continue;
+				fprintf(file, "%10s %10s %8s  %d%% %s\n", "", "", "", 100*array2[j]->count/array[i]->instance_count,
+					mono_method_full_name (array2[j]->method, TRUE));
+			}
+			g_free(array2);
+		}
+		g_free(array);
+	}
+
+	fprintf (file, "managed allocation:\t%llu KB\n\n", prof->total_memory/1024);
+}
+
+static void
+simple_shutdown (MonoProfiler *prof)
+{
+	write_report(stdout, prof);
+}
+
+static void
+write_timely_report (MonoProfiler *prof)
+{
+	FILE *file = fopen("/tmp/profile.txt", "w");
+	if (file) {
+		write_report(file, prof);
+		fclose(file);
+	}
+}
+
+static struct thread_stack_descriptor *
+get_thread_stack (MonoProfiler *prof)
+{
+	struct thread_stack_descriptor *stack = pthread_getspecific (prof->thread_stacks);
+	if (stack == NULL) {
+		stack = g_malloc(sizeof(struct thread_stack_descriptor));
+		pthread_setspecific(prof->thread_stacks, stack);
+		stack->the_stack = NULL;
+		stack->free_records = NULL;
+	}
+	return stack;
+}
+
+static MonoMethod *
+get_current_method (MonoProfiler *prof)
+{
+	struct activation_record *record = get_thread_stack(prof)->the_stack;
+	while (record) {
+		MonoClass *klass = mono_method_get_class(record->method->method);
+		MonoAssemblyName aname;
+		if (mono_assembly_fill_assembly_name(mono_class_get_image(klass), &aname))
+			if (strcmp(aname.name, "mscorlib"))
+				return record->method->method;
+
+		//const char *ns = mono_class_get_namespace(klass);
+		//MonoAssembly *ass = mono_image_get_assembly(mono_class_get_image(klass));
+
+		record = record->next;
+	}
+
+	return NULL;
+}
+
+static void
+simple_method_enter (MonoProfiler *prof, MonoMethod *method)
+{
+	struct method_descriptor *desc;
+	struct activation_record *record;
+	TSC_value tsc_value;
+
+	desc = g_hash_table_lookup (prof->methods, method);
+	
+	if (desc == NULL) {
+		desc = mono_mempool_alloc0 (prof->mempool,
+				            sizeof (struct method_descriptor));
+		g_hash_table_insert (prof->methods, method, desc);
+		desc->method = method;
+	}
+
+	desc->calls++;
+	desc->used_times++;
+
+	assert (method == desc->method);
+
+	struct thread_stack_descriptor *stack = get_thread_stack (prof);
+
+	if (stack->free_records == NULL) {
+		record = mono_mempool_alloc (prof->mempool, 
+					     sizeof (struct activation_record));
+	} else {
+		record = stack->free_records;
+		stack->free_records = record->next;
+	}
+
+	record->next = stack->the_stack;
+	record->method = desc;
+	stack->the_stack = record;
+	rdtsc (tsc_value);
+	record->entry_time = tsc_value.value;
+	record->children_time = 0;
+}
+
+static void
+simple_method_leave (MonoProfiler *prof, MonoMethod *method)
+{
+	struct thread_stack_descriptor *stack = get_thread_stack (prof);
+	struct activation_record *record = stack->the_stack;
+	if (!record) return;
+
+	/*int found = 0;
+	while (record) {
+		if (record->method->method == method) found = 1;
+		record = record->next;
+	}
+	if (!found) return;
+	record = stack->the_stack;*/
+
+	struct method_descriptor *desc = record->method;
+	unsigned long long running_time;
+	TSC_value tsc_value;
+	
+	while (desc->method != method) {
+		desc->flags |= 1;
+		desc->used_times--;
+		stack->the_stack = record->next;
+		record->next = stack->free_records;
+		stack->free_records = record;
+
+		record = stack->the_stack;
+		if (record == NULL) {
+			printf ("unwind failed for `%s'\n", mono_method_full_name (method, TRUE));
+			abort ();
+		}
+		desc = record->method;
+
+		//printf("expecting %s, got %s\n", desc->method->name, method->name);
+	}
+
+	desc->used_times--;
+
+	rdtsc (tsc_value);
+	running_time = tsc_value.value - record->entry_time;
+	desc->cumulative_time += running_time;
+	desc->children_time += record->children_time;
+	if (desc->used_times == 0)
+		desc->real_cumulative += running_time;
+	
+	if (record->next)
+		record->next->children_time += running_time;
+	else
+		prof->total_time += running_time;
+	
+	stack->the_stack = record->next;
+	record->next = stack->free_records;
+	stack->free_records = record;
+}
+
+static void
+simple_allocation (MonoProfiler *prof, MonoObject *obj, MonoClass *klass)
+{
+	struct class_descriptor *desc = 
+		g_hash_table_lookup (prof->classes, klass);
+	size_t size;
+
+	if (desc == NULL) {
+		desc = mono_mempool_alloc0 (prof->mempool,
+				            sizeof (struct class_descriptor));
+		g_hash_table_insert (prof->classes, klass, desc);
+		desc->klass = klass;
+		desc->methods = g_hash_table_new (NULL, NULL);
+	}
+
+	size = mono_object_get_size (obj);
+	
+	prof->total_memory += size;
+	desc->instance_count++;
+	desc->cumulative_size += size;
+
+	MonoMethod *current_method = get_current_method(prof);
+	if (current_method) {
+		struct class_method_descriptor *mdesc = 
+			g_hash_table_lookup (desc->methods, current_method);
+
+		if (mdesc == NULL) {
+			mdesc = mono_mempool_alloc0 (prof->mempool, sizeof (struct class_method_descriptor));
+			g_hash_table_insert (desc->methods, current_method, mdesc);
+			mdesc->method = current_method;
+			mdesc->count = 0;
+		}
+
+		mdesc->count++;
+	}
+
+	if (time(NULL) - prof->last_writeout_time > 15) {
+		prof->last_writeout_time = time(NULL);
+		write_timely_report(prof);
+	}
+}
+
+void mono_profiler_startup(const char *args)
+{
+	MonoProfiler *prof = g_new0 (MonoProfiler, 1);
+
+	prof->last_writeout_time = time(NULL);
+	prof->methods = g_hash_table_new (NULL, NULL);
+	prof->classes = g_hash_table_new (NULL, NULL);
+	prof->mempool = mono_mempool_new ();
+
+	pthread_key_create (&prof->thread_stacks, g_free);
+
+	mono_profiler_install (prof, simple_shutdown);
+	mono_profiler_install_enter_leave (simple_method_enter, simple_method_leave);
+	mono_profiler_install_allocation (simple_allocation);
+	mono_profiler_set_events (MONO_PROFILE_ENTER_LEAVE | MONO_PROFILE_ALLOCATIONS);
+}

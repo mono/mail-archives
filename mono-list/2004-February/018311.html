@@ -1,0 +1,178 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] How can you add an MSIL instruction to mcs and mono?
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:lupus%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="018296.html">
+   <LINK REL="Next"  HREF="018297.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] How can you add an MSIL instruction to mcs and mono?
+   </H1>
+    <B>Paolo Molaro
+    </B> 
+    <A HREF="mailto:lupus%40ximian.com"
+       TITLE="[Mono-list] How can you add an MSIL instruction to mcs and mono?">lupus@ximian.com
+       </A><BR>
+    <I>Wed, 11 Feb 2004 22:25:16 +0100</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="018296.html">[Mono-list] How can you add an MSIL instruction to mcs and mono?
+</A></li>
+        <LI> Next message: <A HREF="018297.html">[Mono-list] What's this message?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18311">[ date ]</a>
+              <a href="thread.html#18311">[ thread ]</a>
+              <a href="subject.html#18311">[ subject ]</a>
+              <a href="author.html#18311">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 02/10/04 <A HREF="mailto:apwilson@rogers.com">apwilson@rogers.com</A> wrote:
+&gt;<i> I am currently attempting to add a new MSIL instruction to Mono for some
+</I>&gt;<i> research I am doing.  I was hoping someone could shed some light on how
+</I>&gt;<i> to do this or direct me to some documentation which would help me do this.
+</I>
+Reading the jit documents in mono/mini should help: mini-doc.txt
+and mini-porting.txt.
+
+&gt;<i> So far:
+</I>&gt;<i> 1) I've modifed mcs to recognize a keyword in a C# file and output MSIL
+</I>&gt;<i> code which conceptually does what I want:  I push a variable onto the
+</I>&gt;<i> &quot;stack&quot; with one instruction and then consume (pop) it with a previously
+</I>&gt;<i> unused instruction.
+</I>&gt;<i> 
+</I>&gt;<i> 2) I've modified the disassembler to see the previously unused opcode as my new one.
+</I>
+You added the opcode to mono/cil/opcode.def, right? That is the place
+where the opcode name, type and its arguments are defined.
+
+&gt;<i> 3) I've attempted, and failed, to get mono to recognize this previously
+</I>&gt;<i> unused opcode and output the appropriate machine specific code.
+</I>&gt;<i> 
+</I>&gt;<i> So basically I need to modify mono to map an MSIL opcode to machine
+</I>&gt;<i> specific code.  Sounds simple, but I know it isn't.
+</I>
+It's quite simple.
+
+&gt;<i> Some files I *think* are involved with what I need to do are:
+</I>&gt;<i> - mono/mini/inssel.brg
+</I>&gt;<i> - mono/mini/mini.c
+</I>&gt;<i> - mono/mini/mini-x86.c
+</I>&gt;<i> - mono/arch/x86/x86-codegen.h
+</I>&gt;<i> 
+</I>&gt;<i> Any information about how mono recognizes MSIL opcodes and translates
+</I>&gt;<i> them into machine specific code or where I could find info about this
+</I>&gt;<i> would be much appreciated.
+</I>
+Read the jit documents above for some background information.
+mini.c is the file that read the IL code stream and decides how any
+single IL instruction is implemented (mono_method_to_ir () func), so you
+always have to add an entry to the big switch inside the function: if
+you take a look at the file you'll find plenty of examples.
+You didn't tell us what kind of instruction you added, so I'll give the
+generic description.
+An IL opcode can be implemented in a number of ways, depending on what
+it does, how it needs to do it etc.
+
+Some opcodes are implemented using a helper function: one of the simpler
+examples is the CEE_STELEM_REF implementation. In this case the opcode
+implementation is written in a C function. You'll need to register the
+function with the jit before use (mono_register_jit_call) and you'll
+emit the call to the helper using the mono_emit_jit_icall() function.
+This is the simpler way to add a new opcode and it doesn't require any
+arch-specific change (though it's limited to what you can do in C code
+and the performance may be limited by the function call).
+
+Other opcodes can be implemented with one or more of the already
+implemented low-level instructions. An examples is the OP_STRLEN opcode
+which implements String.Length using a simple load from memory.
+In this case you need to add a rule to the appropriate burg file,
+describing what are the arguments of the opcode and what is, if any,
+it's 'return' value. The OP_STRLEN case is:
+
+reg: OP_STRLEN (reg) {  
+	MONO_EMIT_LOAD_MEMBASE_OP (s, tree, OP_LOADI4_MEMBASE, state-&gt;reg1, 
+		state-&gt;left-&gt;reg1, G_STRUCT_OFFSET (MonoString, length));
+}
+
+The opcode returns a value in an integer register (state-&gt;reg1) by
+performing a int32 load of the length field of the MonoString
+represented by the input register (state-&gt;left-&gt;reg1): before the burg
+rules are applied, the internal representation is based on trees, so you
+get the left/right pointers.
+This instruction implementation doesn't require arch-specific changes,
+usually and the produced code is fast.
+
+Next we have opcodes that must be implemented with new low-level
+architecture specific instructions (either because of performance
+considerations or because the functionality can't get implemented in
+other ways). You need a burg rule in this case, too. For example,
+consider the OP_CHECK_THIS opcode (used to raise an exception if the
+this pointer is null). The burg rule simply reads:
+
+stmt: OP_CHECK_THIS (reg) {
+	mono_bblock_add_inst (s-&gt;cbb, tree);
+}
+
+Note this opcode doesn't return a value and takes a register as input.
+mono_bblock_add_inst (s-&gt;cbb, tree) just adds the instruction (the tree
+variable) to the current basic block (s-&gt;cbb). In mini this is the place
+where the internal representation switches from the tree format to the
+low-level format (list of simple instructions). In this case the actual
+opcode implementation is delegated to the arch-specific code.
+A low-level opcode needs an entry in the machine description (the *.md
+files in mini/). This entry describes what kkind of registers are used
+if any by the instruction, as well as other details such as constraints
+or other hints to the low-level engine which are arch-specific.
+cpu-pentium.md, for example has the following entry:
+
+checkthis: src1:b len:3
+
+This means the instruction uses an integer register as a base pointer
+(basically a load or store is done on it) and it takes 3 bytes of native
+code to implement it.
+Now you just need to provide the low-level implementation for the opcode
+in one of the mini-$arch.c files, in the mono_arch_output_basic_block()
+function. There is a big switch here too. The x86 implementation is:
+		case OP_CHECK_THIS:
+			/* ensure ins-&gt;sreg1 is not NULL */
+			x86_alu_membase_imm (code, X86_CMP, ins-&gt;sreg1, 0, 0);
+			break;
+
+If the $arch-codegen.h header file doesn't have the code to emit the
+low-level native code, you'll need to write that as well.
+Complex opcodes with register constraints may require other changes to
+the local register allocator, but usually it's not needed.
+
+Hope this helps.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="mailto:lupus@debian.org">lupus@debian.org</A>                                     debian/rules
+<A HREF="mailto:lupus@ximian.com">lupus@ximian.com</A>                             Monkeys do it better
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="018296.html">[Mono-list] How can you add an MSIL instruction to mcs and mono?
+</A></li>
+	<LI> Next message: <A HREF="018297.html">[Mono-list] What's this message?
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18311">[ date ]</a>
+              <a href="thread.html#18311">[ thread ]</a>
+              <a href="subject.html#18311">[ subject ]</a>
+              <a href="author.html#18311">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

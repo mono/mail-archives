@@ -1,0 +1,1374 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] patch : nested types support
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:ravi%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="001800.html">
+   <LINK REL="Next"  HREF="001816.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] patch : nested types support
+   </H1>
+    <B>Ravi Pratap
+    </B> 
+    <A HREF="mailto:ravi%40ximian.com"
+       TITLE="[Mono-list] patch : nested types support">ravi@ximian.com
+       </A><BR>
+    <I>12 Oct 2001 13:54:15 +0530</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="001800.html">[Mono-list] Patches to mono.
+</A></li>
+        <LI> Next message: <A HREF="001816.html">[Mono-list] mcs/nant build errors
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1798">[ date ]</a>
+              <a href="thread.html#1798">[ thread ]</a>
+              <a href="subject.html#1798">[ subject ]</a>
+              <a href="author.html#1798">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hey guys,
+
+	Okay, patches start going here from now :-)
+
+	Here's a patch I committed last night .We now have full support
+for nested types. On the agenda next is delegate support.
+
+	Regards,
+
+		Ravi
+
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/mcs/ChangeLog,v
+retrieving revision 1.128
+diff -u -r1.128 ChangeLog
+--- ChangeLog	2001/10/10 02:36:47	1.128
++++ ChangeLog	2001/10/11 16:43:53
+@@ -1,3 +1,61 @@
++2001-10-11  Ravi Pratap  &lt;<A HREF="mailto:ravi@ximian.com">ravi@ximian.com</A>&gt;
++
++	* class.cs (TypeContainer::DefineType): Method to actually do the business of
++	defining the type in the Modulebuilder or Typebuilder. This is to take
++	care of nested types which need to be defined on the TypeBuilder using
++	DefineNestedMethod.
++
++	(TypeContainer::GetClassBases): Implement. Essentially the code from the 
++	methods in RootContext, only ported to be part of TypeContainer.
++
++	(TypeContainer::GetInterfaceOrClass): Ditto.
++
++	(TypeContainer::LookupInterfaceOrClass, ::MakeFQN): Ditto.
++
++	* interface.cs (Interface::DefineInterface): New method. Does exactly
++	what RootContext.CreateInterface did earlier, only it takes care of nested types 
++	too.
++
++	(Interface::GetInterfaces): Move from RootContext here and port.
++
++	(Interface::GetInterfaceByName): Same here.
++
++	* rootcontext.cs (ResolveTree): Re-write.
++
++	(PopulateTypes): Re-write.
++
++	* class.cs (TypeContainer::Populate): Populate nested types too.
++	(TypeContainer::Emit): Emit nested members too.
++
++	* typemanager.cs (AddUserType): Do not make use of the FullName property,
++	instead just use the name argument passed in as it is already fully
++	qualified.
++
++	(FindMembers): Check in the Builders to TypeContainer mapping instead of the name
++	to TypeContainer mapping to see if a type is user-defined.
++
++	* class.cs (TypeContainer::CloseType): Implement. 
++
++	(TypeContainer::DefineDefaultConstructor): Use Basename, not Name while creating
++	the default constructor.
++	
++	(TypeContainer::Populate): Fix minor bug which led to creating default constructors
++	twice.
++
++	(Constructor::IsDefault): Fix up logic to determine if it is the default constructor
++
++	* interface.cs (CloseType): Create the type here.
++	
++	* rootcontext.cs (CloseTypes): Re-write to recursively close types by running through
++	the hierarchy.
++
++	Remove all the methods which are now in TypeContainer.
++
++2001-10-10  Ravi Pratap  &lt;<A HREF="mailto:ravi@ximian.com">ravi@ximian.com</A>&gt;
++
++	* delegate.cs (Define): Re-write bits to define the delegate
++	correctly.
++
+ 2001-10-10  Miguel de Icaza  &lt;<A HREF="mailto:miguel@ximian.com">miguel@ximian.com</A>&gt;
+ 
+ 	* makefile: Renamed the compiler to `mcs.exe' instead of compiler.exe
+Index: class.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/class.cs,v
+retrieving revision 1.71
+diff -u -r1.71 class.cs
+--- class.cs	2001/10/10 02:36:47	1.71
++++ class.cs	2001/10/11 16:44:00
+@@ -537,16 +537,19 @@
+ 			Constructor c;
+ 			int mods = 0;
+ 
+-			c = new Constructor (Name, new Parameters (null, null),
++			c = new Constructor (Basename, new Parameters (null, null),
+ 					     new ConstructorBaseInitializer (null, new Location (-1)),
+ 					     new Location (-1));
++			
+ 			AddConstructor (c);
++			
+ 			c.Block = new Block (null);
+ 			
+ 			if (is_static)
+ 				mods = Modifiers.STATIC;
++
++			c.ModFlags = mods;
+ 
+-			c.ModFlags = mods;	
+ 		}
+ 
+ 		public void ReportStructInitializedInstanceError ()
+@@ -594,6 +597,282 @@
+ 			else
+ 				return mb.MethodHandle.ToString ();
+ 		}
++
++
++		public static string MakeFQN (string nsn, string name)
++		{
++			string prefix = (nsn == &quot;&quot; ? &quot;&quot; : nsn + &quot;.&quot;);
++
++			return prefix + name;
++		}
++		       
++		Type LookupInterfaceOrClass (object builder, string ns, string name, bool is_class, out bool error)
++		{
++			TypeContainer parent;
++			Type t;
++
++			error = false;
++			name = MakeFQN (ns, name);
++			
++			t  = RootContext.TypeManager.LookupType (name);
++			if (t != null)
++				return t;
++
++			if (is_class){
++				parent = (Class) RootContext.Tree.Classes [name];
++			} else {
++				parent = (Struct) RootContext.Tree.Structs [name];
++			}
++			
++			if (parent != null){
++				t = parent.DefineType (builder);
++				if (t == null){
++					Report.Error (146, &quot;Class definition is circular: `&quot;+name+&quot;'&quot;);
++					error = true;
++					return null;
++				}
++
++				return t;
++			}
++
++			return null;
++		}
++		
++		//
++		// returns the type for an interface or a class, this will recursively
++		// try to define the types that it depends on.
++		//
++		Type GetInterfaceOrClass (object builder, string name, bool is_class)
++		{
++			Type t;
++			bool error;
++
++			//
++			// Attempt to lookup the class on our namespace
++			//
++			t = LookupInterfaceOrClass (builder, Namespace.Name, name, is_class, out error);
++			if (error)
++				return null;
++			
++			if (t != null) 
++				return t;
++
++			//
++			// Attempt to lookup the class on any of the `using'
++			// namespaces
++			//
++
++			for (Namespace ns = Namespace; ns != null; ns = ns.Parent){
++				ArrayList using_list = ns.UsingTable;
++				
++				if (using_list == null)
++					continue;
++
++				foreach (string n in using_list){
++					t = LookupInterfaceOrClass (builder, n, name, is_class, out error);
++					if (error)
++						return null;
++
++					if (t != null)
++						return t;
++				}
++				
++			}
++			Report.Error (246, &quot;Can not find type `&quot;+name+&quot;'&quot;);
++			return null;
++		}
++
++		//
++		// This function computes the Base class and also the
++		// list of interfaces that the class or struct @c implements.
++		//
++		// The return value is an array (might be null) of
++		// interfaces implemented (as Types).
++		//
++		// The @parent argument is set to the parent object or null
++		// if this is `System.Object'. 
++		//
++		Type [] GetClassBases (object builder, bool is_class, out Type parent, out bool error)
++		{
++			ArrayList bases = Bases;
++			int count;
++			int start, j, i;
++			
++			error = false;
++
++			if (is_class)
++				parent = null;
++			else
++				parent = TypeManager.value_type;
++
++			if (bases == null){
++				if (is_class){
++					if (RootContext.StdLib)
++						parent = TypeManager.object_type;
++					else if (Name != &quot;System.Object&quot;)
++						parent = TypeManager.object_type;
++				} else {
++					//
++					// If we are compiling our runtime,
++					// and we are defining ValueType, then our
++					// parent is `System.Object'.
++					//
++					if (!RootContext.StdLib &amp;&amp; Name == &quot;System.ValueType&quot;)
++						parent = TypeManager.object_type;
++				}
++
++				return null;
++			}
++
++			//
++			// Bases should be null if there are no bases at all
++			//
++			count = bases.Count;
++
++			if (is_class){
++				string name = (string) bases [0];
++				Type first = GetInterfaceOrClass (builder, name, is_class);
++
++				if (first == null){
++					error = true;
++					return null;
++				}
++				
++				if (first.IsClass){
++					parent = first;
++					start = 1;
++				} else {
++					parent = TypeManager.object_type;
++					start = 0;
++				}
++			} else {
++				start = 0;
++			}
++
++			Type [] ifaces = new Type [count-start];
++			
++			for (i = start, j = 0; i &lt; count; i++, j++){
++				string name = (string) bases [i];
++				Type t = GetInterfaceOrClass (builder, name, is_class);
++				
++				if (t == null){
++					error = true;
++					return null;
++				}
++
++				if (is_class == false &amp;&amp; !t.IsInterface){
++					Report.Error (527, &quot;In Struct `&quot; + Name + &quot;', type `&quot;+
++						      name +&quot;' is not an interface&quot;);
++					error = true;
++					return null;
++				}
++				
++				if (t.IsSealed) {
++					string detail = &quot;&quot;;
++					
++					if (t.IsValueType)
++						detail = &quot; (a class can not inherit from a struct)&quot;;
++							
++					Report.Error (509, &quot;class `&quot;+ Name +
++						      &quot;': Cannot inherit from sealed class `&quot;+
++						      bases [i]+&quot;'&quot;+detail);
++					error = true;
++					return null;
++				}
++
++				if (t.IsClass) {
++					if (parent != null){
++						Report.Error (527, &quot;In Class `&quot; + Name + &quot;', type `&quot;+
++							      name+&quot;' is not an interface&quot;);
++						error = true;
++						return null;
++					}
++				}
++				
++				ifaces [j] = t;
++			}
++
++			return ifaces;
++		}
++		
++		//
++		// Defines the type in the appropriate ModuleBuilder or TypeBuilder.
++		//
++		public TypeBuilder DefineType (object parent_builder)
++		{
++			Type parent;
++			Type [] ifaces;
++			bool error;
++			bool is_class;
++			
++			if (InTransit)
++				return null;
++			
++			InTransit = true;
++			
++			if (this is Class)
++				is_class = true;
++			else
++				is_class = false;
++			
++			ifaces = GetClassBases (parent_builder, is_class, out parent, out error); 
++			
++			if (error)
++				return null;
++			
++			if (parent_builder is ModuleBuilder) {
++				ModuleBuilder builder = (ModuleBuilder) parent_builder;
++				
++				//
++				// Structs with no fields need to have a &quot;.size 1&quot;
++				// appended
++				//
++				if (!is_class &amp;&amp; Fields == null)
++					TypeBuilder = builder.DefineType (Name,
++									  TypeAttr,
++									  parent, 
++									  PackingSize.Unspecified, 1);
++				else
++				//
++				// classes or structs with fields
++				//
++					TypeBuilder = builder.DefineType (Name,
++									  TypeAttr,
++									  parent,
++									  ifaces);
++
++			} else {
++				TypeBuilder builder = (TypeBuilder) parent_builder;
++				
++				//
++				// Structs with no fields need to have a &quot;.size 1&quot;
++				// appended
++				//
++				if (!is_class &amp;&amp; Fields == null)
++					TypeBuilder = builder.DefineNestedType (Name,
++										TypeAttr,
++										parent, 
++										PackingSize.Unspecified);
++				else
++				//
++				// classes or structs with fields
++				//
++					TypeBuilder = builder.DefineNestedType (Name,
++										TypeAttr,
++										parent,
++										ifaces);
++			}
++
++			RootContext.TypeManager.AddUserType (Name, TypeBuilder, this);
++
++			if (Types != null) {
++				foreach (TypeContainer tc in Types)
++					tc.DefineType (TypeBuilder);
++			}
++			
++			InTransit = false;
++			return TypeBuilder;
++		}
+ 		
+ 		//
+ 		// Populates our TypeBuilder with fields and methods
+@@ -610,7 +889,7 @@
+ 					f.Define (this);
+ 			} 
+ 
+-			if (this is Class){
++			if (this is Class &amp;&amp; constructors == null){
+ 				if (default_constructor == null) 
+ 					DefineDefaultConstructor (false);
+ 
+@@ -713,6 +992,11 @@
+ 				foreach (Delegate d in Delegates)
+ 					d.Define (this);
+ 			}
++			
++			if (Types != null) {
++				foreach (TypeContainer tc in Types)
++					tc.Populate ();
++			}
+ 		}
+ 
+ 		//
+@@ -1003,6 +1287,19 @@
+ 
+ 			if (pending_implementations != null)
+ 				VerifyPendingMethods ();
++
++			if (types != null)
++				foreach (TypeContainer tc in types)
++					tc.Emit ();
++			
++		}
++
++		public void CloseType ()
++		{
++			TypeBuilder.CreateType ();
++			
++			foreach (TypeContainer tc in Types)
++				tc.CloseType ();
+ 		}
+ 
+ 		string MakeName (string n)
+@@ -1575,7 +1872,8 @@
+ 		//
+ 		public bool IsDefault ()
+ 		{
+-			return  (Parameters == null ? true : Parameters.Empty) &amp;&amp;
++			return  (Parameters.FixedParameters == null ? true : Parameters.Empty) &amp;&amp;
++				(Parameters.ArrayParameter == null ? true : Parameters.Empty) &amp;&amp;
+ 				(Initializer is ConstructorBaseInitializer) &amp;&amp;
+ 				(Initializer.Arguments == null);
+ 		}
+Index: cs-parser.jay
+===================================================================
+RCS file: /cvs/public/mcs/mcs/cs-parser.jay,v
+retrieving revision 1.62
+diff -u -r1.62 cs-parser.jay
+--- cs-parser.jay	2001/10/10 02:36:47	1.62
++++ cs-parser.jay	2001/10/11 16:44:06
+@@ -916,7 +916,7 @@
+ 		Interface new_interface;
+ 		string full_interface_name = MakeName ((string) $4);
+ 
+-		new_interface = new Interface (current_container, full_interface_name, (int) $2, 
++		new_interface = new Interface (rc, current_container, full_interface_name, (int) $2, 
+ 					       (Attributes) $1, lexer.Location);
+ 		if (current_interface != null) {
+ 			Location l = lexer.Location;
+Index: delegate.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/delegate.cs,v
+retrieving revision 1.5
+diff -u -r1.5 delegate.cs
+--- delegate.cs	2001/09/30 02:22:09	1.5
++++ delegate.cs	2001/10/11 16:44:06
+@@ -16,15 +16,17 @@
+ 
+ namespace CIR {
+ 	
+-	public class Delegate : DeclSpace {
++	public class Delegate {
+ 
+-		public string name;
++		public string Name;
+ 		public string type;
+ 		public int    mod_flags;
+ 		public Parameters Parameters;
+ 		public Attributes OptAttributes;
+ 		public TypeBuilder DelegateBuilder;
+ 
++		Location loc;
++
+ 		const int AllowedModifiers =
+ 			Modifiers.NEW |
+ 			Modifiers.PUBLIC |
+@@ -33,26 +35,32 @@
+ 			Modifiers.PRIVATE;
+ 
+ 		public Delegate (string type, int mod_flags, string name, Parameters param_list,
+-				 Attributes attrs, Location l) : base (name, l)
++				 Attributes attrs, Location loc)
+ 		{
+-			this.name       = name;
++			this.Name       = name;
+ 			this.type       = type;
+ 			this.mod_flags  = Modifiers.Check (AllowedModifiers, mod_flags, Modifiers.PUBLIC);
+ 			Parameters      = param_list;
+ 			OptAttributes   = attrs;
++			this.loc        = loc;
+ 		}
+ 
+ 		public void Define (TypeContainer parent)
+ 		{
+-			TypeAttributes attr = Modifiers.TypeAttr (ModFlags, parent);
+-
++			TypeAttributes attr;
++			
++			if (parent.IsTopLevel)
++				attr = TypeAttributes.NestedPublic | TypeAttributes.Class;
++			else
++				attr = TypeAttributes.Public | TypeAttributes.Class;
++			
+ 			Type t = parent.LookupType (type, false);
+ 			Type [] param_types = Parameters.GetParameterInfo (parent);
+ 			Type base_type = System.Type.GetType (&quot;System.MulticastDelegate&quot;);
+ 
+-			DelegateBuilder = parent.TypeBuilder.DefineNestedType (name, attr, base_type);
++			DelegateBuilder = parent.TypeBuilder.DefineNestedType (Name, attr, base_type);
+ 
+-			// FIXME : Need to figure out how to proceed from here. 
++			//DelegateBuilder.CreateType ();
+ 
+ 		}
+ 		
+Index: expression.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/expression.cs,v
+retrieving revision 1.78
+diff -u -r1.78 expression.cs
+--- expression.cs	2001/10/10 02:36:47	1.78
++++ expression.cs	2001/10/11 16:44:13
+@@ -3982,7 +3982,7 @@
+ 					return null;
+ 				
+ 				Expression ml;
+-				
++
+ 				ml = MemberLookup (ec, type, &quot;.ctor&quot;, false,
+ 						   MemberTypes.Constructor, AllBindingsFlags);
+ 				
+@@ -4012,7 +4012,7 @@
+ 					       &quot;New invocation: Can not find a constructor for this argument list&quot;);
+ 					return null;
+ 				}
+-
++				
+ 				eclass = ExprClass.Value;
+ 				return this;
+ 			}
+Index: interface.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/interface.cs,v
+retrieving revision 1.14
+diff -u -r1.14 interface.cs
+--- interface.cs	2001/10/03 21:37:52	1.14
++++ interface.cs	2001/10/11 16:44:15
+@@ -44,6 +44,8 @@
+ 		TypeContainer parent;
+ 
+ 		Attributes OptAttributes;
++
++		public readonly RootContext RootContext;
+ 		
+ 		// These will happen after the semantic analysis
+ 		
+@@ -60,13 +62,14 @@
+ 			Modifiers.INTERNAL |
+ 			Modifiers.PRIVATE;
+ 
+-		public Interface (TypeContainer parent, string name, int mod, Attributes attrs, Location l)
++		public Interface (RootContext rc, TypeContainer parent, string name, int mod, Attributes attrs, Location l)
+ 			: base (name, l)
+ 		{
+ 			this.mod_flags = Modifiers.Check (AllowedModifiers, mod, Modifiers.PUBLIC);
+ 			this.parent = parent;
+ 			OptAttributes = attrs;
+-
++			RootContext = rc;
++			
+ 			method_builders = new ArrayList ();
+ 		}
+ 
+@@ -439,6 +442,143 @@
+ 			return true;
+ 		}
+ 
++		//
++		// Returns the Type that represents the interface whose name
++		// is `name'.
++		//
++		
++		Type GetInterfaceTypeByName (object builder, string name)
++		{
++			Interface parent;
++			Type t = RootContext.TypeManager.LookupType (name);
++			
++			if (t != null) {
++
++				if (t.IsInterface)
++					return t;
++				
++				string cause;
++				
++				if (t.IsValueType)
++					cause = &quot;is a struct&quot;;
++				else if (t.IsClass) 
++					cause = &quot;is a class&quot;;
++				else
++					cause = &quot;Should not happen.&quot;;
++
++				Report.Error (527, &quot;`&quot;+name+&quot;' &quot; + cause + &quot;, need an interface instead&quot;);
++				
++				return null;
++			}
++
++			Tree tree = RootContext.Tree;
++			parent = (Interface) tree.Interfaces [name];
++			if (parent == null){
++				string cause = &quot;is undefined&quot;;
++				
++				if (tree.Classes [name] != null)
++					cause = &quot;is a class&quot;;
++				else if (tree.Structs [name] != null)
++					cause = &quot;is a struct&quot;;
++				
++				Report.Error (527, &quot;`&quot;+name+&quot;' &quot; + cause + &quot;, need an interface instead&quot;);
++				return null;
++			}
++			
++			t = parent.DefineInterface (builder);
++			if (t == null){
++				Report.Error (529,
++					      &quot;Inherited interface `&quot;+name+&quot;' is circular&quot;);
++				return null;
++			}
++
++			return t;
++		}
++		
++		//
++		// Returns the list of interfaces that this interface implements
++		// Or null if it does not implement any interface.
++		//
++		// Sets the error boolean accoringly.
++		//
++		Type [] GetInterfaceBases (object builder, out bool error)
++		{
++			Type [] tbases;
++			int i;
++
++			error = false;
++			if (Bases == null)
++				return null;
++			
++			tbases = new Type [Bases.Count];
++			i = 0;
++
++			foreach (string name in Bases){
++				Type t;
++				
++				t = GetInterfaceTypeByName (builder, name);
++				if (t == null){
++					error = true;
++					return null;
++				}
++				
++				tbases [i++] = t;
++			}
++			
++			return tbases;
++		}
++		
++		//
++		// &lt;summary&gt;
++		//  Defines the Interface in the appropriate ModuleBuilder or TypeBuilder
++		// &lt;/summary&gt;
++		// TODO:
++		//   Rework the way we recurse, because for recursive
++		//   definitions of interfaces (A:B and B:A) we report the
++		//   error twice, rather than once.  
++		
++		public TypeBuilder DefineInterface (object parent_builder)
++		{
++			Type [] ifaces;
++			bool error;
++
++			if (InTransit)
++				return null;
++			
++			InTransit = true;
++			
++			ifaces = GetInterfaceBases (parent_builder, out error);
++
++			if (error)
++				return null;
++
++			if (parent_builder is ModuleBuilder) {
++				ModuleBuilder builder = (ModuleBuilder) parent_builder;
++				
++				TypeBuilder = builder.DefineType (Name,
++								  TypeAttributes.Interface |
++								  InterfaceAttr |
++								  TypeAttributes.Abstract,
++								  null,   // Parent Type
++								  ifaces);
++			} else {
++				TypeBuilder builder = (TypeBuilder) parent_builder;
++
++				TypeBuilder = builder.DefineNestedType (Name,
++									TypeAttributes.Interface |
++									InterfaceAttr |
++									TypeAttributes.Abstract,
++									null,   // Parent Type
++									ifaces);
++			}
++			
++			RootContext.TypeManager.AddUserInterface (Name, TypeBuilder, this);
++			
++			InTransit = false;
++			
++			return TypeBuilder;
++		}
++		
+ 		// &lt;summary&gt;
+ 		//   Performs semantic analysis, and then generates the IL interfaces
+ 		// &lt;/summary&gt;
+@@ -465,6 +605,12 @@
+ 				foreach (InterfaceIndexer ii in defined_indexer)
+ 					PopulateIndexer (ii);
+ 		}
++
++		public void CloseType ()
++		{
++			TypeBuilder.CreateType ();
++		}
++		
+ 	}
+ 
+ 	public class InterfaceMemberBase {
+Index: rootcontext.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/rootcontext.cs,v
+retrieving revision 1.33
+diff -u -r1.33 rootcontext.cs
+--- rootcontext.cs	2001/10/10 02:36:47	1.33
++++ rootcontext.cs	2001/10/11 16:44:15
+@@ -84,139 +84,6 @@
+ 			}
+ 		}
+ 
+-		//
+-		// Returns the Type that represents the interface whose name
+-		// is `name'.
+-		//
+-		
+-		Type GetInterfaceTypeByName (string name)
+-		{
+-			Interface parent;
+-			Type t = TypeManager.LookupType (name);
+-
+-			if (t != null) {
+-
+-				if (t.IsInterface)
+-					return t;
+-				
+-				string cause;
+-				
+-				if (t.IsValueType)
+-					cause = &quot;is a struct&quot;;
+-				else if (t.IsClass) 
+-					cause = &quot;is a class&quot;;
+-				else
+-					cause = &quot;Should not happen.&quot;;
+-
+-				Report.Error (527, &quot;`&quot;+name+&quot;' &quot; + cause + &quot;, need an interface instead&quot;);
+-				
+-				return null;
+-			}
+-
+-			parent = (Interface) tree.Interfaces [name];
+-			if (parent == null){
+-				string cause = &quot;is undefined&quot;;
+-				
+-				if (tree.Classes [name] != null)
+-					cause = &quot;is a class&quot;;
+-				else if (tree.Structs [name] != null)
+-					cause = &quot;is a struct&quot;;
+-				
+-				Report.Error (527, &quot;`&quot;+name+&quot;' &quot; + cause + &quot;, need an interface instead&quot;);
+-				return null;
+-			}
+-
+-			t = CreateInterface ((Interface) parent);
+-			if (t == null){
+-				Report.Error (529,
+-					      &quot;Inherited interface `&quot;+name+&quot;' is circular&quot;);
+-				return null;
+-			}
+-
+-			return t;
+-		}
+-		
+-		//
+-		// Returns the list of interfaces that this interface implements
+-		// Or null if it does not implement any interface.
+-		//
+-		// Sets the error boolean accoringly.
+-		//
+-		Type [] GetInterfaceBases (Interface iface, out bool error)
+-		{
+-			ArrayList bases = iface.Bases;
+-			Type [] tbases;
+-			int i;
+-
+-			error = false;
+-			if (bases == null)
+-				return null;
+-			
+-			tbases = new Type [bases.Count];
+-			i = 0;
+-
+-			foreach (string name in iface.Bases){
+-				Type t;
+-
+-				t = GetInterfaceTypeByName (name);
+-				if (t == null){
+-					error = true;
+-					return null;
+-				}
+-				
+-				tbases [i++] = t;
+-			}
+-
+-			return tbases;
+-		}
+-		
+-		//
+-		// Creates the Interface @iface using the ModuleBuilder
+-		//
+-		// TODO:
+-		//   Rework the way we recurse, because for recursive
+-		//   definitions of interfaces (A:B and B:A) we report the
+-		//   error twice, rather than once.  
+-		//
+-		TypeBuilder CreateInterface (Interface iface)
+-		{
+-			TypeBuilder tb = iface.TypeBuilder;
+-			Type [] ifaces;
+-			string name;
+-			bool error;
+-
+-			if (tb != null)
+-				return tb;
+-			
+-			if (iface.InTransit)
+-				return null;
+-			
+-			iface.InTransit = true;
+-
+-			name = iface.Name;
+-
+-			ifaces = GetInterfaceBases (iface, out error);
+-
+-			if (error)
+-				return null;
+-
+-			tb = mb.DefineType (name,
+-					    TypeAttributes.Interface |
+-					    iface.InterfaceAttr |
+-					    TypeAttributes.Abstract,
+-					    null,   // Parent Type
+-					    ifaces);
+-			iface.TypeBuilder = tb;
+-
+-			interface_resolve_order.Add (iface);
+-			
+-			TypeManager.AddUserInterface (name, tb, iface);
+-
+-			iface.InTransit = false;
+-
+-			return tb;
+-		}
+-
+ 		string MakeFQN (string nsn, string name)
+ 		{
+ 			string prefix = (nsn == &quot;&quot; ? &quot;&quot; : nsn + &quot;.&quot;);
+@@ -224,252 +91,6 @@
+ 			return prefix + name;
+ 		}
+ 		       
+-		Type LookupInterfaceOrClass (string ns, string name, bool is_class, out bool error)
+-		{
+-			TypeContainer parent;
+-			Type t;
+-
+-			error = false;
+-			name = MakeFQN (ns, name);
+-			
+-			t  = TypeManager.LookupType (name);
+-			if (t != null)
+-				return t;
+-
+-			if (is_class){
+-				parent = (Class) tree.Classes [name];
+-			} else {
+-				parent = (Struct) tree.Structs [name];
+-			}
+-
+-			if (parent != null){
+-				t = CreateType (parent, is_class);
+-				if (t == null){
+-					Report.Error (146, &quot;Class definition is circular: `&quot;+name+&quot;'&quot;);
+-					error = true;
+-					return null;
+-				}
+-
+-				return t;
+-			}
+-
+-			return null;
+-		}
+-		
+-		//
+-		// returns the type for an interface or a class, this will recursively
+-		// try to define the types that it depends on.
+-		//
+-		Type GetInterfaceOrClass (TypeContainer tc, string name, bool is_class)
+-		{
+-			Type t;
+-			bool error;
+-
+-			//
+-			// Attempt to lookup the class on our namespace
+-			//
+-			t = LookupInterfaceOrClass (tc.Namespace.Name, name, is_class, out error);
+-			if (error)
+-				return null;
+-			
+-			if (t != null) 
+-				return t;
+-
+-			//
+-			// Attempt to lookup the class on any of the `using'
+-			// namespaces
+-			//
+-
+-			for (Namespace ns = tc.Namespace; ns != null; ns = ns.Parent){
+-				ArrayList using_list = ns.UsingTable;
+-
+-				if (using_list == null)
+-					continue;
+-
+-				foreach (string n in using_list){
+-					t = LookupInterfaceOrClass (n, name, is_class, out error);
+-					if (error)
+-						return null;
+-
+-					if (t != null)
+-						return t;
+-				}
+-				
+-			}
+-			Report.Error (246, &quot;Can not find type `&quot;+name+&quot;'&quot;);
+-			return null;
+-		}
+-
+-		//
+-		// This function computes the Base class and also the
+-		// list of interfaces that the class or struct @c implements.
+-		//
+-		// The return value is an array (might be null) of
+-		// interfaces implemented (as Types).
+-		//
+-		// The @parent argument is set to the parent object or null
+-		// if this is `System.Object'. 
+-		//
+-		Type [] GetClassBases (TypeContainer tc, bool is_class, out Type parent, out bool error)
+-		{
+-			ArrayList bases = tc.Bases;
+-			int count;
+-			int start, j, i;
+-			
+-			error = false;
+-
+-			if (is_class)
+-				parent = null;
+-			else
+-				parent = TypeManager.value_type;
+-
+-			if (bases == null){
+-				if (is_class){
+-					if (stdlib)
+-						parent = TypeManager.object_type;
+-					else if (tc.Name != &quot;System.Object&quot;)
+-						parent = TypeManager.object_type;
+-				} else {
+-					//
+-					// If we are compiling our runtime,
+-					// and we are defining ValueType, then our
+-					// parent is `System.Object'.
+-					//
+-					if (!stdlib &amp;&amp; tc. Name == &quot;System.ValueType&quot;)
+-						parent = TypeManager.object_type;
+-				}
+-
+-				return null;
+-			}
+-
+-			//
+-			// Bases should be null if there are no bases at all
+-			//
+-			count = bases.Count;
+-			Debug.Assert (count &gt; 0);
+-
+-			if (is_class){
+-				string name = (string) bases [0];
+-				Type first = GetInterfaceOrClass (tc, name, is_class);
+-
+-				if (first == null){
+-					error = true;
+-					return null;
+-				}
+-				
+-				if (first.IsClass){
+-					parent = first;
+-					start = 1;
+-				} else {
+-					parent = TypeManager.object_type;
+-					start = 0;
+-				}
+-			} else {
+-				start = 0;
+-			}
+-
+-			Type [] ifaces = new Type [count-start];
+-			
+-			for (i = start, j = 0; i &lt; count; i++, j++){
+-				string name = (string) bases [i];
+-				Type t = GetInterfaceOrClass (tc, name, is_class);
+-
+-				if (t == null){
+-					error = true;
+-					return null;
+-				}
+-
+-				if (is_class == false &amp;&amp; !t.IsInterface){
+-					Report.Error (527, &quot;In Struct `&quot;+tc.Name+&quot;', type `&quot;+
+-						      name+&quot;' is not an interface&quot;);
+-					error = true;
+-					return null;
+-				}
+-				
+-				if (t.IsSealed) {
+-					string detail = &quot;&quot;;
+-					
+-					if (t.IsValueType)
+-						detail = &quot; (a class can not inherit from a struct)&quot;;
+-							
+-					Report.Error (509, &quot;class `&quot;+tc.Name+
+-						      &quot;': Cannot inherit from sealed class `&quot;+
+-						      bases [i]+&quot;'&quot;+detail);
+-					error = true;
+-					return null;
+-				}
+-
+-				if (t.IsClass) {
+-					if (parent != null){
+-						Report.Error (527, &quot;In Class `&quot;+tc.Name+&quot;', type `&quot;+
+-							      name+&quot;' is not an interface&quot;);
+-						error = true;
+-						return null;
+-					}
+-				}
+-				
+-				ifaces [j] = t;
+-			}
+-
+-			return ifaces;
+-		}
+-
+-		// &lt;remarks&gt;
+-		//   Creates the TypeBuilder for the TypeContainer @tc (a Class or a Struct)
+-		// &lt;/remarks&gt;
+-		//
+-		TypeBuilder CreateType (TypeContainer tc, bool is_class)
+-		{
+-			TypeBuilder tb = tc.TypeBuilder;
+-			Type parent;
+-			Type [] ifaces;
+-			bool error;
+-			string name;
+-			
+-			if (tb != null)
+-				return tb;
+-
+-			if (tc.InTransit)
+-				return null;
+-			tc.InTransit = true;
+-
+-			name = tc.Name;
+-
+-			ifaces = GetClassBases (tc, is_class, out parent, out error); 
+-
+-			if (error)
+-				return null;
+-
+-			type_container_resolve_order.Add (tc);
+-
+-			//
+-			// Structs with no fields need to have a &quot;.size 1&quot;
+-			// appended
+-			//
+-			if (!is_class &amp;&amp; tc.Fields == null)
+-				tb = mb.DefineType(
+-					name,
+-					tc.TypeAttr,
+-					parent, 
+-					PackingSize.Unspecified, 1);
+-			else
+-				//
+-				// classes or structs with fields
+-				//
+-				tb = mb.DefineType (
+-					name,
+-					tc.TypeAttr,
+-					parent,
+-					ifaces);
+-			
+-			tc.TypeBuilder = tb;
+-
+-			TypeManager.AddUserType (name, tb, tc);
+-			tc.InTransit = false;
+-			
+-			return tb;
+-		}
+-
+ 		// &lt;remarks&gt;
+ 		//   This function is used to resolve the hierarchy tree.
+ 		//   It processes interfaces, structs and classes in that order.
+@@ -479,39 +100,34 @@
+ 		// &lt;/remarks&gt;
+ 		public void ResolveTree ()
+ 		{
+-			Hashtable ifaces, classes, structs;
+-
+-			type_container_resolve_order = new ArrayList ();
+-			
+ 			//
+ 			// Interfaces are processed first, as classes and
+ 			// structs might inherit from an object or implement
+ 			// a set of interfaces, we need to be able to tell
+ 			// them appart by just using the TypeManager.
+ 			//
+-			ifaces = tree.Interfaces;
++
++			TypeContainer root = Tree.Types;
++
++			ArrayList ifaces = root.Interfaces;
+ 			if (ifaces != null){
+ 				interface_resolve_order = new ArrayList ();
+ 				
+-				foreach (DictionaryEntry de in ifaces)
+-					CreateInterface ((Interface) de.Value);
++				foreach (Interface i in ifaces) {
++					Type t = i.DefineInterface (mb);
++					if (t != null)
++						interface_resolve_order.Add (i);
++				}
+ 			}
+-
+-			//
+-			// Process structs and classes next.  Our code assumes
+-			// this order (just for error reporting purposes).
+-			//
+-			structs = tree.Structs;
+-			if (structs != null){
+-				foreach (DictionaryEntry de in structs)
+-					CreateType ((Struct) de.Value, false);
++						
++			type_container_resolve_order = new ArrayList ();
++			
++			foreach (TypeContainer tc in root.Types) {
++				Type t = tc.DefineType (mb);
++				if (t != null)
++					type_container_resolve_order.Add (tc);
+ 			}
+ 
+-			classes = tree.Classes;
+-			if (classes != null){
+-				foreach (DictionaryEntry de in classes)
+-					CreateType ((Class) de.Value, true);
+-			}
+ 		}
+ 			
+ 		// &lt;summary&gt;
+@@ -526,16 +142,19 @@
+ 		// &lt;/remarks&gt;
+ 		public void CloseTypes ()
+ 		{
+-			foreach (TypeBuilder t in TypeManager.UserTypes){
+-				try {
+-					t.CreateType ();
+-				} catch (Exception e){
+-					Console.WriteLine (&quot;Caught Exception while creating type for &quot; + t);
+-					Console.WriteLine (e);
+-				}
+-			}
+-		}
++			TypeContainer root = Tree.Types;
++			
++			ArrayList ifaces = root.Interfaces;
+ 
++			if (ifaces != null)
++				foreach (Interface i in ifaces) 
++					i.CloseType ();
++			
++			foreach (TypeContainer tc in root.Types)
++				tc.CloseType ();
++			
++		}
++		
+ 		//
+ 		// Public function used to locate types, this can only
+ 		// be used after the ResolveTree function has been invoked.
+@@ -545,7 +164,7 @@
+ 		public Type LookupType (TypeContainer tc, string name, bool silent)
+ 		{
+ 			Type t;
+-
++			
+ 			t = TypeManager.LookupType (MakeFQN (tc.Namespace.Name, name));
+ 			if (t != null)
+ 				return t;
+@@ -570,6 +189,11 @@
+ 				}
+ 			}
+ 
++			// For the case the type we are looking for is nested within this one.
++			t = TypeManager.LookupType (tc.Name + &quot;.&quot; + name);
++			if (t != null)
++				return t;
++			
+ 			if (!silent)
+ 				Report.Error (246, &quot;Cannot find type `&quot;+name+&quot;'&quot;);
+ 			
+@@ -618,23 +242,10 @@
+ 
+ 		public void EmitCode ()
+ 		{
+-			Hashtable classes, structs;
+-			
+-			if ((classes = tree.Classes) != null){
+-				foreach (DictionaryEntry de in classes){
+-					TypeContainer tc = (TypeContainer) de.Value;
+-
+-					tc.Emit ();
+-				}
+-			}
+-
+-			if ((structs = tree.Structs) != null){
+-				foreach (DictionaryEntry de in structs){
+-					TypeContainer tc = (TypeContainer) de.Value;
+-
++			if (type_container_resolve_order != null)
++				foreach (TypeContainer tc in type_container_resolve_order)
+ 					tc.Emit ();
+-				}
+-			}
++			
+ 		}
+ 		
+ 		// &lt;summary&gt;
+Index: typemanager.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/typemanager.cs,v
+retrieving revision 1.27
+diff -u -r1.27 typemanager.cs
+--- typemanager.cs	2001/10/05 21:13:47	1.27
++++ typemanager.cs	2001/10/11 16:44:15
+@@ -106,7 +106,7 @@
+ 	
+ 	public void AddUserType (string name, TypeBuilder t)
+ 	{
+-		types.Add (t.FullName, t);
++		types.Add (name, t);
+ 		user_types.Add (t);
+ 	}
+ 
+@@ -114,7 +114,7 @@
+ 	{
+ 		AddUserType (name, t);
+ 		builder_to_container.Add (t, tc);
+-		typecontainers.Add (t.FullName, tc);
++		typecontainers.Add (name, tc);
+ 	}
+ 
+ 	public void AddUserInterface (string name, TypeBuilder t, Interface i)
+@@ -293,8 +293,8 @@
+ 	{
+ 		TypeContainer tc;
+ 		
+-		tc = (TypeContainer) typecontainers [t.FullName];
+-
++		tc = (TypeContainer) builder_to_container [t];
++		
+ 		if (tc == null)
+ 			return t.FindMembers (mt, bf, filter, criteria);
+ 		else 
+
+
+-- 
+&quot;If you're smart, you'll be humble. There always is somebody
+who hasn't read a book and knows twice as much as you do.&quot;
+
+              -- David Duchovny in Readers' Digest
+
+	Ravi Pratap M         &lt;<A HREF="mailto:ravi@ximian.com">ravi@ximian.com</A>&gt;
+                      &lt;<A HREF="http://www.iitm.ac.in/~ravi">http://www.iitm.ac.in/~ravi</A>&gt;
+
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="001800.html">[Mono-list] Patches to mono.
+</A></li>
+	<LI> Next message: <A HREF="001816.html">[Mono-list] mcs/nant build errors
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1798">[ date ]</a>
+              <a href="thread.html#1798">[ thread ]</a>
+              <a href="subject.html#1798">[ subject ]</a>
+              <a href="author.html#1798">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

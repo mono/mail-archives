@@ -1,0 +1,86 @@
+#!/bin/bash
+
+mkdir -p mono/bin/2.0
+
+gmcs -d:MONO -d:NET20 -debug -checked- -out:mono/bin/2.0/MySql.Data.dll \
+    -resource:Source/Resources.resources \
+    -t:library \
+    -pkg:dotnet -r:System.Transactions \
+Properties/AssemblyInfo.cs \
+Source/Resources.Designer.cs \
+Source/CharSetMap.cs \
+Source/command.cs \
+Source/CommandBuilder.cs \
+Source/common/ContextString.cs \
+Source/common/NamedPipeStream.cs \
+Source/common/NativeMethods.cs \
+Source/common/Platform.cs \
+Source/common/SHA1.cs \
+Source/common/SharedMemoryStream.cs \
+Source/common/StreamCreator.cs \
+Source/common/Version.cs \
+Source/common/WinCE.cs \
+Source/CompressedStream.cs \
+Source/Connection.cs \
+Source/Crypt.cs \
+Source/dataadapter.cs \
+Source/datareader.cs \
+Source/Driver.cs \
+Source/Exception.cs \
+Source/Field.cs \
+Source/ISSchemaProvider.cs \
+Source/Logger.cs \
+Source/MySqlClientFactory.cs \
+Source/MySqlConnectionStringBuilder.cs \
+Source/MysqlDefs.cs \
+Source/MySqlError.cs \
+Source/MySqlHelper.cs \
+Source/MySqlPool.cs \
+Source/MySqlPoolManager.cs \
+Source/MySqlPromotableTransaction.cs \
+Source/MySqlStream.cs \
+Source/NativeDriver.cs \
+Source/parameter.cs \
+Source/parameter_collection.cs \
+Source/PerformanceMonitor.cs \
+Source/PreparableStatement.cs \
+Source/ProcedureCache.cs \
+Source/SchemaProvider.cs \
+Source/Statement.cs \
+Source/StoredProcedure.cs \
+Source/transaction.cs \
+Source/Types/MetaData.cs \
+Source/Types/MySqlBinary.cs \
+Source/Types/MySqlBit.cs \
+Source/Types/MySqlByte.cs \
+Source/Types/MySqlConversionException.cs \
+Source/Types/MySqlDateTime.cs \
+Source/Types/MySqlDecimal.cs \
+Source/Types/MySqlDouble.cs \
+Source/Types/MySqlInt16.cs \
+Source/Types/MySqlInt32.cs \
+Source/Types/MySqlInt64.cs \
+Source/Types/MySqlSingle.cs \
+Source/Types/MySqlString.cs \
+Source/Types/MySqlTime.cs \
+Source/Types/MySqlUByte.cs \
+Source/Types/MySqlUInt16.cs \
+Source/Types/MySqlUInt32.cs \
+Source/Types/MySqlUInt64.cs \
+Source/Types/MySqlValue.cs \
+Source/UsageAdvisor.cs \
+Source/zlib/Adler32.cs \
+Source/zlib/Deflate.cs \
+Source/zlib/InfBlocks.cs \
+Source/zlib/InfCodes.cs \
+Source/zlib/Inflate.cs \
+Source/zlib/InfTree.cs \
+Source/zlib/StaticTree.cs \
+Source/zlib/SupportClass.cs \
+Source/zlib/Tree.cs \
+Source/zlib/ZInputStream.cs \
+Source/zlib/Zlib.cs \
+Source/zlib/ZOutputStream.cs \
+Source/zlib/ZStream.cs \
+Source/zlib/ZStreamException.cs \
+Source/common/Cache.cs

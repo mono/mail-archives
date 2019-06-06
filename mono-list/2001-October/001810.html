@@ -1,0 +1,327 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Thinko fixed.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:miguel%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="001808.html">
+   <LINK REL="Next"  HREF="001817.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Thinko fixed.
+   </H1>
+    <B>Miguel de Icaza
+    </B> 
+    <A HREF="mailto:miguel%40ximian.com"
+       TITLE="[Mono-list] Thinko fixed.">miguel@ximian.com
+       </A><BR>
+    <I>Sun, 14 Oct 2001 23:57:54 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="001808.html">[Mono-list] Properties are now working.
+</A></li>
+        <LI> Next message: <A HREF="001817.html">[Mono-list] GTK bindings
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1810">[ date ]</a>
+              <a href="thread.html#1810">[ thread ]</a>
+              <a href="subject.html#1810">[ subject ]</a>
+              <a href="author.html#1810">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hey guys,
+
+   There is a special situation that my previous property patch did
+not take care of:  Properties might appear in:
+
+    variable1 = PropertyName = variable2 = VALUE;
+
+   Which requires a temporary value to be provided so the value can be
+bridged between variable2 and variable1.  This patch introduces the
+feature along with a test.
+
+Index: mcs/ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/mcs/ChangeLog,v
+retrieving revision 1.133
+diff -u -r1.133 ChangeLog
+--- mcs/ChangeLog	2001/10/14 22:30:14	1.133
++++ mcs/ChangeLog	2001/10/15 00:00:57
+@@ -1,5 +1,8 @@
+ 2001-10-14  Miguel de Icaza  &lt;<A HREF="mailto:miguel@ximian.com">miguel@ximian.com</A>&gt;
+ 
++	* assign.cs: Handle PropertyAccess back here, so that we can
++	provide the proper semantic access to properties.
++
+ 	* expression.cs (Expression::ConvertReferenceExplicit): Implement
+ 	a few more explicit conversions. 
+ 
+Index: mcs/assign.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/assign.cs,v
+retrieving revision 1.17
+diff -u -r1.17 assign.cs
+--- mcs/assign.cs	2001/10/14 22:30:14	1.17
++++ mcs/assign.cs	2001/10/15 00:00:57
+@@ -50,6 +50,12 @@
+ 			if (target == null || source == null)
+ 				return null;
+ 
++			Type target_type = target.Type;
++			Type source_type = source.Type;
++
++			type = target_type;
++			eclass = ExprClass.Value;
++			
+ 			//
+ 			// If we are doing a property assignment, then
+ 			// set the `value' field on the property, and Resolve
+@@ -58,23 +64,20 @@
+ 			if (target is PropertyExpr){
+ 				PropertyExpr property_assign = (PropertyExpr) target;
+ 				
+-				property_assign.Value = source;
++				if (!property_assign.VerifyAssignable ())
++					return null;
+ 				
+-				return property_assign.Resolve (ec);
++				return this;
+ 			}
+-
+-			if (source is New &amp;&amp; target.Type.IsSubclassOf (TypeManager.value_type)){
++			
++			if (source is New &amp;&amp; target_type.IsSubclassOf (TypeManager.value_type)){
+ 				New n = (New) source;
+ 
+ 				n.ValueTypeVariable = target;
+ 
+-				return source;
++				return n;
+ 			}
+-
+-			Type target_type = target.Type;
+ 			
+-			Type source_type = source.Type;
+-
+ 			if (target_type != source_type){
+ 				source = ConvertImplicitRequired (ec, source, target_type, l);
+ 				if (source == null)
+@@ -85,16 +88,16 @@
+ 				Report.Error (131, l, &quot;Left hand of an assignment must be a variable, a property or an indexer&quot;);
+ 				return null;
+ 			}
+-			type = target_type;
+-			eclass = ExprClass.Value;
++
+ 			return this;
+ 		}
+ 
+ 		void Emit (EmitContext ec, bool is_statement)
+ 		{
+ 			ILGenerator ig = ec.ig;
++			ExprClass eclass = target.ExprClass;
+ 			
+-			if (target.ExprClass == ExprClass.Variable){
++			if (eclass == ExprClass.Variable){
+ 
+ 				//
+ 				// If it is an instance field, load the this pointer
+@@ -112,11 +115,26 @@
+ 					ig.Emit (OpCodes.Dup);
+ 
+ 				((LValue) target).Store (ec);
+-			} else if (target.ExprClass == ExprClass.PropertyAccess){
+-				// FIXME
+-				throw new Exception (&quot;Can not assign to properties yet&quot;);
+-			} else if (target.ExprClass == ExprClass.IndexerAccess){
+-				// FIXME
++			} else if (eclass == ExprClass.PropertyAccess){
++				PropertyExpr pe = (PropertyExpr) target;
++
++				if (is_statement){
++					pe.Value = source;
++					pe.Emit (ec);
++				} else {
++					LocalTemporary tempo;
++					
++					tempo = new LocalTemporary (ec, source.Type);
++
++					pe.Value = tempo;
++					source.Emit (ec);
++					tempo.Store (ec);
++					target.Emit (ec);
++
++					tempo.Emit (ec);
++				}
++			} else if (eclass == ExprClass.IndexerAccess){
++				
+ 				throw new Exception (&quot;Can not assign to indexers yet&quot;);
+ 			}
+ 		}
+Index: mcs/class.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/class.cs,v
+retrieving revision 1.75
+diff -u -r1.75 class.cs
+--- mcs/class.cs	2001/10/14 22:30:14	1.75
++++ mcs/class.cs	2001/10/15 00:01:03
+@@ -697,7 +697,7 @@
+ 			ArrayList bases = Bases;
+ 			int count;
+ 			int start, j, i;
+-			
++
+ 			error = false;
+ 
+ 			if (is_class)
+Index: mcs/expression.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/expression.cs,v
+retrieving revision 1.83
+diff -u -r1.83 expression.cs
+--- mcs/expression.cs	2001/10/14 22:30:14	1.83
++++ mcs/expression.cs	2001/10/15 00:01:16
+@@ -3168,6 +3168,42 @@
+ 		// &lt;/summary&gt;
+ 		void AddressOf (EmitContext ec);
+ 	}
++
++	public class LocalTemporary : Expression, LValue, MemoryLocation {
++		LocalBuilder builder;
++		
++		public LocalTemporary (EmitContext ec, Type t)
++		{
++			type = t;
++			eclass = ExprClass.Value;
++			builder = ec.GetTemporaryStorage (t);
++		}
++
++		public override Expression DoResolve (EmitContext ec)
++		{
++			return this;
++		}
++
++		public Expression LValueResolve (EmitContext ec)
++		{
++			return this;
++		}
++		
++		public override void Emit (EmitContext ec)
++		{
++			ec.ig.Emit (OpCodes.Ldloc, builder); 
++		}
++
++		public void Store (EmitContext ec)
++		{
++			ec.ig.Emit (OpCodes.Stloc, builder);
++		}
++
++		public void AddressOf (EmitContext ec)
++		{
++			ec.ig.Emit (OpCodes.Ldloca, builder);
++		}
++	}
+ 	
+ 	public class LocalVariableReference : Expression, LValue, MemoryLocation {
+ 		public readonly string Name;
+@@ -4695,24 +4731,31 @@
+ 				return instance_expr;
+ 			}
+ 		}
++
++		public bool VerifyAssignable ()
++		{
++			if (!PropertyInfo.CanWrite){
++				Report.Error (200, loc, 
++					      &quot;The property `&quot; + PropertyInfo.Name +
++					      &quot;' can not be assigned to, as it has not set accessor&quot;);
++				return false;
++			}
++
++			return true;
++		}
+ 		
+ 		override public Expression DoResolve (EmitContext ec)
+ 		{
+-			if (value == null){
+-				if (!PropertyInfo.CanRead){
+-					Report.Error (154, loc, 
+-						      &quot;The property `&quot; + PropertyInfo.Name +
+-						      &quot;' can not be used in &quot; +
+-						      &quot;this context because it lacks a get accessor&quot;);
+-					return null;
+-				}
+-			} else {
+-				if (!PropertyInfo.CanWrite){
+-					Report.Error (200, loc, 
+-						      &quot;The property `&quot; + PropertyInfo.Name +
+-						      &quot;' can not be assigned to, as it has not set accessor&quot;);
+-					return null;
+-				}
++			//
++			// Not really sure who should call perform the test below
++			// given that `assignable' has special code for this.
++			//
++			if (!PropertyInfo.CanRead){
++				Report.Error (154, loc, 
++					      &quot;The property `&quot; + PropertyInfo.Name +
++					      &quot;' can not be used in &quot; +
++					      &quot;this context because it lacks a get accessor&quot;);
++				return null;
+ 			}
+ 			
+ 			return this;
+Index: tests/makefile
+===================================================================
+RCS file: /cvs/public/mcs/tests/makefile,v
+retrieving revision 1.20
+diff -u -r1.20 makefile
+--- tests/makefile	2001/10/14 22:30:14	1.20
++++ tests/makefile	2001/10/15 00:01:19
+@@ -4,7 +4,7 @@
+ TEST_SOURCES = \
+ 	test-1 test-2 test-3 test-4 test-6 test-7 test-8 test-9 test-10 \
+ 	test-11 test-12 test-13 test-16 test-17 test-18 test-20 test-21 \
+-	test-23
++	test-23 test-24
+ 
+ TEST_NOPASS = \
+ 	test-5
+Index: tests/test-23.cs
+===================================================================
+RCS file: /cvs/public/mcs/tests/test-23.cs,v
+retrieving revision 1.1
+diff -u -r1.1 test-23.cs
+--- tests/test-23.cs	2001/10/14 22:30:14	1.1
++++ tests/test-23.cs	2001/10/15 00:01:19
+@@ -51,6 +51,7 @@
+ 		z.XVal = 23;
+ 		if (z.XVal != 23)
+ 			return 7;
++
+ 		return 0;
+ 	}
+ }
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="001808.html">[Mono-list] Properties are now working.
+</A></li>
+	<LI> Next message: <A HREF="001817.html">[Mono-list] GTK bindings
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1810">[ date ]</a>
+              <a href="thread.html#1810">[ thread ]</a>
+              <a href="subject.html#1810">[ subject ]</a>
+              <a href="author.html#1810">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

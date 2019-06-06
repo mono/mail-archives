@@ -1,0 +1,461 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] break, continue implemented.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:miguel%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="001811.html">
+   <LINK REL="Next"  HREF="001813.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] break, continue implemented.
+   </H1>
+    <B>Miguel de Icaza
+    </B> 
+    <A HREF="mailto:miguel%40ximian.com"
+       TITLE="[Mono-list] break, continue implemented.">miguel@ximian.com
+       </A><BR>
+    <I>Tue, 16 Oct 2001 00:48:30 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="001811.html">[Mono-list] today's work
+</A></li>
+        <LI> Next message: <A HREF="001813.html">[Mono-list] General introductory docs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1812">[ date ]</a>
+              <a href="thread.html#1812">[ thread ]</a>
+              <a href="subject.html#1812">[ subject ]</a>
+              <a href="author.html#1812">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hey guys,
+
+   Tonight as I was taking a rest from watching TV (as I got sick over
+the weekend) I hacked break/continue support into the compiler, which
+means that we are not just missing throw and goto to be done with the
+jump statements. 
+
+   Comes with nice test suite.
+
+Miguel.
+
+Index: mcs/ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/mcs/ChangeLog,v
+retrieving revision 1.134
+diff -u -r1.134 ChangeLog
+--- mcs/ChangeLog	2001/10/15 00:03:43	1.134
++++ mcs/ChangeLog	2001/10/16 00:50:46
+@@ -1,3 +1,18 @@
++2001-10-15  Miguel de Icaza  &lt;<A HREF="mailto:miguel@ximian.com">miguel@ximian.com</A>&gt;
++
++	* statement.cs (Break::Emit): Implement.   
++	(Continue::Emit): Implement.
++
++	(For::Emit): Track old being/end loops;  Set Begin loop, ack end loop
++	(While::Emit): Track old being/end loops;  Set Begin loop, ack end loop
++	(Do::Emit): Track old being/end loops;  Set Begin loop, ack end loop
++	(Foreach::Emit): Track old being/end loops;  Set Begin loop, ack
++	end loop
++	
++	* codegen.cs (EmitContext::LoopEnd, EmitContext::LoopBegin): New
++	properties that track the label for the current loop (begin of the
++	loop and end of the loop).
++
+ 2001-10-14  Miguel de Icaza  &lt;<A HREF="mailto:miguel@ximian.com">miguel@ximian.com</A>&gt;
+ 
+ 	* expression.cs: LocalTemporary: a new expression used to
+Index: mcs/codegen.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/codegen.cs,v
+retrieving revision 1.35
+diff -u -r1.35 codegen.cs
+--- mcs/codegen.cs	2001/10/12 14:18:21	1.35
++++ mcs/codegen.cs	2001/10/16 00:50:46
+@@ -108,7 +108,7 @@
+ 		//   value on structure method invocations)
+ 		// &lt;/summary&gt;
+ 		public Hashtable temporary_storage;
+-		
++
+ 		public EmitContext (TypeContainer parent, ILGenerator ig, Type return_type,
+ 				    int code_flags, bool is_constructor)
+ 		{
+@@ -170,5 +170,15 @@
+ 
+ 			return location;
+ 		}
++
++		//
++		// Current loop begin and end labels.
++		//
++		public Label LoopBegin, LoopEnd;
++
++		//
++		// Whether we are inside a loop and break/continue are possible.
++		// 
++		public bool  InLoop;
+ 	}
+ }
+Index: mcs/cs-parser.jay
+===================================================================
+RCS file: /cvs/public/mcs/mcs/cs-parser.jay,v
+retrieving revision 1.65
+diff -u -r1.65 cs-parser.jay
+--- mcs/cs-parser.jay	2001/10/12 14:18:21	1.65
++++ mcs/cs-parser.jay	2001/10/16 00:50:56
+@@ -2654,14 +2654,14 @@
+ break_statement
+ 	: BREAK SEMICOLON
+ 	  {
+-		$$ = new Break ();
++		$$ = new Break (lexer.Location);
+ 	  }
+ 	;
+ 
+ continue_statement
+ 	: CONTINUE SEMICOLON
+ 	  {
+-		$$ = new Continue ();
++		$$ = new Continue (lexer.Location);
+ 	  }
+ 	;
+ 
+Index: mcs/expression.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/expression.cs,v
+retrieving revision 1.84
+diff -u -r1.84 expression.cs
+--- mcs/expression.cs	2001/10/15 00:03:43	1.84
++++ mcs/expression.cs	2001/10/16 00:51:16
+@@ -1969,10 +1969,17 @@
+ 					//
+ 					throw new Exception (&quot;Implement me&quot;);
+ 				} else if (expr.ExprClass == ExprClass.PropertyAccess){
+-					//
+-					// FIXME: Verify that we have both get and set methods
+-					//
+-					throw new Exception (&quot;Implement me&quot;);
++					PropertyExpr pe = (PropertyExpr) expr;
++
++					bool a, b;
++					
++					a = pe.VerifyReadable ();
++					b = pe.VerifyAssignable ();
++					type = expr_type;
++					
++					if (a &amp;&amp; b)
++						return this;
++					return null;
+ 				} else {
+ 					report118 (loc, expr, &quot;variable, indexer or property access&quot;);
+ 				}
+@@ -2007,7 +2014,8 @@
+ 		{
+ 			ILGenerator ig = ec.ig;
+ 			Type expr_type = expr.Type;
+-
++			ExprClass eclass;
++			
+ 			if (method != null) {
+ 
+ 				// Note that operators are static anyway
+@@ -2091,7 +2099,8 @@
+ 				
+ 			case Operator.PostIncrement:
+ 			case Operator.PostDecrement:
+-				if (expr.ExprClass == ExprClass.Variable){
++				eclass = expr.ExprClass;
++				if (eclass == ExprClass.Variable){
+ 					//
+ 					// Resolve already verified that it is an &quot;incrementable&quot;
+ 					// 
+@@ -2104,8 +2113,12 @@
+ 					else
+ 						ig.Emit (OpCodes.Add);
+ 					((LValue) expr).Store (ec);
++				} else if (eclass == ExprClass.PropertyAccess){
++					throw new Exception (&quot;Handle Properties here&quot;);
++				} else if (eclass == ExprClass.IndexerAccess) {
++					throw new Exception (&quot;Handle Indexers here&quot;);
+ 				} else {
+-					throw new Exception (&quot;Handle Indexers and Properties here&quot;);
++					Console.WriteLine (&quot;Unknown exprclass: &quot; + eclass);
+ 				}
+ 				break;
+ 				
+@@ -4743,20 +4756,26 @@
+ 
+ 			return true;
+ 		}
+-		
+-		override public Expression DoResolve (EmitContext ec)
++
++		public bool VerifyReadable ()
+ 		{
+-			//
+-			// Not really sure who should call perform the test below
+-			// given that `assignable' has special code for this.
+-			//
+ 			if (!PropertyInfo.CanRead){
+ 				Report.Error (154, loc, 
+ 					      &quot;The property `&quot; + PropertyInfo.Name +
+ 					      &quot;' can not be used in &quot; +
+ 					      &quot;this context because it lacks a get accessor&quot;);
+-				return null;
++				return false;
+ 			}
++
++			return true;
++		}
++		
++		override public Expression DoResolve (EmitContext ec)
++		{
++			//
++			// Not really sure who should call perform the test below
++			// given that `assignable' has special code for this.
++			//
+ 			
+ 			return this;
+ 		}
+Index: mcs/statement.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/statement.cs,v
+retrieving revision 1.19
+diff -u -r1.19 statement.cs
+--- mcs/statement.cs	2001/10/10 02:36:47	1.19
++++ mcs/statement.cs	2001/10/16 00:51:22
+@@ -122,12 +122,25 @@
+ 		{
+ 			ILGenerator ig = ec.ig;
+ 			Label loop = ig.DefineLabel ();
+-
++			Label old_begin = ec.LoopBegin;
++			Label old_end = ec.LoopEnd;
++			bool  old_inloop = ec.InLoop;
++			
++			ec.LoopBegin = ig.DefineLabel ();
++			ec.LoopEnd = ig.DefineLabel ();
++			ec.InLoop = true;
++				
+ 			ig.MarkLabel (loop);
+ 			EmbeddedStatement.Emit (ec);
++			ig.MarkLabel (ec.LoopBegin);
+ 			EmitBoolExpression (ec, Expr);
+ 			ig.Emit (OpCodes.Brtrue, loop);
++			ig.MarkLabel (ec.LoopEnd);
+ 
++			ec.LoopBegin = old_begin;
++			ec.LoopEnd = old_end;
++			ec.InLoop = old_inloop;
++			
+ 			return false;
+ 		}
+ 	}
+@@ -145,16 +158,25 @@
+ 		public override bool Emit (EmitContext ec)
+ 		{
+ 			ILGenerator ig = ec.ig;
+-			Label while_eval = ig.DefineLabel ();
+-			Label exit = ig.DefineLabel ();
++			Label old_begin = ec.LoopBegin;
++			Label old_end = ec.LoopEnd;
++			bool old_inloop = ec.InLoop;
++			
++			ec.LoopBegin = ig.DefineLabel ();
++			ec.LoopEnd = ig.DefineLabel ();
++			ec.InLoop = true;
+ 			
+-			ig.MarkLabel (while_eval);
++			ig.MarkLabel (ec.LoopBegin);
+ 			EmitBoolExpression (ec, Expr);
+-			ig.Emit (OpCodes.Brfalse, exit);
++			ig.Emit (OpCodes.Brfalse, ec.LoopEnd);
+ 			Statement.Emit (ec);
+-			ig.Emit (OpCodes.Br, while_eval);
+-			ig.MarkLabel (exit);
++			ig.Emit (OpCodes.Br, ec.LoopBegin);
++			ig.MarkLabel (ec.LoopEnd);
+ 
++			ec.LoopBegin = old_begin;
++			ec.LoopEnd = old_end;
++			ec.InLoop = old_inloop;
++			
+ 			return false;
+ 		}
+ 	}
+@@ -179,21 +201,31 @@
+ 		public override bool Emit (EmitContext ec)
+ 		{
+ 			ILGenerator ig = ec.ig;
++			Label old_begin = ec.LoopBegin;
++			Label old_end = ec.LoopEnd;
++			bool old_inloop = ec.InLoop;
+ 			Label loop = ig.DefineLabel ();
+-			Label exit = ig.DefineLabel ();
+ 			
+ 			if (! (InitStatement is EmptyStatement))
+ 				InitStatement.Emit (ec);
+ 
++			ec.LoopBegin = ig.DefineLabel ();
++			ec.LoopEnd = ig.DefineLabel ();
++			ec.InLoop = true;
++
+ 			ig.MarkLabel (loop);
+ 			EmitBoolExpression (ec, Test);
+-			ig.Emit (OpCodes.Brfalse, exit);
++			ig.Emit (OpCodes.Brfalse, ec.LoopEnd);
+ 			Statement.Emit (ec);
++			ig.MarkLabel (ec.LoopBegin);
+ 			if (!(Increment is EmptyStatement))
+ 				Increment.Emit (ec);
+ 			ig.Emit (OpCodes.Br, loop);
+-			ig.MarkLabel (exit);
++			ig.MarkLabel (ec.LoopEnd);
+ 
++			ec.LoopBegin = old_begin;
++			ec.LoopEnd = old_end;
++			ec.InLoop = old_inloop;
+ 			return false;
+ 		}
+ 	}
+@@ -312,24 +344,46 @@
+ 	}
+ 
+ 	public class Break : Statement {
+-		public Break ()
++		Location loc;
++		
++		public Break (Location l)
+ 		{
++			loc = l;
+ 		}
+ 
+ 		public override bool Emit (EmitContext ec)
+ 		{
+-			throw new Exception (&quot;Unimplemented&quot;);
++			ILGenerator ig = ec.ig;
++
++			if (!ec.InLoop){
++				Report.Error (139, loc, &quot;No enclosing loop to continue to&quot;);
++				return false;
++			}
++			
++			ig.Emit (OpCodes.Br, ec.LoopEnd);
++			return false;
+ 		}
+ 	}
+ 
+ 	public class Continue : Statement {
+-		public Continue ()
++		Location loc;
++		
++		public Continue (Location l)
+ 		{
++			loc = l;
+ 		}
+ 
+ 		public override bool Emit (EmitContext ec)
+ 		{
+-			throw new Exception (&quot;Unimplemented&quot;);
++			Label begin = ec.LoopBegin;
++			
++			if (!ec.InLoop){
++				Report.Error (139, loc, &quot;No enclosing loop to continue to&quot;);
++				return false;
++			} 
++
++			ec.ig.Emit (OpCodes.Br, begin);
++			return false;
+ 		}
+ 	}
+ 	
+@@ -996,10 +1050,13 @@
+ 			//
+ 			// Instantiate the enumerator
+ 
+-			Label end = ig.DefineLabel ();
++			Label old_begin = ec.LoopBegin, old_end = ec.LoopEnd;
+ 			Label end_try = ig.DefineLabel ();
+-			Label loop = ig.DefineLabel ();
+-
++			bool old_inloop = ec.InLoop;
++			ec.LoopBegin = ig.DefineLabel ();
++			ec.LoopEnd = ig.DefineLabel ();
++			ec.InLoop = true;
++			
+ 			//
+ 			// FIXME: This code does not work for cases like:
+ 			// foreach (int a in ValueTypeVariable){
+@@ -1021,7 +1078,7 @@
+ 			// if the beast implement IDisposable, we get rid of it
+ 			//
+ 			Label l = ig.BeginExceptionBlock ();
+-			ig.MarkLabel (loop);
++			ig.MarkLabel (ec.LoopBegin);
+ 			ig.Emit (OpCodes.Ldloc, enumerator);
+ 			ig.Emit (OpCodes.Callvirt, TypeManager.bool_movenext_void);
+ 			ig.Emit (OpCodes.Brfalse, end_try);
+@@ -1030,7 +1087,7 @@
+ 			conv.Emit (ec);
+ 			Variable.Store (ec);
+ 			Statement.Emit (ec);
+-			ig.Emit (OpCodes.Br, loop);
++			ig.Emit (OpCodes.Br, ec.LoopBegin);
+ 			ig.MarkLabel (end_try);
+ 
+ 			// The runtime provides this for us.
+@@ -1055,7 +1112,12 @@
+ 			// ig.Emit (OpCodes.Endfinally);
+ 
+ 			ig.EndExceptionBlock ();
+-			ig.MarkLabel (end);
++
++			ig.MarkLabel (ec.LoopEnd);
++			
++			ec.LoopBegin = old_begin;
++			ec.LoopEnd = old_end;
++			ec.InLoop = old_inloop;
+ 
+ 			return false;
+ 		}
+Index: tests/makefile
+===================================================================
+RCS file: /cvs/public/mcs/tests/makefile,v
+retrieving revision 1.21
+diff -u -r1.21 makefile
+--- tests/makefile	2001/10/15 00:03:43	1.21
++++ tests/makefile	2001/10/16 00:51:23
+@@ -4,7 +4,7 @@
+ TEST_SOURCES = \
+ 	test-1 test-2 test-3 test-4 test-6 test-7 test-8 test-9 test-10 \
+ 	test-11 test-12 test-13 test-16 test-17 test-18 test-20 test-21 \
+-	test-23 test-24
++	test-23 test-24 test-25
+ 
+ TEST_NOPASS = \
+ 	test-5
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="001811.html">[Mono-list] today's work
+</A></li>
+	<LI> Next message: <A HREF="001813.html">[Mono-list] General introductory docs
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1812">[ date ]</a>
+              <a href="thread.html#1812">[ thread ]</a>
+              <a href="subject.html#1812">[ subject ]</a>
+              <a href="author.html#1812">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

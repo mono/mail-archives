@@ -1,0 +1,230 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Destructor calling not working properly under
+ Linux?
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:2a5gjx302%40sneakemail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="025244.html">
+   <LINK REL="Next"  HREF="025246.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Destructor calling not working properly under
+ Linux?
+   </H1>
+    <B>Jonathan Gilbert
+    </B> 
+    <A HREF="mailto:2a5gjx302%40sneakemail.com"
+       TITLE="[Mono-list] Destructor calling not working properly under
+ Linux?">2a5gjx302@sneakemail.com
+       </A><BR>
+    <I>Tue, 11 Jan 2005 15:31:17 -0500</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="025244.html">[Mono-list] Destructor calling not working properly under
+ Linux?
+</A></li>
+        <LI> Next message: <A HREF="025246.html">[Mono-list] solaris 10 x86 build
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25245">[ date ]</a>
+              <a href="thread.html#25245">[ thread ]</a>
+              <a href="subject.html#25245">[ subject ]</a>
+              <a href="author.html#25245">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>At 08:57 PM 11/01/2005 +0100, Jurek Bartuszek wrote:
+&gt;|<i> This is my understanding of the situation, anyway...
+</I>&gt;|<i>
+</I>&gt;|<i> Jonathan Gilbert
+</I>&gt;<i>
+</I>&gt;<i>Hmm... so you suggest, that those objects aren't being destroyed at all?
+</I>&gt;<i>
+</I>&gt;<i>And one more question... is there anything in C# that would do the same
+</I>&gt;<i>as 'delete' in C++?
+</I>
+As I mentioned in the original reply, the closest thing to that is the
+IDisposable interface.
+
+There is nothing that directly erases the managed (.NET) parts of an
+object; only the garbage collector can do that. However, if an object
+represents unmanaged resources which must be shut down correctly (such as a
+connection to a database, or a file with some data still in the write
+cache), then as you are looking for it does make sense to have a way to
+release the object's resources. In .NET, the standard way to do this is
+with the IDisposable interface. It gives the implementing object (or rather
+requires of it) a function &quot;Dispose()&quot;, which can be called when the
+resources should be released. It is possible for the function to be called
+more than once, so the object should keep track of whether it has already
+been called. The interface is actually linked into the language, too. Here
+is a short example:
+
+class UnmanagedResource : IDisposable
+{
+  // The following three function declarations (marked &quot;extern&quot;) permit
+  // functions in a DLL/shared object to be called directly from C# code.
+  [DllImport(&quot;helper&quot;)]
+  static extern IntPtr AllocateResource(); // IntPtr is equivalent to 'void
+*' in C/C++
+  [DllImport(&quot;helper&quot;)]
+  static extern void UseResource(IntPtr resource);
+  [DllImport(&quot;helper&quot;)]
+  static extern void ReleaseResource(IntPtr resource);
+
+  IntPtr resource_handle;
+
+  public UnmanagedResource()
+  {
+    resource_handle = AllocateResource(); // call into the unmanaged library
+
+    if (resource_handle == IntPtr.Zero) // IntPtr.Zero is equivalent to
+NULL in C/C++
+      throw new Exception(&quot;The UnmanagedResource failed to initialize
+(AllocateResource returned NULL).&quot;);
+  }
+
+  ~UnmanagedResource() // in the event that we DO get finalized, dispose of
+ourselves
+  {
+    Dispose();
+  }
+
+  bool disposed = false;
+  object disposal_sync = new object(); // only needed if multiple threads
+are used
+
+  public void Dispose() // implementing IDisposable.Dispose()
+  {
+    lock (disposal_sync)
+    {
+      if (!disposed) // make sure we only release the resource once!
+      {
+        ReleaseResource(resource_handle);
+        disposed = true;
+      }
+    }
+  }
+
+  // ..and here is the interface to the .NET world:
+  public void UseResource()
+  {
+    lock (disposal_sync)
+    {
+      if (disposed)
+        throw new ObjectDisposedException();
+
+      UseResource(resource_handle);
+    }
+  }
+}
+
+Okay, I'll admit: This looks like a formidable piece of code. However, each
+bit of its operation is relatively simple to understand. I don't know how
+much you know about .NET, so I'll explain everything. Forgive me if I go
+into too much detail :-)
+
+First, the DllImport attributes are part of a .NET system called Platform
+Invoke. Without necessarily understanding precisely what it is doing behind
+the scenes, this can be taken as roughly equivalent to using
+dlopen()/LoadLibrary() and such to invoke functions in a shared object at
+runtime. The .NET runtime handles the details of translating the arguments
+and return value to/from the .NET world. This is certainly much smoother
+than Java's JNI :-)
+
+Next, the constructor and the finalizer (C# terminology for what looks like
+a C++ destructor). In the constructor, the .DLL/.so is invoked to create an
+instance of a resource managed perhaps by a body of C code. Whatever the
+resource is, it's certain that the .NET garbage collector does not know
+about it. In the finalizer, we simply call Dispose(), since that is how the
+code outside of the class will have to dispose of the resource.
+
+The Dispose() function, as you can see, is careful to ensure that the
+object is only disposed once. Many C libraries will crash or otherwise
+behave unexpectedly if you release a resource more than once, so this is
+important.
+
+Finally, to enable the resource to actually be used, the .DLL/.so function
+'UseResource' is mapped onto by a C# function of the same name. In keeping
+with the OOP paradigm, the implicit argument ('this') takes the place of
+the first parameter to UseResource; the actual value of the handle is
+stored within the class. Since the object can be disposed, it's important
+to make sure we don't call into the .DLL/.so if the resource has already
+been released (that would, in general, be _bad_ :-).
+
+Within Dispose() and UseResource(), there is synchronization to prevent the
+object from being disposed during another thread's call to UseResource().
+This can be omitted entirely (just remove the 'lock () { }' bits). If the
+synchronization *is* necessary, and the library is threadsafe (i.e.,
+UseResource() is re-entrant), it might be worth investing in a
+reader/writer lock; that way, multiple calls to UseResource could overlap,
+but Dispose() could be kept exclusive.
+
+The IDisposable interface and ObjectDisposedExceptions are an integral part
+of the .NET class library; both of them are in the 'System' namespace along
+with Int32, Console and the like. The C# language acknowledges the
+existence of IDisposable with a construct called &quot;using&quot;. The best way to
+describe &quot;using&quot; is by showing the equivalent try/finally construct.
+
+When you write the following code:
+
+using (UnmanagedResource handle = new UnmanagedResource())
+{
+  handle.UseResource();
+}
+
+..the compiler translates it as though you had written the following
+longer, uglier version:
+
+{
+  UnmanagedResource handle = null;
+
+  try
+  {
+    handle = new UnmanagedResource();
+
+    handle.UseResource();
+  }
+  finally
+  {
+    IDisposable disposable_handle = handle as IDisposable;
+
+    if (disposable_handle != null)
+      disposable_handle.Dispose();
+  }
+}
+
+In other words, a &quot;using&quot; block guarantees that an IDisposable object will
+have its Dispose() method called before code execution leaves the &quot;using&quot;
+block.
+
+This e-mail has turned out a lot longer than I anticipated, but I think
+I've covered all of the key points for the C# unmanaged resource
+allocation/deallocation model :-) Let me know if you have any more questions.
+
+Have a good one,
+
+Jonathan Gilbert
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="025244.html">[Mono-list] Destructor calling not working properly under
+ Linux?
+</A></li>
+	<LI> Next message: <A HREF="025246.html">[Mono-list] solaris 10 x86 build
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25245">[ date ]</a>
+              <a href="thread.html#25245">[ thread ]</a>
+              <a href="subject.html#25245">[ subject ]</a>
+              <a href="author.html#25245">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

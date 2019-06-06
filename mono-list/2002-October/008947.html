@@ -1,0 +1,660 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Patch for bugzilla 31265, plus some pthreads
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:thaynes%40openlinksw.com%20%28Tim%20Haynes%29">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="008942.html">
+   <LINK REL="Next"  HREF="008949.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Patch for bugzilla 31265, plus some pthreads
+   </H1>
+    <B>Tim Haynes
+    </B> 
+    <A HREF="mailto:thaynes%40openlinksw.com%20%28Tim%20Haynes%29"
+       TITLE="[Mono-list] Patch for bugzilla 31265, plus some pthreads">thaynes@openlinksw.com (Tim Haynes)
+       </A><BR>
+    <I>Fri, 11 Oct 2002 15:32:01 +0100</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="008942.html">[Mono-list] Re: GetSchemaTable() in OdbcDataReader
+</A></li>
+        <LI> Next message: <A HREF="008949.html">[Mono-list] Patch for bugzilla 31265, plus some pthreads
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8947">[ date ]</a>
+              <a href="thread.html#8947">[ thread ]</a>
+              <a href="subject.html#8947">[ subject ]</a>
+              <a href="author.html#8947">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>--=-=-=
+
+Hi,
+
+Please find a fix completing bug#31265 (reported by Zdravko Tashev): when
+it expands the gc_handles array it does deregister/register the handles
+with the GC regardless of their type. Have added an array to record the
+handle type and act accordingly.
+
+Also, there was a mono_thread_create, but no mono_thread_attach for
+existing threads). Have copied the mono_thread_create and replaced a call t
+pthread_create() with pthread_self(), which works. There is a callback to
+be called on unhandled exception for example, which now can call a
+user-registerable callback or the original callback (calling pthread_exit).
+The code in the user callback mono_thread_attach_aborted_cb should do a
+longjmp to unwind the stack to a frame above any Mono frames.
+
+Cheers,
+
+~Tim
+-- 
+Product Development Consultant
+OpenLink Software
+Tel: +44 (0) 20 8681 7701
+Web: &lt;<A HREF="http://www.openlinksw.com">http://www.openlinksw.com</A>&gt;
+Universal Data Access &amp; Data Integration Technology Providers
+
+
+--=-=-=
+Content-Disposition: attachment; filename=b31265+pthread.diff
+Content-Description: fix for 31265 and pthreads
+
+Index: mono/io-layer/threads.c
+===================================================================
+RCS file: /mono/mono/mono/io-layer/threads.c,v
+retrieving revision 1.35
+diff -u -b -r1.35 threads.c
+--- mono/io-layer/threads.c	3 Oct 2002 14:01:29 -0000	1.35
++++ mono/io-layer/threads.c	10 Oct 2002 15:49:28 -0000
+@@ -263,6 +263,94 @@
+ 	return(handle);
+ }
+ 
++gpointer AttachThread(WapiSecurityAttributes *security G_GNUC_UNUSED, guint32 stacksize G_GNUC_UNUSED,
++		      WapiThreadStart start, gpointer param, guint32 create,
++		      guint32 *tid)
++{
++	struct _WapiHandle_thread *thread_handle;
++	struct _WapiHandlePrivate_thread *thread_private_handle;
++	gpointer handle;
++	gboolean ok;
++	int ret;
++
++	mono_once(&amp;thread_hash_once, thread_hash_init);
++	mono_once (&amp;thread_ops_once, thread_ops_init);
++
++	if(start==NULL) {
++		return(NULL);
++	}
++
++	handle=_wapi_handle_new (WAPI_HANDLE_THREAD);
++	if(handle==_WAPI_HANDLE_INVALID) {
++		g_warning (G_GNUC_PRETTY_FUNCTION
++			   &quot;: error creating thread handle&quot;);
++		return(NULL);
++	}
++
++	_wapi_handle_lock_handle (handle);
++
++	ok=_wapi_lookup_handle (handle, WAPI_HANDLE_THREAD,
++				(gpointer *)&amp;thread_handle,
++				(gpointer *)&amp;thread_private_handle);
++	if(ok==FALSE) {
++		g_warning (G_GNUC_PRETTY_FUNCTION
++			   &quot;: error looking up thread handle %p&quot;, handle);
++		_wapi_handle_unlock_handle (handle);
++		return(NULL);
++	}
++
++	/* Hold a reference while the thread is active, because we use
++	 * the handle to store thread exit information
++	 */
++	_wapi_handle_ref (handle);
++
++	thread_handle-&gt;state=THREAD_STATE_START;
++
++	/* Lock around the thread create, so that the new thread cant
++	 * race us to look up the thread handle in GetCurrentThread()
++	 */
++	mono_mutex_lock(&amp;thread_hash_mutex);
++
++	ret=_wapi_timed_thread_attach(&amp;thread_private_handle-&gt;thread,
++				      create, start, thread_exit, param,
++				      handle);
++	if(ret!=0) {
++#ifdef DEBUG
++		g_message(G_GNUC_PRETTY_FUNCTION &quot;: Thread attach error: %s&quot;,
++			  strerror(ret));
++#endif
++		mono_mutex_unlock(&amp;thread_hash_mutex);
++		_wapi_handle_unlock_handle (handle);
++		_wapi_handle_unref (handle);
++
++		/* And again, because of the reference we took above */
++		_wapi_handle_unref (handle);
++		return(NULL);
++	}
++
++	g_hash_table_insert(thread_hash, &amp;thread_private_handle-&gt;thread-&gt;id,
++			    handle);
++	mono_mutex_unlock(&amp;thread_hash_mutex);
++
++#ifdef DEBUG
++	g_message(G_GNUC_PRETTY_FUNCTION
++		  &quot;: Started thread handle %p thread %p ID %ld&quot;, handle,
++		  thread_private_handle-&gt;thread,
++		  thread_private_handle-&gt;thread-&gt;id);
++#endif
++
++	if(tid!=NULL) {
++#ifdef PTHREAD_POINTER_ID
++		*tid=GPOINTER_TO_UINT(thread_private_handle-&gt;thread-&gt;id);
++#else
++		*tid=thread_private_handle-&gt;thread-&gt;id;
++#endif
++	}
++
++	_wapi_handle_unlock_handle (handle);
++
++	return(handle);
++}
+ gpointer OpenThread (guint32 access G_GNUC_UNUSED, gboolean inherit G_GNUC_UNUSED, guint32 tid)
+ {
+ 	gpointer ret=NULL;
+Index: mono/io-layer/threads.h
+===================================================================
+RCS file: /mono/mono/mono/io-layer/threads.h,v
+retrieving revision 1.8
+diff -u -b -r1.8 threads.h
+--- mono/io-layer/threads.h	3 Sep 2002 16:41:29 -0000	1.8
++++ mono/io-layer/threads.h	10 Oct 2002 15:49:28 -0000
+@@ -40,6 +40,9 @@
+ extern gpointer CreateThread(WapiSecurityAttributes *security,
+ 			     guint32 stacksize, WapiThreadStart start,
+ 			     gpointer param, guint32 create, guint32 *tid);
++extern gpointer AttachThread(WapiSecurityAttributes *security G_GNUC_UNUSED, guint32 stacksize G_GNUC_UNUSED,
++		      WapiThreadStart start, gpointer param, guint32 create,
++		      guint32 *tid);
+ extern gpointer OpenThread (guint32 access, gboolean inherit, guint32 tid);
+ extern void ExitThread(guint32 exitcode) G_GNUC_NORETURN;
+ extern gboolean GetExitCodeThread(gpointer handle, guint32 *exitcode);
+Index: mono/io-layer/timed-thread.c
+===================================================================
+RCS file: /mono/mono/mono/io-layer/timed-thread.c,v
+retrieving revision 1.10
+diff -u -b -r1.10 timed-thread.c
+--- mono/io-layer/timed-thread.c	1 Oct 2002 15:59:51 -0000	1.10
++++ mono/io-layer/timed-thread.c	10 Oct 2002 15:49:32 -0000
+@@ -131,6 +131,33 @@
+ 	return(0);
+ }
+ 
++int _wapi_timed_thread_attach(TimedThread **threadp,
++			      guint32 create_flags,
++			      guint32 (*start_routine)(gpointer),
++			      void (*exit_routine)(guint32, gpointer),
++			      gpointer arg, gpointer exit_userdata)
++{
++	TimedThread *thread;
++
++	thread=(TimedThread *)g_new0(TimedThread, 1);
++
++	mono_mutex_init(&amp;thread-&gt;join_mutex, NULL);
++	pthread_cond_init(&amp;thread-&gt;exit_cond, NULL);
++	thread-&gt;create_flags = create_flags;
++	sem_init (&amp;thread-&gt;suspend_sem, 0, 0);
++	thread-&gt;start_routine = start_routine;
++	thread-&gt;exit_routine = exit_routine;
++	thread-&gt;arg = arg;
++	thread-&gt;exit_userdata = exit_userdata;
++	thread-&gt;exitstatus = 0;
++	thread-&gt;exiting = FALSE;
++
++	*threadp = thread;
++
++	thread-&gt;id = pthread_self();
++	return(0);
++}
++
+ int _wapi_timed_thread_join(TimedThread *thread, struct timespec *timeout,
+ 			    guint32 *exitstatus)
+ {
+Index: mono/io-layer/timed-thread.h
+===================================================================
+RCS file: /mono/mono/mono/io-layer/timed-thread.h,v
+retrieving revision 1.5
+diff -u -b -r1.5 timed-thread.h
+--- mono/io-layer/timed-thread.h	1 Oct 2002 15:59:51 -0000	1.5
++++ mono/io-layer/timed-thread.h	10 Oct 2002 15:49:32 -0000
+@@ -41,6 +41,11 @@
+ 				     guint32 (*start_routine)(gpointer),
+ 				     void (*exit_routine)(guint32, gpointer),
+ 				     gpointer arg, gpointer exit_userdata);
++extern int _wapi_timed_thread_attach(TimedThread **threadp,
++			      guint32 create_flags,
++			      guint32 (*start_routine)(gpointer),
++			      void (*exit_routine)(guint32, gpointer),
++			      gpointer arg, gpointer exit_userdata);
+ extern int _wapi_timed_thread_join(TimedThread *thread,
+ 				   struct timespec *timeout,
+ 				   guint32 *exitstatus);
+Index: mono/jit/jit.c
+===================================================================
+RCS file: /mono/mono/mono/jit/jit.c,v
+retrieving revision 1.256
+diff -u -b -r1.256 jit.c
+--- mono/jit/jit.c	9 Oct 2002 00:45:17 -0000	1.256
++++ mono/jit/jit.c	10 Oct 2002 15:49:44 -0000
+@@ -4038,6 +4038,30 @@
+ 	jit_tls-&gt;end_of_stack = stack_start;
+ }
+ 
++void (*mono_thread_attach_aborted_cb ) (MonoObject *obj) = NULL;
++
++static void
++mono_thread_abort_dummy (MonoObject *obj)
++{
++  if (mono_thread_attach_aborted_cb)
++    mono_thread_attach_aborted_cb (obj);
++  else
++    mono_thread_abort (obj);
++}
++
++static void
++mono_thread_attach_cb (gpointer stack_start)
++{
++	MonoJitTlsData *jit_tls;
++
++	jit_tls = g_new0 (MonoJitTlsData, 1);
++
++	TlsSetValue (mono_jit_tls_id, jit_tls);
++
++	jit_tls-&gt;abort_func = mono_thread_abort_dummy;
++	jit_tls-&gt;end_of_stack = stack_start;
++}
++
+ static CRITICAL_SECTION ms;
+ 
+ static void
+@@ -4123,7 +4147,7 @@
+ 	mono_install_stack_walk (mono_jit_walk_stack);
+ 
+ 	domain = mono_init (file);
+-	mono_runtime_init (domain, mono_thread_start_cb);
++	mono_runtime_init_with_attach (domain, mono_thread_start_cb, mono_thread_attach_cb);
+ 
+ 	return domain;
+ }
+Index: mono/jit/jit.h
+===================================================================
+RCS file: /mono/mono/mono/jit/jit.h,v
+retrieving revision 1.84
+diff -u -b -r1.84 jit.h
+--- mono/jit/jit.h	2 Aug 2002 14:16:20 -0000	1.84
++++ mono/jit/jit.h	10 Oct 2002 15:49:44 -0000
+@@ -48,6 +48,8 @@
+ 
+ extern int mono_exc_esp_offset;
+ 
++extern void (*mono_thread_attach_aborted_cb ) (MonoObject *obj);
++
+ typedef struct _MBTree MBTree;
+ 
+ typedef enum {
+Index: mono/metadata/appdomain.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/appdomain.c,v
+retrieving revision 1.46
+diff -u -b -r1.46 appdomain.c
+--- mono/metadata/appdomain.c	1 Sep 2002 20:47:55 -0000	1.46
++++ mono/metadata/appdomain.c	10 Oct 2002 15:49:48 -0000
+@@ -37,7 +37,7 @@
+  * operational.
+  */
+ void
+-mono_runtime_init (MonoDomain *domain, MonoThreadStartCB start_cb)
++mono_runtime_init_with_attach (MonoDomain *domain, MonoThreadStartCB start_cb, MonoThreadStartCB attach_cb)
+ {
+ 	MonoAppDomainSetup *setup;
+ 	MonoAppDomain *ad;
+@@ -57,7 +57,7 @@
+ 	g_assert (mono_delegate_semaphore != INVALID_HANDLE_VALUE);
+ 	InitializeCriticalSection (&amp;mono_delegate_section);
+ 	
+-	mono_thread_init (domain, start_cb);
++	mono_thread_init_with_attach (domain, start_cb, attach_cb);
+ 
+ 	mono_network_init ();
+ 
+@@ -65,6 +65,12 @@
+ }
+ 
+ void
++mono_runtime_init (MonoDomain *domain, MonoThreadStartCB start_cb)
++{
++  mono_runtime_init_with_attach (domain, start_cb, NULL);
++}
++
++void
+ mono_runtime_cleanup (MonoDomain *domain)
+ {
+ 	mono_runtime_shutdown = 1;
+Index: mono/metadata/assembly.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/assembly.c,v
+retrieving revision 1.46
+diff -u -b -r1.46 assembly.c
+Index: mono/metadata/gc.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/gc.c,v
+retrieving revision 1.17
+diff -u -b -r1.17 gc.c
+--- mono/metadata/gc.c	26 Sep 2002 19:40:15 -0000	1.17
++++ mono/metadata/gc.c	10 Oct 2002 15:49:59 -0000
+@@ -210,6 +210,7 @@
+ /*static CRITICAL_SECTION handle_section;*/
+ static guint32 next_handle = 0;
+ static gpointer *gc_handles = NULL;
++static guint8 *gc_handle_types = NULL;
+ static guint32 array_size = 0;
+ 
+ /*
+@@ -219,6 +220,13 @@
+  * 2 -&gt; weak
+  */
+ 
++typedef enum {
++	HANDLE_WEAK,
++	HANDLE_WEAK_TRACK,
++	HANDLE_NORMAL,
++	HANDLE_PINNED
++} HandleType;
++
+ /*
+  * FIXME: make thread safe and reuse the array entries.
+  */
+@@ -226,25 +234,23 @@
+ ves_icall_System_GCHandle_GetTarget (guint32 handle)
+ {
+ 	MonoObject *obj;
++	gint32 type;
+ 
+ 	if (gc_handles) {
++		type = handle &amp; 0x3;
++		g_assert (type == gc_handle_types [handle &gt;&gt; 2]);
+ 		obj = gc_handles [handle &gt;&gt; 2];
+ 		if (!obj)
+ 			return NULL;
+-		if ((handle &amp; 0x3) &gt; 1)
++
++		if ((type == HANDLE_WEAK) || (type == HANDLE_WEAK_TRACK))
+ 			return REVEAL_POINTER (obj);
++		else
+ 		return obj;
+ 	}
+ 	return NULL;
+ }
+ 
+-typedef enum {
+-	HANDLE_WEAK,
+-	HANDLE_WEAK_TRACK,
+-	HANDLE_NORMAL,
+-	HANDLE_PINNED
+-} HandleType;
+-
+ guint32
+ ves_icall_System_GCHandle_GetTargetHandle (MonoObject *obj, guint32 handle, gint32 type)
+ {
+@@ -254,15 +260,18 @@
+ 	if (idx &gt;= array_size) {
+ #if HAVE_BOEHM_GC
+ 		gpointer *new_array;
++		guint8 *new_type_array;
+ 		if (!array_size)
+ 			array_size = 16;
+ 		new_array = GC_malloc (sizeof (gpointer) * (array_size * 2));
++		new_type_array = GC_malloc (sizeof (guint8) * (array_size * 2));
+ 		if (gc_handles) {
+ 			int i;
+ 			memcpy (new_array, gc_handles, sizeof (gpointer) * array_size);
++			memcpy (new_type_array, gc_handle_types, sizeof (guint8) * array_size);
+ 			/* need to re-register links for weak refs. test if GC_realloc needs the same */
+ 			for (i = 0; i &lt; array_size; ++i) {
+-				if (((gulong)new_array [i]) &amp; 0x1) { /* all and only disguised pointers have it set */
++				if ((gc_handle_types[i] == HANDLE_WEAK) || (gc_handle_types[i] == HANDLE_WEAK_TRACK)) { /* all and only disguised pointers have it set */
+ 					GC_unregister_disappearing_link (&amp;(gc_handles [i]));
+ 					if (new_array [i] != (gpointer)-1)
+ 						GC_general_register_disappearing_link (&amp;(new_array [i]), REVEAL_POINTER (new_array [i]));
+@@ -271,21 +280,22 @@
+ 		}
+ 		array_size *= 2;
+ 		gc_handles = new_array;
++		gc_handle_types = new_type_array;
+ #else
+ 		g_error (&quot;No GCHandle support built-in&quot;);
+ #endif
+ 	}
+-	h = idx &lt;&lt; 2;
+ 
+ 	/* resuse the type from the old target */
+ 	if (type == -1)
+ 		type =  handle &amp; 0x3;
++	h = (idx &lt;&lt; 2) | type;
+ 	switch (type) {
+ 	case HANDLE_WEAK:
+ 	case HANDLE_WEAK_TRACK:
+-		h |= 2;
+ 		val = (gpointer)HIDE_POINTER (val);
+ 		gc_handles [idx] = val;
++		gc_handle_types [idx] = type;
+ #if HAVE_BOEHM_GC
+ 		GC_general_register_disappearing_link (&amp;(gc_handles [idx]), obj);
+ #else
+@@ -293,8 +303,8 @@
+ #endif
+ 		break;
+ 	default:
+-		h |= type;
+ 		gc_handles [idx] = val;
++		gc_handle_types [idx] = type;
+ 		break;
+ 	}
+ 	return h;
+@@ -304,25 +314,30 @@
+ ves_icall_System_GCHandle_FreeHandle (guint32 handle)
+ {
+ 	int idx = handle &gt;&gt; 2;
++	int type = handle &amp; 0x3;
+ 
+ #ifdef HAVE_BOEHM_GC
+-	if ((handle &amp; 0x3) &gt; 1)
++	g_assert (type == gc_handle_types [idx]);
++	if ((type == HANDLE_WEAK) || (type == HANDLE_WEAK_TRACK))
+ 		GC_unregister_disappearing_link (&amp;(gc_handles [idx]));
+ #else
+ 	g_error (&quot;No GCHandle support&quot;);
+ #endif
+ 
+ 	gc_handles [idx] = (gpointer)-1;
++	gc_handle_types [idx] = (guint8)-1;
+ }
+ 
+ gpointer
+ ves_icall_System_GCHandle_GetAddrOfPinnedObject (guint32 handle)
+ {
+ 	MonoObject *obj;
++	int type = handle &amp; 0x3;
+ 
+ 	if (gc_handles) {
+ 		obj = gc_handles [handle &gt;&gt; 2];
+-		if ((handle &amp; 0x3) &gt; 1) {
++		g_assert (gc_handle_types [handle &gt;&gt; 2] == type);
++		if ((type == HANDLE_WEAK) || (type == HANDLE_WEAK_TRACK)) {
+ 			obj = REVEAL_POINTER (obj);
+ 			if (obj == (MonoObject *) -1)
+ 				return NULL;
+Index: mono/metadata/threads.c
+===================================================================
+RCS file: /mono/mono/mono/metadata/threads.c,v
+retrieving revision 1.33
+diff -u -b -r1.33 threads.c
+--- mono/metadata/threads.c	3 Oct 2002 14:01:29 -0000	1.33
++++ mono/metadata/threads.c	10 Oct 2002 15:50:03 -0000
+@@ -61,6 +61,9 @@
+ /* function called at thread start */
+ static MonoThreadStartCB mono_thread_start_cb = NULL;
+ 
++/* function called at thread attach */
++static MonoThreadStartCB mono_thread_attach_cb = NULL;
++
+ /* The TLS key that holds the LocalDataStoreSlot hash in each thread */
+ static guint32 slothash_key;
+ 
+@@ -187,7 +190,7 @@
+ }
+ 
+ MonoThread *
+-mono_thread_create (MonoDomain *domain, gpointer func)
++mono_thread_create_arg (MonoDomain *domain, gpointer func, void *arg)
+ {
+ 	MonoThread *thread;
+ 	HANDLE thread_handle;
+@@ -201,7 +204,7 @@
+ 	start_info-&gt;func = func;
+ 	start_info-&gt;obj = thread;
+ 	start_info-&gt;domain = domain;
+-	/* start_info-&gt;this needs to be set? */
++	start_info-&gt;this = arg;
+ 		
+ 	thread_handle = CreateThread(NULL, 0, start_wrapper, start_info, 0, &amp;tid);
+ #ifdef THREAD_DEBUG
+@@ -218,6 +221,56 @@
+ 	return thread;
+ }
+ 
++static void
++mono_attached_thread_cleanup (MonoObject *obj)
++{
++}
++
++MonoThread *
++mono_thread_attach (MonoDomain *domain)
++{
++	MonoThread *thread;
++	HANDLE thread_handle;
++	struct StartInfo *start_info;
++	guint32 tid;
++
++	thread = (MonoThread *)mono_object_new (domain,
++						mono_defaults.thread_class);
++
++	start_info=g_new0 (struct StartInfo, 1);
++	start_info-&gt;func = NULL;
++	start_info-&gt;obj = thread;
++	start_info-&gt;domain = domain;
++	start_info-&gt;this = NULL;
++
++	thread_handle = AttachThread (NULL, 0, start_wrapper, start_info, 0, &amp;tid);
++#ifdef THREAD_DEBUG
++	g_message(G_GNUC_PRETTY_FUNCTION &quot;: Started thread ID %d (handle %p)&quot;,
++		  tid, thread_handle);
++#endif
++	g_assert (thread_handle);
++
++	thread-&gt;handle=thread_handle;
++	thread-&gt;tid=tid;
++
++	handle_store(thread);
++
++	TlsSetValue (current_object_key, thread);
++	mono_domain_set (domain);
++	thread-&gt;tid=GetCurrentThreadId ();
++	if (mono_thread_attach_cb)
++	  mono_thread_attach_cb (-1);
++	return thread;
++}
++
++
++MonoThread *
++mono_thread_create (MonoDomain *domain, gpointer func)
++{
++  return mono_thread_create_arg (domain, func, NULL);
++}
++
++
+ HANDLE ves_icall_System_Threading_Thread_Thread_internal(MonoThread *this,
+ 							 MonoObject *start)
+ {
+@@ -995,7 +1048,7 @@
+ 	}
+ }
+ 
+-void mono_thread_init(MonoDomain *domain, MonoThreadStartCB start_cb)
++void mono_thread_init_with_attach (MonoDomain *domain, MonoThreadStartCB start_cb, MonoThreadStartCB attach_cb)
+ {
+ 	/* Build a System.Threading.Thread object instance to return
+ 	 * for the main line's Thread.CurrentThread property.
+@@ -1033,6 +1086,7 @@
+ 	TlsSetValue(current_object_key, main_thread);
+ 
+ 	mono_thread_start_cb = start_cb;
++	mono_thread_attach_cb = attach_cb;
+ 
+ 	slothash_key=TlsAlloc();
+ 
+@@ -1044,6 +1098,11 @@
+ 	GetCurrentProcess ();
+ }
+ 
++void mono_thread_init(MonoDomain *domain, MonoThreadStartCB start_cb)
++{
++  mono_thread_init_with_attach (domain, start_cb, NULL);
++}
++
+ #ifdef THREAD_DEBUG
+ static void print_tids (gpointer key, gpointer value, gpointer user)
+ {
+Index: mono/metadata/threads.h
+===================================================================
+RCS file: /mono/mono/mono/metadata/threads.h,v
+retrieving revision 1.18
+diff -u -b -r1.18 threads.h
+--- mono/metadata/threads.h	3 Sep 2002 16:41:29 -0000	1.18
++++ mono/metadata/threads.h	10 Oct 2002 15:50:03 -0000
+@@ -21,6 +21,8 @@
+ MonoThread *mono_thread_current (void);
+ 
+ MonoThread *mono_thread_create (MonoDomain *domain, gpointer func);
++MonoThread *mono_thread_create_arg (MonoDomain *domain, gpointer func, void *arg);
++MonoThread *mono_thread_attach (MonoDomain *domain);
+ 
+ extern HANDLE ves_icall_System_Threading_Thread_Thread_internal(MonoThread *this, MonoObject *start);
+ extern void ves_icall_System_Threading_Thread_Thread_free_internal(MonoThread *this, HANDLE thread);
+
+--=-=-=--
+
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="008942.html">[Mono-list] Re: GetSchemaTable() in OdbcDataReader
+</A></li>
+	<LI> Next message: <A HREF="008949.html">[Mono-list] Patch for bugzilla 31265, plus some pthreads
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#8947">[ date ]</a>
+              <a href="thread.html#8947">[ thread ]</a>
+              <a href="subject.html#8947">[ subject ]</a>
+              <a href="author.html#8947">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

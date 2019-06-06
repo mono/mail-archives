@@ -1,0 +1,315 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Memory Allocation in unmanaged code
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:jonpryor%40vt.edu">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="023180.html">
+   <LINK REL="Next"  HREF="023184.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Memory Allocation in unmanaged code
+   </H1>
+    <B>Jonathan Pryor
+    </B> 
+    <A HREF="mailto:jonpryor%40vt.edu"
+       TITLE="[Mono-list] Memory Allocation in unmanaged code">jonpryor@vt.edu
+       </A><BR>
+    <I>Thu, 09 Sep 2004 19:03:17 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="023180.html">[Mono-list] Memory Allocation in unmanaged code
+</A></li>
+        <LI> Next message: <A HREF="023184.html">[Mono-list] The Mono Crisis
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23205">[ date ]</a>
+              <a href="thread.html#23205">[ thread ]</a>
+              <a href="subject.html#23205">[ subject ]</a>
+              <a href="author.html#23205">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>--=-zw8bdT7yO5vSzcvXW4kb
+Content-Type: text/plain
+Content-Transfer-Encoding: 7bit
+
+On Wed, 2004-09-08 at 17:43, Jim Fehlig wrote:
+&gt;<i> &gt;&gt;&gt;Jonathan Pryor &lt;<A HREF="mailto:jonpryor@vt.edu">jonpryor@vt.edu</A>&gt; 09/06/04 4:57 pm &gt;&gt;&gt; 
+</I>&lt;snip/&gt;
+&gt;<i> I modified the wrapper implementation to use &quot;unsafe&quot; code but still 
+</I>&gt;<i> unsuccessful in retrieving properties from the C# structure below. 
+</I>&gt;<i> The unmanaged ListLocalPrinters is returning a list containing 1 
+</I>&gt;<i> element yet the loop in PrintLibWrapper.ListLocalPrinters is executed 
+</I>&gt;<i> twice, throwing a NullReferenceException when &quot;printer =
+</I>&gt;<i> printer-&gt;nextElement&quot; 
+</I>&gt;<i> is executed on the second pass.  
+</I>
+Your NullReferenceException is generated because the runtime marshaller
+is never involved.
+
+&quot;What!,&quot; I hear you cry.
+
+Well, we avoided it.  We declared a DllImport function which takes an
+IntPtr, so the marshaller just blitted the pointer across, as it
+should.  But then we go off and access the structure members /as if they
+were managed objects/ (the last parts the kicker, as those managed
+objects were never properly initialized).
+
+In other words, this is a Bad Idea:
+
+	struct MyStruct {public string someStringInTheStructure;}
+
+        IntPtr p = GetResource();
+        MyStruct* s = (MyStruct*) p;
+        string n = s-&gt;someStringInTheStructure;
+
+`someStringInTheStructure' won't be properly marshaled as a string, as
+the runtime marshaler never *saw* the string, and thus didn't marshal
+it.  Oops.
+
+Of course, I should have remembered that, but there are only some things
+I can pull off without testing....
+
+The solution?  Marshal the structure, using
+System.Runtime.InteropServices.Marshal.PtrToStructure():
+
+        IntPtr p = GetResource();
+        MyStruct s = (MyStruct) Marshal.PtrToStructure (p, typeof(MyStruct));
+        string n = s.someStringInTheStructure;
+
+That explains the NullReferenceException.
+
+Something else that confuses me is the behavior of `nextElement'; this
+doesn't work properly:
+
+        IntPtr p = GetResource();
+        ListElement* le = (ListElement*) p;
+        while (le != null) le = le-&gt;nextElement;
+
+If I know that GetResource() returns a linked list of 3 elements, the
+while loop is only executed once.  I have no idea why this is, and it
+may be a mono bug.  I'd have to test it against .NET to be sure, but
+that won't happen for awhile (my .NET machine isn't setup; the joy of
+moving...).  I'm certainly open to anyone else testing this scenario
+under .NET and telling me what happens...  (hint, hint.)
+
+The fix for the linked list?  The same as the fix for the
+NullReferenceException: invoke the runtime marshaller directly.
+
+For your learning pleasure, I've attached two files, managed.cs and
+native.c.  Managed.cs walks a linked list, using the InternalPrinterList
+structure, and native.c returns a linked list of PrinterList structures
+containing 3 elements.
+
+Usage:
+
+        $ gcc -shared -fpic native.c -o libnative.so
+        $ mcs -unsafe managed.cs
+        # don't forget to set your library path to find libnative.so
+        $ export LD_LIBRARY_PATH=`pwd`
+        $ mono managed.exe
+
+Now I should just update my Wonder Guide
+(<A HREF="http://www.jprl.com/~jon/interop.html">http://www.jprl.com/~jon/interop.html</A>), and pray that my cable modem
+doesn't disappear again (where's fiber-to-the-home when I want it?), and
+all will be good.  I hope.
+
+ - Jon
+
+--=-zw8bdT7yO5vSzcvXW4kb
+Content-Disposition: attachment; filename=managed.cs
+Content-Type: text/x-csharp; name=managed.cs; charset=UTF-8
+Content-Transfer-Encoding: 7bit
+
+// interop struct 
+
+using System;
+using System.Collections;
+using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Sequential)] 
+unsafe struct InternalPrinterList 
+{ 
+   [MarshalAs(UnmanagedType.ByValTStr/*LPStr*/, SizeConst=1024)] 
+   public string printerUri; 
+ 
+   [MarshalAs(UnmanagedType.ByValTStr/*LPStr*/, SizeConst=1024)] 
+   public string printerCupsUri; 
+ 
+   [MarshalAs(UnmanagedType.ByValTStr/*LPStr*/, SizeConst=1024)] 
+   public string printerName; 
+ 
+   [MarshalAs(UnmanagedType.ByValTStr/*LPStr*/,SizeConst=81)] 
+   public string printerMakeModel; 
+ 
+   public IntPtr nextElement; 
+} 
+
+public class PrinterList {
+   public string Uri, CupsUri, Name, MakeModel;
+}
+ 
+public unsafe class PrinterLib {
+
+   // Convert linked list constructed by unmanaged code to 
+   // array of user-visible PrinterList objects. 
+   public static unsafe PrinterList[] ListLocalPrinters() 
+   { 
+      IntPtr list = IntPtr.Zero; 
+      try 
+      { 
+         ListLocalPrinters(ref list); 
+         Console.WriteLine (&quot;ListLocalPrinters returned: {0:x}&quot;, list);
+         ArrayList printers = new ArrayList(); 
+
+         IntPtr printer = list;
+
+         while (printer != IntPtr.Zero) 
+         { 
+            Console.WriteLine (&quot;printer={0:x}&quot;, printer);
+            InternalPrinterList ipl = (InternalPrinterList) Marshal.PtrToStructure ((IntPtr) printer, typeof(InternalPrinterList));
+            PrinterList pl = new PrinterList(); 
+            pl.Uri = ipl.printerUri; 
+            pl.CupsUri = ipl.printerCupsUri; 
+            pl.Name = ipl.printerName; 
+            pl.MakeModel = ipl.printerMakeModel; 
+
+            // throws NullReferenceException 
+            Console.WriteLine(&quot;PrinterInfo: {0}, {1}&quot;, pl.Name, pl.Uri); 
+    
+            printers.Add(pl); 
+            // Something not right here as we will go through again 
+            // even when list contains only 1 element. 
+            Console.WriteLine (&quot;M: next printer={0:x}&quot;, ipl.nextElement);
+            printer = ipl.nextElement;
+          } 
+          return (PrinterList[]) printers.ToArray (typeof(PrinterList));
+      } 
+      catch (Exception e) 
+      { 
+          return new PrinterList[0]; 
+      } 
+      finally 
+      { 
+         if (list != IntPtr.Zero)  {
+            Console.WriteLine (&quot;Freeing address: {0:x}&quot;, list);
+            FreeLocalPrintersList(list); 
+         }
+      } 
+   } 
+
+   [DllImport (&quot;native&quot;)]
+      private static extern void ListLocalPrinters (ref IntPtr p);
+   [DllImport (&quot;native&quot;)]
+      private static extern void FreeLocalPrintersList (IntPtr p);
+
+   public static unsafe void Main ()
+   {
+      Console.WriteLine (&quot;Sizeof(InternalPrinterList)=&quot; +
+         Marshal.SizeOf(typeof(InternalPrinterList)));
+      Console.WriteLine (&quot;Listing local printers...&quot;);
+
+      PrinterList[] printers = ListLocalPrinters ();
+      foreach (PrinterList pl in printers) {
+         Console.WriteLine (&quot;Printer\n\tUri={0}\n\tCupsUri={1}\n&quot; +
+            &quot;\tName={2}\n\tMakeMode={3}\n&quot;, pl.Uri, pl.CupsUri, pl.Name, 
+            pl.MakeModel);
+      }
+
+      Console.WriteLine (&quot;Done...&quot;);
+   }
+}
+
+
+--=-zw8bdT7yO5vSzcvXW4kb
+Content-Disposition: attachment; filename=native.c
+Content-Type: text/x-csrc; name=native.c; charset=UTF-8
+Content-Transfer-Encoding: 7bit
+
+#include &lt;stdio.h&gt;
+
+struct PrinterList {
+  char printerUri[1024];
+  char printerCupsUri[1024];
+  char printerName[1024];
+  char printerMakeModel[81];
+  struct PrinterList* nextElement;
+};
+typedef struct PrinterList PrinterList;
+
+struct PrinterList g_3 = {
+  &quot;<A HREF="uri://printer-3",">uri://printer-3&quot;,</A>
+  &quot;cups-<A HREF="uri://printer-3",">uri://printer-3&quot;,</A>
+  &quot;<A HREF="name://printer-3",">name://printer-3&quot;,</A>
+  &quot;make-<A HREF="model://printer-3",">model://printer-3&quot;,</A>
+  NULL
+};
+
+struct PrinterList g_2 = {
+  &quot;<A HREF="uri://printer-2",">uri://printer-2&quot;,</A>
+  &quot;cups-<A HREF="uri://printer-2",">uri://printer-2&quot;,</A>
+  &quot;<A HREF="name://printer-2",">name://printer-2&quot;,</A>
+  &quot;make-<A HREF="model://printer-2",">model://printer-2&quot;,</A>
+  &amp;g_3
+};
+
+struct PrinterList g_1 = {
+  &quot;<A HREF="uri://printer-1",">uri://printer-1&quot;,</A>
+  &quot;cups-<A HREF="uri://printer-1",">uri://printer-1&quot;,</A>
+  &quot;<A HREF="name://printer-1",">name://printer-1&quot;,</A>
+  &quot;make-<A HREF="model://printer-1",">model://printer-1&quot;,</A>
+  &amp;g_2
+};
+
+extern void
+ListLocalPrinters (PrinterList **list)
+{
+  printf (&quot;PrinterLib: &amp;g_1=%p\n&quot;, &amp;g_1);
+  printf (&quot;PrinterLib: &amp;g_2=%p\n&quot;, &amp;g_2);
+  printf (&quot;PrinterLib: &amp;g_3=%p\n&quot;, &amp;g_3);
+  *list = &amp;g_1;
+  printf (&quot;PrinterLib: returning pointer %p\n&quot;, &amp;g_1);
+}
+
+extern void
+FreeLocalPrintersList (PrinterList *list)
+{
+  printf (&quot;PrinterLib: freeing pointer %p\n&quot;, list);
+}
+
+int main ()
+{
+  printf (&quot;sizeof(PrinterList)=%i\n&quot;, sizeof(PrinterList));
+  PrinterList* pl;
+  ListLocalPrinters (&amp;pl);
+  while (pl) {
+    printf (&quot;processing %s\n&quot;, pl-&gt;printerName);
+    pl = pl-&gt;nextElement;
+  }
+}
+
+
+--=-zw8bdT7yO5vSzcvXW4kb--
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="023180.html">[Mono-list] Memory Allocation in unmanaged code
+</A></li>
+	<LI> Next message: <A HREF="023184.html">[Mono-list] The Mono Crisis
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#23205">[ date ]</a>
+              <a href="thread.html#23205">[ thread ]</a>
+              <a href="subject.html#23205">[ subject ]</a>
+              <a href="author.html#23205">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

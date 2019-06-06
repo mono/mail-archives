@@ -1,0 +1,168 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Status of Mono's garbage collector
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:lupus%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="025735.html">
+   <LINK REL="Next"  HREF="025788.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Status of Mono's garbage collector
+   </H1>
+    <B>Paolo Molaro
+    </B> 
+    <A HREF="mailto:lupus%40ximian.com"
+       TITLE="[Mono-list] Status of Mono's garbage collector">lupus@ximian.com
+       </A><BR>
+    <I>Tue, 15 Feb 2005 13:27:56 +0100</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="025735.html">[Mono-list] Status of Mono's garbage collector
+</A></li>
+        <LI> Next message: <A HREF="025788.html">[Mono-list] Status of Mono's garbage collector
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25739">[ date ]</a>
+              <a href="thread.html#25739">[ thread ]</a>
+              <a href="subject.html#25739">[ subject ]</a>
+              <a href="author.html#25739">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>On 02/15/05 Holger Arnold wrote:
+&gt;<i> 1. Does Mono still use the Boehm garbage collector? (in the following, I
+</I>&gt;<i> assume it does)
+</I>
+Yes.
+
+&gt;<i> 2. Is memory management of CLI objects separated from the internal memory
+</I>&gt;<i> management of the runtime, i.e., does the Mono runtime depend on gc for
+</I>&gt;<i> memory allocated outside the CLI space? Or is such memory explicitly free'd?
+</I>
+There are a few data structures that are allocated using libgc which are not
+CLI objects. If you're following the svn commits you may have noticed a few
+cleanups have been committed in the last few weeks to reduce the amount
+and types of structures that we need to handle that way. Most of
+the runtime data structures don't use libgc to do allocations.
+We are incrementally changing the code to not use libgc-allocated
+structures (or at least to manage them separately).
+
+&gt;<i> 3. Does Mono's gc use the layout information of CLI objects, i.e., is it
+</I>&gt;<i> exact at least in the CLI space?
+</I>
+Yes, with a few exceptions:
+*) arrays of value types with both pointers and non-pointers are
+currently considered conservatively, IIRC
+*) fixed-size objects bigger than 64 words
+*) any array or object that belongs in a non-root appdomain and
+has reference fields
+*) the area used for ThreadStatic vars is not pointer-precise
+*) the static fields for a class (unless they are all pointer-free)
+
+Some of these are because of bugs in libgc or because of its conservative
+nature (the non-root appdomain objects). We are slowly fixing some of these
+issues to enable libgc to more precisely track references and to be
+able to switch to a different GC in the future.
+To fix some of these issues we also need to have libgc handle
+additions to the root set more gracefully (right now it has a fixed
+number of entries).
+
+&gt;<i> 4. When running some non-trivial programs using Mono, the heap size can
+</I>&gt;<i> increase monotonic with the running time of the program. What is the
+</I>&gt;<i> dominating factor for this behavior: memory fragmentation due to the
+</I>&gt;<i> non-compacting gc or memory leaks due to the inexact gc?
+</I>
+There are several issues that depend on the specific app (and the version
+of mono you used).
+There were some leaks and excessive memory retention issues in some
+codepaths in the mono runtime: these have been mostly all fixed
+in mono svn and 1.1.4 (mostly related to gc handles and multiple
+appdomain support and reflection.emit).
+I don't think that memory retention caused by the conservative nature
+of libgc is a big issue with the current mono (1.1.x or svn), unless
+the application allocates very large arrays: arrays larger than
+a few hundred KB should be avoided or, if possible, they should
+be allocated and reused. If the objects are small, the memory
+retention will be present, but it should represent just a fraction
+of the whole heap size.
+Fragmentation may be an issue, but I haven't investigated how much
+effect it has on heap size. My guess is that much of the issue
+with increasing heap size is because libgc prefers to increase the
+heap instead of being more aggressive at reclaiming memory (this
+is easily triggered by storing somewhat big arrays in objects with
+finalizers). There is probably some tuning or small fixes that need
+to be done in libgc to prevent this from happening.
+Another thing to investigate is to ensure it uses mmap to
+allocate memory insted of sbrk: on default linux behaviour, the
+brk space is much smaller than the mmap space and so having
+the heap in the larger space could help, since it would be
+less fragmented by malloc calls and malloced pointers should
+interfere less with the conservative scanning.
+
+&gt;<i> 5. Does Mono use the incremental mode of the Boehm gc?
+</I>
+We don't, since it usually causes compatibility issues with
+syscalls being interrupted while they write to heap memory.
+
+&gt;<i> 6. Are there any concrete plans to eventually replace the Boehm gc by an
+</I>&gt;<i> exact, compacting gc? What are the next steps towards this?
+</I>
+Yes, we have plans for a generational compacting GC for mono 2.0.
+You may have a look at docs/precise-gc in the mono module for
+some of the details.
+Currently we're doing some changes that allows us to
+use a different GC without changing code all over the place,
+see the metadata/*gc*.{c,h} files. We're also removing
+libgc allocations in the runtime code.
+
+Additionally to the steps defined in the document, we need also to:
+*) handle object.GetHashCode() for objects that can be moved
+(storing the hash in the synchronization field directly, with a flag,
+or in the lock structure when the object is locked)
+*) keep track with a bitmap or some other way (run-length encoding)
+of the reference positions in objects.
+*) define a write barrier macro that can be used in the C runtime
+and start using it (the default would just store the pointer)
+*) change the jit to emit write barrier calls when needed (we
+can have specialized write barriers)
+*) investigate the stuff needed to advance a thread to a GC-safe
+point (single-stepping, read from unmapped memory etc) and implement it
+*) modify the jit to save info about references in stack locations:
+this can be done just for locals as a start, so that at least
+part of the stack is handled precisely.
+
+All of the above can be done without an actual moving GC implementation
+(though testing the code is another thing...).
+If you or anyone else wants to take on a task from the list,
+let me know, so we don't duplicate work. Help is greatly appreciated,
+since there are lots of changes.
+Thanks.
+
+lupus
+
+-- 
+-----------------------------------------------------------------
+<A HREF="mailto:lupus@debian.org">lupus@debian.org</A>                                     debian/rules
+<A HREF="mailto:lupus@ximian.com">lupus@ximian.com</A>                             Monkeys do it better
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="025735.html">[Mono-list] Status of Mono's garbage collector
+</A></li>
+	<LI> Next message: <A HREF="025788.html">[Mono-list] Status of Mono's garbage collector
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#25739">[ date ]</a>
+              <a href="thread.html#25739">[ thread ]</a>
+              <a href="subject.html#25739">[ subject ]</a>
+              <a href="author.html#25739">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

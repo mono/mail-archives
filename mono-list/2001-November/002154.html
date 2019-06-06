@@ -1,0 +1,184 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] jit patch: spill DIV/REM results to memory
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:dietmar%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="002151.html">
+   <LINK REL="Next"  HREF="002156.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] jit patch: spill DIV/REM results to memory
+   </H1>
+    <B>Dietmar Maurer
+    </B> 
+    <A HREF="mailto:dietmar%40ximian.com"
+       TITLE="[Mono-list] jit patch: spill DIV/REM results to memory">dietmar@ximian.com
+       </A><BR>
+    <I>19 Nov 2001 17:06:36 +0100</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="002151.html">[Mono-list] Resource System Proposal
+</A></li>
+        <LI> Next message: <A HREF="002156.html">[Mono-list] Resource System Proposal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2154">[ date ]</a>
+              <a href="thread.html#2154">[ thread ]</a>
+              <a href="subject.html#2154">[ subject ]</a>
+              <a href="author.html#2154">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>We simply write results of DIV/REM instruction to memory. This allows us
+to always match the special register requirements of those instructions
+on x86.
+
+- Dietmar
+
+Index: mono/jit/TODO
+===================================================================
+RCS file: /cvs/public/mono/mono/jit/TODO,v
+retrieving revision 1.3
+diff -u -r1.3 TODO
+--- mono/jit/TODO	2001/11/19 09:30:00	1.3
++++ mono/jit/TODO	2001/11/19 12:03:07
+@@ -1,6 +1,9 @@
++* implementet all floating point instruction in x86.brg, we also need to check
++  the floating branch instruction - some of them seems to be wrong, we need to
++  write better tests for that.
++* implement exceptions
+ * correctly align value types on the stack and in arrays
+ * enum types can have several base types (not only int32)
+ * document the functions and variables in the JIT 
+-* compute the frame size
+ * implement a register set for FP registers (just count register usage on x86)
+ 
+Index: mono/jit/jit.c
+===================================================================
+RCS file: /cvs/public/mono/mono/jit/jit.c,v
+retrieving revision 1.47
+diff -u -r1.47 jit.c
+--- mono/jit/jit.c	2001/11/19 09:30:00	1.47
++++ mono/jit/jit.c	2001/11/19 12:03:07
+@@ -80,6 +80,20 @@
+ 	break;                                                                \
+ }
+ 
++#define MAKE_SPILLED_BI_ALU(name)                                             \
++case CEE_##name: {                                                            \
++	++ip;                                                                 \
++	sp -= 2;                                                              \
++	t1 = mono_ctree_new (mp, MB_TERM_##name, sp [0], sp [1]);             \
++        g_assert (sp [0]-&gt;svt == sp [1]-&gt;svt);                                \
++        t1-&gt;svt = sp [0]-&gt;svt;                                                \
++        t1 = mono_store_tree (cfg, -1, t1, &amp;t2);                              \
++        g_assert (t1);                                                        \
++        ADD_TREE (t1);                                                        \
++	PUSH_TREE (t2, t2-&gt;svt);                                              \
++	break;                                                                \
++}
++
+ #define MAKE_LDIND(name, op, svt)                                             \
+ case CEE_##name: {                                                            \
+ 	++ip;                                                                 \
+@@ -223,6 +237,12 @@
+ 	if (!class-&gt;inited)
+ 		mono_jit_init_class (class);
+ 
++	if (class == mono_defaults.double_class)
++		return MB_TERM_STIND_R8;
++
++	if (class == mono_defaults.single_class)
++		return MB_TERM_STIND_R4;
++
+ 	size =  class-&gt;instance_size - sizeof (MonoObject);
+ 
+ 	switch (size) {
+@@ -2116,10 +2136,10 @@
+ 		MAKE_BI_ALU (SHR)
+ 		MAKE_BI_ALU (SHR_UN)
+ 		MAKE_BI_ALU (MUL)
+-		MAKE_BI_ALU (DIV)
+-		MAKE_BI_ALU (DIV_UN)
+-		MAKE_BI_ALU (REM)
+-		MAKE_BI_ALU (REM_UN)
++		MAKE_SPILLED_BI_ALU (DIV)
++		MAKE_SPILLED_BI_ALU (DIV_UN)
++		MAKE_SPILLED_BI_ALU (REM)
++		MAKE_SPILLED_BI_ALU (REM_UN)
+ 
+ 		MAKE_LDIND (LDIND_I1,  MB_TERM_LDIND_I1, VAL_I32)
+ 		MAKE_LDIND (LDIND_U1,  MB_TERM_LDIND_U1, VAL_I32)
+Index: mono/jit/x86.brg
+===================================================================
+RCS file: /cvs/public/mono/mono/jit/x86.brg,v
+retrieving revision 1.38
+diff -u -r1.38 x86.brg
+--- mono/jit/x86.brg	2001/11/19 09:30:00	1.38
++++ mono/jit/x86.brg	2001/11/19 12:03:07
+@@ -1342,16 +1342,12 @@
+ 	if (tree-&gt;reg1 != tree-&gt;left-&gt;reg1)
+ 		x86_mov_reg_reg (s-&gt;code, tree-&gt;reg1, tree-&gt;left-&gt;reg1, 4);
+ 
+-	// fixme: check if the branch8 is to the right location
+-	x86_breakpoint (s-&gt;code);
+-
+ 	x86_alu_reg_imm (s-&gt;code, X86_CMP, tree-&gt;left-&gt;reg1, 0);
+ 	x86_alu_reg_reg (s-&gt;code, X86_XOR, tree-&gt;reg2, tree-&gt;reg2);
+-	x86_branch8 (s-&gt;code, X86_CC_GE, 4, TRUE);
++	x86_branch8 (s-&gt;code, X86_CC_GE, 5, TRUE);
+ 	i1 = s-&gt;code;
+ 	x86_mov_reg_imm (s-&gt;code, tree-&gt;reg2, -1); 
+-	g_assert ((s-&gt;code - i1) == 4);
+-	g_assert_not_reached ();
++	g_assert ((s-&gt;code - i1) == 5);
+ }
+ 
+ lreg: CONV_U8 (CONST_I4) 1 {
+@@ -1864,6 +1860,10 @@
+ 	x86_fld_membase (s-&gt;code, X86_EBP, tree-&gt;left-&gt;data.i, TRUE);
+ }
+ 
++freg: LDIND_R8 (reg) {
++	x86_fld_membase (s-&gt;code, tree-&gt;left-&gt;reg1, 0, TRUE);
++}
++
+ freg: ADD (freg, freg) {
+ 	x86_fp_op_reg (s-&gt;code, X86_FADD, 1, TRUE);
+ }
+@@ -1898,6 +1898,10 @@
+ 
+ stmt: STIND_R8 (locaddr, freg) {
+ 	x86_fst_membase (s-&gt;code, X86_EBP, tree-&gt;left-&gt;data.i, TRUE, TRUE);
++}
++
++stmt: STIND_R8 (reg, freg) {
++	x86_fst_membase (s-&gt;code, tree-&gt;left-&gt;reg1, 0, TRUE, TRUE);
+ }
+ 
+ stmt: ARG (freg) {
+
+
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="002151.html">[Mono-list] Resource System Proposal
+</A></li>
+	<LI> Next message: <A HREF="002156.html">[Mono-list] Resource System Proposal
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#2154">[ date ]</a>
+              <a href="thread.html#2154">[ thread ]</a>
+              <a href="subject.html#2154">[ subject ]</a>
+              <a href="author.html#2154">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

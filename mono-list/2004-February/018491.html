@@ -1,0 +1,203 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Socket code.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:2a5gjx302%40sneakemail.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="018518.html">
+   <LINK REL="Next"  HREF="018492.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Socket code.
+   </H1>
+    <B>Jonathan Gilbert
+    </B> 
+    <A HREF="mailto:2a5gjx302%40sneakemail.com"
+       TITLE="[Mono-list] Socket code.">2a5gjx302@sneakemail.com
+       </A><BR>
+    <I>Sun, 22 Feb 2004 12:42:14</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="018518.html">[Mono-list] Socket code.
+</A></li>
+        <LI> Next message: <A HREF="018492.html">[Mono-list] Mono and Local Date Format
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18491">[ date ]</a>
+              <a href="thread.html#18491">[ thread ]</a>
+              <a href="subject.html#18491">[ subject ]</a>
+              <a href="author.html#18491">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>At 04:31 PM 21/02/2004 -0800, you wrote:
+&gt;<i>I have some socket code that looks something like this:
+</I>&gt;<i>
+</I>&gt;<i>byte[] bytes = new byte[1448];
+</I>&gt;<i>do {
+</I>&gt;<i>	len = sock.Read(bytes, 0, (int)1448);
+</I>&gt;<i>	s = Encoding.ASCII.GetString(bytes);
+</I>&gt;<i>	buf.Append(s.Substring(0,len));
+</I>&gt;<i>	if (len &lt; 1448)
+</I>&gt;<i>		break;
+</I>&gt;<i>} while (len &gt; 0);
+</I>&gt;<i>
+</I>&gt;<i>The key thing is this used to work with a socket size of 1460, now it is
+</I>&gt;<i>down to 1448.  If I don't set the buffer size exactly then all the data
+</I>&gt;<i>available is not read.  Is there a property to get the packet size of a
+</I>&gt;<i>socket?
+</I>
+The property 'Available' returns the number of bytes which are waiting. In
+general, you can't assume anything about the MTU, though it is reasonable
+to assume that it won't be much larger than 1500, since this limit is
+enforced by the underlying data transport. However, you have to keep in
+mind that TCP is a stream-oriented protocol. It isn't based on the concept
+of packets. Multiple packets could arrive between two calls to sock.Read().
+In addition, TCP packets can exceed the data layer MTU; they will be
+automatically fragmented, and then reassembled by the operating system
+before your code ever sees them. Thus, you can atomically see an increase
+in available bytes of more than the MTU.
+
+Your loop looks roughly correct, except that for the Encoding function, you
+should be using an overload which allows you to specify the amount of data
+to translate. It just so happens that Encoding.ASCII defines a 1-to-1
+correspondence between bytes and characters, but you cannot assume this.
+This leads to another problem as well; a character might be split across
+packet boundaries, in which case it would not decode properly. To properly
+handle this, you need to collect the byte[] values until you have as much
+data as you expected, and only then translate them to a string. Here is how
+I would do it:
+
+static byte[] ReadFully(Socket socket, int numBytes)
+{
+  byte[] ret = new byte[numBytes];
+  int offset = 0;
+
+  while (numBytes &gt; 0)
+  {
+    int received = socket.Receive(ret, offset, numBytes, SocketFlags.None);
+    if (received &lt;= 0)
+      throw new SocketException(&quot;Connection closed by peer or network error
+occurred&quot;);
+    offset += received;
+    numBytes -= received;
+  }
+
+  return ret;
+}
+
+static string ReadString(Socket socket, int expectedBytes)
+{
+  byte[] bytes = ReadFully(socket, expectedBytes);
+
+  return Encoding.ASCII.GetString(bytes);
+}
+
+With this code, if you have a string that you expect to be 10,000 bytes
+long, simply pass 10,000 as the parameter to 'ReadString'. Packets will be
+automatically collected and put back together as appropriate.
+
+If you are expecting TCP to allow the receiving end to Receive() the same
+chunks that the sending end Send()'s, this is a flawed assumption. As I
+mentioned earlier, TCP is a stream-based protocol. You can't any more
+expect to automatically Receive() the same chunks that were sent using
+Send() than you can expect to automatically be able to determine the size
+of each Write() to a file after the file has been written. Just think of
+the TCP stream as a non-packet-oriented stream of bytes. In this context,
+if you have a variable-length string, you need to either send the length of
+the string explicitly before you send the string, or decide on a specific
+terminator. If you chose to use a terminator, then you will need a
+substantially more complicated routine than the one above. Here is a
+routine which I have used in the past:
+
+static string ReadToCRLF(Socket socket)
+{
+  ArrayList buffers = new ArrayList();
+  byte[] buffer = new byte[1000];
+  int offset = 0;
+  bool cr = false;
+
+  while (true)
+  {
+    int bytesToReceive = ((offset + 1 &lt; buffer.Length) &amp;&amp; !cr) ? 2 : 1;
+    int count = socket.Receive(buffer, offset, bytesToReceive,
+SocketFlags.None);
+
+    offset += count;
+
+    if (cr)
+      if (buffer[offset - count] == 10)
+        break;
+      else
+        cr = false;
+
+    if ((count == 2) &amp;&amp; (buffer[offset - 2] == 13) &amp;&amp; (buffer[offset - 1]
+== 10))
+      break;
+
+    if (buffer[offset - 1] == 13)
+      cr = true;
+
+    if (offset == buffer.Length)
+    {
+      buffers.Add(buffer);
+      buffer = new byte[1000];
+      offset = 0;
+    }
+  }
+
+  int totalBytes = buffers.Count * 1000 + offset - 2; /* remove the CRLF */
+
+  byte[] bytes = new byte[totalBytes];
+
+  int remaining = totalBytes;
+  offset = 0; /* re-using this variable */
+  while (remaining &gt; 0)
+  {
+    byte[] source;
+
+    if (buffers.Count &gt; 0) /* this is required because there might be a
+CRLF spanning the boundary between the last two buffers */
+    {
+      source = (byte[])buffers[0];
+      buffers.RemoveAt(0); /* performance might increase slightly by using
+an index instead of erasing buffers, but it shouldn't be a big issue */
+    }
+    else
+      source = buffer; /* the last buffer */
+
+    int numBytes = buffer.Length;
+    if (numBytes &gt; remaining)
+      numBytes = remaining;
+
+    Array.Copy(source, 0, bytes, offset, numBytes);
+
+    offset += numBytes;
+    remaining -= numBytes;
+  }
+
+  return Encoding.ASCII.GetString(bytes);
+}
+
+Jonathan
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="018518.html">[Mono-list] Socket code.
+</A></li>
+	<LI> Next message: <A HREF="018492.html">[Mono-list] Mono and Local Date Format
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#18491">[ date ]</a>
+              <a href="thread.html#18491">[ thread ]</a>
+              <a href="subject.html#18491">[ subject ]</a>
+              <a href="author.html#18491">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

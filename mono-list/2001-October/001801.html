@@ -1,0 +1,489 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Compiler changes.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:miguel%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="001799.html">
+   <LINK REL="Next"  HREF="001802.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Compiler changes.
+   </H1>
+    <B>Miguel de Icaza
+    </B> 
+    <A HREF="mailto:miguel%40ximian.com"
+       TITLE="[Mono-list] Compiler changes.">miguel@ximian.com
+       </A><BR>
+    <I>Fri, 12 Oct 2001 14:09:45 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="001799.html">[Mono-list] mcs/nant build errors
+</A></li>
+        <LI> Next message: <A HREF="001802.html">[Mono-list] glib build error
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1801">[ date ]</a>
+              <a href="thread.html#1801">[ thread ]</a>
+              <a href="subject.html#1801">[ subject ]</a>
+              <a href="author.html#1801">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Today:
+
+	* Handle `readonly' fields.
+
+	* LValue have now a chance to perform their semantic analysis
+          for LValue use (for example, properties can tell whether
+          they can be &quot;get&quot; or &quot;set&quot;).
+
+	* Allow `this' to be assigned to for structures and not for
+          classes.
+
+	* Catch some invalid uses of `this'.
+
+	* Beginning of Property support.
+
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/mcs/ChangeLog,v
+retrieving revision 1.130
+diff -u -r1.130 ChangeLog
+--- ChangeLog	2001/10/11 18:02:54	1.130
++++ ChangeLog	2001/10/12 14:13:35
+@@ -1,6 +1,16 @@
+ 2001-10-11  Miguel de Icaza  &lt;<A HREF="mailto:miguel@ximian.com">miguel@ximian.com</A>&gt;
+ 
+-	* expression.cs (Invocation::Emit): Deal with invocation of
++	* expression.cs (LValue::LValueResolve): New method in the
++	interface, used to perform a second resolution pass for LValues. 
++	
++	(This::DoResolve): Catch the use of this in static methods.
++
++	(This::LValueResolve): Implement.
++
++	(This::Store): Remove warning, assigning to `this' in structures
++	is 
++
++	(Invocation::Emit): Deal with invocation of
+ 	methods on value types.  We need to pass the address to structure
+ 	methods rather than the object itself.  (The equivalent code to
+ 	emit &quot;this&quot; for structures leaves the entire structure on the
+Index: TODO
+===================================================================
+RCS file: /cvs/public/mcs/mcs/TODO,v
+retrieving revision 1.20
+diff -u -r1.20 TODO
+--- TODO	2001/10/11 18:02:54	1.20
++++ TODO	2001/10/12 14:13:35
+@@ -3,6 +3,11 @@
+ 	Handle if (!x) converting to remove the `!' and instead of using
+ 	a brfalse use a brtrue to jump to the end.
+ 
++* MemberLookup
++
++	Should take a Location, and pass this information down, so we
++	can report better errors.
++
+ * Emitcontext
+ 
+ 	Do we really need to instanciate this variable all the time?
+Index: assign.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/assign.cs,v
+retrieving revision 1.15
+diff -u -r1.15 assign.cs
+--- assign.cs	2001/10/10 02:36:47	1.15
++++ assign.cs	2001/10/12 14:13:35
+@@ -61,7 +61,8 @@
+ 			}
+ 			
+ 			if (!(target is LValue)){
+-				Report.Error (131, &quot;Left hand of an assignment must be a variable, a property or an indexer&quot;);
++				Report.Error (131, l, &quot;Left hand of an assignment must be a variable, a property or an indexer&quot;);
++				return null;
+ 			}
+ 			type = target_type;
+ 			eclass = ExprClass.Value;
+Index: class.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/class.cs,v
+retrieving revision 1.72
+diff -u -r1.72 class.cs
+--- class.cs	2001/10/11 16:46:46	1.72
++++ class.cs	2001/10/12 14:13:35
+@@ -1917,7 +1917,7 @@
+ 		public void Emit (TypeContainer parent)
+ 		{
+ 			ILGenerator ig = ConstructorBuilder.GetILGenerator ();
+-			EmitContext ec = new EmitContext (parent, ig, null, ModFlags);
++			EmitContext ec = new EmitContext (parent, ig, null, ModFlags, true);
+ 
+ 			if (parent is Class){
+ 				if (Initializer == null)
+Index: codegen.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/codegen.cs,v
+retrieving revision 1.34
+diff -u -r1.34 codegen.cs
+--- codegen.cs	2001/10/11 18:02:54	1.34
++++ codegen.cs	2001/10/12 14:13:35
+@@ -98,13 +98,19 @@
+ 		public Type ReturnType;
+ 
+ 		// &lt;summary&gt;
++		//   Whether this is generating code for a constructor
++		// &lt;/summary&gt;
++		public bool IsConstructor;
++		
++		// &lt;summary&gt;
+ 		//   Keeps track of the Type to LocalBuilder temporary storage created
+ 		//   to store structures (used to compute the address of the structure
+ 		//   value on structure method invocations)
+ 		// &lt;/summary&gt;
+ 		public Hashtable temporary_storage;
+ 		
+-		public EmitContext (TypeContainer parent, ILGenerator ig, Type return_type, int code_flags)
++		public EmitContext (TypeContainer parent, ILGenerator ig, Type return_type,
++				    int code_flags, bool is_constructor)
+ 		{
+ 			this.ig = ig;
+ 
+@@ -112,9 +118,15 @@
+ 			CheckState = false;
+ 			IsStatic = (code_flags &amp; Modifiers.STATIC) != 0;
+ 			ReturnType = return_type;
+-
++			IsConstructor = is_constructor;
++			
+ 			if (ReturnType == TypeManager.void_type)
+ 				ReturnType = null;
++		}
++
++		public EmitContext (TypeContainer parent, ILGenerator ig, Type return_type, int code_flags)
++			: this (parent, ig, return_type, code_flags, false)
++		{
+ 		}
+ 
+ 		public void EmitTopBlock (Block block)
+Index: expression.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/expression.cs,v
+retrieving revision 1.80
+diff -u -r1.80 expression.cs
+--- expression.cs	2001/10/11 18:02:55	1.80
++++ expression.cs	2001/10/12 14:13:36
+@@ -133,7 +133,7 @@
+ 			if (e != null){
+ 				if (e is SimpleName)
+ 					return e;
+-				
++
+ 				if (e.ExprClass == ExprClass.Invalid)
+ 					throw new Exception (&quot;Expression &quot; + e +
+ 							     &quot; ExprClass is Invalid after resolve&quot;);
+@@ -142,6 +142,9 @@
+ 					if (e.type == null)
+ 						throw new Exception (&quot;Expression &quot; + e +
+ 								     &quot; did not set its type after Resolve&quot;);
++
++				if (e is LValue)
++					e = ((LValue) e).LValueResolve (ec);
+ 			}
+ 
+ 			return e;
+@@ -2958,10 +2961,10 @@
+ 			Location = l;
+ 		}
+ 
+-		public static void Error120 (string name)
++		public static void Error120 (Location l, string name)
+ 		{
+ 			Report.Error (
+-				120,
++				120, l,
+ 				&quot;An object reference is required &quot; +
+ 				&quot;for the non-static field `&quot;+name+&quot;'&quot;);
+ 		}
+@@ -2976,20 +2979,20 @@
+ 				FieldInfo fi = ((FieldExpr) e).FieldInfo;
+ 				
+ 				if (!fi.IsStatic){
+-					Error120 (Name);
++					Error120 (Location, Name);
+ 					return null;
+ 				}
+ 			} else if (e is MethodGroupExpr){
+ 				MethodGroupExpr mg = (MethodGroupExpr) e;
+ 
+ 				if (!mg.RemoveInstanceMethods ()){
+-					Error120 (mg.Methods [0].Name);
++					Error120 (Location, mg.Methods [0].Name);
+ 					return null;
+ 				}
+ 				return e;
+ 			} else if (e is PropertyExpr){
+ 				if (!((PropertyExpr) e).IsStatic){
+-					Error120 (Name);
++					Error120 (Location, Name);
+ 					return null;
+ 				}
+ 			}
+@@ -3050,7 +3053,7 @@
+ 				FieldExpr fe = (FieldExpr) e;
+ 				
+ 				if (!fe.FieldInfo.IsStatic)
+-					fe.InstanceExpression = new This ();
++					fe.InstanceExpression = new This (Location.Null);
+ 			} 				
+ 
+ 			if (ec.IsStatic)
+@@ -3089,11 +3092,20 @@
+ 		//   the address of the LValue and leaves it on the stack
+ 		// &lt;/summary&gt;
+ 		void AddressOf (EmitContext ec);
++
++		// &lt;summary&gt;
++		//   Allows an LValue to perform any necessary semantic
++		//   analysis in an lvalue-context.
++		// &lt;/summary&gt;
++
++		Expression LValueResolve (EmitContext ec);
+ 	}
+ 	
+ 	public class LocalVariableReference : Expression, LValue {
+ 		public readonly string Name;
+ 		public readonly Block Block;
++
++		VariableInfo variable_info;
+ 		
+ 		public LocalVariableReference (Block block, string name)
+ 		{
+@@ -3104,18 +3116,25 @@
+ 
+ 		public VariableInfo VariableInfo {
+ 			get {
+-				return Block.GetVariableInfo (Name);
++				if (variable_info == null)
++					variable_info = Block.GetVariableInfo (Name);
++				return variable_info;
+ 			}
+ 		}
+ 		
+ 		public override Expression DoResolve (EmitContext ec)
+ 		{
+-			VariableInfo vi = Block.GetVariableInfo (Name);
++			VariableInfo vi = VariableInfo;
+ 
+ 			type = vi.VariableType;
+ 			return this;
+ 		}
+ 
++		public Expression LValueResolve (EmitContext ec)
++		{
++			return this;
++		}
++		
+ 		public override void Emit (EmitContext ec)
+ 		{
+ 			VariableInfo vi = VariableInfo;
+@@ -3258,6 +3277,11 @@
+ 			else
+ 				ec.ig.Emit (OpCodes.Ldarga, arg_idx);
+ 		}
++
++		public Expression LValueResolve (EmitContext ec)
++		{
++			return this;
++		}
+ 	}
+ 	
+ 	// &lt;summary&gt;
+@@ -4070,14 +4094,24 @@
+ 	// Represents the `this' construct
+ 	//
+ 	public class This : Expression, LValue {
++		Location loc;
++		
++		public This (Location loc)
++		{
++			this.loc = loc;
++		}
++		
+ 		public override Expression DoResolve (EmitContext ec)
+ 		{
+ 			eclass = ExprClass.Variable;
+ 			type = ec.TypeContainer.TypeBuilder;
+ 
+-			//
+-			// FIXME: Verify that this is only used in instance contexts.
+-			//
++			if (ec.IsStatic){
++				Report.Error (26, loc,
++					      &quot;Keyword this not valid in static code&quot;);
++				return null;
++			}
++			
+ 			return this;
+ 		}
+ 
+@@ -4088,12 +4122,6 @@
+ 
+ 		public void Store (EmitContext ec)
+ 		{
+-			//
+-			// Assignment to the &quot;this&quot; variable.
+-			//
+-			// FIXME: Apparently this is a bug that we
+-			// must catch as `this' seems to be readonly ;-)
+-			//
+ 			ec.ig.Emit (OpCodes.Starg, 0);
+ 		}
+ 
+@@ -4101,6 +4129,16 @@
+ 		{
+ 			ec.ig.Emit (OpCodes.Ldarga_S, (byte) 0);
+ 		}
++
++		public Expression LValueResolve (EmitContext ec)
++		{
++			if (ec.TypeContainer is Class){
++				Report.Error (1604, loc, &quot;Cannot assign to `this'&quot;);
++				return null;
++			}
++
++			return this;
++		}
+ 	}
+ 
+ 	// &lt;summary&gt;
+@@ -4210,7 +4248,7 @@
+ 				//
+ 				if (expr is TypeExpr){
+ 					if (!mg.RemoveInstanceMethods ()){
+-						error176 (loc, mg.Methods [0].Name); 
++						SimpleName.Error120 (loc, mg.Methods [0].Name); 
+ 						return null;
+ 					}
+ 
+@@ -4221,7 +4259,7 @@
+ 				// Instance.MethodGroup
+ 				//
+ 				if (!mg.RemoveStaticMethods ()){
+-					SimpleName.Error120 (mg.Methods [0].Name);
++					error176 (loc, mg.Methods [0].Name);
+ 					return null;
+ 				}
+ 				
+@@ -4250,6 +4288,26 @@
+ 				}
+ 			}
+ 
++			if (member_lookup is PropertyExpr){
++				PropertyExpr pe = (PropertyExpr) member_lookup;
++
++				
++				if (expr is TypeExpr){
++					if (!pe.IsStatic){
++						SimpleName.Error120 (loc, pe.PropertyInfo.Name);
++						return null;
++					}
++				} else {
++					if (pe.IsStatic){
++						error176 (loc, pe.PropertyInfo.Name);
++						return null;
++					}
++					pe.InstanceExpression = expr;
++
++					return pe;
++				}
++			}
++			
+ 			Console.WriteLine (&quot;Support for &quot; + member_lookup + &quot; is not present yet&quot;);
+ 			Environment.Exit (0);
+ 			return null;
+@@ -4424,6 +4482,21 @@
+ 				ec.ig.Emit (OpCodes.Ldflda, FieldInfo);
+ 			}
+ 		}
++
++		public Expression LValueResolve (EmitContext ec)
++		{
++			if (!FieldInfo.IsInitOnly)
++				return this;
++
++			//
++			// InitOnly fields can only be assigned in constructors
++			//
++
++			if (ec.IsConstructor)
++				return this;
++
++			return null;
++		}
+ 	}
+ 	
+ 	// &lt;summary&gt;
+@@ -4433,6 +4506,8 @@
+ 		public readonly PropertyInfo PropertyInfo;
+ 		public readonly bool IsStatic;
+ 		
++		Expression instance_expr;
++		
+ 		public PropertyExpr (PropertyInfo pi)
+ 		{
+ 			PropertyInfo = pi;
+@@ -4448,6 +4523,16 @@
+ 			type = pi.PropertyType;
+ 		}
+ 
++		public Expression InstanceExpression {
++			set {
++				instance_expr = value;
++			}
++
++			get {
++				return instance_expr;
++			}
++		}
++		
+ 		override public Expression DoResolve (EmitContext ec)
+ 		{
+ 			// We are born in resolved state. 
+@@ -4623,7 +4708,11 @@
+ 		{
+ 			throw new Exception (&quot;Implement me !&quot;);
+ 		}
+-		
++
++		public Expression LValueResolve (EmitContext ec)
++		{
++			return this;
++		}
+ 	}
+ 	
+ 	public class BaseAccess : Expression {
+ 
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="001799.html">[Mono-list] mcs/nant build errors
+</A></li>
+	<LI> Next message: <A HREF="001802.html">[Mono-list] glib build error
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1801">[ date ]</a>
+              <a href="thread.html#1801">[ thread ]</a>
+              <a href="subject.html#1801">[ subject ]</a>
+              <a href="author.html#1801">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

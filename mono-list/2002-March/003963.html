@@ -1,0 +1,328 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] JIT patch for stabs debugging
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:martin%40gnome.org">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="003960.html">
+   <LINK REL="Next"  HREF="003967.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] JIT patch for stabs debugging
+   </H1>
+    <B>Martin Baulig
+    </B> 
+    <A HREF="mailto:martin%40gnome.org"
+       TITLE="[Mono-list] JIT patch for stabs debugging">martin@gnome.org
+       </A><BR>
+    <I>10 Mar 2002 02:39:45 +0100</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="003960.html">[Mono-list] Class status page is &quot;blank&quot;
+</A></li>
+        <LI> Next message: <A HREF="003967.html">[Mono-list] JIT patch for stabs debugging
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3963">[ date ]</a>
+              <a href="thread.html#3963">[ thread ]</a>
+              <a href="subject.html#3963">[ subject ]</a>
+              <a href="author.html#3963">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>--=-=-=
+
+Hi,
+
+this afternoon I was finally tired of using Console.WriteLine (...)
+for debugging and looked at `mono --stabs'.
+
+Here's a patch which makes this finally work.
+
+The patch does two things:
+
+1.) Puts a NOP instruction at the start of every method.
+
+    If you use `mono --debug Something', this buts a breakpoint
+    instruction (INT 3) at the start of &quot;Something&quot; - which means
+    that the address of Something's first instruction changes, but
+    this address is already hard-coded into the stabs file.
+
+    So without the NOP instructions you need to recreate your stabs
+    symbol files each time you want to run mono with different --debug
+    arguments.
+
+2.) Uses correct line numbers in the stabs file.
+
+    In mono_debug_add_method(), `t-&gt;cli_add' is a bytecode offset, but
+    not a line number in the .il file.
+
+    For instance, if t-&gt;cli_addr == 0xc, the stabs file must contain
+    the line number of the method's IL_000c line in the .il file.
+
+=====
+2002-03-10  Martin Baulig  &lt;<A HREF="mailto:martin@gnome.org">martin@gnome.org</A>&gt;
+
+	* emit-x86.c (arch_compile_method): When emitting stabs debugging
+	output, put a nop instruction at the start of all functions so that
+	the adresses won't change when using --debug.
+
+	* debug.c (mono_debug_add_method): `tree-&gt;cli_addr' is an offset into
+	the bytecode area, stabs needs a line number in the .il file. Use the
+	new info-&gt;moffsets to get the line number.
+	(AssemblyDebugInfo): Added `total_lines' and `moffsets' fields.
+	`moffsets' is an array of `total_lines' fields (total number of lines
+	in the .il file); for each line in the .il field, this array contains
+	the bytecode offset if it's an &quot;IL_xxxx&quot; line, -1 if it's the last line
+	of a method and 0 otherwise.
+	(debug_load_method_lines): Read the whole .il file and initialize the
+	info-&gt;moffsets field.
+
+====
+
+
+--=-=-=
+Content-Disposition: attachment; filename=jit-debug-patch.txt
+
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mono/mono/jit/ChangeLog,v
+retrieving revision 1.121
+diff -u -u -r1.121 ChangeLog
+--- ChangeLog	2002/03/08 06:08:46	1.121
++++ ChangeLog	2002/03/09 21:48:12
+@@ -1,3 +1,25 @@
++2002-03-10  Martin Baulig  &lt;<A HREF="mailto:martin@gnome.org">martin@gnome.org</A>&gt;
++
++	* emit-x86.c (arch_compile_method): When emitting stabs debugging
++	output, put a nop instruction at the start of all functions so that
++	the adresses won't change when using --debug.
++
++	* debug.c (mono_debug_add_method): `tree-&gt;cli_addr' is an offset into
++	the bytecode area, stabs needs a line number in the .il file. Use the
++	new info-&gt;moffsets to get the line number.
++	(AssemblyDebugInfo): Added `total_lines' and `moffsets' fields.
++	`moffsets' is an array of `total_lines' fields (total number of lines
++	in the .il file); for each line in the .il field, this array contains
++	the bytecode offset if it's an &quot;IL_xxxx&quot; line, -1 if it's the last line
++	of a method and 0 otherwise.
++	(debug_load_method_lines): Read the whole .il file and initialize the
++	info-&gt;moffsets field.
++
++2002-03-09  Martin Baulig  &lt;<A HREF="mailto:martin@gnome.org">martin@gnome.org</A>&gt;
++
++	* x86.brg (DIV_UN): Clear EDX before performing the division and remove
++	the unnecessary CDQ instruction.
++
+ 2002-03-07  Dietmar Maurer  &lt;<A HREF="mailto:dietmar@ximian.com">dietmar@ximian.com</A>&gt;
+ 
+ 	* jit.c (mono_analyze_stack): only load addresses of value types
+Index: debug.c
+===================================================================
+RCS file: /cvs/public/mono/mono/jit/debug.c,v
+retrieving revision 1.6
+diff -u -u -r1.6 debug.c
+--- debug.c	2002/02/19 06:01:21	1.6
++++ debug.c	2002/03/09 21:48:13
+@@ -9,7 +9,9 @@
+ 	FILE *f;
+ 	char *filename;
+ 	char *name;
++	int total_lines;
+ 	int *mlines;
++	int *moffsets;
+ 	int nmethods;
+ 	int next_idx;
+ } AssemblyDebugInfo;
+@@ -106,21 +108,45 @@
+ 		g_free (name);
+ 		return;
+ 	}
++
++	info-&gt;total_lines = 100;
++	info-&gt;moffsets = g_malloc (info-&gt;total_lines * sizeof (int));
++
+ 	g_free (name);
+ 	i = 0;
+ 	while (fgets (buf, sizeof (buf), f)) {
+-		i++;
+-		if (sscanf (buf, &quot; // method line %d&quot;, &amp;mnum) &amp;&amp; mnum &lt; info-&gt;nmethods) {
+-			while (fgets (buf, sizeof (buf), f)) {
+-				++i;
+-				if (strstr (buf, &quot;}&quot;))
+-					break; /* internalcall or runtime method */
+-				if (strstr (buf, &quot;IL_0000:&quot;))
+-					break;
++		int offset = 0, pos = i;
++
++		++i;
++		if (!sscanf (buf, &quot; // method line %d&quot;, &amp;mnum))
++			continue;
++
++		if (mnum &gt;= info-&gt;nmethods)
++			break;
++
++		while (fgets (buf, sizeof (buf), f)) {
++			int newoffset;
++
++			++i;
++			if (i + 2 &gt;= info-&gt;total_lines) {
++				info-&gt;total_lines += 100;
++				info-&gt;moffsets = g_realloc (info-&gt;moffsets, info-&gt;total_lines * sizeof (int));
++				g_assert (info-&gt;moffsets);
++			}
++
++			if (strstr (buf, &quot;}&quot;))
++				break;
++
++			if (sscanf (buf, &quot; IL_%x:&quot;, &amp;newoffset)) {
++				offset = newoffset;
++				if (!offset)
++					pos = i;
+ 			}
+-			/* g_print (&quot;method %d found at %d\n&quot;, mnum, i); */
+-			info-&gt;mlines [mnum] = i;
++
++			info-&gt;moffsets [i] = offset;
+ 		}
++		/* g_print (&quot;method %d found at %d\n&quot;, mnum, pos); */
++		info-&gt;mlines [mnum] = pos;
+ 	}
+ 	fclose (f);
+ }
+@@ -178,6 +204,7 @@
+ {
+ 	fclose (debug-&gt;f);
+ 	g_free (debug-&gt;mlines);
++	g_free (debug-&gt;moffsets);
+ 	g_free (debug-&gt;name);
+ 	g_free (debug-&gt;filename);
+ 	g_free (debug);
+@@ -201,14 +228,16 @@
+ mono_debug_add_method (MonoDebugHandle* debug, MonoFlowGraph *cfg)
+ {
+ 	char *name;
+-	int line = 0;
+-	int i;
++	int line = 0, line_index = 0;
++	int i, print;
+ 	MonoMethod *method = cfg-&gt;method;
+ 	MonoClass *klass = method-&gt;klass;
+ 	MonoMethodSignature *sig = method-&gt;signature;
+ 	char **names = g_new (char*, sig-&gt;param_count);
+ 	AssemblyDebugInfo* info = mono_debug_open_ass (debug, klass-&gt;image);
+ 
++	print = !strcmp (method-&gt;name, &quot;Parse&quot;) || !strcmp (method-&gt;name, &quot;Main&quot;);
++
+ 	/* FIXME: we should mangle the name better */
+ 	name = g_strdup_printf (&quot;%s%s%s__%s_%p&quot;, klass-&gt;name_space, klass-&gt;name_space [0]? &quot;_&quot;: &quot;&quot;,
+ 			klass-&gt;name, method-&gt;name, method);
+@@ -222,6 +251,7 @@
+ 	 */
+ 	for (i = 0; klass-&gt;methods &amp;&amp; i &lt; klass-&gt;method.count; ++i) {
+ 		if (klass-&gt;methods [i] == method) {
++			line_index = klass-&gt;method.first + i + 1;
+ 			line = info-&gt;mlines [klass-&gt;method.first + i + 1];
+ 			/*g_print (&quot;method %d found at line %d\n&quot;, klass-&gt;method.first + i + 1, line);*/
+ 			break;
+@@ -232,7 +262,7 @@
+ 	 * We need to output all the basic info, if we change filename...
+ 	 * fprintf (info-&gt;f, &quot;.stabs \&quot;%s.il\&quot;,100,0,0,0\n&quot;, klass-&gt;image-&gt;assembly_name);
+ 	 */
+-	fprintf (info-&gt;f, &quot;.stabs \&quot;%s:F(0,%d)\&quot;,36,0,%d,%p\n&quot;, name, sig-&gt;ret-&gt;type, line, cfg-&gt;start);
++	fprintf (info-&gt;f, &quot;.stabs \&quot;%s:F(0,%d)\&quot;,36,0,%d,%p\n&quot;, name, sig-&gt;ret-&gt;type, line, cfg-&gt;start+1);
+ 
+ 	/* params */
+ 	mono_method_get_param_names (cfg-&gt;method, (const char **)names);
+@@ -250,12 +280,23 @@
+ 			fprintf (info-&gt;f, &quot;.stabs \&quot;local_%d:(0,%d)=(0,%d)\&quot;,128,0,%d,%d\n&quot;, i, info-&gt;next_idx++, header-&gt;locals [i]-&gt;type, line, stack_offset);
+ 		}
+ 	}
++
++	fprintf (info-&gt;f, &quot;.stabn 68,0,%d,%d\n&quot;, line, 0);
++
+ 	/* start lines of basic blocks */
+ 	for (i = 0; i &lt; cfg-&gt;block_count; ++i) {
+ 		int j;
++
++		// mono_print_forest (cfg-&gt;bblocks [i].forest);
++
+ 		for (j = 0; j &lt; cfg-&gt;bblocks [i].forest-&gt;len; ++j) {
+ 			MBTree *t = (MBTree *) g_ptr_array_index (cfg-&gt;bblocks [i].forest, j);
+-			fprintf (info-&gt;f, &quot;.stabn 68,0,%d,%d\n&quot;, line + t-&gt;cli_addr, t-&gt;addr);
++			int *lines = info-&gt;moffsets + line, *k = lines;
++
++			while ((*k != -1) &amp;&amp; (*k &lt; t-&gt;cli_addr))
++				k++;
++
++			fprintf (info-&gt;f, &quot;.stabn 68,0,%d,%d\n&quot;, line + (k-lines), t-&gt;addr-1);
+ 		}
+ 	}
+ 
+Index: emit-x86.c
+===================================================================
+RCS file: /cvs/public/mono/mono/jit/emit-x86.c,v
+retrieving revision 1.61
+diff -u -u -r1.61 emit-x86.c
+--- emit-x86.c	2002/03/08 06:08:46	1.61
++++ emit-x86.c	2002/03/09 21:48:15
+@@ -1058,6 +1058,8 @@
+ 
+ 		if (match_debug_method (method))
+ 			x86_breakpoint (cfg-&gt;code);
++		else if (mono_debug_handle)
++			x86_nop (cfg-&gt;code);
+ 
+ 		if (mono_jit_dump_forest) {
+ 			int i;
+Index: x86.brg
+===================================================================
+RCS file: /cvs/public/mono/mono/jit/x86.brg,v
+retrieving revision 1.92
+diff -u -u -r1.92 x86.brg
+--- x86.brg	2002/03/08 06:08:46	1.92
++++ x86.brg	2002/03/09 21:48:16
+@@ -816,7 +816,7 @@
+ 	if (tree-&gt;left-&gt;reg1 != X86_EAX)
+ 		x86_mov_reg_reg (s-&gt;code, X86_EAX, tree-&gt;left-&gt;reg1, 4);
+ 
+-	x86_cdq (s-&gt;code);
++	x86_mov_reg_imm (s-&gt;code, X86_EDX, 0);
+ 	x86_div_reg (s-&gt;code, tree-&gt;right-&gt;reg1, FALSE);
+ 
+ 	mono_assert (tree-&gt;reg1 == X86_EAX &amp;&amp;
+
+--=-=-=
+
+
+After applying this patch, single stepping through a function now
+actually works :-)
+
+-- 
+Martin Baulig
+<A HREF="mailto:martin@gnome.org">martin@gnome.org</A>
+
+
+--=-=-=--
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="003960.html">[Mono-list] Class status page is &quot;blank&quot;
+</A></li>
+	<LI> Next message: <A HREF="003967.html">[Mono-list] JIT patch for stabs debugging
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#3963">[ date ]</a>
+              <a href="thread.html#3963">[ thread ]</a>
+              <a href="subject.html#3963">[ subject ]</a>
+              <a href="author.html#3963">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

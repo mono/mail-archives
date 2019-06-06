@@ -1,0 +1,288 @@
+/*
+Copyright (C) 2005  P. Oscar Boykin <boykin@pobox.com>, University of Florida
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+*/
+
+//#define DEBUG
+
+using System.Collections;
+using System.Threading;
+using System;
+
+namespace Brunet
+{
+
+/**
+ * This class offers a means to pass objects in a queue
+ * between threads (or in the same thread).  The Dequeue
+ * method will block until there is something in the Queue
+ */
+public class BlockingQueue {
+ 
+  public class Entry {
+    public object Value;
+    public Entry Next;
+  }
+
+  public BlockingQueue() {
+    _are = new AutoResetEvent(false); 
+    _closed = false;
+    _sync = new object();
+    _head = null;
+    _tail = null;
+    _count = 0;
+    
+    _pool = null;
+    _pool_count = 0;
+  }
+ 
+  protected AutoResetEvent _are;
+ 
+  protected bool _closed;
+
+  protected readonly object _sync;
+  protected Entry _head;
+  protected Entry _tail;
+  protected int _count;
+
+  protected Entry _pool;
+  protected int _pool_count;
+  protected const int MAX_POOL = 100;
+
+  public bool Closed { get { lock ( _sync ) { return _closed; } } }
+  
+  /**
+   * When an item is enqueued, this event is fire
+   */
+  public event EventHandler EnqueueEvent;
+  
+  /* **********************************************
+   * Here all the methods
+   */
+  
+  public void Clear() {
+    lock( _sync ) {
+      _head = null; 
+      _tail = null;
+      _count = 0;
+    }
+  }
+  
+  /**
+   * Once this method is called, and the queue is emptied,
+   * all future Dequeue's will throw exceptions
+   */
+  public void Close() {
+    lock( _sync ) {
+      _closed = true;
+      _are.Set();
+    }
+    //Wake up any blocking threads:
+#if DEBUG
+    System.Console.WriteLine("Close set");
+#endif
+  }
+  
+  /**
+   * @throw Exception if the queue is closed
+   */
+  public object Dequeue() {
+    bool timedout = false;
+    return Dequeue(-1, out timedout);
+  }
+
+  /**
+   * @param millisec how many milliseconds to wait if the queue is empty
+   * @param timedout true if we have to wait too long to get an object
+   * @return the object, if we timeout we return null
+   * @throw Exception if the BlockingQueue is closed and empty
+   */
+  public object Dequeue(int millisec, out bool timedout)
+  {
+    return Dequeue(millisec, out timedout, true);
+  }
+  
+  /**
+   * Handles peeking and dequeueing
+   */
+  protected object Dequeue(int millisec, out bool timedout, bool advance)
+  {
+    object val = null;
+    bool got_val = false;
+    lock( _sync ) {
+      if( _head != null ) {
+        //Easy
+        val = _head.Value;
+        got_val = true;
+	if( advance ) {
+	  Entry tmp_h = _head;
+	  _head = _head.Next;
+          if( _head == null ) { _tail = null; }
+	  _count = _count - 1;
+          //Recycle e:
+          AddToPool(tmp_h);
+        }
+      }
+      else { 
+        //The queue is empty: check to see if it is also closed:
+	if( _closed ) {
+          timedout = false;
+	  throw new InvalidOperationException("BlockingQueue is closed");
+	}
+        //Make sure we don't have any old signals waiting...
+        _are.Reset();
+      }
+    }
+    if( !got_val ) {
+      //We have to wait
+      bool got_set = _are.WaitOne(millisec, false);
+      lock( _sync ) {
+        if( got_set ) {
+	  if( _closed ) {
+            timedout = false;
+	    throw new InvalidOperationException("BlockingQueue is closed");
+          }
+	  //Advance the queue
+          val = _head.Value;
+          got_val = true;
+	  if( advance ) {
+            Entry tmp_h = _head;
+	    _head = _head.Next;
+            if( _head == null ) { _tail = null; }
+	    _count = _count - 1;
+            //Recycle e:
+            AddToPool(tmp_h);
+          }
+        }
+      }
+    }
+    if( got_val ) {
+      timedout = false;
+      return val;
+    }
+    else {
+      //We timed out:
+      timedout = true;
+      return null;
+    }
+  }
+  
+  protected void AddToPool(Entry e) {
+    if( _pool_count < MAX_POOL ) {
+      e.Next = _pool;
+      e.Value = null;
+      _pool = e;
+      _pool_count++;
+    }
+  }
+  protected Entry GetEntry(object v) {
+    //Let's see if we can recycle:
+    Entry e = _pool;
+    if( _pool != null ) {
+      _pool = _pool.Next;
+      _pool_count--;
+    }
+    else {
+      e = new Entry();
+    }
+    e.Value = v; 
+    e.Next = null;
+    return e;
+  }
+  /**
+   * @throw Exception if the queue is closed
+   */
+  public object Peek() {
+    bool timedout = false;
+    return Peek(-1, out timedout);
+  }
+
+  /**
+   * @param millisec how many milliseconds to wait if the queue is empty
+   * @param timedout true if we have to wait too long to get an object
+   * @return the object, if we timeout we return null
+   * @throw Exception if the BlockingQueue is closed and empty
+   */
+  public object Peek(int millisec, out bool timedout)
+  {
+    return Dequeue(millisec, out timedout, false);
+  }
+
+  public void Enqueue(object v) {
+    bool fire = false;
+    lock( _sync ) {
+      //Don't do anything if the queue is closed
+      if( _closed ) { return; }
+      Entry e = GetEntry(v); 
+      if( _tail != null ) {
+        _tail.Next = e;
+      }
+      _tail = e;
+      fire = true;
+    //Now we need to fix up the head:
+      _count = _count + 1;
+      if( _head == null ) {
+        //We just added to an empty queue
+	_head = _tail;
+        _are.Set();
+      }
+    }
+    //After we have alerted any blocking threads (Set), fire
+    //the event:
+    if( fire && (EnqueueEvent != null) ) {
+      EnqueueEvent(this, EventArgs.Empty);
+    }
+  }
+
+  protected const int TEST_RUNS = 500000;
+
+  public void TestThread1()
+  {
+    //See a random number generator with the number 1.
+    Random r = new Random(1);
+    for(int i = 0; i < TEST_RUNS; i++) { 
+      Enqueue( r.Next() );
+    }
+    Close();
+  }
+  
+  public static void Main()
+  {
+    BlockingQueue bq = new BlockingQueue();
+    Thread t = new Thread(bq.TestThread1);
+    t.Start();
+    Random r = new Random(1);
+    for(int i = 0; i < TEST_RUNS; i++) { 
+      int j = (int)bq.Dequeue();
+      int ra = r.Next();
+      if( j != ra ) {
+        Console.Error.WriteLine("{0}: {1} != {2}", i, j, ra);
+	Console.ReadLine();
+      }
+    }
+    //The next dequeue should throw an exception
+    bool got_exception = false;
+    try {
+      bq.Dequeue();
+    }
+    catch(Exception x) { got_exception = true; }
+    if( !got_exception ) {
+      Console.Error.WriteLine("Didn't get exception");
+    }
+  }
+}
+
+}

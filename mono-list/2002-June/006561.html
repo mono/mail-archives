@@ -1,0 +1,223 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] catching stack overflow signals
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:stodden%40in.tum.de">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="006541.html">
+   <LINK REL="Next"  HREF="006544.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] catching stack overflow signals
+   </H1>
+    <B>Daniel Stodden
+    </B> 
+    <A HREF="mailto:stodden%40in.tum.de"
+       TITLE="[Mono-list] catching stack overflow signals">stodden@in.tum.de
+       </A><BR>
+    <I>21 Jun 2002 04:04:41 +0200</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="006541.html">[Mono-list] catching stack overflow signals
+</A></li>
+        <LI> Next message: <A HREF="006544.html">[Mono-list] Object Lookup with a Compound key
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6561">[ date ]</a>
+              <a href="thread.html#6561">[ thread ]</a>
+              <a href="subject.html#6561">[ subject ]</a>
+              <a href="author.html#6561">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>--=-xUP2407B3E4x0NcwP0wM
+Content-Type: text/plain
+Content-Transfer-Encoding: 7bit
+
+On Wed, 2002-06-19 at 17:42, Dietmar Maurer wrote:
+&gt;<i> Hi all,
+</I>
+hi.
+
+&gt;<i> On workaround is to use a stack allocated memory for sigaltstack, for
+</I>&gt;<i> example we can define a local variable:
+</I>&gt;<i> 
+</I>&gt;<i> char alttack [8192] __attribute__ (( aligned (32) )); 
+</I>&gt;<i> 
+</I>&gt;<i> That way we solve the above problem, but i am quite sure that this will
+</I>&gt;<i> confuse pthread somehow, because its thread detection always points to
+</I>&gt;<i> the same thread in signal handler.
+</I>
+indeed it would.
+
+&gt;<i> So maybe someone knows a better solution?
+</I>
+i don't see any alternative to altstack.
+
+win32 seems to handle the overflow problem more elegantly by releasing
+the page protection bit on the guard. exception handlers can then try to
+recover from within the guard region. [1]
+
+sigaltstack however seems at least to be smart enough _not_ to share
+alternates between threads. 
+i haven't looked this up in the kernel yet, though.
+seems installing an altstack on on a per thread start basis fixes the
+problem. see the attached update.
+
+regards,
+dns
+
+[1]<A HREF="http://msdn.microsoft.com/library/default.asp?url=/library/en-us/dnaskdr/html/drgui49.asp">http://msdn.microsoft.com/library/default.asp?url=/library/en-us/dnaskdr/html/drgui49.asp</A>
+
+-- 
+___________________________________________________________________________
+ mailto:<A HREF="mailto:stodden@in.tum.de">stodden@in.tum.de</A>
+
+--=-xUP2407B3E4x0NcwP0wM
+Content-Disposition: attachment; filename=sigtest2.c
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/x-c; name=sigtest2.c; charset=ISO-8859-1
+
+#include &lt;stdlib.h&gt;
+#include &lt;sys/signal.h&gt;
+#define __USE_GNU
+#include &lt;pthread.h&gt;
+#include &lt;setjmp.h&gt;
+
+void
+stack_overflow( int count )
+{
+	char buf[2 * pthread_self()];
+
+	printf( &quot;thread=3D%d count=3D%d, stack=3D%p\n&quot;,=20
+		pthread_self(), count, buf );
+
+	if ( count % 10 =3D=3D 0 ) {
+		printf( &quot;-- yield --\n&quot; );
+		pthread_yield();
+	}
+
+	stack_overflow( count + 1);
+}
+
+#ifdef __i386__
+#define _STACK_GROWS_DOWN       1
+#else
+#error &quot;intel outside, huh?&quot;
+#endif
+
+void sa_segv_action( int sig, siginfo_t *info, void *arg )
+{
+	int ss_sp;
+	pthread_t self =3D pthread_self();
+	pthread_attr_t attr;
+	void *staddr;
+	size_t stsize;
+	void *gdstart, *gdend;
+	size_t gdsize;
+	int ovf =3D 0;
+
+	printf( &quot;caught signal: thread=3D%d, ss_sp=3D%p\n&quot;,=20
+		self, &amp;ss_sp );
+	printf( &quot;fault at:   %p\n&quot;, info-&gt;si_addr );
+
+	// FIXME: won't work for the parent
+	pthread_getattr_np( self, &amp;attr );
+	pthread_attr_getstack( &amp;attr, &amp;staddr, &amp;stsize );
+	pthread_attr_getguardsize( &amp;attr, &amp;gdsize );
+	printf( &quot;stack addr: %p\n&quot;, staddr );
+	printf( &quot;guard size: %p\n&quot;, gdsize );
+=09
+#if _STACK_GROWS_DOWN
+	gdstart =3D staddr - gdsize;
+	gdend =3D staddr;
+#elif _STACK_GROWS_UP
+	ovf =3D /* FIXME */;
+#elif NEED_SEPARATE_REGISTER_STACK
+	ovf =3D /* FIXME */;
+#endif
+	if ( gdstart &lt;=3D info-&gt;si_addr &amp;&amp; info-&gt;si_addr &lt; gdend )
+		printf( &quot;stack overflow, indeed\n&quot; );
+	else
+		printf( &quot;ordinary gpf\n&quot; );
+
+	printf( &quot;-- die --\n&quot; );
+	pthread_exit( NULL );
+}
+
+#define STACKSIZE SIGSTKSZ
+
+void *
+thread_start( void *arg )
+{
+	struct sigaltstack sa;
+	char altstack[SIGSTKSZ];
+
+	sa.ss_sp =3D altstack;
+	sa.ss_size =3D STACKSIZE;
+	sa.ss_flags =3D SS_ONSTACK;
+	sigaltstack( &amp;sa, NULL );
+
+	printf( &quot;thread starts: self=3D%d, stack=3D%p\n&quot;, pthread_self(), altstack=
+ );
+
+	stack_overflow( 0 );
+
+	return NULL;
+}
+
+int
+main( int argc, char **argv )
+{
+	pthread_attr_t attr;
+	size_t guardsize;
+	pthread_t thread1, thread2;
+	struct sigaction act;
+
+	act.sa_sigaction =3D sa_segv_action;
+	act.sa_flags =3D SA_SIGINFO | SA_ONSTACK;
+	sigaction( SIGSEGV, &amp;act, 0);
+
+	pthread_attr_getguardsize( &amp;attr, &amp;guardsize );
+	printf( &quot;guardsize=3D%d\n&quot;, guardsize );
+
+	if ( pthread_create( &amp;thread1, NULL, thread_start, NULL ) ) {
+		printf( &quot;could not create first thread\n&quot; );
+		exit( 1 );
+	}
+
+	if ( pthread_create( &amp;thread2, NULL, thread_start, NULL ) ) {
+		printf( &quot;could not create second thread\n&quot; );
+		exit( 1 );
+	}
+
+	pthread_join( thread1, NULL );
+	pthread_join( thread2, NULL );
+
+	return 0;
+}
+
+--=-xUP2407B3E4x0NcwP0wM--
+
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="006541.html">[Mono-list] catching stack overflow signals
+</A></li>
+	<LI> Next message: <A HREF="006544.html">[Mono-list] Object Lookup with a Compound key
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6561">[ date ]</a>
+              <a href="thread.html#6561">[ thread ]</a>
+              <a href="subject.html#6561">[ subject ]</a>
+              <a href="author.html#6561">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

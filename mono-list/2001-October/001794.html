@@ -1,0 +1,316 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Patch: support for method invocations in structures.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:miguel%40ximian.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="001793.html">
+   <LINK REL="Next"  HREF="001796.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Patch: support for method invocations in structures.
+   </H1>
+    <B>Miguel de Icaza
+    </B> 
+    <A HREF="mailto:miguel%40ximian.com"
+       TITLE="[Mono-list] Patch: support for method invocations in structures.">miguel@ximian.com
+       </A><BR>
+    <I>11 Oct 2001 17:51:40 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="001793.html">[Mono-list] Patches to mono.
+</A></li>
+        <LI> Next message: <A HREF="001796.html">[Mono-list] Patch: integrating MonoBASIC compiler patches
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1794">[ date ]</a>
+              <a href="thread.html#1794">[ thread ]</a>
+              <a href="subject.html#1794">[ subject ]</a>
+              <a href="author.html#1794">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Some patches from today: 
+
+	* Support method invocation on structures.
+
+	* Bug fix parameter references.
+
+Index: ChangeLog
+===================================================================
+RCS file: /cvs/public/mcs/mcs/ChangeLog,v
+retrieving revision 1.129
+diff -u -r1.129 ChangeLog
+--- ChangeLog	2001/10/11 16:46:46	1.129
++++ ChangeLog	2001/10/11 17:58:16
+@@ -1,3 +1,20 @@
++2001-10-11  Miguel de Icaza  &lt;<A HREF="mailto:miguel@ximian.com">miguel@ximian.com</A>&gt;
++
++	* expression.cs (Invocation::Emit): Deal with invocation of
++	methods on value types.  We need to pass the address to structure
++	methods rather than the object itself.  (The equivalent code to
++	emit &quot;this&quot; for structures leaves the entire structure on the
++	stack instead of a pointer to it). 
++
++	(ParameterReference::DoResolve): Compute the real index for the
++	argument based on whether the method takes or not a `this' pointer
++	(ie, the method is static).
++
++	* codegen.cs (EmitContext::GetTemporaryStorage): Used to store
++	value types returned from functions when we need to invoke a
++	method on the sturcture.
++	
++
+ 2001-10-11  Ravi Pratap  &lt;<A HREF="mailto:ravi@ximian.com">ravi@ximian.com</A>&gt;
+ 
+ 	* class.cs (TypeContainer::DefineType): Method to actually do the business of
+Index: TODO
+===================================================================
+RCS file: /cvs/public/mcs/mcs/TODO,v
+retrieving revision 1.19
+diff -u -r1.19 TODO
+--- TODO	2001/10/10 02:36:47	1.19
++++ TODO	2001/10/11 17:58:16
+@@ -1,3 +1,8 @@
++* Optimizations
++
++	Handle if (!x) converting to remove the `!' and instead of using
++	a brfalse use a brtrue to jump to the end.
++
+ * Emitcontext
+ 
+ 	Do we really need to instanciate this variable all the time?
+Index: codegen.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/codegen.cs,v
+retrieving revision 1.33
+diff -u -r1.33 codegen.cs
+--- codegen.cs	2001/10/10 02:36:47	1.33
++++ codegen.cs	2001/10/11 17:58:16
+@@ -8,6 +8,7 @@
+ //
+ 
+ using System;
++using System.Collections;
+ using System.Reflection;
+ using System.Reflection.Emit;
+ 
+@@ -83,7 +84,6 @@
+ 	public class EmitContext {
+ 		public TypeContainer TypeContainer;
+ 		public ILGenerator   ig;
+-		
+ 		public bool CheckState;
+ 
+ 		// &lt;summary&gt;
+@@ -96,6 +96,13 @@
+ 		//   return type.
+ 		// &lt;/summary&gt;
+ 		public Type ReturnType;
++
++		// &lt;summary&gt;
++		//   Keeps track of the Type to LocalBuilder temporary storage created
++		//   to store structures (used to compute the address of the structure
++		//   value on structure method invocations)
++		// &lt;/summary&gt;
++		public Hashtable temporary_storage;
+ 		
+ 		public EmitContext (TypeContainer parent, ILGenerator ig, Type return_type, int code_flags)
+ 		{
+@@ -129,6 +136,27 @@
+ 
+ 			if (!has_ret)
+ 				ig.Emit (OpCodes.Ret);
++		}
++
++		// &lt;summary&gt;
++		//   Returns a temporary storage for a variable of type t as 
++		//   a local variable in the current body.
++		// &lt;/summary&gt;
++		public LocalBuilder GetTemporaryStorage (Type t)
++		{
++			LocalBuilder location;
++			
++			if (temporary_storage == null)
++				temporary_storage = new Hashtable ();
++
++			location = (LocalBuilder) temporary_storage [t];
++			if (location != null)
++				return location;
++
++			location = ig.DeclareLocal (t);
++			temporary_storage.Add (t, location);
++
++			return location;
+ 		}
+ 	}
+ }
+Index: driver.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/driver.cs,v
+retrieving revision 1.28
+diff -u -r1.28 driver.cs
+--- driver.cs	2001/10/05 21:13:47	1.28
++++ driver.cs	2001/10/11 17:58:16
+@@ -338,8 +338,7 @@
+ 			if (errors &gt; 0){
+ 				error (&quot;Parsing failed&quot;);
+ 				return;
+-			} else
+-				notice (&quot;Parsing successful&quot;);
++			}
+ 
+ 			//
+ 			// Load assemblies required
+Index: expression.cs
+===================================================================
+RCS file: /cvs/public/mcs/mcs/expression.cs,v
+retrieving revision 1.79
+diff -u -r1.79 expression.cs
+--- expression.cs	2001/10/11 16:46:46	1.79
++++ expression.cs	2001/10/11 17:58:16
+@@ -3211,6 +3211,7 @@
+ 		public readonly Parameters Pars;
+ 		public readonly String Name;
+ 		public readonly int Idx;
++		int arg_idx;
+ 		
+ 		public ParameterReference (Parameters pars, int idx, string name)
+ 		{
+@@ -3226,32 +3227,36 @@
+ 
+ 			type = types [Idx];
+ 
++			arg_idx = Idx;
++			if (!ec.IsStatic)
++				arg_idx++;
++			
+ 			return this;
+ 		}
+ 
+ 		public override void Emit (EmitContext ec)
+ 		{
+-			if (Idx &lt;= 255)
+-				ec.ig.Emit (OpCodes.Ldarg_S, (byte) Idx);
++			if (arg_idx &lt;= 255)
++				ec.ig.Emit (OpCodes.Ldarg_S, (byte) arg_idx);
+ 			else
+-				ec.ig.Emit (OpCodes.Ldarg, Idx);
++				ec.ig.Emit (OpCodes.Ldarg, arg_idx);
+ 		}
+ 
+ 		public void Store (EmitContext ec)
+ 		{
+-			if (Idx &lt;= 255)
+-				ec.ig.Emit (OpCodes.Starg_S, (byte) Idx);
++			if (arg_idx &lt;= 255)
++				ec.ig.Emit (OpCodes.Starg_S, (byte) arg_idx);
+ 			else
+-				ec.ig.Emit (OpCodes.Starg, Idx);
++				ec.ig.Emit (OpCodes.Starg, arg_idx);
+ 			
+ 		}
+ 
+ 		public void AddressOf (EmitContext ec)
+ 		{
+-			if (Idx &lt;= 255)
+-				ec.ig.Emit (OpCodes.Ldarga_S, (byte) Idx);
++			if (arg_idx &lt;= 255)
++				ec.ig.Emit (OpCodes.Ldarga_S, (byte) arg_idx);
+ 			else
+-				ec.ig.Emit (OpCodes.Ldarga, Idx);
++				ec.ig.Emit (OpCodes.Ldarga, arg_idx);
+ 		}
+ 	}
+ 	
+@@ -3869,7 +3874,9 @@
+ 		public override void Emit (EmitContext ec)
+ 		{
+ 			bool is_static = method.IsStatic;
+-
++			ILGenerator ig = ec.ig;
++			bool struct_call = false;
++				
+ 			if (!is_static){
+ 				MethodGroupExpr mg = (MethodGroupExpr) this.expr;
+ 
+@@ -3877,28 +3884,50 @@
+ 				// If this is ourselves, push &quot;this&quot;
+ 				//
+ 				if (mg.InstanceExpression == null){
+-					ec.ig.Emit (OpCodes.Ldarg_0);
++					ig.Emit (OpCodes.Ldarg_0);
+ 				} else {
++					Expression ie = mg.InstanceExpression;
++					
+ 					//
+ 					// Push the instance expression
+ 					//
+-					mg.InstanceExpression.Emit (ec);
++					if (ie.Type.IsSubclassOf (TypeManager.value_type)){
++
++						struct_call = true;
++
++						//
++						// If the expression is an LValue, then
++						// we can optimize and use AddressOf on the
++						// return.
++						//
++						// If not we have to use some temporary storage for
++						// it.
++						if (ie is LValue)
++							((LValue) ie).AddressOf (ec);
++						else {
++							ie.Emit (ec);
++							LocalBuilder temp = ec.GetTemporaryStorage (ie.Type);
++							ig.Emit (OpCodes.Stloc, temp);
++							ig.Emit (OpCodes.Ldloca, temp);
++						}
++					} else 
++						ie.Emit (ec);
+ 				}
+ 			}
+ 
+ 			if (Arguments != null)
+ 				EmitArguments (ec, method, Arguments);
+ 
+-			if (is_static){
++			if (is_static || struct_call){
+ 				if (method is MethodInfo)
+-					ec.ig.Emit (OpCodes.Call, (MethodInfo) method);
++					ig.Emit (OpCodes.Call, (MethodInfo) method);
+ 				else
+-					ec.ig.Emit (OpCodes.Call, (ConstructorInfo) method);
++					ig.Emit (OpCodes.Call, (ConstructorInfo) method);
+ 			} else {
+ 				if (method is MethodInfo)
+-					ec.ig.Emit (OpCodes.Callvirt, (MethodInfo) method);
++					ig.Emit (OpCodes.Callvirt, (MethodInfo) method);
+ 				else
+-					ec.ig.Emit (OpCodes.Callvirt, (ConstructorInfo) method);
++					ig.Emit (OpCodes.Callvirt, (ConstructorInfo) method);
+ 			}
+ 		}
+ 
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="001793.html">[Mono-list] Patches to mono.
+</A></li>
+	<LI> Next message: <A HREF="001796.html">[Mono-list] Patch: integrating MonoBASIC compiler patches
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#1794">[ date ]</a>
+              <a href="thread.html#1794">[ thread ]</a>
+              <a href="subject.html#1794">[ subject ]</a>
+              <a href="author.html#1794">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

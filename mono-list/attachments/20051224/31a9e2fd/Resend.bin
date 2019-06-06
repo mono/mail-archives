@@ -1,0 +1,212 @@
+/*
+   Resend.cs by Harald Maiss
+   
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 2, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.  
+
+*/ 
+
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+
+class Resend
+{
+	char[][] bufTable;
+	const int PacketsPerSuperPacket = 256;
+	int writeBuf = 0;
+	int readBuf = 0;
+	Thread tcpSendThread;
+	Record record;
+	bool isStopped = false;
+	long resendPacketCount = 0;
+	int resendCount = 0; 
+	int maxPacketsPerResend = 0;
+
+	const int dataRateIntervalTime = 5;   // Sekunden
+	const double dataRateFactor = 
+		1500.0 * 8 / (dataRateIntervalTime * 1000000); // = 0.024 
+	int dataRateIntervalCount = 0;
+	int dataRateMaxPacketsPerInterval = 0;
+	Thread dataRateThread;
+	
+
+	void DataRate()
+	{
+		try {
+			long lastPacketCount = record.PacketCount;
+			long curPacketCount;
+			int packetsPerInterval;
+			while (true) {
+				Thread.Sleep(dataRateIntervalTime * 1000);
+				dataRateIntervalCount++;
+				curPacketCount = record.PacketCount;
+				packetsPerInterval = (int)(curPacketCount - lastPacketCount);
+				if (packetsPerInterval > dataRateMaxPacketsPerInterval) {
+					dataRateMaxPacketsPerInterval = packetsPerInterval;
+				}
+				lastPacketCount = curPacketCount;
+				if (packetsPerInterval > 3750) {  
+					record.Log.Write("data rate > 9Mbit/s\n");
+				}
+			}
+		} catch (ThreadAbortException) {
+			;	
+		}
+	}
+
+	
+	public Resend(Record record)
+	{
+		this.record = record;
+		bufTable = new char[record.SPktBufNum][];
+		for (int i = 0; i < record.SPktBufNum; i++) {
+			bufTable[i] = new char[PacketsPerSuperPacket];
+			for (int j = 0; j < PacketsPerSuperPacket; j++) {
+				bufTable[i][j] = 'y';
+			}
+		}
+		dataRateThread = new Thread(new ThreadStart(DataRate));
+		dataRateThread.Start();
+		
+		tcpSendThread = new Thread(new ThreadStart(TcpSender));
+		tcpSendThread.Start();
+	}
+	
+	int NextBuf(int bufPos)
+	{
+		int tmp = bufPos + 1;
+		if (tmp == record.SPktBufNum) return 0;
+		else if (tmp > record.SPktBufNum) {
+			record.Log.Write("Resend() - BufPos too large\n");
+			return 0;
+		} else return tmp;
+	}
+
+	public void Acknowledge(UdpPacket packet)
+	{
+		if (packet != null) {
+			try {
+				bufTable[packet.SPktBuf][packet.PacketPos] = 'n';
+				if (writeBuf != packet.SPktBuf) writeBuf = packet.SPktBuf;
+
+				if (packet.Status == UdpPacket.PacketStatus.SPktLast) {
+					writeBuf = NextBuf(writeBuf);
+					tcpSendThread.Interrupt();
+				}
+			} catch (IndexOutOfRangeException) {
+				record.Log.Write("Resend() - Acknowledege out of range\n");
+				// fehlerhafte Packete ignorieren
+			}
+		}
+	}	
+	void TcpSender()
+	{
+		byte[] request;
+		while (true) {
+			while (readBuf != writeBuf) {
+				int packetNum = 0;
+				for (int i = 0; i < PacketsPerSuperPacket; i++) {
+				  if (bufTable[readBuf][i] == 'y') {
+					  packetNum++;
+				  }
+				}	  
+				if (packetNum > 0) {
+					string requestString = 		
+							String.Format("RESEND {0} {1}\n", readBuf, 
+					                    new string(bufTable[readBuf]));
+					request = System.Text.Encoding.ASCII.GetBytes(requestString);
+					try {
+						record.TcpSocket.Send(request, 0, request.Length, 0);
+					} catch (SocketException) {
+						record.Log.Write(
+								"TcpSender: connection to dbox interrupted\n");
+						return;
+					}
+					if (record.IsResendMessages) {
+						record.Log.Write(String.Format(
+					                 "RESEND {0} packets\n", packetNum));
+					}
+					if (packetNum > maxPacketsPerResend) {
+						maxPacketsPerResend = packetNum;
+					}
+					resendPacketCount += packetNum;
+					resendCount++;
+				}
+				for (int i = 0; i < PacketsPerSuperPacket; i++) {
+					bufTable[readBuf][i] = 'y';
+				}
+				readBuf = NextBuf(readBuf);
+			}
+			if (isStopped) {
+				dataRateThread.Abort();
+				
+				record.Log.Write("to DBox: STOP\n");
+				request = System.Text.Encoding.ASCII.GetBytes("STOP\n");
+				try {
+					record.TcpSocket.Send(request, 0, request.Length, 0);
+				} catch (SocketException) {
+					record.Log.Write(
+							"TcpSender: connection to dbox interrupted\n");
+					return;
+				}
+				
+				if (resendPacketCount == 0) {
+					record.Log.Write(String.Format(
+						"network statistics:\n" +
+						"max:      {0:F1} Mbit/s total data rate\n" +
+						"average:  {1:F1} Mbit/s total data rate\n" +
+						"no resends\n",
+						dataRateFactor * dataRateMaxPacketsPerInterval,
+						dataRateFactor * record.PacketCount / 
+						                    (dataRateIntervalCount + 1)
+					));
+				} else {
+					record.Log.Write(String.Format(
+						"network statistics:\n" +
+						"max:      {0:F1} Mbit/s total data rate\n" +
+						"average:  {1:F1} Mbit/s total data rate\n" +
+						"average:  {2:F3} Mbit/s resend data rate\n" + 
+						"count:    {3} resend packets\n" +
+						"average:  1 resend packet per {4:F1} total packets\n" +
+						"max:      {5} packets per resend\n" +
+						"average:  {6:F1} packets per resend\n", 
+						dataRateFactor * dataRateMaxPacketsPerInterval,
+						dataRateFactor * record.PacketCount / 
+						                          (dataRateIntervalCount + 1),
+						dataRateFactor * resendPacketCount / 
+						                          (dataRateIntervalCount + 1),
+						resendPacketCount, 
+						(double)record.PacketCount/resendPacketCount, 
+						maxPacketsPerResend,
+						(double)resendPacketCount/resendCount));
+				}
+				break;
+			}
+			
+			try {
+				Thread.Sleep(200);
+			} catch (ThreadInterruptedException) {
+				;
+			}	
+		}
+		record.Log.Write("TcpSender stopped\n");
+	}
+	public void Stop()
+	{
+		isStopped = true;
+	}
+}
+

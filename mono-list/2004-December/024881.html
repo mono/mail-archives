@@ -1,0 +1,226 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Re: Calling back from unmanaged code to managed
+ code.
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:francis%40aspl.es">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <META http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+   <LINK REL="Previous"  HREF="024864.html">
+   <LINK REL="Next"  HREF="024901.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Re: Calling back from unmanaged code to managed
+ code.
+   </H1>
+    <B>Francis Brosnan Blázquez
+    </B> 
+    <A HREF="mailto:francis%40aspl.es"
+       TITLE="[Mono-list] Re: Calling back from unmanaged code to managed
+ code.">francis@aspl.es
+       </A><BR>
+    <I>Sat, 11 Dec 2004 13:07:53 +0100</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="024864.html">[Mono-list] Re: Calling back from unmanaged code to managed code.
+</A></li>
+        <LI> Next message: <A HREF="024901.html">[Mono-list] Re: Calling back from unmanaged code to managed
+ code.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24881">[ date ]</a>
+              <a href="thread.html#24881">[ thread ]</a>
+              <a href="subject.html#24881">[ subject ]</a>
+              <a href="author.html#24881">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>About this issue:
+
+Finally I've found a solution. I think it's a litle complex, but really
+integrated not only with mono but also with other .NET runtime and you
+get lot of powerful features doing like I'm going to say.
+
+Maybe mono still lacks support for this case, I mean, integrate
+unmanaged threads with managed ones. But this exposes, not only a
+not-easy-to-solve mono problem, but also a problem on how to bind this
+type of libraries in a proper way which allows you to get better
+results.
+
+The whole problem comes from trying to bind a C API which callbacks
+asynchronously to the caller as it is. Reading about what support should
+give .NET runtime and how native .NET code can be translated into
+asynchronous code I've realized that the best way to bind asynchronous
+libraries is to keep unmanaged and managed code separated.
+
+Try to think about every thread model we can find in every platform and
+you'll realize that you should not really on mono to support this.
+Microsoft .NET binding says that &quot;the runtime must detect newly
+unmanaged created threads and support them&quot; [1], but, they talks from
+its points of view: Microsoft Windows platforms. 
+
+In short, if you have a library with a C API to bind like the follows:
+
+    // signature for the response callback
+    typedef void (*Callback) (SomeCStruct * response, gpointer data);
+
+    // request api
+    void my_async_func_to_bind (gint value, Callback cb, gpointer data);
+
+In which your callback &quot;cb&quot; will be executed at the end of the
+my_async_func_to_bind execution.
+The response, with the user data provided, will be passed to &quot;cb&quot;, in a
+newly unmanaged created thread appart from the main thread which have
+call my_async_func_to_bind.
+
+In this context, it won't be a good idea (and you should NOT) to bind
+this C API directly because you are relaying on the runtime to get it
+working as I say. 
+
+Instead of that you need to create an litle c-glue to transfor your
+asynchronous C API into a new synchronous C API. To do this, you can use
+GAsyncQueues from glib in this way:
+
+   // support function which only catch the response 
+   void return_my_value_on_my_queue (SomeCStruct * response,
+                                     gpointer data)
+   {
+      GAsyncQueue * queue = (GAsyncQueue *) data;
+
+      g_async_queue_ref (queue);
+      g_async_queue_push (queue, response);
+      g_async_queue_unref (queue);
+
+      return;
+   } 
+   
+   // synchronous version of my_async_func_to_bind
+   SomeCStruct * my_sync_func_to_bind (gint value) 
+   {
+      GAsyncQueue * queue    = g_async_queue_new ();
+      SomeCStruct * response = NULL;
+      my_async_func_to_bind (value, return_my_value_on_my_queue, queue);
+      
+      response = g_async_queue_pop (queue);
+
+      return response;      
+   }
+
+With the code above, the caller thread (in this context, a managed
+thread with have entered into the unmanaged code) will be blocked on
+g_async_queue_pop until reponse arrives and a g_async_queue_push occur.
+
+Now, you have a really simple signature to bind. To bind this you only
+need to declare all needed DllImport stuff as follows:
+
+   [StructLayout(LayoutKind.Sequential)]
+   public class SomeCStruct {
+       // members declarations as they are ordered in the C API
+   }
+   
+   
+  
+   public class YourLib {
+      [DllImport(&quot;yourlib&quot;)]
+      extern static SomeCStruct my_sync_func_to_bind (int value);
+
+      public static SomeCStruct Get (int value) 
+      {
+          return my_sync_func_to_bind (value);
+      }  
+   }
+
+You need to import SomeCStruct as a class and set that StructLayout.
+Read the Jonathan Pryor document to get more information [3].
+
+Okay, I know what your thinking at this moment: &quot;But, we are not talking
+about asynchronous API? I need the same asynchronous functionality. With
+this approach, we have only synchronous API&quot;. Keep on reading.
+
+.NET have a really powerful support to create Asynchronous version from
+synchronous method [2]. If you want to have an asynchronous version from
+a synchronous method do as follows:
+
+   1) Add a delegate into your class implementation file (not into the
+      class itself) with the same signature as your wanted to make
+      asynchronous class Method:
+       
+      public delegate SomeCStruct AsyncGet (int value);
+
+   2) Now, the consumer class code must do something like this to
+      invoke asynchronously your Get method:
+     
+      int value = // some value
+      AsyncGet dlgt = new AsyncGet (YourLib.Get);
+
+      dlgt.BeginInvoke (value, new AsyncCallback (ProcessGet),dlgt);
+
+      // your code have &quot;invoke&quot; the Get method and it doesn't get
+      // blocked. The response will be recieved at ProcessGet 
+
+   3) Your ProcessGet method needs to implement the
+      AsyncCallback interface and the IAsyncResult interface as follows:
+     
+      public void ProcessGet (IAsyncResult ar)
+      {
+          AsyncGet dlgt        = ar.AsyncState as AsyncGet;
+          SomeCStruct response = dlgt.EndInvoke (ar);
+
+          // do all the stuff need with response
+      } 
+
+
+Conclusion:
+
+1) Maybe this is a mono problem. I'm not agree with this because
+implement a general solution will requiere an effort which won't be
+corresponded with the functionality gained. 
+
+2) In the case mono support this, I will strongly recommend not to relay
+on it because you'll be mono-specific.
+
+3) With this solution you have increased your C-API functionality by
+giving it a synchronous version. 
+
+4) with this solution you have an really simple to understand .NET class
+api which allows consumer to choose how to invoke it.
+
+5) Finally, think about events. C Asynchronous API only support to
+callbacks only one delegate. 
+
+   
+[1] Managed and Unmanaged Threading in Microsoft Windows
+<A HREF="http://msdn.microsoft.com/library/default.asp?url=/library/en-us/cpguide/=">http://msdn.microsoft.com/library/default.asp?url=/library/en-us/cpguide/=</A>
+html/cpconmanagedunmanagedthreadinginmicrosoftwindows.asp
+
+[2] Asynchronous programming overview
+<A HREF="http://msdn.microsoft.com/library/default.asp?url=/library/en-us/cpguide/=">http://msdn.microsoft.com/library/default.asp?url=/library/en-us/cpguide/=</A>
+html/cpovrasynchronousprogrammingoverview.asp
+
+[3] Managed and Unmanaged Code Integration
+<A HREF="http://www.jprl.com/~jon/interop.html">http://www.jprl.com/~jon/interop.html</A>
+
+-- 
+Francis Brosnan Blázquez &lt;<A HREF="mailto:francis@aspl.es">francis@aspl.es</A>&gt;
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="024864.html">[Mono-list] Re: Calling back from unmanaged code to managed code.
+</A></li>
+	<LI> Next message: <A HREF="024901.html">[Mono-list] Re: Calling back from unmanaged code to managed
+ code.
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#24881">[ date ]</a>
+              <a href="thread.html#24881">[ thread ]</a>
+              <a href="subject.html#24881">[ subject ]</a>
+              <a href="author.html#24881">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

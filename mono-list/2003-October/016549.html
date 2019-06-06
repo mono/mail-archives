@@ -1,0 +1,272 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] Marshaling bug?
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:jonpryor%40vt.edu">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="016547.html">
+   <LINK REL="Next"  HREF="016548.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] Marshaling bug?
+   </H1>
+    <B>Jonathan Pryor
+    </B> 
+    <A HREF="mailto:jonpryor%40vt.edu"
+       TITLE="[Mono-list] Marshaling bug?">jonpryor@vt.edu
+       </A><BR>
+    <I>Sat, 25 Oct 2003 12:40:23 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="016547.html">[Mono-list] Marshaling bug?
+</A></li>
+        <LI> Next message: <A HREF="016548.html">[Mono-list] mod_mono installation error
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16549">[ date ]</a>
+              <a href="thread.html#16549">[ thread ]</a>
+              <a href="subject.html#16549">[ subject ]</a>
+              <a href="author.html#16549">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Pardon me for saying this, but your SWT code is borked.  Seriously.
+
+Why?  Opaque pointer values should be expressed as a System.IntPtr, not
+a System.Int32 (&quot;int&quot;).  This is so that if you ever move to a platform
+with a different sized pointer (say, 64-bit Opteron, or PowerPC 970, or
+UltraSparc, or...), you won't kill all your pointer values.
+
+Furthermore, you've got arrays where you shouldn't have arrays. 
+Consider the prototype for g_utf8_to_utf16:
+
+	gunichar* g_utf8_to_utf16 (const gchar *str,
+		glong len,
+		glong *items_read,
+		glong *items_written,
+		GError **error);
+
+Then, consider how C code would call it:
+
+	int items_read, items_written;
+	const char* str = &quot;this is my utf-8 string&quot;;
+	gunichar* result = 
+		g_utf8_to_utf16 (str, strlen (str),
+			&amp;items_read,
+			&amp;items_written,
+			NULL /* ignore errors */);
+
+Assuming that we don't want to handle wrapping GError in C#, this would
+be a better wrapper:
+
+	[DllImport(...)]
+	static extern IntPtr g_utf8_to_utf16 (byte[] str, int len, 
+		out int items_read, out int items_written,
+		IntPtr error /* pass IntPtr.Zero for this */);
+
+Notice that &quot;items_read&quot; and &quot;items_written&quot; are mapped to a &quot;out&quot;
+parameter, instead of an array.  This is more appropriate for this
+function (and for any function similar to it -- items_read and
+items_written aren't holding arrays, they're just an &quot;out&quot; pointer for
+various data).
+
+To answer your last question: what's the advantage of this:
+
+	string s = &quot;Let's i18n, baby...do it hard!&quot;;
+	IntPtr unmanaged_memory = Marshal.StringToHGlobalAnsi (s);
+
+over the voluminous amounts of code you demonstrated before?  Well, it's
+shorter.
+
+But it's also seriously broken, at least from a
+cross-platform/portability perspective.  Here's why:
+
+  - Not all platforms support &quot;HGLOBAL&quot;.  On Unix platforms, this is
+    likely to be normal g_malloc/g_free, but on Windows, this should
+    be using the GlobalAlloc and GlobalFree Win32 APIs.  Which means
+    you have different functions to call on different platforms, which
+    will be a portability headache.
+
+  - Even worse, StringToHGlobalAnsi creates an &quot;Ansi&quot; string.  Ansi
+    IS NOT Utf-8.  At least, you can't assume that it is, though it
+    *could* be.  Ansi is, typically, the local code page, and if you've
+    been paying attention to the file-name handling thread on 
+    mono-devel-list, you'd know that trying to mix the current code
+    page with Unicode handling is fraught with danger (and confusion,
+    and annoyance, and users with Pitchforks complaining about your
+    app not working right...).
+
+So, how do you do string-interop, portably, between Mono &amp; GTK+?  Well,
+you could just use Gtk#, which will tackle this issue (eventually; it
+appears to use Marshal.StringToHGlobalAnsi in some places, so it's
+likely assuming that, under Mono, Ansi == UTF-8).  This is certainly the
+easiest way to go, unless you're dead set on providing *another* GTK+
+wrapper.  (Of course, this places a Gtk# dependency on SWT, which may be
+undesirable.)
+
+If you do it on your own, you're pretty much stuck doing what you're
+doing in your first example.
+
+As for why it doesn't work, it could be a regression.  On my system, it
+appears to be correctly converting the .NET UTF-16 input string &quot;str&quot;
+into a UTF-8 string -- I'm able to pass &quot;data&quot; to g_printf and see
+unmanaged representation.
+
+It's the return trip -- converting the UTF-8 unmanaged memory and
+copying it into the CLI char[] array, that appears to be the problem. 
+I'll need to write a small test case, and if this is a new marshalling
+bug, I'll file it in bugzilla.
+
+Thanks,
+ - Jon
+
+On Sat, 2003-10-25 at 09:52, <A HREF="mailto:pbaena@uol.com.ar">pbaena@uol.com.ar</A> wrote:
+&gt;<i> I reported a bug (#50116) about this problem of mine (of SWT really), and I wanted to get help from the experts to see if the API can be improved.
+</I>&gt;<i> 
+</I>&gt;<i> SWT works this way to append and retrieve from a g_list:
+</I>&gt;<i> 
+</I>&gt;<i> --------------------------------CODE-------------------------
+</I>&gt;<i> using System;
+</I>&gt;<i> using System.Runtime.InteropServices;
+</I>&gt;<i> 
+</I>&gt;<i> class testbug {
+</I>&gt;<i> 
+</I>&gt;<i> public const string GLIB_LIBRARY        = &quot;glib-2.0&quot;;
+</I>&gt;<i> public const string STRLEN_LIBRARY      = &quot;pango-1.0&quot;;
+</I>&gt;<i> public const string MEMMOVE_LIBRARY     = &quot;gtk-x11-2.0&quot;;
+</I>&gt;<i> 
+</I>&gt;<i> [DllImport(GLIB_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern int g_utf16_to_utf8(char[] str, int len, int[]
+</I>&gt;<i> items_read, int[] items_written, int[] error);
+</I>&gt;<i> [DllImport(GLIB_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern int g_utf8_to_utf16(byte[] str, int len, int[]
+</I>&gt;<i> items_read, int[] items_written, int[] error);
+</I>&gt;<i> 
+</I>&gt;<i> [DllImport(STRLEN_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern int strlen(int str);
+</I>&gt;<i> 
+</I>&gt;<i> [DllImport(MEMMOVE_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern void memmove(int dest, int[] src, int size);
+</I>&gt;<i> [DllImport(MEMMOVE_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern void memmove(int dest, byte[] src, int size);
+</I>&gt;<i> [DllImport(MEMMOVE_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern void memmove(int[] dest, byte[] src, int size);
+</I>&gt;<i> [DllImport(MEMMOVE_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern void memmove(byte[] dest, int src, int size);
+</I>&gt;<i> [DllImport(MEMMOVE_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern void memmove(char[] dest, int src, int size);
+</I>&gt;<i> [DllImport(MEMMOVE_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern void memmove(int[] dest, int src, int size); 
+</I>&gt;<i> 
+</I>&gt;<i> [DllImport(GLIB_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern void g_free(int mem);
+</I>&gt;<i> [DllImport(GLIB_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern int g_malloc(int size); 
+</I>&gt;<i> 
+</I>&gt;<i> [DllImport(GLIB_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern int g_list_append(int list, int data); 
+</I>&gt;<i> [DllImport(GLIB_LIBRARY, CharSet = CharSet.Unicode)]
+</I>&gt;<i> public static extern int g_list_nth_data(int list, int n);
+</I>&gt;<i> 
+</I>&gt;<i>  
+</I>&gt;<i> public static void Main ()
+</I>&gt;<i> { 
+</I>&gt;<i>         string str = &quot;Let's i18n, baby...do it hard!&quot;;
+</I>&gt;<i>         int glist = 0; 
+</I>&gt;<i>         bool terminate = true;
+</I>&gt;<i>         char [] strchar = str.ToCharArray(); 
+</I>&gt;<i> 
+</I>&gt;<i>         int [] items_read = new int [1], items_written = new int [1];
+</I>&gt;<i>         int ptr = g_utf16_to_utf8 (strchar, str.Length, items_read, 
+</I>&gt;<i> items_written, null);
+</I>&gt;<i>  
+</I>&gt;<i>         int written = items_written [0];
+</I>&gt;<i>         //TEMPORARY CODE - convertion stops at the first NULL 
+</I>&gt;<i>         if (items_read [0] != strchar.Length) written++;
+</I>&gt;<i>         byte [] buffer = new byte [written + (terminate ? 1 : 0)]; 
+</I>&gt;<i>         memmove (buffer, ptr, written);
+</I>&gt;<i>         g_free (ptr); 
+</I>&gt;<i> 
+</I>&gt;<i>         int data = g_malloc (buffer.Length);
+</I>&gt;<i>         memmove (data, buffer, buffer.Length); 
+</I>&gt;<i>         glist = g_list_append (glist, data);
+</I>&gt;<i>  
+</I>&gt;<i>         data = g_list_nth_data (glist, 0);
+</I>&gt;<i>         int length = strlen (data); 
+</I>&gt;<i>         byte [] buffer1 = new byte [length];
+</I>&gt;<i>         memmove (buffer1, data, length); 
+</I>&gt;<i> 
+</I>&gt;<i>         ptr = g_utf8_to_utf16 (buffer1, buffer1.Length, null,
+</I>&gt;<i> items_written, null); 
+</I>&gt;<i> 
+</I>&gt;<i>         length = items_written [0]; 
+</I>&gt;<i>         char [] chars = new char [length];
+</I>&gt;<i>         memmove (chars, ptr, length * 2); 
+</I>&gt;<i> 
+</I>&gt;<i>         Console.WriteLine (chars); 
+</I>&gt;<i> 
+</I>&gt;<i>         g_free (ptr); 
+</I>&gt;<i> }
+</I>&gt;<i> 
+</I>&gt;<i> }
+</I>&gt;<i> ------------------------------------------------------------------
+</I>&gt;<i> 
+</I>&gt;<i> That worked till mono 0.28, but doesn't work with current mono from CVS. Now I was testing things and found that this other approach to the problem works:
+</I>&gt;<i> 
+</I>&gt;<i> ------------------------------CODE--------------------------------
+</I>&gt;<i> using System;
+</I>&gt;<i> using System.Runtime.InteropServices;
+</I>&gt;<i> 
+</I>&gt;<i> class testbug {
+</I>&gt;<i> 
+</I>&gt;<i> public const string GLIB_LIBRARY        = &quot;glib-2.0&quot;;
+</I>&gt;<i> 
+</I>&gt;<i> [DllImport(GLIB_LIBRARY, CharSet = CharSet.Unicode)] 
+</I>&gt;<i> public static extern int g_list_append(int list, IntPtr data);
+</I>&gt;<i> [DllImport(GLIB_LIBRARY, CharSet = CharSet.Unicode)] 
+</I>&gt;<i> public static extern string g_list_nth_data(int list, int n);
+</I>&gt;<i>  
+</I>&gt;<i> public static void Main ()
+</I>&gt;<i> { 
+</I>&gt;<i>         string str = &quot;Let's i18n, baby...do it hard!&quot;;
+</I>&gt;<i>         int glist = 0; 
+</I>&gt;<i> 
+</I>&gt;<i> 	glist = g_list_append (glist, Marshal.StringToHGlobalAnsi (str)); 
+</I>&gt;<i>         string data2 = g_list_nth_data (glist, 0); 
+</I>&gt;<i> 	Console.WriteLine (data2);
+</I>&gt;<i> 
+</I>&gt;<i> 	return;
+</I>&gt;<i> }
+</I>&gt;<i> 
+</I>&gt;<i> }
+</I>&gt;<i> ----------------------------------------------------------------
+</I>&gt;<i> 
+</I>&gt;<i> Now I was wondering what are the advantages of the latest approach in contrast with SWT's. Can you give me some advice?
+</I>&gt;<i> 
+</I>&gt;<i> Thank you very much!
+</I>&gt;<i> Pablo
+</I>&gt;<i> _______________________________________________
+</I>&gt;<i> Mono-list maillist  -  <A HREF="mailto:Mono-list@lists.ximian.com">Mono-list@lists.ximian.com</A>
+</I>&gt;<i> <A HREF="http://lists.ximian.com/mailman/listinfo/mono-list">http://lists.ximian.com/mailman/listinfo/mono-list</A>
+</I>
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="016547.html">[Mono-list] Marshaling bug?
+</A></li>
+	<LI> Next message: <A HREF="016548.html">[Mono-list] mod_mono installation error
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16549">[ date ]</a>
+              <a href="thread.html#16549">[ thread ]</a>
+              <a href="subject.html#16549">[ subject ]</a>
+              <a href="author.html#16549">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

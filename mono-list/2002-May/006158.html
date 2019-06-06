@@ -1,0 +1,210 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] FW: [Mono-hackers-list] More implementation of the Marshal class
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:danmorg%40sc.rr.com">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="006161.html">
+   <LINK REL="Next"  HREF="006159.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] FW: [Mono-hackers-list] More implementation of the Marshal class
+   </H1>
+    <B>Daniel Morgan
+    </B> 
+    <A HREF="mailto:danmorg%40sc.rr.com"
+       TITLE="[Mono-list] FW: [Mono-hackers-list] More implementation of the Marshal class">danmorg@sc.rr.com
+       </A><BR>
+    <I>Thu, 30 May 2002 11:23:26 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="006161.html">[Mono-list] Mono as a Server Platform
+</A></li>
+        <LI> Next message: <A HREF="006159.html">[Mono-list] Mono as a Server Platform
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6158">[ date ]</a>
+              <a href="thread.html#6158">[ thread ]</a>
+              <a href="subject.html#6158">[ subject ]</a>
+              <a href="author.html#6158">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I thought others maybe interested in how marshalling support could be
+implemented in Mono.
+
+Paolo gave me permission to email his message to the Mono-List.
+
+-----Original Message-----
+From: <A HREF="mailto:mono-hackers-list-admin@ximian.com">mono-hackers-list-admin@ximian.com</A>
+[mailto:<A HREF="mailto:mono-hackers-list-admin@ximian.com">mono-hackers-list-admin@ximian.com</A>] On Behalf Of Paolo Molaro
+Sent: Wednesday, May 29, 2002 7:11 AM
+To: Mono Hackers
+Subject: Re: [Mono-hackers-list] More implementation of the Marshal
+class
+
+On 05/28/02 Daniel Morgan wrote:
+&gt;<i> I assume PtrToStructure() would be implemented as a internal call and
+</I>&gt;<i> placed in mono/mono/metadata/icall.c
+</I>
+Yes, but the logic needed to implement it needs to go into
+metadata/marshal.c, because it's used when marshaling the structure
+to P/Invoke methods.
+
+&gt;<i> However, to gain a better understanding of what I may have to do,
+</I>&gt;<i> I would need to look at:
+</I>&gt;<i> /mono/mono/metadata/class.c and /mono/mono/metadata/class.h
+</I>&gt;<i> 
+</I>&gt;<i> Particularily, the functions are helpful:
+</I>&gt;<i> class_compute_field_layout ()
+</I>&gt;<i> mono_class_init ()
+</I>&gt;<i> mono_get_class()
+</I>
+Actually, you don't need to look at that, but only to the result of that
+calls, i.e. the class-&gt;fields array.
+The MonoClassField structure has some of the info you need: field type
+and field offset inside the _object_. We still need to load the
+marshaling info from the metadata tables, though.
+
+&gt;<i> At first, I thought align was the same thing as the Pack described in
+</I>&gt;<i> the MSDN docs for StructLayoutAttribute, but Lupus pointed out that
+</I>pack
+&gt;<i> is not the same thing as align.  I think Lupus recently committed
+</I>&gt;<i> something for a pack directive to cvs.  I don't know if it has
+</I>anything
+&gt;<i> to do with the Pack field in StructLayoutAttribute.
+</I>
+Yes, it's the same thing, though it has no relevance to the
+implementation of PtrToStructure().
+
+&gt;<i> Any ideas on how to implement PtrToStructure() ?
+</I>
+I have some rough design ideas about how it should all work.
+You can get away with a small hack in the mean time to get you started,
+but I'd like the final code to look something like the following
+proposal (if there are no objections).
+
+Problem: implement the marshaling facilities (both for PtrToStructure()
+and the reverse and for P/Invoke invocations).
+There are a lot of details on how it should be implemented and some of
+the details are quite messy: I want this code to be as generic as
+possible so that it can be used by all the runtimes on all the
+architectures if possible.
+
+The basic idea is: for each type that we need to marshal we write the
+code needed in a special custom bytecode. This bytecode can be either
+'interpreted' or it can be easily translated into native code.
+PtrToStructure() will likely interpret it, but the jit and the interp
+will translate it to native code to implement P/Invoke: this way, all
+the messy logic is in a single place and the arch or runtime specific
+code only needs to do a simple translation.
+
+Consider:
+&lt;C#&gt;
+struct S {
+	[MarshalAs(UnmanagedType.LPStr)]
+	string name;
+	[MarshalAs(UnmanagedType.Bool)]
+	bool val;
+}
+&lt;C&gt;
+struct S {
+	char* name;
+	gboolean val;
+}
+
+Here the bool value takes one byte in the object, but it takes 4 bytes
+in the C structure: this is only one of the several issues we need to be
+aware of.
+So, here is how the bytecode may look like to go from the C# object
+(&quot;from&quot;) to the C struct (&quot;dest&quot;):
+
+	ldobj dest
+	ld.ptr c_name_offset
+	free_if_needed
+	ldobj dest
+	add c_name_offset
+	ldobj from
+	ld.str name_offset
+	conv.lpstr
+	stind.ptr
+	ldobj dest
+	add c_val_offset
+	ldobj from
+	ld.bool
+	conv.native_bool
+	stind.native_bool
+
+The code will have a small header to know in advance the stack size
+needed. 
+
+	ldobj 	loads the address of either the source or destination.
+	add 	adds an integer offset to a pointer.
+	ld.ptr 	loads a pointer from the pointer on the stack
+	free_if_needed calls g_free/free on the pointer on the stack if
+		required
+	ld.str 	loads a MonoString* from the pointer on the stack
+	conv.lpstr converts a MonoString* to a char*
+	stdind.ptr indirect stores a pointer
+	ld.bool loads a C# bool value
+	stind.native_bool indirect stores a native bool
+
+and so on...
+There are about 50 or so opcodes needed, but they should be easy to
+implement.
+The same idea could be used for the P/Invoke calls with a couple more
+special opcodes. For example when calling:
+
+	double stof (string val);
+
+we could have:
+
+	localloc,ptr 0
+	localloc.double 1
+	local_addr 0
+	ldarg.str 0
+	conv.lpstr
+	stind.ptr
+	local_addr 0
+	ld.ptr
+	call func
+	local_addr 1
+	stind.double 1 // store retval from FP stack
+	local_addr 0
+	free
+	local_addr 1
+	ld.double
+
+The bytecode-&gt;binary code translator could be the same for the interp
+and the jit on each arch, because the only difference would be in how
+the ldarg.* opcodes retreive the incoming arguments.
+
+As you see, these are just rough ideas that still need much thinking.
+Suggestions and comments are welcome.
+
+lupus
+
+
+
+
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="006161.html">[Mono-list] Mono as a Server Platform
+</A></li>
+	<LI> Next message: <A HREF="006159.html">[Mono-list] Mono as a Server Platform
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#6158">[ date ]</a>
+              <a href="thread.html#6158">[ thread ]</a>
+              <a href="subject.html#6158">[ subject ]</a>
+              <a href="author.html#6158">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

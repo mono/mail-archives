@@ -1,0 +1,241 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [Mono-list] need some help with PInvoke..
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:jonpryor%40vt.edu">
+   <META NAME="robots" CONTENT="index,nofollow">
+   
+   <LINK REL="Previous"  HREF="014886.html">
+   <LINK REL="Next"  HREF="014899.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[Mono-list] need some help with PInvoke..
+   </H1>
+    <B>Jonathan Pryor
+    </B> 
+    <A HREF="mailto:jonpryor%40vt.edu"
+       TITLE="[Mono-list] need some help with PInvoke..">jonpryor@vt.edu
+       </A><BR>
+    <I>09 Jul 2003 14:15:09 -0400</I>
+    <P><UL>
+        <LI> Previous message: <A HREF="014886.html">[Mono-list] need some help with PInvoke..
+</A></li>
+        <LI> Next message: <A HREF="014899.html">[Mono-list] need some help with PInvoke..
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14896">[ date ]</a>
+              <a href="thread.html#14896">[ thread ]</a>
+              <a href="subject.html#14896">[ subject ]</a>
+              <a href="author.html#14896">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>I suspect that what you want to do isn't possible.
+
+You state that you're using opaque data types.  So, to paraphrase a lot,
+you have an API like:
+
+	/* C language */
+	typedef void* HDATA;
+	char* GetDescription (HDATA data);
+	void CreateData (HDATA* to_init);
+	/* ... */
+
+This doesn't have an exact &quot;mesh&quot; with P/Invoke.  There are two ways to
+wrap something like the above.
+
+The first way is similar to what's done in Gtk# -- use System.IntPtr
+instead of &quot;void*&quot; and use the IntPtr exclusively as a pointer into
+managed memory:
+
+	// C#
+	public class Data {
+		[DllImport (&quot;mylib&quot;)]
+		private static extern string GetDescription(IntPtr d);
+
+		[DllImport (&quot;mylib&quot;)]
+		private static extern void CreateData (out IntPtr init);
+
+		private IntPtr handle;
+
+		public Data () {
+			CreateData (out handle);
+		}
+
+		public string Description {
+			get {return GetDescription (handle);}
+		}
+	}
+
+This works, but has IntPtr's everywhere.
+
+The second method would be to just use unsafe code everywhere, and use
+void* as the data member instead of a IntPtr.  Otherwise, it looks the
+same.
+
+However, what you posted doesn't exactly match the above.  You have a
+&quot;mostly opaque&quot; data structure (given that your C code directly
+references the `desc' member of the NOERR class).
+
+There's a problem with this.  The .NET/mono runtime systems make two
+assumptions: structs are located on the stack, and classes are allocated
+in garbage-collected, .NET-controlled, memory.  Non-stack, non-garbage
+collected memory doesn't enter the picture AT ALL.  This runs directly
+contrary to your example code, where `hdf_init' is allocating
+(unmanaged) memory and storing a pointer to it in *hdf.  You're trying
+to mix the two memory heaps (managed vs. unmanaged), and the runtime
+won't like that.
+
+For example, if we assume the C code:
+
+	void hdf_init (HDF** hdf) {
+		*hdf = malloc (sizeof(HDF));
+	}
+
+and the C# code:
+
+	class Hdf {
+		int foo;
+	}
+
+	class User {
+		[DllImport(&quot;&quot;)]
+		private static extern void hdf_init (ref Hdf);
+
+		public static void Main () {
+			Hdf h = null;
+			hdf_init (ref h);
+		}
+	}
+
+Recall that .NET class variables are actually pointers, so the argument
+for `User.hdf_init' is correct -- a pointer to a pointer is actually
+passed.  The problem is the interaction between the C code, and how it
+breaks the .NET memory model assumptions.  After the call to hdf_init,
+`h' will actually refer to unmanaged, non-GCed memory.  FURTHERMORE,
+what the memory is actually pointing to is no longer a .NET `Hdf' type. 
+.NET class types contain extra object header information, for use with
+run-time type checking and the virtual function mechanism.  So if you
+attempt to use this, you can either expect an error on the first use of
+`h', or an error/segfault on the next garbage collection.
+
+In short, you can't do that.  Mixing managed and unmanaged memory can
+only really be done in Managed C++, and you have to be *very* careful
+when you do so (paying careful attention to the issues outlined above).
+
+So, what's the solution?  Expose your HDF type as a *fully* opaque data
+type, providing C functions to access whatever data is within it,
+instead of using &quot;normal&quot; member access.  Use the accessor functions
+from C#. and make sure you keep the managed and unmanaged memory
+separate.
+
+See the generated Gtk# sources for an example of this.  C code can
+directly access GObject members, but (1) that's not good style (you're
+not supposed to do that), and (2) it's impossible to do that from C#.
+
+ - Jon
+
+P.S.  Sorry for the long email/rant.  Also, don't try actually compiling
+the code printed above -- I didn't try compiling it, it's for
+demonstration/example purposes only (to help make my point). 
+
+On Wed, 2003-07-09 at 03:37, David Jeske wrote:
+&gt;<i> I'm trying to write a PInvoke wrapper and I'm having trouble doing
+</I>&gt;<i> something pretty basic. Perhaps someone can help me.
+</I>&gt;<i> 
+</I>&gt;<i> The C-function I'm trying to call has this prototype:
+</I>&gt;<i> 
+</I>&gt;<i>   NEOERR* hdf_init (HDF **hdf);
+</I>&gt;<i> 
+</I>&gt;<i> As far as C# is concerned, HDF and NEOERR are just opaque
+</I>&gt;<i> data-structures. 
+</I>&gt;<i> 
+</I>&gt;<i> When hdf_init runs, it allocates some datastructures, and passes back
+</I>&gt;<i> the pointer through the externally allocated hdf pointer. I just want
+</I>&gt;<i> to print the address of this structure so I can see that something is
+</I>&gt;<i> working. Here is a C-program that does what I want..
+</I>&gt;<i> 
+</I>&gt;<i> #include &lt;ClearSilver.h&gt;
+</I>&gt;<i> 
+</I>&gt;<i> int main() {
+</I>&gt;<i>   HDF *hdf;
+</I>&gt;<i>   NEOERR *err;
+</I>&gt;<i> 
+</I>&gt;<i>   err = hdf_init(&amp;hdf);
+</I>&gt;<i> 
+</I>&gt;<i>   if (err) {
+</I>&gt;<i>       printf(&quot;error: %s\n&quot;, err-&gt;desc);
+</I>&gt;<i>       return 1;
+</I>&gt;<i>    }
+</I>&gt;<i> 
+</I>&gt;<i>    printf(&quot;success: 0x%X\n&quot;, hdf);
+</I>&gt;<i> }
+</I>&gt;<i> 
+</I>&gt;<i> I can't seem to get this to work through C# and PInvoke with
+</I>&gt;<i> mono.. (All of this is with Linux. I can't try with csc right now
+</I>&gt;<i> because I don't have the dll built for windows) My attempt is here:
+</I>&gt;<i> 
+</I>&gt;<i> using System;
+</I>&gt;<i> using System.Runtime.InteropServices;
+</I>&gt;<i> 
+</I>&gt;<i> [StructLayout(LayoutKind.Sequential)] public class HDF {}
+</I>&gt;<i> [StructLayout(LayoutKind.Sequential)] public class LPHDF {
+</I>&gt;<i>   //[MarshalAs(UnmanagedType.LPStruct)]
+</I>&gt;<i>   //public HDF hdf;
+</I>&gt;<i>   public int hdf;
+</I>&gt;<i> }
+</I>&gt;<i> 
+</I>&gt;<i> public class Hdf {
+</I>&gt;<i>   // NEOERR* hdf_init (_HDF **hdf);
+</I>&gt;<i> 
+</I>&gt;<i>   [DllImport(&quot;libneo.so&quot;, EntryPoint=&quot;hdf_init&quot;)]
+</I>&gt;<i>   [return: MarshalAs(UnmanagedType.LPStruct)]
+</I>&gt;<i>   private static extern void hdf_init(
+</I>&gt;<i>        [ MarshalAs(UnmanagedType.LPStruct)]
+</I>&gt;<i>          LPHDF hdf);
+</I>&gt;<i> 
+</I>&gt;<i> public static int Main(string[] argv) {
+</I>&gt;<i>    Console.WriteLine(&quot;start test&quot;);
+</I>&gt;<i> 
+</I>&gt;<i>     LPHDF lphdf = new LPHDF();
+</I>&gt;<i>     hdf_init(lphdf);
+</I>&gt;<i>     Console.WriteLine(lphdf.hdf);
+</I>&gt;<i>    
+</I>&gt;<i> 
+</I>&gt;<i>    return 0;
+</I>&gt;<i>  }
+</I>&gt;<i> 
+</I>&gt;<i> };
+</I>&gt;<i> 
+</I>&gt;<i> Whenever I run this, it just prints out &quot;0&quot; as the alleged value of
+</I>&gt;<i> lphdf.hdf. This is no good. Any suggestions?
+</I>&gt;<i> 
+</I>&gt;<i> If you want to poke at the real stuff, you can download libneo.so here:
+</I>&gt;<i> 
+</I>&gt;<i>   <A HREF="http://mozart.chat.net/~jeske/_drop/pinvoke/">http://mozart.chat.net/~jeske/_drop/pinvoke/</A>
+</I>&gt;<i> 
+</I>&gt;<i> libneo is built out of the clearsilver package from here:
+</I>&gt;<i>  
+</I>&gt;<i>   <A HREF="http://www.clearsilver.net/">http://www.clearsilver.net/</A>
+</I>
+
+</PRE>
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI> Previous message: <A HREF="014886.html">[Mono-list] need some help with PInvoke..
+</A></li>
+	<LI> Next message: <A HREF="014899.html">[Mono-list] need some help with PInvoke..
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#14896">[ date ]</a>
+              <a href="thread.html#14896">[ thread ]</a>
+              <a href="subject.html#14896">[ subject ]</a>
+              <a href="author.html#14896">[ author ]</a>
+         </LI>
+       </UL>
+</body></html>

@@ -1,0 +1,106 @@
+/*
+ * symbols.h: redefines all WAPI symbols to avoid naming pollution.
+ */
+
+#ifndef _WAPI_SYMBOLS_H_
+#define _WAPI_SYMBOLS_H_
+
+#define closesocket Monoclosesocket
+#define ioctlsocket Monoioctlsocket
+#define CloseHandle MonoCloseHandle
+#define CopyFile MonoCopyFile
+#define CreateDirectory MonoCreateDirectory
+#define CreateEvent MonoCreateEvent
+#define CreateFile MonoCreateFile
+#define CreateMutex MonoCreateMutex
+#define CreatePipe MonoCreatePipe
+#define CreateProcess MonoCreateProcess
+#define CreateSemaphore MonoCreateSemaphore
+#define CreateThread MonoCreateThread
+#define DeleteCriticalSection MonoDeleteCriticalSection
+#define DeleteFile MonoDeleteFile
+#define EnumProcessModules MonoEnumProcessModules
+#define EnumProcesses MonoEnumProcesses
+#define ExitThread MonoExitThread
+#define FileTimeToSystemTime MonoFileTimeToSystemTime
+#define FindClose MonoFindClose
+#define FindFirstFile MonoFindFirstFile
+#define FindNextFile MonoFindNextFile
+#define FlushFileBuffers MonoFlushFileBuffers
+#define GetCurrentDirectory MonoGetCurrentDirectory
+#define GetCurrentProcess MonoGetCurrentProcess
+#define GetCurrentProcessId MonoGetCurrentProcessId
+#define GetCurrentThread MonoGetCurrentThread
+#define GetCurrentThreadId MonoGetCurrentThreadId
+#define GetExitCodeProcess MonoGetExitCodeProcess
+#define GetExitCodeThread MonoGetExitCodeThread
+#define GetFileAttributes MonoGetFileAttributes
+#define GetFileAttributesEx MonoGetFileAttributesEx
+#define GetFileSize MonoGetFileSize
+#define GetFileTime MonoGetFileTime
+#define GetFileType MonoGetFileType
+#define GetLastError MonoGetLastError
+#define GetLogicalDriveStrings MonoGetLogicalDriveStrings
+#define GetModuleBaseName MonoGetModuleBaseName
+#define GetProcessId MonoGetProcessId
+#define GetProcessTimes MonoGetProcessTimes
+#define GetProcessWorkingSetSize MonoGetProcessWorkingSetSize
+#define GetStdHandle MonoGetStdHandle
+#define GetSystemInfo MonoGetSystemInfo
+#define GetTempPath MonoGetTempPath
+#define GetThreadContext MonoGetThreadContext
+#define GetTickCount MonoGetTickCount
+#define ImpersonateLoggedOnUser MonoImpersonateLoggedOnUser
+#define InitializeCriticalSection MonoInitializeCriticalSection
+#define InitializeCriticalSectionAndSpinCount MonoInitializeCriticalSectionAndSpinCount
+#define LockFile MonoLockFile
+#define MoveFile MonoMoveFile
+#define OpenEvent MonoOpenEvent
+#define OpenMutex MonoOpenMutex
+#define OpenProcess MonoOpenProcess
+#define OpenSemaphore MonoOpenSemaphore
+#define OpenThread MonoOpenThread
+#define PulseEvent MonoPulseEvent
+#define QueryPerformanceCounter MonoQueryPerformanceCounter
+#define QueryPerformanceFrequency MonoQueryPerformanceFrequency
+#define QueueUserAPC MonoQueueUserAPC
+#define ReadFile MonoReadFile
+#define ReleaseMutex MonoReleaseMutex
+#define ReleaseSemaphore MonoReleaseSemaphore
+#define RemoveDirectory MonoRemoveDirectory
+#define ResetEvent MonoResetEvent
+#define ResumeThread MonoResumeThread
+#define RevertToSelf MonoRevertToSelf
+#define SetCriticalSectionSpinCount MonoSetCriticalSectionSpinCount
+#define SetCurrentDirectory MonoSetCurrentDirectory
+#define SetEndOfFile MonoSetEndOfFile
+#define SetEvent MonoSetEvent
+#define SetFileAttributes MonoSetFileAttributes
+#define SetFilePointer MonoSetFilePointer
+#define SetFileTime MonoSetFileTime
+#define SetLastError MonoSetLastError
+#define SetProcessWorkingSetSize MonoSetProcessWorkingSetSize
+#define ShellExecuteEx MonoShellExecuteEx
+#define SignalObjectAndWait MonoSignalObjectAndWait
+#define Sleep MonoSleep
+#define SleepEx MonoSleepEx
+#define SuspendThread MonoSuspendThread
+#define TerminateProcess MonoTerminateProcess
+#define TlsAlloc MonoTlsAlloc
+#define TlsFree MonoTlsFree
+#define TlsGetValue MonoTlsGetValue
+#define TlsSetValue MonoTlsSetValue
+#define TryEnterCriticalSection MonoTryEnterCriticalSection
+#define UnlockFile MonoUnlockFile
+#define WSACleanup MonoWSACleanup
+#define WSAGetLastError MonoWSAGetLastError
+#define WSAIoctl MonoWSAIoctl
+#define WSASetLastError MonoWSASetLastError
+#define WSAStartup MonoWSAStartup
+#define WaitForMultipleObjects MonoWaitForMultipleObjects
+#define WaitForMultipleObjectsEx MonoWaitForMultipleObjectsEx
+#define WaitForSingleObject MonoWaitForSingleObject
+#define WaitForSingleObjectEx MonoWaitForSingleObjectEx
+#define WriteFile MonoWriteFile
+
+#endif
