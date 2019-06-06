@@ -1,0 +1,178 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [macios-devel] Signal-chaining &amp; crash reporters
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:macios-devel%40lists.dot.net?Subject=Re%3A%20%5Bmacios-devel%5D%20Signal-chaining%20%26%20crash%20reporters&In-Reply-To=%3C63F69566-BFA6-45C5-B714-FAF4DF767CE0%40microsoft.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="000015.html">
+   <LINK REL="Next"  HREF="000017.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[macios-devel] Signal-chaining &amp; crash reporters</H1>
+    <B>Rolf Kvinge</B> 
+    <A HREF="mailto:macios-devel%40lists.dot.net?Subject=Re%3A%20%5Bmacios-devel%5D%20Signal-chaining%20%26%20crash%20reporters&In-Reply-To=%3C63F69566-BFA6-45C5-B714-FAF4DF767CE0%40microsoft.com%3E"
+       TITLE="[macios-devel] Signal-chaining &amp; crash reporters">Rolf.Kvinge at microsoft.com
+       </A><BR>
+    <I>Fri Sep 16 06:13:56 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="000015.html">[macios-devel] iOS 10 samples
+</A></li>
+        <LI>Next message (by thread): <A HREF="000017.html">[macios-devel] Signal-chaining &amp; crash reporters
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16">[ date ]</a>
+              <a href="thread.html#16">[ thread ]</a>
+              <a href="subject.html#16">[ subject ]</a>
+              <a href="author.html#16">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Hi!
+
+Recently we've realized that third-party libraries that do crash reporting (such as Insights or HockeyApp) are not notified when crashes occur (SIGSEGV).
+
+These third-party libraries have typically adopted code similar to this: <A HREF="http://stackoverflow.com/a/14499336/183422">http://stackoverflow.com/a/14499336/183422</A> to cope with the fact that the Mono runtime must handle SIGSEGV and SIGBUS before anybody else (SIGSEGVs occur for NullReferenceExceptions, and the GC uses SIGBUS frequently for its own purposes).
+
+The current sequence of events is this:
+
+a) The app launches, and Xamarin.iOS initializes the Mono runtime. At that time the Mono runtime checks if there are any existing signal handlers, and store those handlers (so that they can be invoked if the Mono runtime determines a SIGSEGV did not occur in managed code).
+b) Managed code starts running, and the actual app initializes any third-party libraries. At this point third-party libraries typically do something like this:
+
+    * Fetches current signal handlers (which would be Mono's signal handlers) and stores them.
+   * Initializes third-party crash-reporting libraries, which installs signal handlers.
+    * Restores the stored signal handlers.
+
+    Sample HockeyApp code: <A HREF="https://github.com/bitstadium/HockeySDK-Xamarin/blob/master/source/HockeySDK.iOSBindings/Additions.cs">https://github.com/bitstadium/HockeySDK-Xamarin/blob/master/source/HockeySDK.iOSBindings/Additions.cs</A> - L30-L52&lt;<A HREF="https://github.com/bitstadium/HockeySDK-Xamarin/blob/master/source/HockeySDK.iOSBindings/Additions.cs#L30-L52">https://github.com/bitstadium/HockeySDK-Xamarin/blob/master/source/HockeySDK.iOSBindings/Additions.cs#L30-L52</A>&gt;
+
+c) Something goes wrong (in native code), and the app receives a SIGSEGV.
+
+    * Mono's signal handler is invoked and determines it's not a NullReferenceException.
+    * Mono calls the signal handler it stored during initialization. As you can see this is not the third-party library's signal handler, it's the OS' default signal handler, which causes the process to exit (without notifying the third-party crash-reporting library) and the OS generates a crash report (which the app developer will not see, because he believes the third-party crash-reporting library reports those).
+
+So how do we fix this?
+
+A couple of ideas:
+
+1) Add an API to select/set the signal handler Mono chains to:
+
+namespace ObjCRuntime {
+      public class Runtime {
+            public struct SigAction
+            {
+                  public IntPtr Handler; //
+                  public uint Mask; // sa_mask =&gt; sigset_t =&gt; __darwin_sigset_t =&gt; uint32_t
+                  public int Flags; // sa_flags =&gt; int
+            }
+
+            public static bool InstallSignalHandler (int signal, SigAction handler, out SigAction previous_handler);
+      }
+}
+
+    The idea being to do something like this (modified code from HockeyApp's link from above):
+
+      // Store Mono SIGSEGV and SIGBUS handlers
+      sigaction(Signal.SIGBUS, IntPtr.Zero, sigbus);
+      sigaction(Signal.SIGSEGV, IntPtr.Zero, sigsegv);
+
+      // Enable crash reporting libraries
+      DoStartManager();
+
+      +     Runtime.SigAction handler, previous_handler;
+      +     IntPtr hockey_signal = Marshal.AllocHGlobal (512);
+      +     foreach (var signal in new Signal [] { Signal.SIGBUS, Signal.SIGSEGV }) {
+      +           sigaction (signal, IntPtr.Zero, hockey_signal);
+      +           handler = (Runtime.SigAction) Marshal.PtrToStructure (hockey_signal, typeof (Runtime.SigAction));
+      +           bool rv = Runtime.InstallSignalHandler ((int) signal, handler, out previous_handler);
+      +     }
+      +     Marshal.FreeHGlobal (hockey_signal);
+
+      // Restore Mono SIGSEGV and SIGBUS handlers
+      sigaction(Signal.SIGBUS, sigbus, IntPtr.Zero);
+      sigaction(Signal.SIGSEGV, sigsegv, IntPtr.Zero);
+
+    IMHO this is ugly, and also it can't be implemented in current third-party bindings without losing support for older versions of Xamarin.iOS.
+
+    OTOH it does not put any restrictions on the signal handler to chain to (more flexibility).
+
+2) Add an attribute that gives the name of the signal handler, and then Xamarin.iOS generates the required code to make sure these signal handlers are called for signals Mono doesn't handle:
+
+      [assembly: SignalHandler (Signal.SIGSEGV, &quot;third_party_signal_handler&quot;, EnableAtStartup: false)]
+      [assembly: SignalHandler (Signal.SIGBUS, &quot;third_party_signal_handler&quot;, EnableAtStartup: false)]
+
+    The problem here is that the signal handler might be called before the third-party library is initialized (Xamarin.iOS would enable this signal handler before mono is initialized, which means that the app has not had time to initialize the third-party library).
+
+    This could be solved adding a simple function to enable the attribute's signal handler:
+
+                ObjCRuntime.Runtime.EnableCustomSignalHandlers ();
+
+    The big advantage here is that it can catch crashes during app initialization (including Mono's initialization).
+
+3) A mix of both of the above:
+
+      ObjCRuntime.Runtime.EnableCustomSignalHandler (Signals.SIGSEGV, &quot;third_party_signal_handler&quot;);
+
+   The problem here is that we'd have to use dlsym to lookup the function pointer for third_party_signal_handler, which can be problematic sometimes (#1 just gets the function pointer from the signal handler the native third-party library installed, and for #2 generate native code that references the function instead).
+
+4) A mix of all of the above:
+
+      // A function that fetches the current signal handler and makes mono chain to this signal handler
+      ObjCRuntime.Runtime.EnableCurrentSignalHandler (Signals.SIGSEGV);
+
+    Which would be used like this:
+
+      // Store Mono SIGSEGV and SIGBUS handlers
+      sigaction(Signal.SIGBUS, IntPtr.Zero, sigbus);
+      sigaction(Signal.SIGSEGV, IntPtr.Zero, sigsegv);
+
+      // Enable crash reporting libraries
+      DoStartManager();
+
+      +     ObjCRuntime.Runtime.EnableCurrentSignalHandler (Signals.SIGSEGV);
+      +     ObjCRuntime.Runtime.EnableCurrentSignalHandler (Signals.SIGBUS);
+
+      // Restore Mono SIGSEGV and SIGBUS handlers
+      sigaction(Signal.SIGBUS, sigbus, IntPtr.Zero);
+      sigaction(Signal.SIGSEGV, sigsegv, IntPtr.Zero);
+
+Any other ideas? Suggestions for better naming for the API?
+
+BTW this is multiple-choice: we can implement all of these, they're not mutually exclusive.
+
+I think #4 looks like the best option for now, so I'll start implementing that one unless someone says otherwise.
+
+Rolf
+-------------- next part --------------
+An HTML attachment was scrubbed...
+URL: &lt;<A HREF="http://lists.dot.net/pipermail/macios-devel/attachments/20160916/aa785205/attachment-0001.html">http://lists.dot.net/pipermail/macios-devel/attachments/20160916/aa785205/attachment-0001.html</A>&gt;
+</PRE>
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="000015.html">[macios-devel] iOS 10 samples
+</A></li>
+	<LI>Next message (by thread): <A HREF="000017.html">[macios-devel] Signal-chaining &amp; crash reporters
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#16">[ date ]</a>
+              <a href="thread.html#16">[ thread ]</a>
+              <a href="subject.html#16">[ subject ]</a>
+              <a href="author.html#16">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.dot.net/mailman/listinfo/macios-devel">More information about the macios-devel
+mailing list</a><br>
+</body></html>

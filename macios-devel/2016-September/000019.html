@@ -1,0 +1,150 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [macios-devel] [android-devel] Signal-chaining &amp; crash reporters
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:macios-devel%40lists.dot.net?Subject=Re%3A%20%5Bmacios-devel%5D%20%5Bandroid-devel%5D%20Signal-chaining%20%26%20crash%20reporters&In-Reply-To=%3C0DDC0A40-EC1F-4F76-8D6D-1B9B128CDE3E%40vt.edu%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=utf-8">
+   <LINK REL="Previous"  HREF="000017.html">
+   <LINK REL="Next"  HREF="000018.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[macios-devel] [android-devel] Signal-chaining &amp; crash reporters</H1>
+    <B>Jonathan Pryor</B> 
+    <A HREF="mailto:macios-devel%40lists.dot.net?Subject=Re%3A%20%5Bmacios-devel%5D%20%5Bandroid-devel%5D%20Signal-chaining%20%26%20crash%20reporters&In-Reply-To=%3C0DDC0A40-EC1F-4F76-8D6D-1B9B128CDE3E%40vt.edu%3E"
+       TITLE="[macios-devel] [android-devel] Signal-chaining &amp; crash reporters">jonpryor at vt.edu
+       </A><BR>
+    <I>Fri Sep 16 16:43:59 UTC 2016</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="000017.html">[macios-devel] Signal-chaining &amp; crash reporters
+</A></li>
+        <LI>Next message (by thread): <A HREF="000018.html">[macios-devel] [android-devel] Signal-chaining &amp; crash reporters
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19">[ date ]</a>
+              <a href="thread.html#19">[ thread ]</a>
+              <a href="subject.html#19">[ subject ]</a>
+              <a href="author.html#19">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>Kumpera: Please see Option #5, at end.
+
+On Sep 16, 2016, at 10:59 AM, Sebastien Pouliot via android-devel &lt;<A HREF="http://lists.dot.net/mailman/listinfo/macios-devel">android-devel at lists.dot.net</A>&gt; wrote:
+&gt;<i> The current sequence of events is this:
+</I>&gt;<i>  
+</I>&gt;<i> a) The app launches, and Xamarin.iOS initializes the Mono runtime.
+</I>
+Which raises Plausible Solution #0: structure things such that the 3rd party lib sets the default signal handler *before* mono is initialized.
+
+This could be done by e.g. using a C++ global object in an archive linked into the main binary: the constructor will be executed before `main()` executes, so by the time mono has initialized it will see the 3rd party SIGSEGV handler, not the system handler.
+
+There are problems with this:
+
+1. Before `main()`, execution order of global constructors is undefined. This solution is “scalable”, in that any number of libraries can participate, but the order between those libraries can’t be controlled.
+
+2. It requires that the 3rd party library be create-able in this fashion. For example, if it uses a license key which is only available in managed code, this can’t work.
+
+3. It only works for *app* projects. This can thus work for Xamarin.iOS, but it *can’t* work for Xamarin.Android, which uses shared libraries.
+
+However, we can apply similar Judo to make things work in Xamarin.Android. Mono is initialized on Android through a ContentProvider with a high //provider/@android:initOrder value; the `initOrder` value controls the order of loading ContentProviders. You could thus set things up so that the 3rd party lib uses a Java ContentProvider with a *higher* `initOrder` value, thus ensuring that the 3rd party lib is initialized *before* Xamarin.Android. Mono will thus see the 3rd party’s SIGSEGV handler, not the system one.
+
+The immediate problem here is that Xamarin.Android sets the initOrder value to int.MaxValue, but we can certainly lower the value we use to allow code to execute before the Xamarin.Android bootstrap code…
+
+Pro: works/can be made to work *now*, with minimal/no changes to mono and Xamarin.
+
+Con: Requires modifying process state before Mono starts executing, which isn’t always easy or straightforward (requires native code).
+
+&gt;<i> b) Managed code starts running, and the actual app initializes any third-party libraries. At this point third-party libraries typipcally do something like this:
+</I>
+This is assuming/requiring that the 3rd party code is managed code. When it comes to signal handlers, I don’t think that’s valid; any reasonably sane SIGSEGV-handling code *must* be native. Thus, we don’t necessarily need to support initializing it *during* execution of managed code.
+
+That might still be a good idea… I’m not sure, myself.
+
+&gt;<i> A couple of ideas:
+</I>&gt;<i>  
+</I>&gt;<i> 1) Add an API to select/set the signal handler Mono chains to:
+</I>&gt;<i>  
+</I>&gt;<i> namespace ObjCRuntime {
+</I>&gt;<i>       public class Runtime {
+</I>&gt;<i>             public struct SigAction
+</I>&gt;<i>             {
+</I>&gt;<i>                   public IntPtr Handler; //
+</I>&gt;<i>                   public uint Mask; // sa_mask =&gt; sigset_t =&gt; __darwin_sigset_t =&gt; uint32_t
+</I>&gt;<i>                   public int Flags; // sa_flags =&gt; int
+</I>&gt;<i>             }
+</I>&gt;<i>  
+</I>&gt;<i>             public static bool InstallSignalHandler (int signal, SigAction handler, out SigAction previous_handler);
+</I>&gt;<i>       }
+</I>&gt;<i> }
+</I>
+I would prefer to *not* expose a managed binding of `struct sigaction`, in part to reduce portability issues. On Android, `sigset_t` is `unsigned long`, so on 64-bit platforms this will be a 64-bit value, not a 32-bit value, so this wouldn’t be compatible.
+
+Granted, we could have “parallel” definitions for Android vs. iOS, but if we’re doing to define a new API, we should try to minimize such things. :-)
+
+&gt;<i> 2) Add an attribute that gives the name of the signal handler, and then Xamarin.iOS generates the required code to make sure these signal handlers are called for signals Mono doesn't handle:
+</I>
+Such an attribute would need to be iOS/Mac-specific; there’s no Android equivalent. It would also require that `third_party_signal_handler` be a public symbol that the linker can find, in addition to the “use before initialized” issue that Rolf notes.
+
+I think Solution #0 (global C++ objects) overlaps with this general idea, and is cleaner to boot.
+
+&gt;<i> 3) A mix of both of the above:
+</I>&gt;<i>  
+</I>&gt;<i>       ObjCRuntime.Runtime.EnableCustomSignalHandler (Signals.SIGSEGV, &quot;third_party_signal_handler&quot;);
+</I>&gt;<i>  
+</I>&gt;<i>    The problem here is that we'd have to use dlsym to lookup the function pointer for third_party_signal_handler, which can be problematic sometimes (#1 just gets the function pointer from the signal handler the native third-party library installed, and for #2 generate native code that references the function instead).
+</I>
+Another issue: the signals that are specified are signals that Mono needs to handle *first*. I’m not sure that this list of signals is/should be set in stone; what if Mono needs to be first for processing SIGILL in the future? Then this code will be out-of-date, possibly resulting on obscure errors.
+
+This doesn’t feel “safe” to me
+
+&gt;<i>  4) A mix of all of the above:
+</I>..
+&gt;<i> Any other ideas? Suggestions for better naming for the API?
+</I>
+Option 5: a “new&quot; Mono function.
+
+The fundamental problem is that Mono *must* be the first signal handler for e.g. SIGSEGV, but ~anybody else can replace the SIGSEGV handler at any time.
+
+What if the Mono team made one of the following function public:
+
+	// in: <A HREF="https://github.com/mono/mono/blob/master/mono/mini/mini-posix.c">https://github.com/mono/mono/blob/master/mono/mini/mini-posix.c</A>
+	void mono_runtime_install_handlers (void);
+	void mono_runtime_posix_install_handlers (void);
+
+My quick reading of `mono_runtime_posix_install_handlers()` (line ~470) suggests that it registers those signals. It’s currently “internal”, i.e. you can’t `dlsym()` that function from `libmonosgen-2.0.dylib`, but if it were public, you could then register all your third party library code, then call `mono_runtime_install_handlers()`, and the app would be fine.
+
+There would be a problem if e.g. a null value was used in between 3rd party crash handler registration and use of `mono_runtime_install_handlers()`, but such issues should be minimized with appropriate coding, and these issues exist in e.g. current practice.
+
+ - Jon
+
+</PRE>
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="000017.html">[macios-devel] Signal-chaining &amp; crash reporters
+</A></li>
+	<LI>Next message (by thread): <A HREF="000018.html">[macios-devel] [android-devel] Signal-chaining &amp; crash reporters
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#19">[ date ]</a>
+              <a href="thread.html#19">[ thread ]</a>
+              <a href="subject.html#19">[ subject ]</a>
+              <a href="author.html#19">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="http://lists.dot.net/mailman/listinfo/macios-devel">More information about the macios-devel
+mailing list</a><br>
+</body></html>
